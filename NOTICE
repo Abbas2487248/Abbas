@@ -1,0 +1,14 @@
+# NOTICE
+
+This repository contains the fesTerm project, originally published at
+https://github.com/fes/fesTerm. The upstream project metadata identifies its
+workspace license as MIT and its original authors as `fes`.
+
+This notice does not replace or modify upstream copyright notices, authorship,
+third-party licenses, or the terms that apply to upstream files and assets.
+No ownership of upstream material is claimed by this notice.
+
+Repository-specific maintenance files added by Abbas in 2026, including the
+SSH GitHub Actions workflow, are separate additions. Any copyright claim by
+Abbas applies only to original material personally authored for those additions,
+not to the upstream fesTerm project or third-party material.
