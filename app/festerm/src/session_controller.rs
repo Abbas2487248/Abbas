@@ -1,0 +1,5136 @@
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
+use festerm_core::{Dimensions, Terminal};
+use festerm_session::{
+    AutomationAdmissionGuard, AutomationEpoch, FlowDirection, HostKeyPrompt, PasswordPrompt,
+    Session, SessionError, SessionErrorKind, SessionEvent, SessionLifecycle, SessionSendError,
+    SessionTryReceiveError, SshPortForwardRuntime, TerminalSize, DEFAULT_COMMAND_QUEUE_CAPACITY,
+    MAX_IO_CHUNK_BYTES,
+};
+use festerm_ui_egui::{
+    EncodedInputSink, InputRoute, InputSinkDiagnostics, TERMINAL_RESIZE_DEBOUNCE,
+};
+
+#[cfg(test)]
+use festerm_session::SessionMetrics;
+
+/// Maximum session events drained for one session before yielding to the
+/// round-robin update scheduler.
+pub const MAX_SESSION_EVENTS_PER_SLICE: usize = 64;
+
+fn next_automation_instance(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .ok()
+}
+
+fn automation_instance() -> Option<u64> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let instance = next_automation_instance(&NEXT);
+    if instance.is_none() {
+        tracing::error!("automation session identities exhausted; new sessions cannot be shared");
+    }
+    instance
+}
+
+/// Byte threshold for one session's scheduling slice. An indivisible event
+/// may cross it by at most that event's bounded payload.
+pub const MAX_INGEST_BYTES_PER_SESSION_SLICE: usize = MAX_IO_CHUNK_BYTES * 4;
+
+/// Total synchronous output-ingest time available to all sessions in an
+/// application update.
+pub const GLOBAL_INGEST_TIME_BUDGET: Duration = Duration::from_millis(4);
+
+/// Aggregate byte threshold across all sessions in one application update.
+/// The final bounded session slice may cross it by at most one slice.
+pub const MAX_INGEST_BYTES_PER_UPDATE: usize = MAX_INGEST_BYTES_PER_SESSION_SLICE * 64;
+
+/// Maximum bytes retained in the ordered pending-write buffer.
+pub const MAX_PENDING_COMMAND_BYTES: usize = DEFAULT_COMMAND_QUEUE_CAPACITY * MAX_IO_CHUNK_BYTES;
+
+/// The number of content-free resize observations retained for diagnostics.
+const RESIZE_PROBE_HISTORY: usize = 16;
+
+/// A content-free observation for one accepted PTY resize request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResizeProbeGeneration {
+    /// Monotonically increasing local sequence number for an accepted resize.
+    pub generation: u64,
+    pub dimensions: TerminalSize,
+    pub applied: bool,
+    /// Output bytes delivered to the app before this resize was queued.
+    pub output_bytes_at_request: u64,
+    /// Output bytes delivered after this resize was queued and before a newer
+    /// resize request superseded this observation.
+    pub output_bytes_since_request: u64,
+    /// Exact `CSI 6 n` cursor-position queries recognized after this request.
+    pub cursor_position_queries_since_request: u64,
+    /// Current visible nonblank-cell count, never the cells' text.
+    pub visible_nonblank_cells: usize,
+}
+
+/// Bounded content-free diagnostics for output around PTY resizes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResizeProbe {
+    next_generation: u64,
+    output_bytes: u64,
+    cursor_position_queries: u64,
+    scanner: CursorPositionQueryScanner,
+    generations: VecDeque<ResizeProbeGeneration>,
+}
+
+impl ResizeProbe {
+    fn record_resize_request(&mut self, dimensions: TerminalSize) {
+        if self.generations.len() == RESIZE_PROBE_HISTORY {
+            self.generations.pop_front();
+        }
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.generations.push_back(ResizeProbeGeneration {
+            generation: self.next_generation,
+            dimensions,
+            applied: false,
+            output_bytes_at_request: self.output_bytes,
+            output_bytes_since_request: 0,
+            cursor_position_queries_since_request: 0,
+            visible_nonblank_cells: 0,
+        });
+    }
+
+    fn record_resize_applied(&mut self, size: TerminalSize) {
+        if let Some(generation) = self
+            .generations
+            .iter_mut()
+            .find(|generation| !generation.applied && generation.dimensions == size)
+        {
+            generation.applied = true;
+        }
+    }
+
+    fn record_output(&mut self, bytes: &[u8]) {
+        let byte_count = bytes.len() as u64;
+        let cursor_position_queries = self.scanner.observe(bytes);
+        self.output_bytes = self.output_bytes.saturating_add(byte_count);
+        self.cursor_position_queries = self
+            .cursor_position_queries
+            .saturating_add(cursor_position_queries);
+        if let Some(generation) = self.generations.back_mut() {
+            generation.output_bytes_since_request = generation
+                .output_bytes_since_request
+                .saturating_add(byte_count);
+            generation.cursor_position_queries_since_request = generation
+                .cursor_position_queries_since_request
+                .saturating_add(cursor_position_queries);
+        }
+    }
+
+    fn record_visible_nonblank_cells(&mut self, terminal: &Terminal) {
+        let Some(generation) = self.generations.back_mut() else {
+            return;
+        };
+        let count = (0..terminal.dimensions().rows())
+            .flat_map(|row| {
+                (0..terminal.dimensions().columns())
+                    .filter_map(move |column| terminal.cell_ref(column, row))
+            })
+            .filter(|cell| cell.character() != ' ')
+            .count();
+        generation.visible_nonblank_cells = count;
+    }
+
+    pub const fn observed_output_bytes(&self) -> u64 {
+        self.output_bytes
+    }
+
+    pub const fn cursor_position_queries(&self) -> u64 {
+        self.cursor_position_queries
+    }
+
+    pub const fn requested_generations(&self) -> u64 {
+        self.next_generation
+    }
+
+    pub fn applied_generations(&self) -> u64 {
+        self.generations
+            .iter()
+            .filter(|generation| generation.applied)
+            .count() as u64
+    }
+
+    /// Copies only bounded numeric resize observations; no terminal text is
+    /// retained or exposed by this diagnostic API.
+    pub fn generations(&self) -> Vec<ResizeProbeGeneration> {
+        self.generations.iter().copied().collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CursorPositionQueryScanner {
+    #[default]
+    Ground,
+    Escape,
+    CsiStart,
+    CsiSix,
+    CsiOther,
+}
+
+impl CursorPositionQueryScanner {
+    fn observe(&mut self, mut bytes: &[u8]) -> u64 {
+        let mut recognized = 0_u64;
+        loop {
+            // Only ESC leaves ground, so plain text is skipped wholesale.
+            if *self == Self::Ground {
+                let Some(escape) = bytes.iter().position(|&byte| byte == 0x1b) else {
+                    return recognized;
+                };
+                bytes = &bytes[escape..];
+            }
+            let Some((&byte, rest)) = bytes.split_first() else {
+                return recognized;
+            };
+            bytes = rest;
+            *self = match (*self, byte) {
+                (_, 0x1b) => Self::Escape,
+                (Self::Ground, _) => Self::Ground,
+                (Self::Escape, b'[') => Self::CsiStart,
+                (Self::Escape, _) => Self::Ground,
+                (Self::CsiStart, b'6') => Self::CsiSix,
+                (Self::CsiStart, 0x40..=0x7e) => Self::Ground,
+                (Self::CsiStart, _) => Self::CsiOther,
+                (Self::CsiSix, b'n') => {
+                    recognized = recognized.saturating_add(1);
+                    Self::Ground
+                }
+                (Self::CsiSix, 0x40..=0x7e) => Self::Ground,
+                (Self::CsiSix, _) => Self::CsiOther,
+                (Self::CsiOther, 0x40..=0x7e) => Self::Ground,
+                (Self::CsiOther, _) => Self::CsiOther,
+            };
+        }
+    }
+}
+
+// ─── Pending Command Buffer ──────────────────────────────────────────────────
+
+pub(crate) struct PendingCommandBuffer {
+    writes: VecDeque<PendingWrite>,
+    queued_bytes: usize,
+    capacity: usize,
+    clipboard: Option<ClipboardBarrier>,
+    last_flush_accepted: usize,
+    last_flush_dropped: usize,
+}
+
+struct ClipboardBarrier {
+    token: u64,
+    position: usize,
+    filling: bool,
+    failed: bool,
+}
+
+struct PendingWrite {
+    bytes: Vec<u8>,
+    observation: Option<u64>,
+    ui_input: bool,
+}
+
+impl PendingCommandBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            writes: VecDeque::new(),
+            queued_bytes: 0,
+            capacity,
+            clipboard: None,
+            last_flush_accepted: 0,
+            last_flush_dropped: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn enqueue(&mut self, bytes: &[u8]) -> Result<(), PendingCommandError> {
+        self.enqueue_from_source(bytes, false, false)
+    }
+
+    fn enqueue_from_source(
+        &mut self,
+        bytes: &[u8],
+        keyboard_input: bool,
+        ui_input: bool,
+    ) -> Result<(), PendingCommandError> {
+        if bytes.len() > MAX_IO_CHUNK_BYTES {
+            return Err(PendingCommandError::TooLarge {
+                maximum: MAX_IO_CHUNK_BYTES,
+                actual: bytes.len(),
+            });
+        }
+        let queued_bytes = self
+            .queued_bytes
+            .checked_add(bytes.len())
+            .filter(|queued_bytes| *queued_bytes <= self.capacity)
+            .ok_or(PendingCommandError::Full {
+                capacity: self.capacity,
+                queued: self.queued_bytes,
+                attempted: bytes.len(),
+            })?;
+        if !bytes.is_empty() {
+            let write = PendingWrite {
+                bytes: bytes.to_vec(),
+                observation: None,
+                ui_input,
+            };
+            if keyboard_input
+                && self
+                    .clipboard
+                    .as_ref()
+                    .is_some_and(|barrier| barrier.filling)
+            {
+                let barrier = self.clipboard.take().unwrap();
+                self.writes.insert(barrier.position, write);
+            } else if !keyboard_input && self.clipboard.is_some() {
+                // Protocol replies are not keystrokes. Keep terminal queries
+                // serviceable even while user input waits for paste consent.
+                let barrier = self.clipboard.as_mut().unwrap();
+                self.writes.insert(barrier.position, write);
+                barrier.position += 1;
+            } else {
+                self.writes.push_back(write);
+            }
+            self.queued_bytes = queued_bytes;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn flush(&mut self, session: &impl Session) -> PendingFlush {
+        self.flush_observed(session, |_, _| {}, |_| {})
+    }
+
+    fn flush_observed(
+        &mut self,
+        session: &impl Session,
+        mut settle: impl FnMut(u64, &'static str),
+        mut accepted_input: impl FnMut(&[u8]),
+    ) -> PendingFlush {
+        self.last_flush_accepted = 0;
+        self.last_flush_dropped = 0;
+        loop {
+            if self
+                .clipboard
+                .as_ref()
+                .is_some_and(|barrier| barrier.position == 0)
+            {
+                return PendingFlush::Clipboard;
+            }
+            let Some(write) = self.writes.front() else {
+                return PendingFlush::Drained;
+            };
+            match session.try_send_input(&write.bytes) {
+                Ok(()) => {
+                    let bytes = self
+                        .writes
+                        .pop_front()
+                        .expect("front element remains until a successful send");
+                    self.queued_bytes = self.queued_bytes.saturating_sub(bytes.bytes.len());
+                    if bytes.ui_input {
+                        accepted_input(&bytes.bytes);
+                    }
+                    self.last_flush_accepted += 1;
+                    if let Some(barrier) = &mut self.clipboard {
+                        barrier.position -= 1;
+                    }
+                    if let Some(observation) = bytes.observation {
+                        settle(observation, "accepted-by-session");
+                    }
+                }
+                Err(SessionSendError::Full { .. }) => return PendingFlush::Backpressured,
+                Err(error) => {
+                    let dropped_bytes = self.queued_bytes;
+                    self.last_flush_dropped = dropped_bytes;
+                    for write in self.writes.drain(..) {
+                        if let Some(observation) = write.observation {
+                            settle(observation, "rejected-by-session");
+                        }
+                    }
+                    self.queued_bytes = 0;
+                    self.clipboard = None;
+                    return PendingFlush::Unrecoverable {
+                        error,
+                        dropped_bytes,
+                    };
+                }
+            }
+        }
+    }
+
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes
+    }
+
+    pub fn queued_writes(&self) -> usize {
+        self.writes.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PendingCommandError {
+    Full {
+        capacity: usize,
+        queued: usize,
+        attempted: usize,
+    },
+    TooLarge {
+        maximum: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for PendingCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full {
+                capacity,
+                queued,
+                attempted,
+            } => write!(
+                formatter,
+                "pending session writes exceeded their {capacity}-byte bound \
+                 ({queued} queued, {attempted} additional)"
+            ),
+            Self::TooLarge { maximum, actual } => write!(
+                formatter,
+                "session write is {actual} bytes and exceeds the {maximum}-byte limit"
+            ),
+        }
+    }
+}
+
+pub(crate) enum PendingFlush {
+    Drained,
+    Clipboard,
+    Backpressured,
+    Unrecoverable {
+        error: SessionSendError,
+        dropped_bytes: usize,
+    },
+}
+
+/// Exact input, IME, and backend attachment generations for one admission.
+pub struct AutomationInputFence {
+    controller_instance: u64,
+    input: Arc<AutomationEpoch>,
+    input_generation: u64,
+    ime: Arc<AutomationEpoch>,
+    ime_generation: u64,
+    attachment: Arc<AutomationEpoch>,
+    attachment_generation: u64,
+}
+
+impl AutomationInputFence {
+    /// The caller must hold the shared admission lock through this check and
+    /// the effect or disclosure it protects.
+    pub fn is_current(&self) -> bool {
+        self.input.is_current(self.input_generation)
+            && self.ime.is_current(self.ime_generation)
+            && self.attachment.is_current(self.attachment_generation)
+    }
+
+    pub(crate) fn matches_attachment(
+        &self,
+        controller_instance: u64,
+        attachment: &Arc<AutomationEpoch>,
+        generation: u64,
+    ) -> bool {
+        self.controller_instance == controller_instance
+            && Arc::ptr_eq(&self.attachment, attachment)
+            && self.attachment_generation == generation
+    }
+}
+
+// ─── Session Controller ──────────────────────────────────────────────────────
+
+/// Application-level controller that owns session event pumping, ordered pending
+/// writes, terminal replies, resize forwarding, lifecycle state, and diagnostics.
+///
+/// The controller preserves the architectural invariant that only one logical
+/// writer mutates a `Terminal` from session output.
+pub struct SessionController<S: Session> {
+    pub input_recorder: festerm_ui_egui::routing_trace::SharedRecorder,
+    recording_stream: Option<festerm_recording::RecordingStream>,
+    last_input_delivery: &'static str,
+    input_event_is_keyboard: bool,
+    input_event_human_noted: bool,
+    automation_input_epoch: Option<Arc<AutomationEpoch>>,
+    automation_ime_epoch: Option<Arc<AutomationEpoch>>,
+    automation_input_armed: bool,
+    pending_human_inputs: Vec<Weak<()>>,
+    last_pending_input_index: Option<usize>,
+    clipboard_discarded_bytes: usize,
+    native_input_expectation: Option<(&'static [u8], usize, bool)>,
+    session: Option<S>,
+    session_name: &'static str,
+    startup_error: Option<String>,
+    diagnostics: InputSinkDiagnostics,
+    pending_writes: PendingCommandBuffer,
+    pending_resize: Option<TerminalSize>,
+    /// A requested resize awaiting debounce (see [`TERMINAL_RESIZE_DEBOUNCE`])
+    /// before it is forwarded to the PTY, paired with when it was last
+    /// (re)staged.
+    debounced_resize: Option<(TerminalSize, Instant)>,
+    last_lifecycle: Option<SessionLifecycle>,
+    /// Monotonic transport generation, advanced by the application before a
+    /// reconnect request. Lifecycle events may be observed out of order with
+    /// a backend's initial state and are therefore not a safe generation seam.
+    lifecycle_generation: u64,
+    automation_instance: Option<u64>,
+    automation_liveness: Arc<AtomicBool>,
+    observation_revision: u64,
+    last_error: Option<String>,
+    last_backpressure: Option<FlowDirection>,
+    host_key_prompt: Option<HostKeyPrompt>,
+    password_prompt: Option<PasswordPrompt>,
+    port_forwards: Vec<SshPortForwardRuntime>,
+    last_resize: Option<TerminalSize>,
+    resize_probe: ResizeProbe,
+    /// Whether any resize has ever been requested for this controller. The
+    /// very first resize (immediately after a session is spawned, before the
+    /// PTY has ever been told a size other than its startup default) is sent
+    /// to the backend immediately rather than debounced: the shell has not
+    /// yet had a chance to read the stale startup winsize and draw output
+    /// against it, so there is no drag-flood to protect against, and waiting
+    /// out the debounce only widens the window in which the child can read a
+    /// size that our locally reflowed `Terminal` no longer matches (this
+    /// mismatch is what produced a stray, un-erased row from zsh's
+    /// `PROMPT_EOL_MARK` on the very first local shell).
+    has_requested_resize: bool,
+    /// Whether the most recent [`Self::pump_events`] call observed at least
+    /// one `SessionEvent::Output` chunk, independent of `hit_limit` (which
+    /// only reports whether the bounded session slice was exhausted -
+    /// true for backpressure, not for "any output arrived"). Callers that
+    /// want to know whether new session output landed this frame (e.g. the
+    /// background-tab "new output" chip marker, feature request #68) must
+    /// read this rather than `pump_events`'s own return value.
+    last_pump_output_received: bool,
+    last_pump_closed: bool,
+}
+
+impl<S: Session> SessionController<S> {
+    /// Creates a controller from an already-started session.
+    ///
+    /// This is the production constructor when the session was started externally
+    /// (e.g. by the bootstrap code that owns the notifier).
+    pub fn with_session(session: S) -> Self {
+        Self::with_named_session(session, "Local shell")
+    }
+
+    /// Creates a controller from an already-started session with its
+    /// user-visible transport name.
+    pub fn with_named_session(session: S, session_name: &'static str) -> Self {
+        let lifecycle = session.lifecycle();
+        Self {
+            session: Some(session),
+            session_name,
+            startup_error: None,
+            diagnostics: InputSinkDiagnostics::default(),
+            pending_writes: PendingCommandBuffer::new(MAX_PENDING_COMMAND_BYTES),
+            native_input_expectation: None,
+            input_recorder: Default::default(),
+            recording_stream: None,
+            last_input_delivery: "no-delivery",
+            input_event_is_keyboard: true,
+            input_event_human_noted: false,
+            automation_input_epoch: None,
+            automation_ime_epoch: None,
+            automation_input_armed: false,
+            pending_human_inputs: Vec::new(),
+            last_pending_input_index: None,
+            clipboard_discarded_bytes: 0,
+            pending_resize: None,
+            debounced_resize: None,
+            last_lifecycle: Some(lifecycle),
+            lifecycle_generation: 1,
+            automation_instance: automation_instance(),
+            automation_liveness: Arc::new(AtomicBool::new(true)),
+            observation_revision: 1,
+            last_error: None,
+            last_backpressure: None,
+            host_key_prompt: None,
+            password_prompt: None,
+            port_forwards: Vec::new(),
+            last_resize: None,
+            resize_probe: ResizeProbe::default(),
+            has_requested_resize: false,
+            last_pump_output_received: false,
+            last_pump_closed: false,
+        }
+    }
+
+    /// Creates a controller in no-session mode with a startup error message.
+    pub fn with_startup_error(error: String) -> Self {
+        Self::with_named_startup_error(error, "Local shell")
+    }
+
+    /// Creates a no-session controller with a transport-specific startup
+    /// error while retaining the normal no-session behavior.
+    pub fn with_named_startup_error(error: String, session_name: &'static str) -> Self {
+        Self {
+            session: None,
+            session_name,
+            startup_error: Some(error),
+            diagnostics: InputSinkDiagnostics::default(),
+            pending_writes: PendingCommandBuffer::new(MAX_PENDING_COMMAND_BYTES),
+            native_input_expectation: None,
+            input_recorder: Default::default(),
+            recording_stream: None,
+            last_input_delivery: "no-delivery",
+            input_event_is_keyboard: true,
+            input_event_human_noted: false,
+            automation_input_epoch: None,
+            automation_ime_epoch: None,
+            automation_input_armed: false,
+            pending_human_inputs: Vec::new(),
+            last_pending_input_index: None,
+            clipboard_discarded_bytes: 0,
+            pending_resize: None,
+            debounced_resize: None,
+            last_lifecycle: None,
+            lifecycle_generation: 0,
+            automation_instance: automation_instance(),
+            automation_liveness: Arc::new(AtomicBool::new(true)),
+            observation_revision: 1,
+            last_error: None,
+            last_backpressure: None,
+            host_key_prompt: None,
+            password_prompt: None,
+            port_forwards: Vec::new(),
+            last_resize: None,
+            resize_probe: ResizeProbe::default(),
+            has_requested_resize: false,
+            last_pump_output_received: false,
+            last_pump_closed: false,
+        }
+    }
+
+    /// Test constructor: creates a controller with an injected session double.
+    ///
+    /// This is the controlled test seam — callers supply a fake or mock `Session`
+    /// implementation rather than constructing internal fields directly.
+    pub fn for_test(session: S) -> Self {
+        Self::with_session(session)
+    }
+
+    pub fn start_error(&self) -> Option<&str> {
+        self.startup_error.as_deref()
+    }
+
+    pub fn session(&self) -> Option<&S> {
+        self.session.as_ref()
+    }
+
+    pub fn attach_recording_stream(&mut self, stream: festerm_recording::RecordingStream) {
+        self.recording_stream = Some(stream);
+    }
+
+    pub fn recording_id(&self) -> Option<festerm_recording::RecordingId> {
+        self.recording_stream
+            .as_ref()
+            .map(festerm_recording::RecordingStream::recording_id)
+    }
+
+    pub fn detach_recording_stream(&mut self, id: festerm_recording::RecordingId) {
+        if self.recording_id() == Some(id) {
+            self.recording_stream = None;
+        }
+    }
+
+    pub fn record_configuration(&self, terminal: &Terminal) {
+        if let Some(stream) = &self.recording_stream {
+            // The shared recording retains any error and wakes its owner.
+            observe_recording_configuration(stream, terminal);
+        }
+    }
+
+    pub fn record_reset(&self) {
+        if let Some(stream) = &self.recording_stream {
+            let _ = stream.observe_reset();
+        }
+    }
+
+    pub fn ingest_recorded_output(&self, terminal: &mut Terminal, bytes: &[u8]) {
+        apply_recording_output(terminal, bytes, self.recording_stream.as_ref());
+    }
+
+    pub fn end_recording_on_replacement(&mut self) {
+        drop(self.recording_stream.take());
+    }
+
+    pub fn record_resize(&self, terminal: &Terminal) {
+        if let Some(stream) = &self.recording_stream {
+            let _ = stream.observe_resize(terminal);
+        }
+    }
+
+    /// Returns the last observed session lifecycle, without terminal content.
+    ///
+    /// Used by chip-status presentation (`docs/gui-design.md` "Connection
+    /// states"); it never exposes bytes or terminal text.
+    pub fn lifecycle(&self) -> Option<SessionLifecycle> {
+        self.last_lifecycle.clone()
+    }
+
+    #[cfg(test)]
+    pub fn set_lifecycle_for_test(&mut self, lifecycle: SessionLifecycle) {
+        self.update_automation_liveness(&lifecycle);
+        self.last_lifecycle = Some(lifecycle);
+    }
+
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+
+    pub(crate) const fn observation_revision(&self) -> u64 {
+        self.observation_revision
+    }
+
+    pub(crate) const fn automation_instance(&self) -> Option<u64> {
+        self.automation_instance
+    }
+
+    pub(crate) fn automation_liveness(&self) -> Arc<AtomicBool> {
+        self.automation_liveness.clone()
+    }
+
+    pub(crate) fn automation_attachment_epoch(
+        &self,
+    ) -> Option<Arc<festerm_session::AutomationEpoch>> {
+        self.session.as_ref()?.automation_epoch()
+    }
+
+    /// Reserves only on this controller's backend. This is not authorization.
+    #[allow(dead_code)]
+    pub(crate) fn reserve_automation_input(
+        &self,
+        bytes: &[u8],
+    ) -> Result<
+        festerm_session::ReservedAutomationInput,
+        festerm_session::ReserveAutomationInputError,
+    > {
+        let instance = self
+            .automation_instance
+            .ok_or(festerm_session::ReserveAutomationInputError::Unavailable)?;
+        self.session
+            .as_ref()
+            .ok_or(festerm_session::ReserveAutomationInputError::Unavailable)?
+            .reserve_automation_input(instance, bytes)
+    }
+
+    pub(crate) fn set_automation_ime_epoch(&mut self, epoch: &Arc<AutomationEpoch>) {
+        if self
+            .automation_ime_epoch
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, epoch))
+        {
+            self.invalidate_automation_input();
+            self.automation_ime_epoch = Some(epoch.clone());
+        }
+    }
+
+    /// Keeps capture blocked while a user-confirmed input can still be sent.
+    pub(crate) fn begin_pending_human_input(&mut self) -> Arc<()> {
+        self.human_input_takeover();
+        self.pending_human_inputs
+            .retain(|intent| intent.strong_count() != 0);
+        let intent = Arc::new(());
+        self.pending_human_inputs.push(Arc::downgrade(&intent));
+        intent
+    }
+
+    /// Captures a human-input and attachment fence, not a writer lease.
+    ///
+    /// A caller must separately obtain native handoff, validate the target and
+    /// broker lease, and retain the shared admission lock while checking this
+    /// exact fence and publishing any effect or worker disclosure. An empty
+    /// local queue does not prove a safe remote editing or TUI state.
+    pub fn capture_automation_input_fence(&mut self) -> Option<AutomationInputFence> {
+        let guard = festerm_session::automation_admission_lock()?;
+        self.capture_automation_input_fence_locked(&guard)
+    }
+
+    /// Captures all three epochs atomically inside an existing admission
+    /// boundary. UI callers must obtain that boundary nonblockingly.
+    pub(crate) fn capture_automation_input_fence_locked(
+        &mut self,
+        guard: &AutomationAdmissionGuard,
+    ) -> Option<AutomationInputFence> {
+        self.pending_human_inputs
+            .retain(|intent| intent.strong_count() != 0);
+        if !matches!(self.last_lifecycle, Some(SessionLifecycle::Running))
+            || !self.automation_liveness.load(Ordering::Acquire)
+            || !self.pending_human_inputs.is_empty()
+            || self.pending_writes.clipboard.is_some()
+            || !self.pending_writes.writes.is_empty()
+        {
+            return None;
+        }
+        let attachment = self.session.as_ref()?.automation_epoch()?;
+        let attachment_generation = attachment.capture_under_admission(guard)?;
+        let ime = self.automation_ime_epoch.as_ref()?.clone();
+        let ime_generation = ime.capture_under_admission(guard)?;
+        let epoch = self
+            .automation_input_epoch
+            .get_or_insert_with(|| Arc::new(AutomationEpoch::new()))
+            .clone();
+        if epoch.capture_under_admission(guard).is_none() {
+            epoch.transition_under_admission(guard, true);
+        }
+        let generation = epoch.capture_under_admission(guard)?;
+        let fence = AutomationInputFence {
+            controller_instance: self.automation_instance?,
+            input: epoch,
+            input_generation: generation,
+            ime,
+            ime_generation,
+            attachment,
+            attachment_generation,
+        };
+        self.automation_input_armed = true;
+        Some(fence)
+    }
+
+    fn human_input_takeover(&mut self) {
+        if self.automation_input_armed {
+            if let Some(epoch) = &self.automation_input_epoch {
+                epoch.transition(true);
+            }
+            self.automation_input_armed = false;
+        }
+    }
+
+    fn invalidate_automation_input(&mut self) {
+        if let Some(epoch) = &self.automation_input_epoch {
+            epoch.transition(false);
+        }
+        self.automation_input_armed = false;
+    }
+
+    fn update_automation_liveness(&mut self, lifecycle: &SessionLifecycle) {
+        if matches!(lifecycle, SessionLifecycle::Running) {
+            if !self.automation_liveness.load(Ordering::Acquire) {
+                let guard = festerm_session::automation_admission_lock();
+                self.automation_liveness = Arc::new(AtomicBool::new(guard.is_some()));
+            }
+        } else {
+            crate::automation::set_admission_flag(&self.automation_liveness, false);
+            self.invalidate_automation_input();
+        }
+    }
+
+    pub(crate) fn record_local_observation_change(&mut self) {
+        self.observation_revision = self.observation_revision.saturating_add(1);
+        if self.observation_revision == u64::MAX {
+            crate::automation::set_admission_flag(&self.automation_liveness, false);
+            tracing::warn!("terminal observation revision exhausted; automation must refuse");
+        }
+    }
+
+    pub fn advance_lifecycle_generation(&mut self) {
+        drop(self.recording_stream.take());
+        let guard = festerm_session::automation_admission_lock();
+        self.automation_liveness.store(false, Ordering::Release);
+        self.automation_liveness = Arc::new(AtomicBool::new(guard.is_some()));
+        drop(guard);
+        self.invalidate_automation_input();
+        self.lifecycle_generation = self.lifecycle_generation.saturating_add(1);
+        if let Some(token) = self
+            .pending_writes
+            .clipboard
+            .as_ref()
+            .map(|barrier| barrier.token)
+        {
+            self.cancel_clipboard_input(token, "discarded-generation-change");
+        }
+        let dropped_bytes = self.pending_writes.queued_bytes();
+        if dropped_bytes > 0 {
+            let mut recorder = self
+                .input_recorder
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for write in &self.pending_writes.writes {
+                if let Some(observation) = write.observation {
+                    recorder.settle(observation, "discarded-generation-change");
+                }
+            }
+            drop(recorder);
+            self.pending_writes = PendingCommandBuffer::new(self.pending_writes.capacity());
+            tracing::warn!(
+                target: "festerm::session",
+                dropped_bytes,
+                "discarded pending input before reconnect"
+            );
+            self.last_error = Some(format!(
+                "discarded {dropped_bytes} pending input bytes before reconnect"
+            ));
+        }
+    }
+
+    /// Returns the current remote host-key decision request, if any.
+    pub fn host_key_prompt(&self) -> Option<&HostKeyPrompt> {
+        self.host_key_prompt.as_ref()
+    }
+
+    /// Clears `prompt` only when it is still the current host-key request.
+    ///
+    /// Resolution is performed by the SSH session owner. Keeping this state
+    /// transition here prevents an already-resolved request from remaining in
+    /// the UI while a later request is allowed to replace it.
+    pub fn clear_host_key_prompt(&mut self, prompt: &HostKeyPrompt) -> bool {
+        if self.host_key_prompt.as_ref() == Some(prompt) {
+            self.host_key_prompt = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the current interactive password decision request, if any.
+    pub fn password_prompt(&self) -> Option<&PasswordPrompt> {
+        self.password_prompt.as_ref()
+    }
+
+    /// The most recent SSH port-forward snapshot emitted by the worker.
+    /// Non-SSH sessions retain the empty default.
+    pub fn port_forwards(&self) -> &[SshPortForwardRuntime] {
+        &self.port_forwards
+    }
+
+    /// Clears `prompt` only when it is still the current password request.
+    ///
+    /// Mirrors [`Self::clear_host_key_prompt`]: resolution happens through
+    /// the SSH session owner, and this state transition keeps an
+    /// already-resolved request from lingering in the UI while a later
+    /// request is allowed to replace it.
+    pub fn clear_password_prompt(&mut self, prompt: &PasswordPrompt) -> bool {
+        if self.password_prompt.as_ref() == Some(prompt) {
+            self.password_prompt = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Makes a host-key decision failure visible through the ordinary session
+    /// status surface without retaining trust-request data.
+    pub fn record_host_key_resolution_error(&mut self, error: impl std::fmt::Display) {
+        self.last_error = Some(format!("host-key decision could not be applied: {error}"));
+    }
+
+    /// Makes a content-free application operation rejection visible through
+    /// the ordinary session status surface.
+    pub fn record_operation_error(&mut self, operation: &str, error: impl std::fmt::Display) {
+        self.last_error = Some(format!("{operation} could not be applied: {error}"));
+    }
+
+    /// Returns whether another frame is required to continue a bounded drain.
+    ///
+    /// This reports backpressure (the per-session slice cap was hit), *not*
+    /// "did any output arrive" - a normal, modest burst of output drains
+    /// well under [`MAX_SESSION_EVENTS_PER_SLICE`] and reports `false` here
+    /// even though real output was ingested. Callers that need to know
+    /// whether output arrived this call (e.g. the background-tab "new
+    /// output" chip marker) must read [`Self::last_pump_output_received`]
+    /// instead of this return value.
+    pub fn pump_events(&mut self, terminal: &mut Terminal) -> bool {
+        self.pump_events_with_resize(terminal, |terminal, dimensions| {
+            terminal.resize(dimensions).is_ok()
+        })
+    }
+
+    pub fn pump_events_with_resize(
+        &mut self,
+        terminal: &mut Terminal,
+        resize: impl FnMut(&mut Terminal, Dimensions) -> bool,
+    ) -> bool {
+        self.pump_events_with_resize_slice(terminal, resize)
+            .hit_limit
+    }
+
+    pub(crate) fn pump_events_with_resize_slice(
+        &mut self,
+        terminal: &mut Terminal,
+        resize: impl FnMut(&mut Terminal, Dimensions) -> bool,
+    ) -> PumpResult {
+        self.last_pump_output_received = false;
+        self.last_pump_closed = false;
+        let Some(session) = &self.session else {
+            return PumpResult {
+                hit_limit: false,
+                output_received: false,
+                ingested_bytes: 0,
+                closed: false,
+            };
+        };
+        let mut observed = Vec::new();
+        let resize_probe = &mut self.resize_probe;
+        let recording_stream = &mut self.recording_stream;
+        let result = pump_session_events_with_mutations(
+            session,
+            terminal,
+            MAX_SESSION_EVENTS_PER_SLICE,
+            resize,
+            |event| match event {
+                PumpedSessionEvent::Output(bytes) => resize_probe.record_output(bytes),
+                PumpedSessionEvent::Event(event) => observed.push(event.clone()),
+            },
+            |mutation| match mutation {
+                TerminalMutation::Output { bytes, terminal } => {
+                    apply_recording_output(terminal, bytes, recording_stream.as_ref());
+                }
+                TerminalMutation::Recovery { command, terminal } => {
+                    apply_recovery_sync(terminal, command, recording_stream.as_ref());
+                }
+                TerminalMutation::Resize(terminal) => {
+                    if let Some(stream) = recording_stream.as_ref() {
+                        let _ = stream.observe_resize(terminal);
+                    }
+                }
+                TerminalMutation::IntegrityFailure(message) => {
+                    if let Some(stream) = recording_stream.as_ref() {
+                        if let Err(error) = stream.fail_integrity(message) {
+                            tracing::error!(
+                                "Could not stop recording after a session failure: {error}"
+                            );
+                        }
+                    }
+                }
+                TerminalMutation::End => {
+                    drop(recording_stream.take());
+                }
+            },
+        );
+        for event in observed {
+            self.observe_session_event(event);
+        }
+        if result.hit_limit {
+            self.last_backpressure = Some(FlowDirection::Output);
+        }
+        self.last_pump_output_received = result.output_received;
+        self.last_pump_closed = result.closed;
+        result
+    }
+
+    /// Whether the most recent [`Self::pump_events`] call observed at least
+    /// one chunk of session output. See that method's doc comment for why
+    /// this is distinct from its own `bool` return value.
+    pub const fn last_pump_output_received(&self) -> bool {
+        self.last_pump_output_received
+    }
+
+    pub(crate) const fn last_pump_closed(&self) -> bool {
+        self.last_pump_closed
+    }
+
+    fn observe_session_event(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::Lifecycle(lifecycle) => {
+                tracing::info!(target: "festerm::session", ?lifecycle, "session lifecycle");
+                if !matches!(lifecycle, SessionLifecycle::Running) {
+                    self.port_forwards = Vec::new();
+                }
+                self.update_automation_liveness(&lifecycle);
+                self.last_lifecycle = Some(lifecycle);
+            }
+            SessionEvent::ResizeApplied(size) => {
+                tracing::debug!(
+                    target: "festerm::session",
+                    columns = size.columns(),
+                    rows = size.rows(),
+                    "session resized"
+                );
+                self.last_resize = Some(size);
+                self.resize_probe.record_resize_applied(size);
+            }
+            SessionEvent::Backpressure { direction, .. } => {
+                tracing::warn!(
+                    target: "festerm::session",
+                    ?direction,
+                    "session queue pressure"
+                );
+                self.last_backpressure = Some(direction);
+            }
+            SessionEvent::HostKeyVerification(prompt) => {
+                self.host_key_prompt = Some(prompt);
+            }
+            SessionEvent::PasswordRequested(prompt) => {
+                self.password_prompt = Some(prompt);
+            }
+            SessionEvent::PortForwardsUpdated(forwards) => {
+                self.port_forwards = forwards;
+            }
+            SessionEvent::Error(error) => self.record_session_error(error),
+            SessionEvent::RecoverySync(_) => self.record_local_observation_change(),
+            SessionEvent::Output(_) => {}
+        }
+    }
+
+    pub fn forward_terminal_replies(&mut self, terminal: &mut Terminal) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.terminal_replies_owned_by_backend())
+        {
+            let _ = terminal.drain_replies();
+            let _ = terminal.take_reply_queue_overflowed();
+            return;
+        }
+        if terminal.take_reply_queue_overflowed() {
+            self.last_error = Some("terminal reply queue overflowed".to_owned());
+            tracing::warn!(
+                target: "festerm::session",
+                "terminal reply queue overflowed before session forwarding"
+            );
+        }
+        let replies = terminal.drain_replies();
+        if !replies.is_empty() {
+            self.queue_bytes(&replies, "terminal reply");
+        }
+    }
+
+    /// A metadata-only position in the existing bounded ordered byte queue.
+    /// Normal input continues to be encoded, but cannot pass this position.
+    pub fn begin_clipboard_input(&mut self, token: u64) -> bool {
+        self.human_input_takeover();
+        self.finish_failed_clipboard_input();
+        if self.pending_writes.clipboard.is_some() {
+            return false;
+        }
+        self.pending_writes.clipboard = Some(ClipboardBarrier {
+            token,
+            position: self.pending_writes.writes.len(),
+            filling: false,
+            failed: false,
+        });
+        true
+    }
+
+    pub fn clipboard_input_pending(&self, token: u64) -> bool {
+        self.pending_writes
+            .clipboard
+            .as_ref()
+            .is_some_and(|barrier| barrier.token == token && !barrier.failed)
+    }
+
+    pub fn clipboard_input_failed(&self, token: u64) -> bool {
+        self.pending_writes
+            .clipboard
+            .as_ref()
+            .is_some_and(|barrier| barrier.token == token && barrier.failed)
+    }
+
+    pub fn prepare_clipboard_input(&mut self, token: u64) -> bool {
+        if let Some(barrier) = &mut self.pending_writes.clipboard {
+            if barrier.token == token && !barrier.failed {
+                barrier.filling = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn cancel_clipboard_input(&mut self, token: u64, reason: &'static str) {
+        if self
+            .pending_writes
+            .clipboard
+            .as_ref()
+            .is_some_and(|barrier| barrier.token == token)
+        {
+            self.discard_clipboard_tail(reason, false);
+        }
+    }
+
+    pub fn fail_clipboard_input(&mut self, token: u64, reason: &'static str) {
+        if self.pending_writes.clipboard.is_none() {
+            self.pending_writes.clipboard = Some(ClipboardBarrier {
+                token,
+                position: self.pending_writes.writes.len(),
+                filling: false,
+                failed: true,
+            });
+        } else if self
+            .pending_writes
+            .clipboard
+            .as_ref()
+            .is_some_and(|barrier| barrier.token == token)
+        {
+            self.discard_clipboard_tail(reason, true);
+        }
+    }
+
+    pub fn finish_failed_clipboard_input(&mut self) {
+        if self
+            .pending_writes
+            .clipboard
+            .as_ref()
+            .is_some_and(|barrier| barrier.failed)
+        {
+            self.pending_writes.clipboard = None;
+        }
+    }
+    fn clipboard_tail_bytes(&self) -> usize {
+        self.pending_writes.clipboard.as_ref().map_or(0, |barrier| {
+            self.pending_writes
+                .writes
+                .iter()
+                .skip(barrier.position)
+                .map(|write| write.bytes.len())
+                .sum()
+        })
+    }
+
+    fn discard_clipboard_tail(&mut self, reason: &'static str, keep_failed_barrier: bool) {
+        let Some(mut barrier) = self.pending_writes.clipboard.take() else {
+            return;
+        };
+        let mut recorder = self
+            .input_recorder
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for write in self.pending_writes.writes.drain(barrier.position..) {
+            self.pending_writes.queued_bytes = self
+                .pending_writes
+                .queued_bytes
+                .saturating_sub(write.bytes.len());
+            self.clipboard_discarded_bytes = self
+                .clipboard_discarded_bytes
+                .saturating_add(write.bytes.len());
+            if let Some(observation) = write.observation {
+                recorder.settle(observation, reason);
+            }
+        }
+        if keep_failed_barrier {
+            barrier.failed = true;
+            barrier.filling = false;
+            self.pending_writes.clipboard = Some(barrier);
+        }
+    }
+
+    pub fn take_clipboard_discarded_bytes(&mut self) -> usize {
+        std::mem::take(&mut self.clipboard_discarded_bytes)
+    }
+
+    pub fn expect_native_input(&mut self, bytes: &'static [u8]) {
+        self.native_input_expectation = Some((bytes, 0, false));
+    }
+
+    pub fn native_input_matches(&self) -> bool {
+        self.native_input_expectation
+            .is_some_and(|(expected, offset, failed)| !failed && offset == expected.len())
+    }
+
+    pub fn flush_pending_writes(&mut self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let recorder = self.input_recorder.clone();
+        let held_bytes = self.clipboard_tail_bytes();
+        let expectation = &mut self.native_input_expectation;
+        match self.pending_writes.flush_observed(
+            session,
+            |observation, outcome| {
+                recorder
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .settle(observation, outcome);
+            },
+            |bytes| {
+                if let Some((expected, offset, failed)) = expectation {
+                    let end = offset.saturating_add(bytes.len());
+                    *failed |= expected.get(*offset..end) != Some(bytes);
+                    *offset = end.min(expected.len().saturating_add(1));
+                }
+            },
+        ) {
+            PendingFlush::Drained => {
+                self.last_input_delivery = "accepted-by-session";
+            }
+            PendingFlush::Clipboard => {
+                self.last_input_delivery = "queued-clipboard";
+            }
+            PendingFlush::Backpressured => {
+                self.last_input_delivery = "queued-backpressure";
+                self.last_backpressure = Some(FlowDirection::Input);
+                if self.pending_writes.clipboard.is_none() {
+                    self.input_recorder
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clipboard_wait_became_backpressure();
+                }
+            }
+            PendingFlush::Unrecoverable {
+                error,
+                dropped_bytes,
+            } => {
+                self.clipboard_discarded_bytes =
+                    self.clipboard_discarded_bytes.saturating_add(held_bytes);
+                self.last_input_delivery = "rejected-by-session";
+                self.record_pending_failure(
+                    format!(
+                        "session pending writes became unrecoverable after {error}; \
+                         discarded {dropped_bytes} bytes"
+                    ),
+                    Some(error),
+                );
+            }
+        }
+    }
+
+    /// Stages a requested resize for debounced delivery to the PTY, restarting
+    /// the debounce window whenever the requested size actually changes (a
+    /// resize repeated with the same size, e.g. re-observed across frames,
+    /// does not push out an already-staged deadline).
+    ///
+    /// The very first resize this controller ever sees skips the debounce
+    /// entirely (see `has_requested_resize`): it is sent immediately.
+    fn stage_resize(&mut self, size: TerminalSize) {
+        if !self.has_requested_resize {
+            self.has_requested_resize = true;
+            self.debounced_resize = None;
+            self.try_resize(size);
+            return;
+        }
+        if self.debounced_resize.map(|(staged, _)| staged) != Some(size) {
+            self.debounced_resize = Some((size, Instant::now()));
+        }
+    }
+
+    /// Sends any resize whose debounce interval has elapsed, and retries a
+    /// previous resize that hit session backpressure. Called every frame
+    /// regardless of whether a resize is currently staged.
+    pub fn flush_pending_resize(&mut self) {
+        if let Some(size) = self.pending_resize.take() {
+            self.try_resize(size);
+        }
+        if let Some((size, staged_at)) = self.debounced_resize {
+            if staged_at.elapsed() >= TERMINAL_RESIZE_DEBOUNCE {
+                self.debounced_resize = None;
+                self.try_resize(size);
+            }
+        }
+    }
+
+    /// Keep the deadline armed if egui's scheduled frame arrives before it.
+    pub fn next_resize_repaint_delay(&self) -> Option<Duration> {
+        self.debounced_resize
+            .map(|(_, staged)| TERMINAL_RESIZE_DEBOUNCE.saturating_sub(staged.elapsed()))
+    }
+
+    /// Sends a still-debounced resize immediately, bypassing the rest of
+    /// [`TERMINAL_RESIZE_DEBOUNCE`]. A live window drag cannot overlap with
+    /// typing (the mouse button is held down the whole time), so new
+    /// keystrokes imply any in-flight drag has already ended and the
+    /// settled size can be forwarded to the PTY right away instead of
+    /// waiting out an arbitrary timer.
+    fn force_flush_pending_resize(&mut self) {
+        if let Some((size, _)) = self.debounced_resize.take() {
+            self.try_resize(size);
+        }
+    }
+
+    fn try_resize(&mut self, size: TerminalSize) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        match session.try_resize(size) {
+            Ok(()) => self.resize_probe.record_resize_request(size),
+            Err(SessionSendError::Full { .. }) => {
+                self.pending_resize = Some(size);
+                self.last_backpressure = Some(FlowDirection::Resize);
+            }
+            Err(error) => self.record_send_error(error),
+        }
+    }
+
+    fn queue_bytes(&mut self, bytes: &[u8], source: &str) {
+        let ui_input = source == "UI input";
+        self.last_pending_input_index = None;
+        if self.session.is_none() {
+            self.last_input_delivery = "rejected-no-session";
+            return;
+        }
+        if ui_input
+            && self
+                .pending_writes
+                .clipboard
+                .as_ref()
+                .is_some_and(|barrier| barrier.failed)
+        {
+            self.last_input_delivery = "rejected-clipboard-buffer";
+            self.clipboard_discarded_bytes =
+                self.clipboard_discarded_bytes.saturating_add(bytes.len());
+            return;
+        }
+        let filling = ui_input
+            && self
+                .pending_writes
+                .clipboard
+                .as_ref()
+                .is_some_and(|barrier| barrier.filling);
+        let filling_token = self
+            .pending_writes
+            .clipboard
+            .as_ref()
+            .map(|barrier| barrier.token);
+        let held_bytes = self.clipboard_tail_bytes();
+        let insertion = self
+            .pending_writes
+            .clipboard
+            .as_ref()
+            .filter(|barrier| barrier.filling || !ui_input)
+            .map_or(self.pending_writes.writes.len(), |barrier| barrier.position);
+        match self
+            .pending_writes
+            .enqueue_from_source(bytes, ui_input, source != "terminal reply")
+        {
+            Ok(()) => {
+                self.flush_pending_writes();
+                let accepted = self.pending_writes.last_flush_accepted;
+                if filling && self.last_input_delivery == "rejected-by-session" {
+                    // The fence was replaced before flushing, so the flush
+                    // itself could no longer count the discarded suffix.
+                    let dropped = if insertion < accepted {
+                        self.pending_writes.last_flush_dropped
+                    } else {
+                        held_bytes
+                    };
+                    self.clipboard_discarded_bytes =
+                        self.clipboard_discarded_bytes.saturating_add(dropped);
+                    self.fail_clipboard_input(
+                        filling_token.unwrap(),
+                        "discarded-clipboard-write-failed",
+                    );
+                }
+                if !bytes.is_empty() {
+                    if insertion < accepted {
+                        self.last_input_delivery = "accepted-by-session";
+                    } else if self.last_input_delivery != "rejected-by-session" {
+                        self.last_pending_input_index = Some(insertion - accepted);
+                        if self
+                            .pending_writes
+                            .clipboard
+                            .as_ref()
+                            .is_some_and(|barrier| insertion - accepted >= barrier.position)
+                        {
+                            self.last_input_delivery = "queued-clipboard";
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                if self.pending_writes.clipboard.is_some() {
+                    self.discard_clipboard_tail("discarded-clipboard-buffer-overflow", true);
+                    if !ui_input
+                        && self
+                            .pending_writes
+                            .enqueue_from_source(bytes, false, source != "terminal reply")
+                            .is_ok()
+                    {
+                        self.flush_pending_writes();
+                    } else if !filling {
+                        self.clipboard_discarded_bytes =
+                            self.clipboard_discarded_bytes.saturating_add(bytes.len());
+                    }
+                }
+                self.last_input_delivery = "rejected-queue-bound";
+                self.record_pending_failure(error.to_string(), None);
+            }
+        }
+        tracing::trace!(
+            target: "festerm::session",
+            byte_count = bytes.len(),
+            source,
+            "queued content-free session write"
+        );
+    }
+
+    fn record_pending_failure(&mut self, message: String, error: Option<SessionSendError>) {
+        if let Some(error) = error {
+            tracing::warn!(
+                target: "festerm::session",
+                %error,
+                "session command became unrecoverable"
+            );
+        } else {
+            tracing::warn!(
+                target: "festerm::session",
+                %message,
+                "session pending-write bound exceeded"
+            );
+        }
+        self.last_error = Some(message);
+    }
+
+    fn record_send_error(&mut self, error: SessionSendError) {
+        tracing::warn!(target: "festerm::session", %error, "session command rejected");
+        self.last_error = Some(error.to_string());
+    }
+
+    fn record_session_error(&mut self, error: SessionError) {
+        tracing::error!(target: "festerm::session", %error, "session backend error");
+        self.last_error = Some(error.to_string());
+    }
+
+    pub fn status_line(&self) -> String {
+        if let Some(error) = &self.startup_error {
+            return format!("{} unavailable: {error}", self.session_name);
+        }
+        let Some(_session) = &self.session else {
+            return "No active session".to_owned();
+        };
+        let lifecycle = self
+            .last_lifecycle
+            .as_ref()
+            .unwrap_or(&SessionLifecycle::Starting);
+        let latest_error = self
+            .last_error
+            .as_deref()
+            .map(|error| format!("; error: {error}"))
+            .unwrap_or_default();
+        let latest_resize = self
+            .last_resize
+            .map(|size| format!("; resize {}x{}", size.columns(), size.rows()))
+            .unwrap_or_default();
+        format!(
+            "{} {lifecycle:?}{latest_resize}{latest_error}",
+            self.session_name,
+            lifecycle = lifecycle
+        )
+    }
+
+    pub fn diagnostics_line(&self) -> String {
+        if let Some(error) = &self.startup_error {
+            return format!("{} unavailable: {error}", self.session_name);
+        }
+        let Some(session) = &self.session else {
+            return "No active session".to_owned();
+        };
+        let metrics = session.metrics();
+        let lifecycle = self
+            .last_lifecycle
+            .as_ref()
+            .unwrap_or(&SessionLifecycle::Starting);
+        let latest_error = self
+            .last_error
+            .as_deref()
+            .map(|error| format!("; error: {error}"))
+            .unwrap_or_default();
+        let queue_pressure = self
+            .last_backpressure
+            .map(|direction| format!("; pressure: {direction:?}"))
+            .unwrap_or_default();
+        let latest_resize = self
+            .last_resize
+            .map(|size| format!("; resize {}x{}", size.columns(), size.rows()))
+            .unwrap_or_default();
+        let resize_probe = self.resize_probe.generations.back().copied();
+        let resize_probe = resize_probe
+            .map(|generation| {
+                format!(
+                    "; resize probe g{} {}/{} B, cpr {}, cells {}",
+                    generation.generation,
+                    generation.output_bytes_since_request,
+                    generation.output_bytes_at_request,
+                    generation.cursor_position_queries_since_request,
+                    generation.visible_nonblank_cells,
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "{} {lifecycle:?}; in {} B, out {} B; events {}/{} (high {}); \
+             pending writes {} entries, {} / {} B; pressure {}; errors {}; resizes {}\
+             {latest_resize}{resize_probe}{queue_pressure}{latest_error}",
+            self.session_name,
+            metrics.input_bytes,
+            metrics.output_bytes,
+            metrics.event_queue_depth,
+            metrics.event_queue_capacity,
+            metrics.event_queue_high_watermark,
+            self.pending_writes.queued_writes(),
+            self.pending_writes.queued_bytes(),
+            self.pending_writes.capacity(),
+            metrics.backpressure_count,
+            metrics.error_count,
+            metrics.resize_count,
+        )
+    }
+
+    /// Records a content-free visible-cell count for the most recently
+    /// accepted resize. The count never retains or logs application text.
+    pub fn observe_resize_probe_terminal_state(&mut self, terminal: &Terminal) {
+        self.resize_probe.record_visible_nonblank_cells(terminal);
+    }
+
+    pub fn resize_probe(&self) -> &ResizeProbe {
+        &self.resize_probe
+    }
+
+    /// Requests shutdown of the owned session without blocking the GUI thread.
+    ///
+    /// The session worker terminates the process tree and performs its bounded
+    /// reader cleanup in the background. This is called for both tab removal
+    /// and application teardown, where waiting would stall the native close
+    /// animation.
+    pub fn shutdown(&self) {
+        crate::automation::set_admission_flag(&self.automation_liveness, false);
+        if let Some(epoch) = &self.automation_input_epoch {
+            epoch.transition(false);
+        }
+        if let Some(session) = &self.session {
+            match session.try_shutdown() {
+                Ok(()) => tracing::debug!(
+                    target: "festerm::session",
+                    "requested session shutdown"
+                ),
+                Err(error) => tracing::error!(
+                    target: "festerm::session",
+                    %error,
+                    "could not request session shutdown"
+                ),
+            }
+        }
+    }
+}
+
+impl<S: Session> EncodedInputSink for SessionController<S> {
+    fn terminal_resizes_owned_by_backend(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.terminal_replies_owned_by_backend())
+    }
+
+    fn begin_input_event(&mut self, keyboard_input: bool) {
+        self.input_event_is_keyboard = keyboard_input;
+        self.input_event_human_noted = false;
+    }
+
+    fn begin_human_input(&mut self) {
+        self.human_input_takeover();
+        self.input_event_human_noted = true;
+    }
+
+    fn record_encoded_input(&mut self, bytes: &[u8]) {
+        if self.input_event_is_keyboard && !self.input_event_human_noted {
+            self.human_input_takeover();
+        }
+        self.input_event_human_noted = false;
+        self.force_flush_pending_resize();
+        self.diagnostics.byte_count = self
+            .diagnostics
+            .byte_count
+            .saturating_add(bytes.len() as u64);
+        let source = if self.input_event_is_keyboard {
+            "UI input"
+        } else {
+            "UI report"
+        };
+        self.input_event_is_keyboard = true;
+        self.queue_bytes(bytes, source);
+    }
+
+    fn observe_input_route(&mut self, route: InputRoute) {
+        self.diagnostics.event_count = self.diagnostics.event_count.saturating_add(1);
+        self.diagnostics.last_outcome = Some(route.outcome);
+        self.diagnostics.last_queue_depth = route.queue_depth;
+    }
+
+    fn observe_local_selection(&mut self, decision: &'static str) {
+        self.input_recorder
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .annotate_selection(decision);
+    }
+
+    fn observe_local_gesture(
+        &mut self,
+        class: &'static str,
+        decision: &'static str,
+        modifiers: u8,
+    ) {
+        self.input_recorder
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record(
+                "terminal-view",
+                festerm_ui_egui::routing_trace::Metadata { class, modifiers },
+                decision,
+                "no-delivery",
+                0,
+            );
+    }
+
+    fn observe_input_event(
+        &mut self,
+        metadata: festerm_ui_egui::routing_trace::Metadata,
+        route: InputRoute,
+    ) {
+        self.input_event_is_keyboard = true;
+        self.input_event_human_noted = false;
+        self.observe_input_route(route);
+        let observation = self
+            .input_recorder
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record_route(metadata, route, self.last_input_delivery);
+        if route.delivered_bytes > 0 {
+            if let Some(write) = self
+                .last_pending_input_index
+                .take()
+                .and_then(|index| self.pending_writes.writes.get_mut(index))
+            {
+                write.observation = observation;
+            }
+        }
+    }
+
+    fn record_terminal_resize(&mut self, dimensions: Dimensions) {
+        match terminal_size(dimensions) {
+            Ok(size) => self.stage_resize(size),
+            Err(error) => {
+                self.last_error = Some(error);
+            }
+        }
+    }
+
+    fn input_diagnostics(&self) -> Option<InputSinkDiagnostics> {
+        Some(self.diagnostics)
+    }
+}
+
+impl<S: Session> Drop for SessionController<S> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+// ─── Free Functions ──────────────────────────────────────────────────────────
+
+pub fn terminal_size(dimensions: Dimensions) -> Result<TerminalSize, String> {
+    let columns = u16::try_from(dimensions.columns()).map_err(|_| {
+        format!(
+            "terminal columns {} exceed PTY limits",
+            dimensions.columns()
+        )
+    })?;
+    let rows = u16::try_from(dimensions.rows())
+        .map_err(|_| format!("terminal rows {} exceed PTY limits", dimensions.rows()))?;
+    TerminalSize::new(columns, rows).map_err(|error| error.to_string())
+}
+
+pub struct PumpResult {
+    pub hit_limit: bool,
+    /// Whether at least one `SessionEvent::Output` chunk was observed during
+    /// this call, regardless of whether the bounded drain hit its limit.
+    /// Unlike `hit_limit` (a backpressure signal), this is what callers
+    /// should check to learn "did new output arrive this frame".
+    pub output_received: bool,
+    pub ingested_bytes: usize,
+    closed: bool,
+}
+
+/// A borrowed session event delivered while the terminal is pumped.
+///
+/// Output is borrowed so observers can collect content-free metrics without
+/// cloning or retaining application bytes.
+pub enum PumpedSessionEvent<'a> {
+    Output(&'a [u8]),
+    Event(&'a SessionEvent),
+}
+
+enum TerminalMutation<'a> {
+    Output {
+        bytes: &'a [u8],
+        terminal: &'a mut Terminal,
+    },
+    Recovery {
+        command: &'a festerm_sessiond::RecoverySyncCommand,
+        terminal: &'a mut Terminal,
+    },
+    Resize(&'a Terminal),
+    IntegrityFailure(&'static str),
+    End,
+}
+
+pub fn pump_session_events(
+    session: &impl Session,
+    terminal: &mut Terminal,
+    maximum: usize,
+    observe: impl FnMut(PumpedSessionEvent<'_>),
+) -> PumpResult {
+    pump_session_events_with_resize(
+        session,
+        terminal,
+        maximum,
+        |terminal, dimensions| terminal.resize(dimensions).is_ok(),
+        observe,
+    )
+}
+
+fn pump_session_events_with_resize(
+    session: &impl Session,
+    terminal: &mut Terminal,
+    maximum: usize,
+    mut resize: impl FnMut(&mut Terminal, Dimensions) -> bool,
+    mut observe: impl FnMut(PumpedSessionEvent<'_>),
+) -> PumpResult {
+    pump_session_events_with_mutations(
+        session,
+        terminal,
+        maximum,
+        &mut resize,
+        &mut observe,
+        |mutation| match mutation {
+            TerminalMutation::Output { bytes, terminal } => terminal.ingest(bytes),
+            TerminalMutation::Recovery { command, terminal } => {
+                apply_recovery_sync(terminal, command, None);
+            }
+            _ => {}
+        },
+    )
+}
+
+fn pump_session_events_with_mutations(
+    session: &impl Session,
+    terminal: &mut Terminal,
+    maximum: usize,
+    mut resize: impl FnMut(&mut Terminal, Dimensions) -> bool,
+    mut observe: impl FnMut(PumpedSessionEvent<'_>),
+    mut mutation: impl FnMut(TerminalMutation<'_>),
+) -> PumpResult {
+    let mut output_received = false;
+    let mut ingested_bytes = 0usize;
+    for _ in 0..maximum {
+        match session.try_recv_event() {
+            Ok(event) => match &event {
+                SessionEvent::Output(bytes) => {
+                    output_received = true;
+                    observe(PumpedSessionEvent::Output(bytes));
+                    mutation(TerminalMutation::Output { bytes, terminal });
+                    if session.terminal_replies_owned_by_backend() {
+                        let _ = terminal.drain_replies();
+                        let _ = terminal.take_reply_queue_overflowed();
+                    }
+                    ingested_bytes = ingested_bytes.saturating_add(bytes.len());
+                    if ingested_bytes >= MAX_INGEST_BYTES_PER_SESSION_SLICE {
+                        return PumpResult {
+                            hit_limit: true,
+                            output_received,
+                            ingested_bytes,
+                            closed: false,
+                        };
+                    }
+                }
+                SessionEvent::RecoverySync(payload) => {
+                    match festerm_sessiond::decode_recovery_sync_command(payload) {
+                        Ok(command) => {
+                            let recovered_bytes = match &command {
+                                festerm_sessiond::RecoverySyncCommand::MirrorBytes(bytes) => {
+                                    bytes.len()
+                                }
+                                _ => 0,
+                            };
+                            mutation(TerminalMutation::Recovery {
+                                command: &command,
+                                terminal,
+                            });
+                            ingested_bytes = ingested_bytes.saturating_add(recovered_bytes);
+                            observe(PumpedSessionEvent::Event(&event));
+                            if ingested_bytes >= MAX_INGEST_BYTES_PER_SESSION_SLICE {
+                                return PumpResult {
+                                    hit_limit: true,
+                                    output_received,
+                                    ingested_bytes,
+                                    closed: false,
+                                };
+                            }
+                        }
+                        Err(error) => {
+                            mutation(TerminalMutation::IntegrityFailure(
+                                "Recording stopped because terminal recovery data was invalid",
+                            ));
+                            observe(PumpedSessionEvent::Event(&SessionEvent::Error(
+                                SessionError::new(
+                                    SessionErrorKind::Output,
+                                    format!("invalid persistent-session control: {error}"),
+                                ),
+                            )));
+                            return PumpResult {
+                                hit_limit: false,
+                                output_received,
+                                ingested_bytes,
+                                closed: false,
+                            };
+                        }
+                    }
+                }
+                SessionEvent::ResizeApplied(size)
+                    if session.terminal_replies_owned_by_backend() =>
+                {
+                    let resized =
+                        Dimensions::new(usize::from(size.columns()), usize::from(size.rows()))
+                            .is_ok_and(|dimensions| resize(terminal, dimensions));
+                    if !resized {
+                        mutation(TerminalMutation::IntegrityFailure(
+                            "Recording stopped because terminal resize was rejected",
+                        ));
+                        observe(PumpedSessionEvent::Event(&SessionEvent::Error(
+                            SessionError::new(
+                                SessionErrorKind::Resize,
+                                "persistent-session resize was rejected",
+                            ),
+                        )));
+                    } else {
+                        mutation(TerminalMutation::Resize(terminal));
+                    }
+                    observe(PumpedSessionEvent::Event(&event));
+                }
+                SessionEvent::Lifecycle(
+                    SessionLifecycle::Failed(_) | SessionLifecycle::Disconnected(_),
+                ) => {
+                    mutation(TerminalMutation::IntegrityFailure(
+                        "Recording stopped because a terminal session failed",
+                    ));
+                    mutation(TerminalMutation::End);
+                    observe(PumpedSessionEvent::Event(&event));
+                }
+                SessionEvent::Lifecycle(
+                    SessionLifecycle::Exited(_) | SessionLifecycle::Stopped,
+                ) => {
+                    mutation(TerminalMutation::End);
+                    observe(PumpedSessionEvent::Event(&event));
+                }
+                _ => observe(PumpedSessionEvent::Event(&event)),
+            },
+            Err(error @ (SessionTryReceiveError::Empty | SessionTryReceiveError::Closed)) => {
+                let closed = matches!(error, SessionTryReceiveError::Closed);
+                if closed {
+                    mutation(TerminalMutation::IntegrityFailure(
+                        "Recording stopped because a terminal event stream closed unexpectedly",
+                    ));
+                    mutation(TerminalMutation::End);
+                }
+                return PumpResult {
+                    hit_limit: false,
+                    output_received,
+                    ingested_bytes,
+                    closed,
+                };
+            }
+        }
+    }
+    PumpResult {
+        hit_limit: true,
+        output_received,
+        ingested_bytes,
+        closed: false,
+    }
+}
+
+fn apply_recording_output(
+    terminal: &mut Terminal,
+    bytes: &[u8],
+    stream: Option<&festerm_recording::RecordingStream>,
+) {
+    if let Some(stream) = stream {
+        let _ = stream.ingest_output(terminal, bytes);
+    } else {
+        terminal.ingest(bytes);
+    }
+}
+
+fn observe_recording_configuration(
+    stream: &festerm_recording::RecordingStream,
+    terminal: &Terminal,
+) {
+    if terminal.color_scheme() != &festerm_ui_egui::terminal_color_scheme() {
+        let _ = stream.fail_integrity(
+            "Recording stopped because terminal colors do not match the visible view",
+        );
+    } else {
+        let _ = stream.observe_configuration(terminal);
+    }
+}
+
+fn apply_recovery_sync(
+    terminal: &mut Terminal,
+    command: &festerm_sessiond::RecoverySyncCommand,
+    stream: Option<&festerm_recording::RecordingStream>,
+) {
+    match command {
+        festerm_sessiond::RecoverySyncCommand::SetScrollbackLimit { limit_bytes } => {
+            terminal.set_scrollback_limit(*limit_bytes);
+            if let Some(stream) = stream {
+                observe_recording_configuration(stream, terminal);
+            }
+        }
+        festerm_sessiond::RecoverySyncCommand::SetColorScheme(scheme) => {
+            terminal.set_color_scheme(*scheme);
+            if let Some(stream) = stream {
+                observe_recording_configuration(stream, terminal);
+            }
+        }
+        festerm_sessiond::RecoverySyncCommand::MirrorBytes(bytes) => {
+            apply_recording_output(terminal, bytes, stream);
+        }
+        festerm_sessiond::RecoverySyncCommand::ResetToInitialState => {
+            terminal.reset_to_initial_state();
+            if let Some(stream) = stream {
+                let _ = stream.observe_reset();
+            }
+        }
+    }
+    let _ = terminal.drain_replies();
+    let _ = terminal.take_reply_queue_overflowed();
+}
+
+pub fn seed_session_failure(terminal: &mut Terminal, error: &str) {
+    seed_session_startup_failure(terminal, error, "Local shell");
+}
+
+/// Renders the existing visible no-session fallback for any transport whose
+/// startup fails before a session can be created.
+pub fn seed_session_startup_failure(
+    terminal: &mut Terminal,
+    error: &str,
+    session_name: &'static str,
+) {
+    terminal.ingest(
+        format!(
+            "\x1b[2J\x1b[H\
+\x1b[1;31m{session_name} could not start.\x1b[0m\r\n\
+\r\n\
+\x1b[1;33mfesTerm remains in no-session mode; this is not a shell.\x1b[0m\r\n\
+\r\n\
+Check the session status line for the content-free launch error.\r\n\
+No commands are executed until a session can be created.\r\n"
+        )
+        .as_bytes(),
+    );
+    tracing::error!(
+        target: "festerm::session",
+        error,
+        %session_name,
+        "showing no-session fallback after session startup failure"
+    );
+}
+
+// ─── Test Support ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+    use festerm_ssh::{SshPortForwardRequestError, SshPortForwardSpec};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex, MutexGuard},
+    };
+
+    pub struct FakeSession {
+        events: Mutex<VecDeque<SessionEvent>>,
+        input_results: Mutex<VecDeque<Result<(), SessionSendError>>>,
+        sent: Mutex<Vec<Vec<u8>>>,
+        backend_owned_terminal: bool,
+        events_closed: bool,
+        automation_epoch: Arc<AutomationEpoch>,
+    }
+
+    impl FakeSession {
+        pub fn new(events: impl IntoIterator<Item = SessionEvent>) -> Self {
+            Self::with_input_results(events, [])
+        }
+
+        pub fn with_input_results(
+            events: impl IntoIterator<Item = SessionEvent>,
+            input_results: impl IntoIterator<Item = Result<(), SessionSendError>>,
+        ) -> Self {
+            let automation_epoch = Arc::new(AutomationEpoch::new());
+            automation_epoch.transition(true);
+            Self {
+                events: Mutex::new(events.into_iter().collect()),
+                input_results: Mutex::new(input_results.into_iter().collect()),
+                sent: Mutex::new(Vec::new()),
+                backend_owned_terminal: false,
+                events_closed: false,
+                automation_epoch,
+            }
+        }
+
+        fn events(&self) -> MutexGuard<'_, VecDeque<SessionEvent>> {
+            self.events.lock().expect("fake session event lock")
+        }
+
+        pub fn sent(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().expect("fake session sent lock").clone()
+        }
+
+        pub fn with_backend_owned_terminal(mut self) -> Self {
+            self.backend_owned_terminal = true;
+            self
+        }
+
+        pub fn with_closed_events(mut self) -> Self {
+            self.events_closed = true;
+            self
+        }
+    }
+
+    impl Session for FakeSession {
+        fn terminal_replies_owned_by_backend(&self) -> bool {
+            self.backend_owned_terminal
+        }
+
+        fn id(&self) -> festerm_session::SessionId {
+            festerm_session::SessionId::next()
+        }
+
+        fn lifecycle(&self) -> SessionLifecycle {
+            SessionLifecycle::Running
+        }
+
+        fn automation_epoch(&self) -> Option<Arc<AutomationEpoch>> {
+            Some(self.automation_epoch.clone())
+        }
+
+        fn metrics(&self) -> SessionMetrics {
+            SessionMetrics::default()
+        }
+
+        fn try_send_input(&self, bytes: &[u8]) -> Result<(), SessionSendError> {
+            let result = self
+                .input_results
+                .lock()
+                .expect("fake session input result lock")
+                .pop_front()
+                .unwrap_or(Ok(()));
+            if result.is_ok() {
+                self.sent
+                    .lock()
+                    .expect("fake session sent lock")
+                    .push(bytes.to_vec());
+            }
+            result
+        }
+
+        fn try_resize(&self, _size: TerminalSize) -> Result<(), SessionSendError> {
+            Ok(())
+        }
+
+        fn try_shutdown(&self) -> Result<(), SessionSendError> {
+            Ok(())
+        }
+
+        fn try_recv_event(&self) -> Result<SessionEvent, SessionTryReceiveError> {
+            self.events().pop_front().ok_or(if self.events_closed {
+                SessionTryReceiveError::Closed
+            } else {
+                SessionTryReceiveError::Empty
+            })
+        }
+
+        fn shutdown(
+            &self,
+            _timeout: Duration,
+        ) -> Result<festerm_session::ShutdownResult, festerm_session::ShutdownError> {
+            Ok(festerm_session::ShutdownResult::Stopped)
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum FakeSshOperation {
+        Reconnect,
+        Add {
+            direction: festerm_session::SshPortForwardDirection,
+            bind_host: String,
+            bind_port: u16,
+            destination_host: String,
+            destination_port: u16,
+        },
+        Remove {
+            direction: festerm_session::SshPortForwardDirection,
+            bind_host: String,
+            bind_port: u16,
+        },
+        Query,
+    }
+
+    struct FakeSshSessionInner {
+        sent: Mutex<Vec<Vec<u8>>>,
+        id: festerm_session::SessionId,
+        lifecycle: Mutex<SessionLifecycle>,
+        automation_epoch: Arc<festerm_session::AutomationEpoch>,
+        events: Mutex<VecDeque<SessionEvent>>,
+        operations: Mutex<Vec<FakeSshOperation>>,
+        add_port_forward_error: Mutex<Option<SshPortForwardRequestError>>,
+        terminal_file_identity: Mutex<(Option<String>, Option<String>)>,
+        ordered_test_input: Mutex<Option<VecDeque<TestInput>>>,
+        invalidate_after_test_reservation: std::sync::atomic::AtomicBool,
+        authoritative_recovery: std::sync::atomic::AtomicBool,
+        recovered_terminal: Mutex<Option<Terminal>>,
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        notifier: Mutex<Option<Arc<dyn festerm_session::SessionEventNotifier>>>,
+    }
+
+    enum TestInput {
+        Bytes(Vec<u8>),
+        Reserved(festerm_session::PendingAutomationInput),
+    }
+
+    #[derive(Clone)]
+    pub struct FakeSshSession {
+        inner: Arc<FakeSshSessionInner>,
+    }
+
+    impl FakeSshSession {
+        pub fn new(events: impl IntoIterator<Item = SessionEvent>) -> Self {
+            let automation_epoch = Arc::new(festerm_session::AutomationEpoch::new());
+            automation_epoch.transition(true);
+            Self {
+                inner: Arc::new(FakeSshSessionInner {
+                    sent: Mutex::new(Vec::new()),
+                    id: festerm_session::SessionId::next(),
+                    lifecycle: Mutex::new(SessionLifecycle::Running),
+                    automation_epoch,
+                    events: Mutex::new(events.into_iter().collect()),
+                    operations: Mutex::new(Vec::new()),
+                    add_port_forward_error: Mutex::new(None),
+                    terminal_file_identity: Mutex::new((None, None)),
+                    ordered_test_input: Mutex::new(None),
+                    invalidate_after_test_reservation: std::sync::atomic::AtomicBool::new(false),
+                    authoritative_recovery: std::sync::atomic::AtomicBool::new(false),
+                    recovered_terminal: Mutex::new(None),
+                    #[cfg(all(windows, target_arch = "x86_64"))]
+                    notifier: Mutex::new(None),
+                }),
+            }
+        }
+
+        pub fn operations(&self) -> Vec<FakeSshOperation> {
+            self.inner
+                .operations
+                .lock()
+                .expect("fake ssh operations lock")
+                .clone()
+        }
+
+        pub fn enable_authoritative_recovery(&self) {
+            self.inner
+                .authoritative_recovery
+                .store(true, Ordering::Release);
+        }
+
+        pub fn recovery_protocol_is_authoritative(&self) -> bool {
+            self.inner.authoritative_recovery.load(Ordering::Acquire)
+        }
+
+        pub fn set_recovered_terminal(&self, terminal: Terminal) {
+            *self.inner.recovered_terminal.lock().unwrap() = Some(terminal);
+        }
+
+        pub fn take_recovered_terminal(&self) -> Option<Terminal> {
+            self.inner.recovered_terminal.lock().unwrap().take()
+        }
+
+        pub fn set_terminal_file_identity(&self, fingerprint: &str, cwd: &str) {
+            *self.inner.terminal_file_identity.lock().unwrap() =
+                (Some(fingerprint.to_owned()), Some(cwd.to_owned()));
+        }
+
+        pub fn terminal_file_fingerprint(&self) -> Option<String> {
+            self.inner.terminal_file_identity.lock().unwrap().0.clone()
+        }
+
+        pub fn terminal_file_cwd(&self) -> Option<String> {
+            self.inner.terminal_file_identity.lock().unwrap().1.clone()
+        }
+
+        pub fn set_add_port_forward_error(&self, error: SshPortForwardRequestError) {
+            *self
+                .inner
+                .add_port_forward_error
+                .lock()
+                .expect("fake ssh error lock") = Some(error);
+        }
+
+        pub fn sent(&self) -> Vec<Vec<u8>> {
+            self.inner.sent.lock().expect("fake ssh sent lock").clone()
+        }
+
+        pub fn enable_ordered_test_input(&self) {
+            *self.inner.ordered_test_input.lock().unwrap() = Some(VecDeque::new());
+        }
+
+        pub fn invalidate_after_test_reservation(&self) {
+            self.inner
+                .invalidate_after_test_reservation
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        pub fn enqueue_ordered_test_input(&self, bytes: &[u8]) {
+            self.inner
+                .ordered_test_input
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .push_back(TestInput::Bytes(bytes.to_vec()));
+        }
+
+        pub fn drain_ordered_test_input(&self) -> Vec<Vec<u8>> {
+            let mut queue = self.inner.ordered_test_input.lock().unwrap();
+            let queue = queue.as_mut().unwrap();
+            let mut output = Vec::new();
+            while let Some(item) = queue.front_mut() {
+                match item {
+                    TestInput::Bytes(bytes) => output.push(std::mem::take(bytes)),
+                    TestInput::Reserved(pending) => match pending.poll() {
+                        festerm_session::AutomationInputStatus::Pending => break,
+                        festerm_session::AutomationInputStatus::Ready(bytes) => {
+                            output.push(bytes.to_vec())
+                        }
+                        festerm_session::AutomationInputStatus::Cancelled => {}
+                    },
+                }
+                queue.pop_front();
+            }
+            output
+        }
+
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        pub fn set_notifier_for_test(
+            &self,
+            notifier: Arc<dyn festerm_session::SessionEventNotifier>,
+        ) {
+            *self.inner.notifier.lock().expect("fake ssh notifier lock") = Some(notifier);
+        }
+
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        pub fn pending_events_for_test(&self) -> usize {
+            self.inner.events.lock().expect("fake ssh event lock").len()
+        }
+
+        pub fn push_event(&self, event: SessionEvent) {
+            if let SessionEvent::Lifecycle(lifecycle) = &event {
+                let mut current = self
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .expect("fake ssh lifecycle lock");
+                if *current != *lifecycle {
+                    self.inner
+                        .automation_epoch
+                        .transition(matches!(lifecycle, SessionLifecycle::Running));
+                    *current = lifecycle.clone();
+                }
+            }
+            self.inner
+                .events
+                .lock()
+                .expect("fake ssh event lock")
+                .push_back(event);
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            if let Some(notifier) = self
+                .inner
+                .notifier
+                .lock()
+                .expect("fake ssh notifier lock")
+                .as_ref()
+            {
+                notifier.notify();
+            }
+        }
+
+        pub fn replace_attachment_without_event(&self) {
+            self.inner.automation_epoch.transition(false);
+            self.inner.automation_epoch.transition(true);
+        }
+
+        pub fn reconnect_available(&self) -> bool {
+            matches!(
+                self.lifecycle(),
+                SessionLifecycle::Running | SessionLifecycle::Disconnected(_)
+            )
+        }
+
+        pub fn try_reconnect(&self) -> Result<(), festerm_ssh::SshReconnectError> {
+            if !self.reconnect_available() {
+                return Err(festerm_ssh::SshReconnectError::NotRunning);
+            }
+            self.inner
+                .operations
+                .lock()
+                .expect("fake ssh operations lock")
+                .push(FakeSshOperation::Reconnect);
+            self.push_event(SessionEvent::Lifecycle(SessionLifecycle::Starting));
+            Ok(())
+        }
+
+        pub fn try_add_port_forward(
+            &self,
+            forward: impl SshPortForwardSpec,
+        ) -> Result<(), SshPortForwardRequestError> {
+            if let Some(error) = *self
+                .inner
+                .add_port_forward_error
+                .lock()
+                .expect("fake ssh error lock")
+            {
+                return Err(error);
+            }
+            self.inner
+                .operations
+                .lock()
+                .expect("fake ssh operations lock")
+                .push(FakeSshOperation::Add {
+                    direction: forward.direction(),
+                    bind_host: forward.bind_host().to_owned(),
+                    bind_port: forward.bind_port(),
+                    destination_host: forward.destination_host().to_owned(),
+                    destination_port: forward.destination_port(),
+                });
+            Ok(())
+        }
+
+        pub fn try_remove_port_forward(
+            &self,
+            direction: festerm_session::SshPortForwardDirection,
+            bind_host: impl Into<String>,
+            bind_port: u16,
+        ) -> Result<(), SshPortForwardRequestError> {
+            self.inner
+                .operations
+                .lock()
+                .expect("fake ssh operations lock")
+                .push(FakeSshOperation::Remove {
+                    direction,
+                    bind_host: bind_host.into(),
+                    bind_port,
+                });
+            Ok(())
+        }
+
+        pub fn try_query_port_forwards(&self) -> Result<(), SshPortForwardRequestError> {
+            self.inner
+                .operations
+                .lock()
+                .expect("fake ssh operations lock")
+                .push(FakeSshOperation::Query);
+            Ok(())
+        }
+    }
+
+    impl Session for FakeSshSession {
+        fn id(&self) -> festerm_session::SessionId {
+            self.inner.id
+        }
+
+        fn lifecycle(&self) -> SessionLifecycle {
+            self.inner
+                .lifecycle
+                .lock()
+                .expect("fake ssh lifecycle lock")
+                .clone()
+        }
+
+        fn automation_epoch(&self) -> Option<Arc<festerm_session::AutomationEpoch>> {
+            Some(self.inner.automation_epoch.clone())
+        }
+
+        fn metrics(&self) -> SessionMetrics {
+            SessionMetrics::default()
+        }
+
+        fn try_send_input(&self, bytes: &[u8]) -> Result<(), SessionSendError> {
+            self.inner
+                .sent
+                .lock()
+                .expect("fake ssh sent lock")
+                .push(bytes.to_vec());
+            Ok(())
+        }
+
+        fn reserve_automation_input(
+            &self,
+            controller_instance: u64,
+            bytes: &[u8],
+        ) -> Result<
+            festerm_session::ReservedAutomationInput,
+            festerm_session::ReserveAutomationInputError,
+        > {
+            let (reservation, pending) = festerm_session::automation_input_slot(
+                bytes,
+                controller_instance,
+                self.inner.automation_epoch.clone(),
+            )?;
+            let mut queue_guard = self
+                .inner
+                .ordered_test_input
+                .lock()
+                .map_err(|_| festerm_session::ReserveAutomationInputError::Unavailable)?;
+            let queue = queue_guard
+                .as_mut()
+                .ok_or(festerm_session::ReserveAutomationInputError::Unsupported)?;
+            queue.push_back(TestInput::Reserved(pending));
+            drop(queue_guard);
+            if self
+                .inner
+                .invalidate_after_test_reservation
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                self.replace_attachment_without_event();
+            }
+            Ok(reservation)
+        }
+
+        fn try_resize(&self, _size: TerminalSize) -> Result<(), SessionSendError> {
+            Ok(())
+        }
+
+        fn try_shutdown(&self) -> Result<(), SessionSendError> {
+            Ok(())
+        }
+
+        fn try_recv_event(&self) -> Result<SessionEvent, SessionTryReceiveError> {
+            let event = self
+                .inner
+                .events
+                .lock()
+                .expect("fake ssh event lock")
+                .pop_front()
+                .ok_or(SessionTryReceiveError::Empty)?;
+            if let SessionEvent::Lifecycle(lifecycle) = &event {
+                *self
+                    .inner
+                    .lifecycle
+                    .lock()
+                    .expect("fake ssh lifecycle lock") = lifecycle.clone();
+            }
+            Ok(event)
+        }
+
+        fn shutdown(
+            &self,
+            _timeout: Duration,
+        ) -> Result<festerm_session::ShutdownResult, festerm_session::ShutdownError> {
+            Ok(festerm_session::ShutdownResult::Stopped)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fake::FakeSession;
+
+    #[cfg(any(unix, windows))]
+    use std::time::Instant;
+
+    #[cfg(any(unix, windows))]
+    use festerm_pty::{LocalProfile, LocalPtySession};
+
+    struct PrivateRecordingDir {
+        _directory: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl PrivateRecordingDir {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    fn private_recording_dir() -> PrivateRecordingDir {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        festerm_unix_security::make_private_directory(
+            &std::fs::File::open(directory.path()).unwrap(),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        let path = {
+            let parent = festerm_windows_security::lock_directory_path_without_delete_sharing(
+                directory.path(),
+            )
+            .unwrap();
+            let child = std::path::Path::new("private");
+            festerm_windows_security::create_current_user_only_directory(&parent, child).unwrap();
+            directory.path().join(child)
+        };
+        #[cfg(not(windows))]
+        let path = directory.path().to_owned();
+        PrivateRecordingDir {
+            _directory: directory,
+            path,
+        }
+    }
+
+    fn install_ime_epoch<S: Session>(
+        controller: &mut SessionController<S>,
+    ) -> Arc<AutomationEpoch> {
+        let epoch = Arc::new(AutomationEpoch::new());
+        epoch.transition(true);
+        controller.set_automation_ime_epoch(&epoch);
+        epoch
+    }
+
+    fn fence_is_current(fence: &AutomationInputFence) -> bool {
+        let _guard = festerm_session::automation_admission_lock().unwrap();
+        fence.is_current()
+    }
+
+    #[test]
+    fn automation_controller_identity_exhaustion_refuses_new_identities() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_automation_instance(&counter), Some(u64::MAX - 1));
+        assert_eq!(next_automation_instance(&counter), None);
+        assert_eq!(next_automation_instance(&counter), None);
+    }
+
+    #[test]
+    fn controller_human_input_invalidates_handoff_without_revoking_focus_reports() {
+        let mut controller = SessionController::with_session(FakeSession::new([]));
+        install_ime_epoch(&mut controller);
+        let mut terminal = Terminal::new(Dimensions::new(20, 5).unwrap()).unwrap();
+        terminal.ingest(b"\x1b[?1004h");
+        let fence = controller.capture_automation_input_fence().unwrap();
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Focus(festerm_core::FocusEvent::Out),
+            &mut controller,
+        );
+        assert!(fence_is_current(&fence));
+
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Key(festerm_core::Key::Enter),
+            &mut controller,
+        );
+        assert!(!fence_is_current(&fence));
+        assert!(controller
+            .session
+            .as_ref()
+            .unwrap()
+            .sent()
+            .concat()
+            .ends_with(b"\r"));
+
+        let fence = controller.capture_automation_input_fence().unwrap();
+        assert!(controller.begin_clipboard_input(31));
+        assert!(!fence_is_current(&fence));
+        assert!(controller.capture_automation_input_fence().is_none());
+        controller.cancel_clipboard_input(31, "test-cancel");
+        assert!(controller.capture_automation_input_fence().is_some());
+    }
+
+    #[test]
+    fn controller_handoff_waits_for_ime_and_queued_input() {
+        let mut controller = SessionController::with_session(FakeSession::with_input_results(
+            [],
+            [
+                Err(SessionSendError::Full {
+                    operation: festerm_session::SessionOperation::Input,
+                    capacity: 1,
+                }),
+                Ok(()),
+            ],
+        ));
+        let ime = install_ime_epoch(&mut controller);
+        let fence = controller.capture_automation_input_fence().unwrap();
+        ime.transition(false);
+        assert!(!fence_is_current(&fence));
+        assert!(controller.capture_automation_input_fence().is_none());
+        ime.transition(true);
+        assert!(controller.capture_automation_input_fence().is_some());
+
+        controller.record_encoded_input(b"human");
+        assert!(controller.capture_automation_input_fence().is_none());
+        controller.flush_pending_writes();
+        let fence = controller.capture_automation_input_fence().unwrap();
+        controller.shutdown();
+        assert!(!fence_is_current(&fence));
+        assert!(controller.capture_automation_input_fence().is_none());
+    }
+
+    #[test]
+    fn pending_human_input_invalidates_and_blocks_until_its_last_owner_drops() {
+        let mut controller = SessionController::with_session(FakeSession::new([]));
+        install_ime_epoch(&mut controller);
+        let fence = controller.capture_automation_input_fence().unwrap();
+        let pending = controller.begin_pending_human_input();
+        let preview = pending.clone();
+        assert!(!fence_is_current(&fence));
+        assert!(controller.capture_automation_input_fence().is_none());
+        drop(pending);
+        assert!(controller.capture_automation_input_fence().is_none());
+        drop(preview);
+        assert!(controller.capture_automation_input_fence().is_some());
+        assert!(!fence_is_current(&fence));
+    }
+
+    #[test]
+    fn closed_backend_blocks_capture_before_lifecycle_delivery() {
+        let session = FakeSession::new([]);
+        let attachment = session.automation_epoch().unwrap();
+        let mut controller = SessionController::with_session(session);
+        install_ime_epoch(&mut controller);
+        let fence = controller.capture_automation_input_fence().unwrap();
+        attachment.transition(false);
+        assert!(matches!(
+            controller.lifecycle(),
+            Some(SessionLifecycle::Running)
+        ));
+        assert!(!fence_is_current(&fence));
+        assert!(controller.capture_automation_input_fence().is_none());
+    }
+
+    #[test]
+    fn terminal_human_input_fence_closes_before_keyboard_and_mouse_delivery() {
+        struct CheckedSink<'a> {
+            controller: &'a mut SessionController<FakeSession>,
+            fence: AutomationInputFence,
+            delivered: bool,
+        }
+
+        impl EncodedInputSink for CheckedSink<'_> {
+            fn begin_input_event(&mut self, keyboard_input: bool) {
+                self.controller.begin_input_event(keyboard_input);
+            }
+
+            fn begin_human_input(&mut self) {
+                self.controller.begin_human_input();
+            }
+
+            fn record_encoded_input(&mut self, bytes: &[u8]) {
+                {
+                    let _guard = festerm_session::automation_admission_lock().unwrap();
+                    assert!(!self.fence.is_current());
+                }
+                self.delivered = true;
+                self.controller.record_encoded_input(bytes);
+            }
+        }
+
+        let mut controller = SessionController::with_session(FakeSession::new([]));
+        install_ime_epoch(&mut controller);
+        let mut terminal = Terminal::new(Dimensions::new(20, 5).unwrap()).unwrap();
+        terminal.ingest(b"\x1b[?1000h\x1b[?1006h");
+        for event in [
+            festerm_core::InputEvent::Key(festerm_core::Key::Enter),
+            festerm_core::InputEvent::Mouse(festerm_core::MouseEvent {
+                kind: festerm_core::MouseEventKind::Release(festerm_core::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: festerm_core::Modifiers::NONE,
+            }),
+        ] {
+            let fence = controller.capture_automation_input_fence().unwrap();
+            let mut sink = CheckedSink {
+                controller: &mut controller,
+                fence,
+                delivered: false,
+            };
+            festerm_ui_egui::route_input(&mut terminal, event, &mut sink);
+            assert!(sink.delivered);
+        }
+        let fence = controller.capture_automation_input_fence().unwrap();
+        let sent = controller.session.as_ref().unwrap().sent();
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Mouse(festerm_core::MouseEvent {
+                kind: festerm_core::MouseEventKind::Move { button: None },
+                column: 0,
+                row: 0,
+                modifiers: festerm_core::Modifiers::NONE,
+            }),
+            &mut controller,
+        );
+        assert!(!fence_is_current(&fence));
+        assert_eq!(controller.session.as_ref().unwrap().sent(), sent);
+    }
+
+    #[test]
+    fn keyboard_clipboard_barrier_preserves_prefix_suffix_and_accepted_byte_oracle() {
+        let session = FakeSession::with_input_results(
+            [],
+            [
+                Err(SessionSendError::Full {
+                    operation: festerm_session::SessionOperation::Input,
+                    capacity: 1,
+                }),
+                Ok(()),
+                Ok(()),
+                Ok(()),
+            ],
+        );
+        let mut controller = SessionController::with_session(session);
+        let mut terminal = Terminal::new(Dimensions::new(20, 5).unwrap()).unwrap();
+        controller.expect_native_input(b"beforepaste\r");
+        controller
+            .input_recorder
+            .lock()
+            .unwrap()
+            .set_recording(true);
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste("before".into()),
+            &mut controller,
+        );
+        assert!(controller.begin_clipboard_input(31));
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Key(festerm_core::Key::Enter),
+            &mut controller,
+        );
+        assert_eq!(
+            controller.session.as_ref().unwrap().sent().concat(),
+            b"before"
+        );
+        assert!(!controller.native_input_matches());
+        assert!(controller.prepare_clipboard_input(31));
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste("paste".into()),
+            &mut controller,
+        );
+        assert_eq!(
+            controller.session.as_ref().unwrap().sent().concat(),
+            b"beforepaste\r"
+        );
+        assert!(controller.native_input_matches());
+        assert_eq!(controller.pending_writes.queued_bytes(), 0);
+        assert!(!controller
+            .input_recorder
+            .lock()
+            .unwrap()
+            .report()
+            .contains("queue=queued-"));
+        controller.queue_bytes(b"reply", "terminal reply");
+        assert!(
+            controller.native_input_matches(),
+            "protocol replies are not native UI-input observations"
+        );
+    }
+
+    #[test]
+    fn keyboard_clipboard_buffer_overflow_fails_closed_and_counts_discarded_input() {
+        let mut controller = SessionController::with_session(FakeSession::new([]));
+        controller.pending_writes.capacity = 4;
+        let mut terminal = Terminal::new(Dimensions::new(20, 5).unwrap()).unwrap();
+        controller
+            .input_recorder
+            .lock()
+            .unwrap()
+            .set_recording(true);
+        assert!(controller.begin_clipboard_input(31));
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste("held".into()),
+            &mut controller,
+        );
+        assert_eq!(controller.pending_writes.queued_bytes(), 4);
+        assert!(controller.prepare_clipboard_input(31));
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste("xx".into()),
+            &mut controller,
+        );
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Key(festerm_core::Key::Enter),
+            &mut controller,
+        );
+        assert!(controller.clipboard_input_failed(31));
+        assert!(controller.session.as_ref().unwrap().sent().is_empty());
+        assert_eq!(controller.pending_writes.queued_bytes(), 0);
+        assert_eq!(controller.take_clipboard_discarded_bytes(), 5);
+        let report = controller.input_recorder.lock().unwrap().report();
+        assert!(report.contains("discarded-clipboard-buffer-overflow"));
+        assert!(!report.contains("held"));
+        controller.finish_failed_clipboard_input();
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste("new".into()),
+            &mut controller,
+        );
+        assert_eq!(controller.session.as_ref().unwrap().sent().concat(), b"new");
+    }
+
+    #[test]
+    fn keyboard_clipboard_backend_failure_never_releases_buffered_suffix() {
+        for paste_accepted in [false, true] {
+            let closed = Err(SessionSendError::Closed {
+                operation: festerm_session::SessionOperation::Input,
+            });
+            let results = if paste_accepted {
+                vec![Ok(()), closed]
+            } else {
+                vec![closed]
+            };
+            let mut controller =
+                SessionController::with_session(FakeSession::with_input_results([], results));
+            let mut terminal = Terminal::new(Dimensions::new(20, 5).unwrap()).unwrap();
+            controller
+                .input_recorder
+                .lock()
+                .unwrap()
+                .set_recording(true);
+            assert!(controller.begin_clipboard_input(31));
+            festerm_ui_egui::route_input(
+                &mut terminal,
+                festerm_core::InputEvent::Key(festerm_core::Key::Enter),
+                &mut controller,
+            );
+            assert!(controller.prepare_clipboard_input(31));
+            festerm_ui_egui::route_input(
+                &mut terminal,
+                festerm_core::InputEvent::Paste("paste".into()),
+                &mut controller,
+            );
+            festerm_ui_egui::route_input(
+                &mut terminal,
+                festerm_core::InputEvent::Paste("later".into()),
+                &mut controller,
+            );
+            assert!(controller.clipboard_input_failed(31));
+            assert_eq!(controller.take_clipboard_discarded_bytes(), 6);
+            assert_eq!(
+                controller.session.as_ref().unwrap().sent().concat(),
+                if paste_accepted {
+                    b"paste".as_slice()
+                } else {
+                    b""
+                }
+            );
+            let report = controller.input_recorder.lock().unwrap().report();
+            let paste = report
+                .lines()
+                .find(|line| line.contains("observation=2 "))
+                .unwrap();
+            assert!(paste.contains(if paste_accepted {
+                "queue=accepted-by-session"
+            } else {
+                "queue=rejected-by-session"
+            }));
+        }
+    }
+
+    #[test]
+    fn keyboard_clipboard_barrier_keeps_protocol_replies_serviceable() {
+        for capacity in [4, 64] {
+            let mut controller = SessionController::with_session(FakeSession::new([]));
+            controller.pending_writes.capacity = capacity;
+            let mut terminal = Terminal::new(Dimensions::new(20, 5).unwrap()).unwrap();
+            assert!(controller.begin_clipboard_input(31));
+            festerm_ui_egui::route_input(
+                &mut terminal,
+                festerm_core::InputEvent::Paste("held".into()),
+                &mut controller,
+            );
+            controller.queue_bytes(b"reply", "terminal reply");
+            if capacity == 4 {
+                // A reply larger than the entire bound remains rejected by
+                // the pre-existing queue limit; a fitting reply can proceed.
+                controller.queue_bytes(b"ok", "terminal reply");
+                assert_eq!(controller.session.as_ref().unwrap().sent().concat(), b"ok");
+                assert!(!controller.clipboard_input_pending(31));
+            } else {
+                assert_eq!(
+                    controller.session.as_ref().unwrap().sent().concat(),
+                    b"reply"
+                );
+                assert!(controller.clipboard_input_pending(31));
+            }
+            controller.cancel_clipboard_input(31, "discarded-clipboard-cancelled");
+            controller.flush_pending_writes();
+            assert!(!controller
+                .session
+                .as_ref()
+                .unwrap()
+                .sent()
+                .concat()
+                .windows(4)
+                .any(|bytes| bytes == b"held"));
+        }
+    }
+
+    #[test]
+    fn keyboard_clipboard_partial_backend_failure_counts_only_unsent_suffix() {
+        let session = FakeSession::with_input_results(
+            [],
+            [
+                Ok(()),
+                Ok(()),
+                Err(SessionSendError::Closed {
+                    operation: festerm_session::SessionOperation::Input,
+                }),
+            ],
+        );
+        let mut controller = SessionController::with_session(session);
+        let mut terminal = Terminal::new(Dimensions::new(20, 5).unwrap()).unwrap();
+        assert!(controller.begin_clipboard_input(31));
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste("one".into()),
+            &mut controller,
+        );
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Key(festerm_core::Key::Enter),
+            &mut controller,
+        );
+        assert!(controller.prepare_clipboard_input(31));
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste("p".into()),
+            &mut controller,
+        );
+        assert_eq!(
+            controller.session.as_ref().unwrap().sent().concat(),
+            b"pone"
+        );
+        assert_eq!(controller.take_clipboard_discarded_bytes(), 1);
+        assert!(controller.clipboard_input_failed(31));
+    }
+
+    #[test]
+    fn keyboard_clipboard_wait_does_not_suppress_focus_or_mouse_reports() {
+        let mut controller = SessionController::with_session(FakeSession::new([]));
+        let mut terminal = Terminal::new(Dimensions::new(20, 5).unwrap()).unwrap();
+        terminal.ingest(b"\x1b[?1004h\x1b[?1000h\x1b[?1006h");
+        assert!(controller.begin_clipboard_input(31));
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste("held".into()),
+            &mut controller,
+        );
+        controller.expect_native_input(b"\x1b[O");
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Focus(festerm_core::FocusEvent::Out),
+            &mut controller,
+        );
+        assert!(
+            controller.native_input_matches(),
+            "native acceptance observations still include UI reports"
+        );
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Mouse(festerm_core::MouseEvent {
+                kind: festerm_core::MouseEventKind::Release(festerm_core::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: festerm_core::Modifiers::NONE,
+            }),
+            &mut controller,
+        );
+        assert_eq!(
+            controller.session.as_ref().unwrap().sent().concat(),
+            b"\x1b[O\x1b[<0;1;1m"
+        );
+        assert!(controller.clipboard_input_pending(31));
+        controller.cancel_clipboard_input(31, "discarded-clipboard-cancelled");
+        assert_eq!(controller.take_clipboard_discarded_bytes(), 4);
+    }
+
+    #[test]
+    fn keyboard_pending_delivery_settles_original_observation_across_stop_clear_and_generation() {
+        for scenario in [
+            "accepted",
+            "rejected",
+            "generation",
+            "stopped",
+            "cleared",
+            "evicted",
+        ] {
+            let session = FakeSession::with_input_results(
+                [],
+                [
+                    Err(SessionSendError::Full {
+                        operation: festerm_session::SessionOperation::Input,
+                        capacity: 1,
+                    }),
+                    if scenario == "rejected" {
+                        Err(SessionSendError::Closed {
+                            operation: festerm_session::SessionOperation::Input,
+                        })
+                    } else {
+                        Ok(())
+                    },
+                ],
+            );
+            let mut controller = SessionController::with_session(session);
+            let mut terminal = Terminal::new(Dimensions::new(20, 5).unwrap()).unwrap();
+            {
+                let mut recorder = controller.input_recorder.lock().unwrap();
+                recorder.set_target(71, 1);
+                recorder.set_recording(true);
+            }
+            festerm_ui_egui::route_input(
+                &mut terminal,
+                festerm_core::InputEvent::Paste("controlled-secret-token".into()),
+                &mut controller,
+            );
+            assert!(controller
+                .input_recorder
+                .lock()
+                .unwrap()
+                .report()
+                .contains("queue=queued-backpressure"));
+            {
+                let mut recorder = controller.input_recorder.lock().unwrap();
+                recorder.set_target(99, 2);
+                if scenario == "stopped" {
+                    recorder.set_recording(false);
+                }
+                if scenario == "cleared" {
+                    recorder.clear();
+                }
+                if matches!(scenario, "cleared" | "evicted") {
+                    for _ in 0..festerm_ui_egui::routing_trace::CAPACITY {
+                        recorder.record(
+                            "application",
+                            festerm_ui_egui::routing_trace::Metadata {
+                                class: "later-observation",
+                                modifiers: 0,
+                            },
+                            "captured",
+                            "no-delivery",
+                            0,
+                        );
+                    }
+                }
+            }
+            if scenario == "generation" {
+                controller.advance_lifecycle_generation();
+            } else {
+                controller.flush_pending_writes();
+            }
+            let report = controller.input_recorder.lock().unwrap().report();
+            assert!(!report.contains("controlled-secret-token"));
+            assert!(
+                !report.contains("queue=queued-backpressure"),
+                "{scenario}: {report}"
+            );
+            if matches!(scenario, "cleared" | "evicted") {
+                assert!(!report.contains("queue=accepted-by-session"));
+                assert!(!report.contains("target=71"));
+            } else {
+                assert!(report.contains("observation=1 target=71 generation=1"));
+                assert!(
+                    report.contains(match scenario {
+                        "rejected" => "queue=rejected-by-session",
+                        "generation" => "queue=discarded-generation-change",
+                        _ => "queue=accepted-by-session",
+                    }),
+                    "{scenario}: {report}"
+                );
+            }
+            assert_eq!(controller.pending_writes.queued_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn application_advances_lifecycle_generation_at_reconnect_boundary() {
+        let mut controller =
+            SessionController::<FakeSession>::with_named_startup_error("test".to_owned(), "test");
+        assert_eq!(controller.lifecycle_generation(), 0);
+
+        controller.advance_lifecycle_generation();
+        assert_eq!(controller.lifecycle_generation(), 1);
+        controller.advance_lifecycle_generation();
+        assert_eq!(controller.lifecycle_generation(), 2);
+    }
+
+    #[test]
+    fn reconnect_boundary_discards_pending_input_without_replaying_it() {
+        let mut controller =
+            SessionController::<FakeSession>::with_named_startup_error("test".to_owned(), "test");
+        controller.pending_writes.enqueue(b"old input").unwrap();
+        controller.advance_lifecycle_generation();
+        assert_eq!(controller.pending_writes.queued_bytes(), 0);
+        assert_eq!(controller.pending_writes.queued_writes(), 0);
+        assert!(controller
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("9 pending input bytes"));
+    }
+
+    /// Regression test: a freshly created session's very first resize (the
+    /// reflow that corrects a new tab's initial 80x24 guess to the window's
+    /// real measured size) must reach the PTY immediately rather than
+    /// waiting out `TERMINAL_RESIZE_DEBOUNCE`. Debouncing that first resize
+    /// left a window in which the newly spawned shell could read the stale
+    /// startup size and draw its first prompt (including zsh's
+    /// `PROMPT_EOL_MARK` fill-and-erase dance) against a width our locally
+    /// reflowed `Terminal` no longer matched, stranding a visible "%" mark
+    /// on its own row instead of it being cleanly self-erased.
+    #[test]
+    fn the_first_resize_of_a_new_session_bypasses_the_debounce() {
+        let session = FakeSession::new([]);
+        let mut controller = SessionController::for_test(session);
+        let dimensions = Dimensions::new(77, 23).unwrap();
+        controller.record_terminal_resize(dimensions);
+        // No sleep, no `flush_pending_resize` call: the resize must already
+        // have been sent to the backend synchronously.
+        let generations = controller.resize_probe().generations();
+        assert_eq!(
+            generations.len(),
+            1,
+            "the first resize must be requested immediately, not staged"
+        );
+
+        // A second resize shortly after (e.g. a live drag continuing) is
+        // still debounced as usual.
+        let redragged = Dimensions::new(80, 24).unwrap();
+        controller.record_terminal_resize(redragged);
+        assert_eq!(
+            controller.resize_probe().generations().len(),
+            1,
+            "a subsequent resize must still wait out the normal debounce"
+        );
+        controller.flush_pending_resize();
+        assert_eq!(controller.resize_probe().generations().len(), 1);
+        assert!(controller.next_resize_repaint_delay().is_some());
+        std::thread::sleep(TERMINAL_RESIZE_DEBOUNCE);
+        controller.flush_pending_resize();
+        assert_eq!(controller.resize_probe().generations().len(), 2);
+        assert!(controller.next_resize_repaint_delay().is_none());
+    }
+
+    #[test]
+    fn resize_probe_recognizes_fragmented_cursor_queries_without_retaining_output() {
+        let mut scanner = CursorPositionQueryScanner::default();
+        assert_eq!(scanner.observe(b"\x1b["), 0);
+        assert_eq!(scanner.observe(b"6n"), 1);
+        assert_eq!(scanner.observe(b"\x1b[16n"), 0);
+        assert_eq!(scanner.observe(b"\x1b[6n"), 1);
+        assert_eq!(scanner.observe(b"plain text\x1b[6nmore\x1b[6n tail"), 2);
+        assert_eq!(scanner.observe(b"text\x1b"), 0);
+        assert_eq!(scanner.observe(b"[6n"), 1);
+        assert_eq!(scanner.observe(b"no escapes here"), 0);
+    }
+
+    #[test]
+    fn authoritative_resize_and_output_are_applied_in_wire_order_without_duplicate_replies() {
+        let session = FakeSession::new([
+            SessionEvent::Output(b"before\x1b[6n".to_vec()),
+            SessionEvent::ResizeApplied(TerminalSize::new(12, 4).unwrap()),
+            SessionEvent::Output(b"\x1b[4;12HX\x1b[6n".to_vec()),
+        ])
+        .with_backend_owned_terminal();
+        let mut terminal = Terminal::new(Dimensions::new(20, 6).unwrap()).unwrap();
+        let mut resized = false;
+        let result = pump_session_events_with_resize(
+            &session,
+            &mut terminal,
+            10,
+            |terminal, dimensions| {
+                assert_eq!(terminal.dimensions(), Dimensions::new(20, 6).unwrap());
+                assert_eq!(terminal.cell_ref(0, 0).unwrap().text(), "b");
+                resized = true;
+                terminal.resize(dimensions).is_ok()
+            },
+            |_| {},
+        );
+        assert!(resized);
+        assert!(!result.hit_limit);
+        assert_eq!(terminal.cell_ref(11, 3).unwrap().text(), "X");
+        assert!(session.sent().is_empty());
+    }
+
+    #[test]
+    fn recording_observes_applied_output_resize_and_recovery_without_local_input() {
+        use festerm_recording::{ArtifactEvent, ArtifactReader, Completion, FinishReason};
+
+        let recovery = festerm_sessiond::encode_recovery_sync_command(
+            &festerm_sessiond::RecoverySyncCommand::MirrorBytes(b"\x1b[2J\x1b[Hsynced".to_vec()),
+        )
+        .unwrap();
+        let session = FakeSession::new([
+            SessionEvent::Output(b"before".to_vec()),
+            SessionEvent::ResizeApplied(TerminalSize::new(12, 4).unwrap()),
+            SessionEvent::RecoverySync(recovery),
+            SessionEvent::Output(b"!".to_vec()),
+            SessionEvent::Lifecycle(SessionLifecycle::Stopped),
+            SessionEvent::Output(b"after stop".to_vec()),
+        ])
+        .with_backend_owned_terminal();
+        let mut controller = SessionController::for_test(session);
+        let mut terminal = Terminal::new(Dimensions::new(20, 6).unwrap()).unwrap();
+        let directory = private_recording_dir();
+        let (wake, ready) = std::sync::mpsc::channel();
+        let (recording, mut streams) =
+            festerm_recording::SharedRecording::start(directory.path(), &[&terminal], move || {
+                let _ = wake.send(());
+            })
+            .unwrap();
+        controller.attach_recording_stream(streams.remove(0));
+        for character in "PRIVATE-LOCAL-INPUT".chars() {
+            festerm_ui_egui::route_input(
+                &mut terminal,
+                festerm_core::InputEvent::Key(festerm_core::Key::Character(character)),
+                &mut controller,
+            );
+        }
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste("PRIVATE-PASTE".to_owned()),
+            &mut controller,
+        );
+        assert_eq!(
+            controller.session.as_ref().unwrap().sent().concat(),
+            b"PRIVATE-LOCAL-INPUTPRIVATE-PASTE"
+        );
+        controller.pump_events(&mut terminal);
+        recording.stop(FinishReason::User).unwrap();
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let Completion::Complete { path, .. } = recording.poll_completion().unwrap().unwrap()
+        else {
+            panic!("recording did not complete");
+        };
+        let bytes = std::fs::read(path).unwrap();
+        for private_input in [b"PRIVATE-LOCAL-INPUT".as_slice(), b"PRIVATE-PASTE"] {
+            assert!(!bytes
+                .windows(private_input.len())
+                .any(|window| window == private_input));
+        }
+        let mut reader = ArtifactReader::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = reader.next_event().unwrap() {
+            events.push(match event {
+                ArtifactEvent::Started { .. } => "start",
+                ArtifactEvent::Output { bytes, .. } if bytes == b"before" => "before",
+                ArtifactEvent::Resized { dimensions, .. } => {
+                    assert_eq!(dimensions, Dimensions::new(12, 4).unwrap());
+                    "resize"
+                }
+                ArtifactEvent::Output { bytes, .. } if bytes == b"\x1b[2J\x1b[Hsynced" => {
+                    "recovery"
+                }
+                ArtifactEvent::Output { bytes, .. } if bytes == b"!" => "after recovery",
+                ArtifactEvent::Ended { .. } => "end",
+                ArtifactEvent::Finished { .. } => "finish",
+                _ => panic!("unexpected recorded event"),
+            });
+        }
+        assert_eq!(
+            events,
+            [
+                "start",
+                "before",
+                "resize",
+                "recovery",
+                "after recovery",
+                "end",
+                "finish"
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_palette_mismatch_stops_recording_before_later_output() {
+        use festerm_recording::{ArtifactEvent, ArtifactReader, Completion, FinishReason};
+
+        let mut terminal = Terminal::new(Dimensions::new(20, 6).unwrap()).unwrap();
+        terminal.ingest(b"\x1b[8msecret");
+        let directory = private_recording_dir();
+        let (wake, ready) = std::sync::mpsc::channel();
+        let (recording, streams) =
+            festerm_recording::SharedRecording::start(directory.path(), &[&terminal], move || {
+                let _ = wake.send(());
+            })
+            .unwrap();
+        let foreign = festerm_core::ColorScheme::new(
+            festerm_core::ColorScheme::DEFAULT_FOREGROUND,
+            festerm_core::Rgb::new(0, 0, 0),
+            festerm_core::ColorScheme::DEFAULT_FOREGROUND,
+            festerm_core::ColorScheme::DEFAULT_ANSI,
+        );
+        apply_recovery_sync(
+            &mut terminal,
+            &festerm_sessiond::RecoverySyncCommand::SetColorScheme(foreign),
+            Some(&streams[0]),
+        );
+        assert!(!recording.is_recording().unwrap());
+        assert!(recording
+            .take_failure()
+            .unwrap()
+            .unwrap()
+            .contains("colors do not match"));
+        streams[0]
+            .ingest_output(&mut terminal, b"AFTER-PALETTE-LOSS")
+            .unwrap();
+        let completion = loop {
+            ready.recv_timeout(Duration::from_secs(10)).unwrap();
+            if let Some(completion) = recording.poll_completion().unwrap() {
+                break completion;
+            }
+        };
+        let Completion::Incomplete {
+            path,
+            reason: FinishReason::IntegrityFailure,
+            ..
+        } = completion
+        else {
+            panic!("a palette mismatch must leave an incomplete recording");
+        };
+        let mut reader = ArtifactReader::new(std::fs::File::open(path).unwrap()).unwrap();
+        let Some(ArtifactEvent::Started { terminal, .. }) = reader.next_event().unwrap() else {
+            panic!("expected the safe checkpoint");
+        };
+        assert!(!terminal.row_text(0).unwrap().contains("secret"));
+        while let Some(event) = reader.next_event().unwrap() {
+            assert!(!matches!(
+                event,
+                ArtifactEvent::Configured { .. } | ArtifactEvent::Output { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_recovery_stops_a_shared_recording_as_incomplete() {
+        use festerm_recording::{Completion, FinishReason};
+
+        let session = FakeSession::new([SessionEvent::RecoverySync(vec![255])]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal = Terminal::new(Dimensions::new(20, 6).unwrap()).unwrap();
+        let directory = private_recording_dir();
+        let (wake, ready) = std::sync::mpsc::channel();
+        let (recording, mut streams) =
+            festerm_recording::SharedRecording::start(directory.path(), &[&terminal], move || {
+                let _ = wake.send(());
+            })
+            .unwrap();
+        controller.attach_recording_stream(streams.remove(0));
+        controller.pump_events(&mut terminal);
+        assert!(!recording.is_recording().unwrap());
+        assert!(recording
+            .take_failure()
+            .unwrap()
+            .unwrap()
+            .contains("recovery data was invalid"));
+        let completion = loop {
+            ready.recv_timeout(Duration::from_secs(10)).unwrap();
+            if let Some(completion) = recording.poll_completion().unwrap() {
+                break completion;
+            }
+        };
+        assert!(matches!(
+            completion,
+            Completion::Incomplete {
+                reason: FinishReason::IntegrityFailure,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn terminal_failure_keeps_prior_output_but_marks_recording_incomplete() {
+        use festerm_recording::{ArtifactEvent, ArtifactReader, Completion, FinishReason};
+
+        let session = FakeSession::new([
+            SessionEvent::Output(b"last reliable output".to_vec()),
+            SessionEvent::Lifecycle(SessionLifecycle::Failed(SessionError::new(
+                SessionErrorKind::Output,
+                "reader failed",
+            ))),
+            SessionEvent::Output(b"after failure".to_vec()),
+        ]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal = Terminal::new(Dimensions::new(30, 2).unwrap()).unwrap();
+        let directory = private_recording_dir();
+        let (wake, ready) = std::sync::mpsc::channel();
+        let (recording, mut streams) =
+            festerm_recording::SharedRecording::start(directory.path(), &[&terminal], move || {
+                let _ = wake.send(());
+            })
+            .unwrap();
+        controller.attach_recording_stream(streams.remove(0));
+        controller.pump_events(&mut terminal);
+        assert!(!recording.is_recording().unwrap());
+        assert!(recording
+            .take_failure()
+            .unwrap()
+            .unwrap()
+            .contains("terminal session failed"));
+        let completion = loop {
+            ready.recv_timeout(Duration::from_secs(10)).unwrap();
+            if let Some(completion) = recording.poll_completion().unwrap() {
+                break completion;
+            }
+        };
+        let Completion::Incomplete {
+            path,
+            reason: FinishReason::IntegrityFailure,
+            ..
+        } = completion
+        else {
+            panic!("terminal failure must make the recording incomplete");
+        };
+        let mut reader = ArtifactReader::new(std::fs::File::open(path).unwrap()).unwrap();
+        assert!(matches!(
+            reader.next_event().unwrap(),
+            Some(ArtifactEvent::Started { .. })
+        ));
+        assert!(matches!(
+            reader.next_event().unwrap(),
+            Some(ArtifactEvent::Output { bytes, .. }) if bytes == b"last reliable output"
+        ));
+        assert!(matches!(
+            reader.next_event().unwrap(),
+            Some(ArtifactEvent::Finished {
+                reason: FinishReason::IntegrityFailure,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn disconnected_or_closed_session_stops_the_shared_recording_incomplete() {
+        use festerm_recording::{Completion, FinishReason};
+
+        for session in [
+            FakeSession::new([SessionEvent::Lifecycle(SessionLifecycle::Disconnected(
+                SessionError::new(SessionErrorKind::Output, "connection lost"),
+            ))]),
+            FakeSession::new([]).with_closed_events(),
+        ] {
+            let mut controller = SessionController::for_test(session);
+            let mut terminal = Terminal::new(Dimensions::new(20, 2).unwrap()).unwrap();
+            let other = Terminal::new(Dimensions::new(20, 2).unwrap()).unwrap();
+            let directory = private_recording_dir();
+            let (wake, ready) = std::sync::mpsc::channel();
+            let (recording, mut streams) = festerm_recording::SharedRecording::start(
+                directory.path(),
+                &[&terminal, &other],
+                move || {
+                    let _ = wake.send(());
+                },
+            )
+            .unwrap();
+            controller.attach_recording_stream(streams.remove(0));
+            controller.pump_events(&mut terminal);
+            assert!(!recording.is_recording().unwrap());
+            assert!(recording.take_failure().unwrap().is_some());
+            let completion = loop {
+                ready.recv_timeout(Duration::from_secs(10)).unwrap();
+                if let Some(completion) = recording.poll_completion().unwrap() {
+                    break completion;
+                }
+            };
+            assert!(matches!(
+                completion,
+                Completion::Incomplete {
+                    reason: FinishReason::IntegrityFailure,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn event_channel_closing_after_clean_exit_does_not_fail_other_streams() {
+        let session = FakeSession::new([SessionEvent::Lifecycle(SessionLifecycle::Exited(
+            festerm_session::SessionExit::with_exit_code(0),
+        ))])
+        .with_closed_events();
+        let mut controller = SessionController::for_test(session);
+        let mut terminal = Terminal::new(Dimensions::new(20, 2).unwrap()).unwrap();
+        let other = Terminal::new(Dimensions::new(20, 2).unwrap()).unwrap();
+        let directory = private_recording_dir();
+        let (recording, mut streams) = festerm_recording::SharedRecording::start(
+            directory.path(),
+            &[&terminal, &other],
+            || {},
+        )
+        .unwrap();
+        controller.attach_recording_stream(streams.remove(0));
+        controller.pump_events(&mut terminal);
+        assert!(recording.is_recording().unwrap());
+        assert!(recording.take_failure().unwrap().is_none());
+        recording
+            .stop(festerm_recording::FinishReason::User)
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_authoritative_control_is_reported() {
+        let session = FakeSession::new([SessionEvent::RecoverySync(vec![255])]);
+        let mut terminal = Terminal::new(Dimensions::new(20, 6).unwrap()).unwrap();
+        let mut reported = false;
+        pump_session_events(&session, &mut terminal, 10, |event| {
+            if let PumpedSessionEvent::Event(SessionEvent::Error(_)) = event {
+                reported = true;
+            }
+        });
+        assert!(reported);
+    }
+
+    #[test]
+    fn resize_probe_correlates_output_with_an_applied_generation() {
+        let session = FakeSession::new([
+            SessionEvent::Output(b"\x1b[".to_vec()),
+            SessionEvent::Output(b"6nX".to_vec()),
+            SessionEvent::ResizeApplied(TerminalSize::new(73, 26).unwrap()),
+        ]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(73, 26).unwrap()).expect("terminal allocation");
+        controller.record_terminal_resize(terminal.dimensions());
+        std::thread::sleep(TERMINAL_RESIZE_DEBOUNCE);
+        controller.flush_pending_resize();
+        assert!(!controller.pump_events(&mut terminal));
+        controller.observe_resize_probe_terminal_state(&terminal);
+
+        let generations = controller.resize_probe().generations();
+        assert_eq!(controller.resize_probe().observed_output_bytes(), 5);
+        assert_eq!(controller.resize_probe().cursor_position_queries(), 1);
+        assert_eq!(generations.len(), 1);
+        assert!(generations[0].applied);
+        assert_eq!(generations[0].output_bytes_since_request, 5);
+        assert_eq!(generations[0].cursor_position_queries_since_request, 1);
+        assert_eq!(generations[0].visible_nonblank_cells, 1);
+    }
+
+    #[test]
+    fn no_session_fallback_retains_only_content_free_input_metadata() {
+        let mut controller: SessionController<FakeSession> =
+            SessionController::with_startup_error("controlled startup failure".to_owned());
+        controller.record_encoded_input(b"private paste contents");
+        controller.observe_input_route(InputRoute {
+            outcome: festerm_core::InputEventOutcome::Encoded { bytes: 22 },
+            queue_depth: 22,
+            delivered_bytes: 22,
+        });
+
+        assert_eq!(
+            controller.input_diagnostics(),
+            Some(InputSinkDiagnostics {
+                event_count: 1,
+                byte_count: 22,
+                last_outcome: Some(festerm_core::InputEventOutcome::Encoded { bytes: 22 }),
+                last_queue_depth: 22,
+            })
+        );
+    }
+
+    #[test]
+    fn no_session_fallback_is_not_a_prompt() {
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+        seed_session_failure(&mut terminal, "controlled failure");
+        assert!(terminal
+            .row_text(2)
+            .is_some_and(|row| row.starts_with("fesTerm remains in no-session mode")));
+    }
+
+    #[test]
+    fn fake_session_pump_keeps_the_application_as_terminal_writer() {
+        let session = FakeSession::new([
+            SessionEvent::Output(b"fake backend output".to_vec()),
+            SessionEvent::Lifecycle(SessionLifecycle::Exited(
+                festerm_session::SessionExit::with_exit_code(0),
+            )),
+        ]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        let hit_limit = controller.pump_events(&mut terminal);
+
+        // `pump_events`'s own return value is a backpressure signal (was it
+        // hit the bounded session-slice cap), not "did output arrive" - a
+        // modest, single-event burst like this one drains well under the
+        // cap and reports `false` here even though real output was
+        // ingested. `last_pump_output_received()` is the correct signal for
+        // "did output arrive this call" (e.g. the background-tab "new
+        // output" chip marker, feature request #68 - see the regression test
+        // below for the bug this previously caused).
+        assert!(!hit_limit);
+        assert!(controller.last_pump_output_received());
+        assert!(terminal
+            .row_text(0)
+            .is_some_and(|row| row.starts_with("fake backend output")));
+    }
+
+    #[test]
+    fn modest_background_output_is_not_lost_behind_the_backpressure_signal() {
+        // Regression test for a bug where the chip "new output" marker
+        // (feature request #68) was gated on `pump_events`'s own `bool`
+        // return, which only reports whether the bounded session slice
+        // hit `MAX_SESSION_EVENTS_PER_SLICE` - so any burst under that cap
+        // (i.e. almost all ordinary output) never set the unread flag.
+        // `last_pump_output_received()` must report the output regardless
+        // of whether the session-slice cap was hit.
+        let session = FakeSession::new([SessionEvent::Output(b"a few lines\r\n".to_vec())]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        assert!(!controller.last_pump_output_received());
+        let hit_limit = controller.pump_events(&mut terminal);
+        assert!(
+            !hit_limit,
+            "a single modest event never hits the session-slice cap"
+        );
+        assert!(
+            controller.last_pump_output_received(),
+            "modest output must still be reported as received"
+        );
+
+        // A pump call that observes no output at all clears the flag.
+        controller.pump_events(&mut terminal);
+        assert!(!controller.last_pump_output_received());
+    }
+
+    #[test]
+    fn host_key_prompt_crosses_the_session_boundary_without_terminal_output() {
+        let session = FakeSession::new([SessionEvent::HostKeyVerification(HostKeyPrompt::new(
+            "ssh.example.test",
+            2222,
+            "SHA256:content-free-fingerprint",
+        ))]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        assert!(!controller.pump_events(&mut terminal));
+        let prompt = controller
+            .host_key_prompt()
+            .expect("host-key prompt retained")
+            .clone();
+        assert_eq!(prompt.host(), "ssh.example.test");
+        assert_eq!(prompt.port(), 2222);
+        assert_eq!(
+            prompt.sha256_fingerprint(),
+            "SHA256:content-free-fingerprint"
+        );
+        assert!(terminal
+            .row_text(0)
+            .is_some_and(|row| row.trim().is_empty()));
+
+        assert!(controller.clear_host_key_prompt(&prompt));
+        assert!(controller.host_key_prompt().is_none());
+    }
+
+    #[test]
+    fn host_key_prompt_is_not_cleared_by_a_different_request() {
+        let session = FakeSession::new([SessionEvent::HostKeyVerification(HostKeyPrompt::new(
+            "ssh.example.test",
+            2222,
+            "SHA256:current",
+        ))]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        assert!(!controller.pump_events(&mut terminal));
+        assert!(!controller.clear_host_key_prompt(&HostKeyPrompt::new(
+            "ssh.example.test",
+            2222,
+            "SHA256:other",
+        )));
+        assert_eq!(
+            controller
+                .host_key_prompt()
+                .map(HostKeyPrompt::sha256_fingerprint),
+            Some("SHA256:current")
+        );
+    }
+
+    #[test]
+    fn password_prompt_crosses_the_session_boundary_and_clears_once_resolved() {
+        let session = FakeSession::new([SessionEvent::PasswordRequested(PasswordPrompt::new(
+            "fes",
+            "ssh.example.test",
+            0,
+            false,
+        ))]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        assert!(!controller.pump_events(&mut terminal));
+        let prompt = controller
+            .password_prompt()
+            .expect("password prompt retained")
+            .clone();
+        assert_eq!(prompt.username(), "fes");
+        assert_eq!(prompt.host(), "ssh.example.test");
+        assert!(!prompt.previous_attempt_failed());
+
+        assert!(controller.clear_password_prompt(&prompt));
+        assert!(controller.password_prompt().is_none());
+    }
+
+    #[test]
+    fn port_forward_snapshots_cross_the_session_boundary_without_terminal_output() {
+        let session = FakeSession::new([SessionEvent::PortForwardsUpdated(vec![
+            SshPortForwardRuntime::new(
+                festerm_session::SshPortForwardDirection::Local,
+                "127.0.0.1",
+                15432,
+                "db.internal",
+                5432,
+                festerm_session::SshPortForwardSource::Profile,
+                festerm_session::SshPortForwardState::Active,
+                None,
+            ),
+        ])]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        assert!(controller.port_forwards().is_empty());
+        assert!(!controller.pump_events(&mut terminal));
+        assert_eq!(controller.port_forwards().len(), 1);
+        assert!(terminal
+            .row_text(0)
+            .is_some_and(|row| row.trim().is_empty()));
+    }
+
+    #[test]
+    fn disconnecting_clears_the_retained_port_forward_snapshot() {
+        let session = FakeSession::new([
+            SessionEvent::PortForwardsUpdated(vec![SshPortForwardRuntime::new(
+                festerm_session::SshPortForwardDirection::Remote,
+                "127.0.0.1",
+                18080,
+                "127.0.0.1",
+                8080,
+                festerm_session::SshPortForwardSource::Ephemeral,
+                festerm_session::SshPortForwardState::Failed,
+                Some("remote bind denied".to_owned()),
+            )]),
+            SessionEvent::Lifecycle(SessionLifecycle::Disconnected(
+                festerm_session::SessionError::new(
+                    festerm_session::SessionErrorKind::Spawn,
+                    "network lost",
+                ),
+            )),
+        ]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        controller.pump_events(&mut terminal);
+
+        assert!(controller.port_forwards().is_empty());
+        assert_eq!(controller.port_forwards.capacity(), 0);
+    }
+
+    #[test]
+    fn a_pending_host_key_prompt_and_a_pending_password_prompt_can_coexist_on_the_controller() {
+        // The worker only ever emits a password request once the host key
+        // has already been verified, mirroring `ssh`'s own fingerprint
+        // -first ordering (see `establish_connection`'s `Interactive` arm).
+        // Nothing at the controller layer enforces mutual exclusion between
+        // the two Option fields, though: it is application chrome
+        // (`app.rs`'s `TabContent::Session` rendering) that must check
+        // `host_key_prompt()` before `password_prompt()` so an unresolved
+        // fingerprint prompt is never silently skipped in favor of a later
+        // password prompt. This test pins that both can be simultaneously
+        // present on the controller, so a future refactor that makes chrome
+        // stop checking host-key first fails loudly in the UI rather than
+        // relying on an invariant that isn't actually enforced here.
+        let session = FakeSession::new([
+            SessionEvent::HostKeyVerification(HostKeyPrompt::new(
+                "ssh.example.test",
+                22,
+                "SHA256:content-free-fingerprint",
+            )),
+            SessionEvent::PasswordRequested(PasswordPrompt::new(
+                "fes",
+                "ssh.example.test",
+                0,
+                false,
+            )),
+        ]);
+        let mut controller = SessionController::for_test(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        controller.pump_events(&mut terminal);
+
+        assert!(
+            controller.host_key_prompt().is_some(),
+            "an unresolved host-key prompt must remain visible"
+        );
+        assert!(
+            controller.password_prompt().is_some(),
+            "a password prompt the worker already emitted must remain visible too"
+        );
+    }
+
+    #[test]
+    fn host_key_resolution_failure_is_visible_in_session_status() {
+        let mut controller = SessionController::for_test(FakeSession::new([]));
+
+        controller.record_host_key_resolution_error("no host-key prompt is pending");
+
+        assert!(controller
+            .status_line()
+            .contains("host-key decision could not be applied: no host-key prompt is pending"));
+    }
+
+    #[test]
+    fn capped_event_pump_requests_a_follow_up_frame() {
+        let session = FakeSession::new([
+            SessionEvent::Output(b"first".to_vec()),
+            SessionEvent::Output(b"second".to_vec()),
+        ]);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        let result = pump_session_events(&session, &mut terminal, 1, |_| {});
+
+        assert!(result.hit_limit);
+        assert!(terminal
+            .row_text(0)
+            .is_some_and(|row| row.starts_with("first")));
+    }
+
+    #[test]
+    fn ingest_byte_budget_bounds_a_single_session_slice() {
+        // A large heavy-output backlog (e.g. a `dir /s` on a big tree) can
+        // arrive as far fewer than `MAX_SESSION_EVENTS_PER_SLICE` chunks
+        // once each chunk is close to `MAX_IO_CHUNK_BYTES`. Without a byte
+        // budget, a single `pump_session_events` call would synchronously
+        // `Terminal::ingest` all of it - this proves the byte budget kicks
+        // in and reports `hit_limit` (so callers keep requesting repaints
+        // and draining incrementally) well before the event-count cap.
+        let chunk = vec![b'x'; MAX_INGEST_BYTES_PER_SESSION_SLICE];
+        let session = FakeSession::new([
+            SessionEvent::Output(chunk.clone()),
+            SessionEvent::Output(chunk),
+        ]);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        let mut observed_events = 0usize;
+        let result = pump_session_events_with_resize(
+            &session,
+            &mut terminal,
+            MAX_SESSION_EVENTS_PER_SLICE,
+            |terminal, dimensions| terminal.resize(dimensions).is_ok(),
+            |_| observed_events += 1,
+        );
+
+        assert!(result.hit_limit, "byte budget must report backpressure");
+        assert!(result.output_received);
+        assert_eq!(
+            observed_events, 1,
+            "only the first chunk should be ingested before the byte budget stops the drain"
+        );
+    }
+
+    #[test]
+    fn ingest_byte_budget_stops_at_the_session_slice_ceiling() {
+        let chunk_count = MAX_INGEST_BYTES_PER_SESSION_SLICE / MAX_IO_CHUNK_BYTES + 1;
+        let session = FakeSession::new(
+            (0..chunk_count).map(|_| SessionEvent::Output(vec![b'x'; MAX_IO_CHUNK_BYTES])),
+        );
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        let mut observed_events = 0usize;
+        let result = pump_session_events_with_resize(
+            &session,
+            &mut terminal,
+            usize::MAX,
+            |terminal, dimensions| terminal.resize(dimensions).is_ok(),
+            |_| observed_events += 1,
+        );
+
+        assert!(
+            result.hit_limit,
+            "the session-slice ceiling must report backpressure"
+        );
+        assert_eq!(
+            observed_events,
+            MAX_INGEST_BYTES_PER_SESSION_SLICE / MAX_IO_CHUNK_BYTES,
+            "an unexpired budget drains up to the session-slice ceiling"
+        );
+    }
+
+    #[test]
+    fn recording_observes_each_applied_chunk_before_the_ingest_budget_yields() {
+        let session = FakeSession::new(
+            (0..5).map(|index| SessionEvent::Output(vec![b'a' + index; MAX_IO_CHUNK_BYTES])),
+        );
+        let mut terminal = Terminal::new(Dimensions::new(80, 24).unwrap()).unwrap();
+        let mut recorded = 0;
+        let result = pump_session_events_with_mutations(
+            &session,
+            &mut terminal,
+            usize::MAX,
+            |terminal, dimensions| terminal.resize(dimensions).is_ok(),
+            |_| {},
+            |mutation| {
+                if let TerminalMutation::Output {
+                    bytes, terminal, ..
+                } = mutation
+                {
+                    terminal.ingest(bytes);
+                    assert_eq!(
+                        terminal.cell_ref(0, 0).unwrap().text(),
+                        std::str::from_utf8(&bytes[..1]).unwrap()
+                    );
+                    recorded += bytes.len();
+                }
+            },
+        );
+        assert!(result.hit_limit);
+        assert_eq!(recorded, MAX_INGEST_BYTES_PER_SESSION_SLICE);
+    }
+
+    #[test]
+    fn pending_commands_survive_backpressure_and_preserve_reply_input_order() {
+        let session = FakeSession::with_input_results(
+            [],
+            [
+                Err(SessionSendError::Full {
+                    operation: festerm_session::SessionOperation::Input,
+                    capacity: 2,
+                }),
+                Err(SessionSendError::Full {
+                    operation: festerm_session::SessionOperation::Input,
+                    capacity: 2,
+                }),
+                Ok(()),
+                Ok(()),
+            ],
+        );
+        let mut pending = PendingCommandBuffer::new(64);
+
+        pending.enqueue(b"reply").unwrap();
+        assert!(matches!(
+            pending.flush(&session),
+            PendingFlush::Backpressured
+        ));
+        pending.enqueue(b"input").unwrap();
+        assert!(matches!(
+            pending.flush(&session),
+            PendingFlush::Backpressured
+        ));
+        assert_eq!(pending.queued_writes(), 2);
+        assert_eq!(pending.queued_bytes(), b"replyinput".len());
+
+        assert!(matches!(pending.flush(&session), PendingFlush::Drained));
+        assert_eq!(session.sent(), vec![b"reply".to_vec(), b"input".to_vec()]);
+        assert_eq!(pending.queued_writes(), 0);
+    }
+
+    #[test]
+    fn pending_command_bound_reports_unrecoverable_input_explicitly() {
+        let mut pending = PendingCommandBuffer::new(4);
+        pending.enqueue(b"four").unwrap();
+
+        let error = pending.enqueue(b"more").unwrap_err();
+
+        assert_eq!(
+            error,
+            PendingCommandError::Full {
+                capacity: 4,
+                queued: 4,
+                attempted: 4,
+            }
+        );
+        assert!(error.to_string().contains("exceeded their 4-byte bound"));
+        assert_eq!(pending.queued_bytes(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grow_columns_and_rows_after_bottom_row_prompt_preserves_typed_command_output() {
+        use festerm_pty::default_local_profile;
+
+        fn joined_screen(terminal: &Terminal) -> String {
+            (0..terminal.dimensions().rows())
+                .map(|row| terminal.row_text(row).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let profile = default_local_profile().expect("default shell profile");
+        let session = LocalPtySession::start(profile, TerminalSize::new(20, 6).unwrap()).unwrap();
+        let mut controller = SessionController::with_session(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(20, 6).unwrap()).expect("terminal allocation");
+
+        // Push the prompt down toward the bottom row with filler output.
+        for marker in ["ls -l", "ls -l"] {
+            controller.record_encoded_input(marker.as_bytes());
+            controller.record_encoded_input(b"\n");
+            std::thread::sleep(Duration::from_millis(300));
+            controller.pump_events(&mut terminal);
+        }
+        for _ in 0..20 {
+            controller.pump_events(&mut terminal);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Grow BOTH columns and rows together, as a real corner-drag
+        // would, then give the shell time to process SIGWINCH before
+        // sending the command (mirrors a real human pausing after resize).
+        terminal
+            .resize(Dimensions::new(40, 16).unwrap())
+            .expect("local reflow");
+        controller.record_terminal_resize(terminal.dimensions());
+        std::thread::sleep(Duration::from_millis(500));
+        controller.pump_events(&mut terminal);
+        controller.flush_pending_resize();
+        controller.record_encoded_input(b"echo done123\n");
+        for _ in 0..100 {
+            controller.pump_events(&mut terminal);
+            controller.flush_pending_resize();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            joined_screen(&terminal).contains("done123"),
+            "command output should be visible, got:\n{}",
+            joined_screen(&terminal)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rapid_live_resizes_preserve_continuous_pty_output_and_apply_the_settled_size() {
+        fn terminal_text_including_scrollback(terminal: &Terminal) -> String {
+            let history = terminal
+                .scrollback_lines()
+                .flat_map(|line| line.cells())
+                .map(|cell| cell.character())
+                .collect::<String>();
+            let visible = (0..terminal.dimensions().rows())
+                .filter_map(|row| terminal.row_text(row))
+                .collect::<String>();
+            format!("{history}{visible}")
+        }
+
+        // A real PTY continuously emits numbered lines while the application
+        // receives a jittery corner-drag-sized sequence. This covers the
+        // boundary absent from core-only reflow tests: terminal reflow happens
+        // synchronously, while the child receives only the debounced final
+        // TIOCSWINSZ/SIGWINCH resize.
+        let profile = LocalProfile::new("/bin/sh").with_arguments([
+            "-c",
+            "i=0; while [ \"$i\" -lt 64 ]; do printf 'FRAME:%02d\\n' \"$i\"; \
+             i=$((i + 1)); sleep 0.02; done",
+        ]);
+        let session = LocalPtySession::start(profile, TerminalSize::new(40, 8).unwrap())
+            .expect("controlled resize stream starts");
+        let mut controller = SessionController::with_session(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(40, 8).unwrap()).expect("terminal allocation");
+
+        let drag_steps = [
+            (41, 9),
+            (44, 10),
+            (43, 9),
+            (48, 12),
+            (52, 11),
+            (57, 14),
+            (55, 13),
+            (60, 16),
+        ];
+        for index in 0..64 {
+            let (columns, rows) = drag_steps[index % drag_steps.len()];
+            let dimensions = Dimensions::new(columns, rows).expect("drag dimensions are valid");
+            terminal.resize(dimensions).expect("live reflow succeeds");
+            controller.record_terminal_resize(dimensions);
+            controller.pump_events(&mut terminal);
+            controller.observe_resize_probe_terminal_state(&terminal);
+            controller.forward_terminal_replies(&mut terminal);
+            controller.flush_pending_writes();
+            controller.flush_pending_resize();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let settled_size = TerminalSize::new(60, 16).expect("settled size is valid");
+        controller.force_flush_pending_resize();
+        // A real child process emits 64 lines at ~20ms apart (~1.3s) after a
+        // debounced resize settle; under CI's noisier/more loaded runners
+        // that can occasionally take much longer than on a quiet local
+        // machine, so give it generous headroom rather than the 5s that
+        // works reliably locally.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            controller.pump_events(&mut terminal);
+            controller.observe_resize_probe_terminal_state(&terminal);
+            controller.forward_terminal_replies(&mut terminal);
+            controller.flush_pending_writes();
+            controller.flush_pending_resize();
+
+            let terminal_text = terminal_text_including_scrollback(&terminal);
+            let final_resize_applied =
+                controller
+                    .resize_probe()
+                    .generations()
+                    .last()
+                    .is_some_and(|generation| {
+                        generation.applied && generation.dimensions == settled_size
+                    });
+            if final_resize_applied && terminal_text.contains("FRAME:63") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let terminal_text = terminal_text_including_scrollback(&terminal);
+        for index in 0..64 {
+            assert!(
+                terminal_text.contains(&format!("FRAME:{index:02}")),
+                "rapid live resizing lost PTY output marker FRAME:{index:02}"
+            );
+        }
+        assert_eq!(
+            controller.resize_probe().requested_generations(),
+            2,
+            "the drag's very first resize is sent immediately (see \
+             `has_requested_resize`), and the remaining rapid UI resizes \
+             during the drag must still collapse into exactly one settled \
+             PTY resize"
+        );
+        assert!(
+            controller
+                .resize_probe()
+                .generations()
+                .last()
+                .is_some_and(
+                    |generation| generation.applied && generation.dimensions == settled_size
+                ),
+            "the settled PTY resize must be applied before the stream completes"
+        );
+        assert!(matches!(
+            controller
+                .session()
+                .expect("controlled session remains available")
+                .shutdown(Duration::from_secs(2)),
+            Ok(festerm_session::ShutdownResult::AlreadyStopped)
+                | Ok(festerm_session::ShutdownResult::Stopped)
+        ));
+    }
+
+    #[cfg(unix)]
+    fn pump_controlled_session_until(
+        controller: &mut SessionController<LocalPtySession>,
+        terminal: &mut Terminal,
+        predicate: impl Fn(&Terminal) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            controller.pump_events(terminal);
+            controller.forward_terminal_replies(terminal);
+            controller.flush_pending_writes();
+            controller.flush_pending_resize();
+            if predicate(terminal) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for controlled application session state");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_session_routes_m6_modes_replies_input_resize_and_alternate_screen() {
+        let profile = LocalProfile::new("/bin/sh").with_arguments([
+            "-c",
+            "stty raw -echo; \
+             printf 'PRIMARY\\033[?1049hALT\\033[6n'; \
+             dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \\n'; printf '\\n'; \
+             printf '\\033[?2004h\\033[?1004h\\033[?1000h\\033[?1006h'; \
+             dd bs=1 count=25 2>/dev/null | od -An -tx1 | tr -d ' \\n'; printf '\\n'; \
+             printf '\\033[?1049lDONE\\n'; exit",
+        ]);
+        let session = LocalPtySession::start(profile, TerminalSize::new(80, 24).unwrap()).unwrap();
+        let mut controller = SessionController::with_session(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+
+        pump_controlled_session_until(&mut controller, &mut terminal, |terminal| {
+            let modes = terminal.modes();
+            modes.alternate_screen()
+                && modes.bracketed_paste()
+                && modes.focus_reporting()
+                && modes.sgr_mouse()
+        });
+
+        terminal.resize(Dimensions::new(73, 26).unwrap()).unwrap();
+        controller.record_terminal_resize(terminal.dimensions());
+        // Settle the debounced resize (see `TERMINAL_RESIZE_DEBOUNCE`) before
+        // the script below races ahead and exits; real interactive shells
+        // never exit within a resize's debounce window, but this script
+        // deliberately finishes fast, so waiting here mirrors realistic
+        // timing instead of the resize losing its race against process exit.
+        std::thread::sleep(TERMINAL_RESIZE_DEBOUNCE);
+        controller.flush_pending_resize();
+        assert_eq!(
+            terminal.handle_input(festerm_core::InputEvent::Focus(
+                festerm_core::FocusEvent::In,
+            )),
+            festerm_core::InputEventOutcome::Encoded { bytes: 3 }
+        );
+        assert_eq!(
+            terminal.handle_input(festerm_core::InputEvent::Paste("z".to_owned())),
+            festerm_core::InputEventOutcome::Encoded { bytes: 13 }
+        );
+        assert_eq!(
+            terminal.handle_input(festerm_core::InputEvent::Mouse(festerm_core::MouseEvent {
+                kind: festerm_core::MouseEventKind::Press(festerm_core::MouseButton::Left),
+                column: 1,
+                row: 2,
+                modifiers: festerm_core::Modifiers::NONE,
+            },)),
+            festerm_core::InputEventOutcome::Encoded { bytes: 9 }
+        );
+        let input = terminal.drain_input();
+        assert_eq!(input, b"\x1b[I\x1b[200~z\x1b[201~\x1b[<0;2;3M");
+        controller.record_encoded_input(&input);
+
+        pump_controlled_session_until(&mut controller, &mut terminal, |terminal| {
+            !terminal.modes().alternate_screen()
+                && terminal
+                    .row_text(0)
+                    .is_some_and(|row| row.starts_with("PRIMARYDONE"))
+        });
+        assert!(controller
+            .session()
+            .is_some_and(|session| session.metrics().resize_count >= 1));
+        assert!(matches!(
+            controller
+                .session()
+                .expect("controlled session remains available")
+                .shutdown(Duration::from_secs(2)),
+            Ok(festerm_session::ShutdownResult::AlreadyStopped)
+                | Ok(festerm_session::ShutdownResult::Stopped)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_banner_survives_repeated_app_owned_resizes() {
+        use festerm_pty::LocalPtySession;
+
+        let session = LocalPtySession::start_default_with_preference(
+            TerminalSize::new(80, 24).unwrap(),
+            false,
+        )
+        .expect("Windows command processor starts");
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+        let deadline = Instant::now() + Duration::from_secs(3);
+
+        while Instant::now() < deadline
+            && !terminal
+                .row_text(0)
+                .is_some_and(|row| row.starts_with("Microsoft Windows"))
+        {
+            pump_session_events(
+                &session,
+                &mut terminal,
+                MAX_SESSION_EVENTS_PER_SLICE,
+                |_| {},
+            );
+            let replies = terminal.drain_replies();
+            if !replies.is_empty() {
+                session
+                    .try_send_input(&replies)
+                    .expect("cursor-position reply reaches ConPTY");
+            }
+
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            terminal
+                .row_text(0)
+                .is_some_and(|row| row.starts_with("Microsoft Windows")),
+            "Windows banner should be available before resize"
+        );
+
+        for (index, dimensions) in [
+            Dimensions::new(37, 13).unwrap(),
+            Dimensions::new(73, 26).unwrap(),
+            Dimensions::new(50, 18).unwrap(),
+            Dimensions::new(73, 26).unwrap(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            terminal.resize(dimensions).unwrap();
+            session
+                .try_resize(terminal_size(dimensions).unwrap())
+                .expect("resize reaches ConPTY");
+            let reply_deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < reply_deadline {
+                pump_session_events(
+                    &session,
+                    &mut terminal,
+                    MAX_SESSION_EVENTS_PER_SLICE,
+                    |_| {},
+                );
+                let replies = terminal.drain_replies();
+                if !replies.is_empty() {
+                    session
+                        .try_send_input(&replies)
+                        .expect("resize cursor-position reply reaches ConPTY");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let marker = format!("P0FRAME:{index}");
+            session
+                .try_send_input(format!("echo {marker}\r\n").as_bytes())
+                .expect("controlled output reaches ConPTY");
+            let resize_deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < resize_deadline {
+                let result = pump_session_events(
+                    &session,
+                    &mut terminal,
+                    MAX_SESSION_EVENTS_PER_SLICE,
+                    |_| {},
+                );
+                let replies = terminal.drain_replies();
+                if !replies.is_empty() {
+                    session
+                        .try_send_input(&replies)
+                        .expect("cursor-position reply reaches ConPTY");
+                }
+                if (0..terminal.dimensions().rows()).any(|row| {
+                    terminal
+                        .row_text(row)
+                        .is_some_and(|text| text.contains(&marker))
+                }) {
+                    break;
+                }
+                if !result.hit_limit {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            assert!(
+                (0..terminal.dimensions().rows()).any(|row| {
+                    terminal
+                        .row_text(row)
+                        .is_some_and(|text| text.contains(&marker))
+                }),
+                "resize to {}x{} lost output emitted after the resize",
+                dimensions.columns(),
+                dimensions.rows()
+            );
+        }
+
+        assert_eq!(
+            session.shutdown(Duration::from_secs(2)),
+            Ok(festerm_session::ShutdownResult::Stopped)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_default_shell_keeps_the_prompt_column_across_a_command_newline() {
+        use festerm_pty::LocalPtySession;
+
+        let session = LocalPtySession::start_default_with_preference(
+            TerminalSize::new(87, 26).unwrap(),
+            false,
+        )
+        .expect("Windows command processor starts");
+        let mut controller = SessionController::with_session(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(87, 26).unwrap()).expect("terminal allocation");
+
+        pump_controlled_until(
+            &mut controller,
+            &mut terminal,
+            |terminal| {
+                terminal
+                    .row_text(terminal.cursor().row())
+                    .is_some_and(|text| text.starts_with("C:\\") && text.trim_end().ends_with('>'))
+            },
+            Duration::from_secs(3),
+            "initial default-shell prompt",
+        );
+
+        let initial_cursor = terminal.cursor();
+        controller.record_encoded_input(b"ver\r");
+        controller.flush_pending_writes();
+        pump_controlled_until(
+            &mut controller,
+            &mut terminal,
+            |terminal| {
+                terminal.cursor().row() > initial_cursor.row()
+                    && terminal
+                        .row_text(terminal.cursor().row())
+                        .is_some_and(|text| text.trim_end().ends_with('>'))
+            },
+            Duration::from_secs(3),
+            "returned default-shell prompt",
+        );
+
+        let cursor = terminal.cursor();
+        let prompt = terminal
+            .row_text(cursor.row())
+            .expect("visible cursor row exists");
+        assert!(
+            prompt.starts_with("C:\\"),
+            "command output must return to a left-aligned cmd prompt, got {prompt:?}"
+        );
+        assert_eq!(
+            cursor.column(),
+            prompt.trim_end().chars().count(),
+            "the cursor must follow the returned prompt rather than retaining a prior output column"
+        );
+        assert!(matches!(
+            controller
+                .session()
+                .expect("session remains available")
+                .shutdown(Duration::from_secs(2)),
+            Ok(festerm_session::ShutdownResult::Stopped)
+                | Ok(festerm_session::ShutdownResult::AlreadyStopped)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_powershell_multiline_paste_keeps_source_line_order() {
+        let directory = tempfile::Builder::new()
+            .prefix("festerm-paste-order-")
+            .tempdir()
+            .expect("isolated PowerShell history directory");
+        let history = directory.path().join("history.txt");
+        let setup = format!(
+            "Import-Module PSReadLine; \
+             Set-PSReadLineOption -HistorySaveStyle SaveNothing \
+             -HistorySavePath '{}' -BellStyle None; \
+             function global:prompt {{ 'PASTE_ORDER> ' }}",
+            history.to_string_lossy().replace('\'', "''")
+        );
+        let profile = LocalProfile::new("pwsh.exe")
+            .with_arguments(["-NoLogo", "-NoProfile", "-NoExit", "-Command", &setup])
+            .with_working_directory(directory.path());
+        let session = LocalPtySession::start(profile, TerminalSize::new(120, 40).unwrap())
+            .expect("controlled PowerShell 7 starts");
+        let mut controller = SessionController::with_session(session);
+        let mut terminal =
+            Terminal::new(Dimensions::new(120, 40).unwrap()).expect("terminal allocation");
+        pump_controlled_until(
+            &mut controller,
+            &mut terminal,
+            |terminal| smoke_row_contains(terminal, "PASTE_ORDER>"),
+            Duration::from_secs(15),
+            "controlled PowerShell prompt",
+        );
+        let text =
+            "Write-Output 'FIRST_MARK'\nWrite-Output 'SECOND_MARK'\nWrite-Output 'THIRD_MARK'";
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Paste(text.to_owned()),
+            &mut controller,
+        );
+        festerm_ui_egui::route_input(
+            &mut terminal,
+            festerm_core::InputEvent::Key(festerm_core::Key::Enter),
+            &mut controller,
+        );
+        pump_controlled_until(
+            &mut controller,
+            &mut terminal,
+            |terminal| {
+                (0..terminal.dimensions().rows()).any(|row| {
+                    terminal
+                        .row_text(row)
+                        .is_some_and(|text| text.trim() == "THIRD_MARK")
+                })
+            },
+            Duration::from_secs(15),
+            "ordered PowerShell paste output",
+        );
+        let order = (0..terminal.dimensions().rows())
+            .filter_map(|row| terminal.row_text(row))
+            .map(|row| row.trim().to_owned())
+            .filter(|row| matches!(row.as_str(), "FIRST_MARK" | "SECOND_MARK" | "THIRD_MARK"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            controller
+                .session()
+                .unwrap()
+                .shutdown(Duration::from_secs(2)),
+            Ok(festerm_session::ShutdownResult::Stopped)
+                | Ok(festerm_session::ShutdownResult::AlreadyStopped)
+        ));
+        assert_eq!(order, ["FIRST_MARK", "SECOND_MARK", "THIRD_MARK"]);
+    }
+
+    // ─── Tier 6 native-platform smoke tests ─────────────────────────────────
+    //
+    // All tests below are marked `#[ignore]` and are NOT part of the PR-blocking
+    // CI matrix.  Run them explicitly via:
+    //
+    //   cargo test -p festerm -- --include-ignored
+    //
+    // or via `.github/workflows/native-smoke.yml` (scheduled + dispatch).
+    //
+    // Flaky-failure policy: tests here NEVER silently retry.  A single run
+    // either passes or fails.  See `docs/native-smoke-policy.md`.
+
+    /// Returns the path to the `festerm-pty-test-child` binary for smoke tests.
+    #[cfg(any(unix, windows))]
+    fn test_child_path_for_smoke() -> std::path::PathBuf {
+        let mut path = std::env::current_exe()
+            .expect("test executable path is known")
+            .canonicalize()
+            .expect("test executable path is accessible");
+        path.pop();
+        if path.ends_with("deps") {
+            path.pop();
+        }
+        let name = if cfg!(windows) {
+            "festerm-pty-test-child.exe"
+        } else {
+            "festerm-pty-test-child"
+        };
+        path.push(name);
+        assert!(
+            path.exists(),
+            "festerm-pty-test-child not found at {path:?}; \
+             run `cargo test --workspace` to build it first"
+        );
+        path
+    }
+
+    /// Poll `controller` until the session exits or the deadline passes.
+    ///
+    /// Avoids the closure-borrow conflict in `pump_controlled_until`.
+    #[cfg(any(unix, windows))]
+    fn wait_for_session_exit(
+        controller: &mut SessionController<LocalPtySession>,
+        terminal: &mut Terminal,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            controller.pump_events(terminal);
+            controller.forward_terminal_replies(terminal);
+            controller.flush_pending_writes();
+            let exited = controller
+                .session()
+                .map(|s| {
+                    matches!(
+                        s.lifecycle(),
+                        SessionLifecycle::Exited(_) | SessionLifecycle::Stopped
+                    )
+                })
+                .unwrap_or(true);
+            if exited {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("smoke-flow timeout: test child did not exit within {timeout:?}");
+    }
+
+    /// Pump `controller` + `terminal` until `predicate(terminal)` is true or
+    /// `timeout` elapses.  Panics on timeout with `context` as the message.
+    ///
+    /// No retries — one run, one result.
+    #[cfg(any(unix, windows))]
+    fn pump_controlled_until(
+        controller: &mut SessionController<LocalPtySession>,
+        terminal: &mut Terminal,
+        predicate: impl Fn(&Terminal) -> bool,
+        timeout: Duration,
+        context: &str,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            controller.pump_events(terminal);
+            controller.forward_terminal_replies(terminal);
+            controller.flush_pending_writes();
+            controller.flush_pending_resize();
+            if predicate(terminal) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("smoke-flow timeout: {context}");
+    }
+
+    /// Pumps a controlled session until a content-free controller observation
+    /// satisfies `predicate`, without inspecting terminal text.
+    #[cfg(any(unix, windows))]
+    fn pump_content_free_until(
+        controller: &mut SessionController<LocalPtySession>,
+        terminal: &mut Terminal,
+        predicate: impl Fn(&SessionController<LocalPtySession>) -> bool,
+        timeout: Duration,
+        context: &str,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            controller.pump_events(terminal);
+            controller.observe_resize_probe_terminal_state(terminal);
+            controller.forward_terminal_replies(terminal);
+            controller.flush_pending_writes();
+            if predicate(controller) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("smoke-flow timeout: {context}");
+    }
+
+    /// Returns `true` if any terminal row contains `needle`.
+    #[cfg(any(unix, windows))]
+    fn smoke_row_contains(terminal: &Terminal, needle: &str) -> bool {
+        (0..terminal.dimensions().rows())
+            .filter_map(|r| terminal.row_text(r))
+            .any(|text| text.contains(needle))
+    }
+
+    /// **Windows inbox ConPTY fallback smoke.**
+    ///
+    /// This deliberately runs before CI stages the optional verified sidecar.
+    /// It establishes that the secure inbox fallback can start, resize, and
+    /// resume output. The pinned sidecar smoke below is the Windows
+    /// content-continuity acceptance test.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "native smoke — run via native-smoke.yml before staging the pinned runtime"]
+    fn windows_inbox_conpty_fallback_starts_resizes_and_resumes_output() {
+        assert_eq!(
+            festerm_pty::prepare_windows_conpty_runtime()
+                .expect("secure inbox runtime selection succeeds"),
+            festerm_pty::ConptyRuntimeSelection::Inbox,
+            "this workflow step must run before the bundled runtime is staged"
+        );
+
+        let profile = LocalProfile::new(test_child_path_for_smoke()).with_arguments([
+            "emit:READY",
+            "read-line",
+            "echo:ECHO",
+            "exit:0",
+        ]);
+        let session = LocalPtySession::start(profile, TerminalSize::new(73, 26).unwrap())
+            .expect("inbox ConPTY session starts");
+        let mut terminal =
+            Terminal::new(Dimensions::new(73, 26).unwrap()).expect("terminal allocation");
+        let mut controller = SessionController::for_test(session);
+
+        pump_content_free_until(
+            &mut controller,
+            &mut terminal,
+            |controller| controller.resize_probe().observed_output_bytes() > 0,
+            Duration::from_secs(5),
+            "initial inbox ConPTY output",
+        );
+        let output_before_resize = controller.resize_probe().observed_output_bytes();
+        terminal
+            .resize(Dimensions::new(50, 18).unwrap())
+            .expect("terminal resize succeeds");
+        controller.record_terminal_resize(terminal.dimensions());
+        pump_content_free_until(
+            &mut controller,
+            &mut terminal,
+            |controller| {
+                controller
+                    .resize_probe()
+                    .generations()
+                    .last()
+                    .is_some_and(|generation| generation.applied)
+            },
+            Duration::from_secs(5),
+            "inbox ConPTY resize application",
+        );
+        let output_after_resize = controller.resize_probe().observed_output_bytes();
+        assert!(output_after_resize >= output_before_resize);
+
+        controller.record_encoded_input(b"resume\r\n");
+        pump_content_free_until(
+            &mut controller,
+            &mut terminal,
+            |controller| controller.resize_probe().observed_output_bytes() > output_after_resize,
+            Duration::from_secs(5),
+            "inbox ConPTY post-resize output",
+        );
+        wait_for_session_exit(&mut controller, &mut terminal, Duration::from_secs(5));
+    }
+
+    /// **Windows ConPTY smoke flow — issue #3 resize sequence.**
+    ///
+    /// Uses `festerm-pty-test-child` as the controlled shell.  The child emits
+    /// output before `read-line` while we apply the four-step resize sequence
+    /// (`37×13 → 73×26 → 50×18 → 73×26`), then verifies a content-free resize
+    /// probe and output arriving after the final resize.
+    ///
+    /// Acceptance criterion: the sequence completes without a session error,
+    /// every resize produces an applied generation with visible cells, and
+    /// output bytes resume after the final resize.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "native smoke — run via native-smoke.yml or with --include-ignored; not PR-blocking"]
+    fn windows_conpty_smoke_flow_with_test_child_and_issue3_resizes() {
+        let profile = LocalProfile::new(test_child_path_for_smoke()).with_arguments([
+            "emit:LINE-A",
+            "emit:LINE-B",
+            "emit:MARKER",
+            "read-line",
+            "echo:ECHO",
+            "report-size",
+            "exit:0",
+        ]);
+
+        let session = LocalPtySession::start(profile, TerminalSize::new(73, 26).unwrap())
+            .expect("ConPTY session starts with test child");
+
+        let mut terminal =
+            Terminal::new(Dimensions::new(73, 26).unwrap()).expect("terminal allocation");
+        let mut controller = SessionController::for_test(session);
+
+        // Step 1: wait for repository-owned output without retaining its text.
+        pump_content_free_until(
+            &mut controller,
+            &mut terminal,
+            |controller| controller.resize_probe().observed_output_bytes() > 0,
+            Duration::from_secs(5),
+            "initial output from test child",
+        );
+        assert_eq!(terminal.dimensions().columns(), 73);
+        assert_eq!(terminal.dimensions().rows(), 26);
+        let output_before_resize = controller.resize_probe().observed_output_bytes();
+        let first_resize_generation = controller
+            .resize_probe()
+            .requested_generations()
+            .saturating_add(1);
+
+        // Step 2: apply the issue #3 sequence while the child is blocked on
+        // input. Only numeric probe observations are retained.
+        for &(cols, rows) in &[(37u16, 13u16), (73, 26), (50, 18), (73, 26)] {
+            let dims =
+                Dimensions::new(cols as usize, rows as usize).expect("resize dimensions are valid");
+            terminal.resize(dims).expect("terminal resize succeeds");
+            controller.record_terminal_resize(dims);
+            // Pump for ≥200 ms to give ConPTY time to apply the resize.
+            let settle = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < settle {
+                controller.pump_events(&mut terminal);
+                controller.observe_resize_probe_terminal_state(&terminal);
+                controller.forward_terminal_replies(&mut terminal);
+                controller.flush_pending_writes();
+                controller.flush_pending_resize();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                terminal.dimensions().columns(),
+                cols as usize,
+                "columns after resize to {cols}×{rows}"
+            );
+            assert_eq!(
+                terminal.dimensions().rows(),
+                rows as usize,
+                "rows after resize to {cols}×{rows}"
+            );
+        }
+
+        let generations = controller
+            .resize_probe()
+            .generations()
+            .into_iter()
+            .filter(|generation| generation.generation >= first_resize_generation)
+            .collect::<Vec<_>>();
+        assert_eq!(generations.len(), 4, "one probe generation per resize");
+        assert!(
+            generations.iter().all(|generation| generation.applied),
+            "every resize must reach ConPTY"
+        );
+        assert!(
+            generations
+                .iter()
+                .all(|generation| generation.visible_nonblank_cells > 0),
+            "content-free visible-cell observations must remain nonzero"
+        );
+        assert!(
+            controller.resize_probe().observed_output_bytes() >= output_before_resize,
+            "output accounting must not regress across resizes"
+        );
+        let output_after_resize = controller.resize_probe().observed_output_bytes();
+
+        // Step 3: send a line to unblock read-line.
+        controller.record_encoded_input(b"hello\r\n");
+
+        // Step 4: wait for post-resize bytes without matching application text.
+        pump_content_free_until(
+            &mut controller,
+            &mut terminal,
+            |controller| controller.resize_probe().observed_output_bytes() > output_after_resize,
+            Duration::from_secs(5),
+            "post-resize output from test child",
+        );
+
+        // Step 5: wait for exit and assert bounded shutdown.
+        wait_for_session_exit(&mut controller, &mut terminal, Duration::from_secs(5));
+    }
+
+    /// **Windows ConPTY — bounded shutdown terminates the process tree.**
+    ///
+    /// Verifies that dropping the `SessionController` (which calls `shutdown`)
+    /// terminates a spinning test child within the documented 2-second bound.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "native smoke — run via native-smoke.yml or with --include-ignored; not PR-blocking"]
+    fn windows_conpty_bounded_shutdown_terminates_process_tree() {
+        let profile =
+            LocalProfile::new(test_child_path_for_smoke()).with_arguments(["emit:RUNNING", "spin"]);
+
+        let session = LocalPtySession::start(profile, TerminalSize::new(73, 26).unwrap())
+            .expect("ConPTY session starts");
+
+        let mut terminal =
+            Terminal::new(Dimensions::new(73, 26).unwrap()).expect("terminal allocation");
+        let mut controller = SessionController::for_test(session);
+
+        pump_controlled_until(
+            &mut controller,
+            &mut terminal,
+            |t| smoke_row_contains(t, "RUNNING"),
+            Duration::from_secs(5),
+            "RUNNING marker from spinning test child",
+        );
+
+        let start = Instant::now();
+        drop(controller); // triggers bounded shutdown via Drop impl
+        assert!(
+            start.elapsed() <= Duration::from_secs(3),
+            "bounded ConPTY shutdown exceeded 3-second budget: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// **Unix PTY smoke flow — issue #3 resize sequence.**
+    ///
+    /// Mirrors the Windows ConPTY flow on the Unix PTY path.  Written for
+    /// platform coverage; the first Linux CI run via `native-smoke.yml` will
+    /// provide ground-truth results.
+    ///
+    /// **Cannot execute in the Windows sandbox** — results pending Linux CI.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "native smoke — run via native-smoke.yml or with --include-ignored; not PR-blocking"]
+    fn unix_pty_smoke_flow_with_test_child_and_issue3_resizes() {
+        let profile = LocalProfile::new(test_child_path_for_smoke()).with_arguments([
+            "emit:LINE-A",
+            "emit:LINE-B",
+            "emit:MARKER",
+            "read-line",
+            "echo:ECHO",
+            "report-size",
+            "exit:0",
+        ]);
+
+        let session = LocalPtySession::start(profile, TerminalSize::new(73, 26).unwrap())
+            .expect("Unix PTY session starts with test child");
+
+        let mut terminal =
+            Terminal::new(Dimensions::new(73, 26).unwrap()).expect("terminal allocation");
+        let mut controller = SessionController::for_test(session);
+
+        pump_controlled_until(
+            &mut controller,
+            &mut terminal,
+            |t| smoke_row_contains(t, "MARKER"),
+            Duration::from_secs(5),
+            "MARKER from test child",
+        );
+        assert_eq!(terminal.dimensions().columns(), 73);
+        assert_eq!(terminal.dimensions().rows(), 26);
+
+        for &(cols, rows) in &[(37u16, 13u16), (73, 26), (50, 18), (73, 26)] {
+            let dims =
+                Dimensions::new(cols as usize, rows as usize).expect("resize dimensions are valid");
+            terminal.resize(dims).expect("terminal resize succeeds");
+            controller.record_terminal_resize(dims);
+            let settle = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < settle {
+                controller.pump_events(&mut terminal);
+                controller.forward_terminal_replies(&mut terminal);
+                controller.flush_pending_writes();
+                controller.flush_pending_resize();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(terminal.dimensions().columns(), cols as usize);
+            assert_eq!(terminal.dimensions().rows(), rows as usize);
+        }
+
+        controller.record_encoded_input(b"hello\r\n");
+
+        pump_controlled_until(
+            &mut controller,
+            &mut terminal,
+            |t| smoke_row_contains(t, "ECHO:hello"),
+            Duration::from_secs(5),
+            "ECHO:hello from test child after resize sequence",
+        );
+
+        pump_controlled_until(
+            &mut controller,
+            &mut terminal,
+            |t| smoke_row_contains(t, "26 73"),
+            Duration::from_secs(5),
+            "report-size showing 26 73 at final 73×26 size",
+        );
+
+        wait_for_session_exit(&mut controller, &mut terminal, Duration::from_secs(5));
+    }
+
+    /// **Unix PTY — bounded shutdown terminates the process tree.**
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "native smoke — run via native-smoke.yml or with --include-ignored; not PR-blocking"]
+    fn unix_pty_bounded_shutdown_terminates_process_tree() {
+        let profile =
+            LocalProfile::new(test_child_path_for_smoke()).with_arguments(["emit:RUNNING", "spin"]);
+
+        let session = LocalPtySession::start(profile, TerminalSize::new(73, 26).unwrap())
+            .expect("Unix PTY session starts");
+
+        let mut terminal =
+            Terminal::new(Dimensions::new(73, 26).unwrap()).expect("terminal allocation");
+        let mut controller = SessionController::for_test(session);
+
+        pump_controlled_until(
+            &mut controller,
+            &mut terminal,
+            |t| smoke_row_contains(t, "RUNNING"),
+            Duration::from_secs(5),
+            "RUNNING marker from spinning test child",
+        );
+
+        let start = Instant::now();
+        drop(controller);
+        assert!(
+            start.elapsed() <= Duration::from_secs(3),
+            "bounded Unix PTY shutdown exceeded 3-second budget: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// **P5 reference-application PTY probe.**
+    ///
+    /// This opt-in probe runs exactly one allowlisted locally installed
+    /// application, applies two PTY resizes, and sends its fixed quit sequence.
+    /// It deliberately retains only output counts and resize observations; the
+    /// native-window smoke and headless UI tests own focus and key-routing
+    /// coverage. Invoke it through `scripts/run-p5-reference.*`.
+    #[cfg(any(unix, windows))]
+    #[test]
+    #[ignore = "P5 optional reference-application probe — run through scripts/run-p5-reference.*"]
+    fn p5_reference_application_pty_probe() {
+        let reference = std::env::var("FESTERM_P5_REFERENCE_APP")
+            .expect("FESTERM_P5_REFERENCE_APP selects one allowlisted reference application");
+        let mut cleanup_path = None;
+        let (profile, quit_sequence) = match reference.as_str() {
+            "less" => {
+                let path = std::env::temp_dir()
+                    .join(format!("festerm-p5-less-{}.txt", std::process::id()));
+                std::fs::write(&path, "repository-owned P5 fixture\n".repeat(64))
+                    .expect("P5 less fixture is writable");
+                cleanup_path = Some(path.clone());
+                (
+                    LocalProfile::new("less").with_arguments([path]),
+                    b"q".as_slice(),
+                )
+            }
+            "nvim" => (
+                LocalProfile::new("nvim").with_arguments(["--clean", "-u", "NONE", "-n"]),
+                b"\x1b:qa!\r".as_slice(),
+            ),
+            "htop" => (LocalProfile::new("htop"), b"q".as_slice()),
+            "tmux" => {
+                let socket = format!("festerm-p5-{}", std::process::id());
+                (
+                    LocalProfile::new("tmux").with_arguments([
+                        "-L",
+                        socket.as_str(),
+                        "-f",
+                        "/dev/null",
+                        "new-session",
+                        "-s",
+                        "p5",
+                    ]),
+                    b"\x02d".as_slice(),
+                )
+            }
+            _ => panic!("unsupported P5 reference application selector: {reference}"),
+        };
+
+        let initial_size = TerminalSize::new(80, 24).expect("initial PTY size is valid");
+        let session = LocalPtySession::start(profile, initial_size)
+            .unwrap_or_else(|error| panic!("P5 {reference} session did not start: {error}"));
+        let mut terminal =
+            Terminal::new(Dimensions::new(80, 24).unwrap()).expect("terminal allocation");
+        let mut controller = SessionController::for_test(session);
+
+        pump_content_free_until(
+            &mut controller,
+            &mut terminal,
+            |controller| controller.resize_probe().observed_output_bytes() > 0,
+            Duration::from_secs(5),
+            "initial reference-application output",
+        );
+        let output_before_resize = controller.resize_probe().observed_output_bytes();
+        for dimensions in [
+            Dimensions::new(100, 30).unwrap(),
+            Dimensions::new(50, 18).unwrap(),
+        ] {
+            terminal
+                .resize(dimensions)
+                .expect("terminal resize succeeds");
+            controller.record_terminal_resize(dimensions);
+            controller.force_flush_pending_resize();
+            pump_content_free_until(
+                &mut controller,
+                &mut terminal,
+                |controller| {
+                    controller
+                        .resize_probe()
+                        .generations()
+                        .last()
+                        .is_some_and(|generation| generation.applied)
+                },
+                Duration::from_secs(5),
+                "reference-application PTY resize application",
+            );
+        }
+        assert!(
+            controller.resize_probe().observed_output_bytes() >= output_before_resize,
+            "reference application output count must not regress across resize"
+        );
+
+        controller.record_encoded_input(quit_sequence);
+        wait_for_session_exit(&mut controller, &mut terminal, Duration::from_secs(5));
+        if let Some(path) = cleanup_path {
+            std::fs::remove_file(path).expect("P5 less fixture is removable");
+        }
+        #[cfg(unix)]
+        if reference == "tmux" {
+            let socket = format!("festerm-p5-{}", std::process::id());
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", socket.as_str(), "kill-server"])
+                .status();
+        }
+    }
+}

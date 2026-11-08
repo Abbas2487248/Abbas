@@ -1,0 +1,80 @@
+#!/usr/bin/env sh
+set -eu
+
+job_path=$1
+source_map_path=$2
+artifact_directory=$3
+
+validate_job() {
+    jq -e '
+        (.adapter_id == "festerm") and
+        (.adapter_schema_version == 1) and
+        (.platform == "macos") and
+        (.mode == "native-smoke" or .mode == "os-input-smoke" or .mode == "optional-validation" or .mode == "running-session-stress" or .mode == "keyboard-routing-check" or .mode == "keyboard-routing-native") and
+        (.payload == {})
+    ' "$job_path" >/dev/null
+}
+
+festerm_source() {
+    jq -er '
+        [.[] | select(.id == "festerm")] |
+        if length == 1 then .[0].path else error("expected exactly one festerm source") end
+    ' "$source_map_path"
+}
+
+require_pass_status() {
+    grep -qx 'status=pass' "$1"
+}
+
+validate_job
+source_path=$(festerm_source)
+[ -d "$source_path" ]
+mkdir -p "$artifact_directory"
+
+mode=$(jq -er '.mode' "$job_path")
+case "$mode" in
+    keyboard-routing-check)
+        result_path="$artifact_directory/keyboard-routing-check.txt"
+        printf 'status=running\n' >"$result_path"
+        if python3 "$source_path/scripts/check_keyboard_routing.py"; then
+            printf 'status=pass\n' >"$result_path"
+        else
+            printf 'status=fail\n' >"$result_path"
+            exit 1
+        fi
+        ;;
+    running-session-stress)
+        result_path="$artifact_directory/running-session-stress.txt"
+        printf 'status=running\n' >"$result_path"
+        if python3 "$source_path/scripts/check_running_sessions.py" --batch 8 --cycles 3; then
+            printf 'status=pass\n' >"$result_path"
+        else
+            printf 'status=fail\n' >"$result_path"
+            exit 1
+        fi
+        ;;
+    native-smoke)
+        (
+            cd "$source_path"
+            cargo build --workspace
+            FESTERM_NATIVE_WINDOW_SMOKE=1 \
+            FESTERM_NATIVE_SMOKE_RESULT_PATH="$artifact_directory/native-smoke.txt" \
+            "$source_path/target/debug/festerm"
+        )
+        require_pass_status "$artifact_directory/native-smoke.txt"
+        ;;
+    os-input-smoke|keyboard-routing-native)
+        if [ "$mode" = keyboard-routing-native ]; then
+            export FESTERM_NATIVE_KEYBOARD_ROUTING_SMOKE=1
+        fi
+        "$source_path/scripts/run-macos-os-input-smoke.sh" \
+            "$artifact_directory/$mode.txt"
+        require_pass_status "$artifact_directory/$mode.txt"
+        ;;
+    optional-validation)
+        FESTERM_RUN_OPTIONAL_VALIDATION=1 \
+        FESTERM_OPTIONAL_VALIDATION_RESULT_PATH="$artifact_directory/optional-validation.txt" \
+        "$source_path/scripts/run-optional-validation.sh"
+        require_pass_status "$artifact_directory/optional-validation.txt"
+        ;;
+esac

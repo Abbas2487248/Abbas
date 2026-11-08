@@ -1,0 +1,21 @@
+[package]
+name = "festerm-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native SSH session transport and trust policy for fesTerm."
+
+[dependencies]
+festerm-session = { path = "../festerm-session" }
+festerm-secret-store = { path = "../festerm-secret-store" }
+russh = { version = "0.62.5", default-features = false, features = ["ring"] }
+russh-sftp = "=2.3.0"
+ssh-key = "=0.7.0-rc.11"
+tokio = { version = "1.17.0", default-features = false, features = ["fs", "io-util", "net", "rt", "sync", "time"] }
+tracing = "0.1"
+zeroize = "1"
+
+[lints]
+workspace = true

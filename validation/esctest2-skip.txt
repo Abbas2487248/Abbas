@@ -1,0 +1,13 @@
+# esctest2 tests that `esctest2-allow.txt` enables but that we exclude, with
+# the reason for each. One reason per line, so every skip is an admission
+# rather than a silence.
+#
+# Entries are Python regexes matched against the full test name. A skip wins
+# over the allowlist.
+#
+# "We have not got round to it" does not belong here - that is the
+# allowlist's absence, and #220 records what is deliberately left out. This is
+# for tests we have deliberately pulled *out* of a family we otherwise hold
+# ourselves to.
+
+# (no skips: every allowlisted test runs)

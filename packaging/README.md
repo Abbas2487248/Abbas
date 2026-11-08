@@ -1,0 +1,156 @@
+# fesTerm packaging
+
+The checked-in `cargo-packager` 0.11.8 manifests implement ADR-0021:
+
+- `macos.toml` produces the `.app` and DMG;
+- `windows.toml` produces the current-user NSIS installer and includes the
+  hash-verified ConPTY runtime staged by `scripts/stage-conpty.ps1`;
+- `linux.toml` produces AppImage and Debian packages.
+
+Every current direct-distribution native package includes both the `festerm`
+application and its `festerm-sessiond` local-session persistence helper. They
+must be built from the same workspace revision and installed beside each other
+so the application can resolve the helper without searching `PATH`.
+
+The direct desktop packages also advertise fesTerm as an optional Markdown
+**Open With** handler for `.md` and `.markdown` only. This is an alternate
+handler, not a default-owner claim, and it must never register every text file:
+
+- macOS merges `packaging/macos-info.plist` into the generated `Info.plist`.
+  The document type is `Viewer` with `LSHandlerRank=Alternate` and imports the
+  Markdown UTI for extension/MIME discovery when the system does not already
+  provide one.
+- Windows uses the reviewed NSIS template in
+  `packaging/windows-open-with.nsi` instead of cargo-packager's built-in file
+  association macro. The pinned cargo-packager 0.11.8 macro writes the
+  extension default value, which would seize `.md`; fesTerm registers only its
+  current-user `fesTerm.Markdown` ProgID in each extension's
+  `OpenWithProgids` and removes only those owned entries on uninstall. Its
+  command is quoted as `"festerm.exe" --open -- "%1"`. The template copy is
+  derived from cargo-packager 0.11.8 and is carried under
+  `packaging/cargo-packager-template.LICENSE-MIT`; keep attribution, license,
+  and the focused diff against the pinned upstream template when updating it.
+- Linux uses a custom desktop-entry template so both Debian and AppImage
+  generation advertise `MimeType=text/markdown` and invoke
+  `festerm --open -- %F`. AppImages appear in Open With only after the user's
+  desktop environment integrates the AppImage desktop entry.
+
+Application/native launch handling consumes the corresponding platform file
+open event or the shared CLI contract `festerm --open -- <paths...>`.
+
+Windows packages the helper as the immutable
+`festerm-sessiond-<release>.exe`; a release must never reuse another release's
+helper filename. The release workflow copies the already Authenticode-signed
+build into that name, and `check_packaging.py` ties the resource name to the
+workspace version and requires the staging step in both package workflows.
+fesTerm then copies that source to the current user's private sessiond runtime
+directory as
+`helpers/festerm-sessiond-<release>-<architecture>/festerm-sessiond-<release>-<architecture>.exe`
+and launches the runtime copy. The pinned ConPTY sidecar
+(`runtime/conpty/**`, ADR-0011) is copied into that same generation directory,
+because the loader resolves the sidecar relative to the running executable: a
+helper staged without one silently falls back to the inbox ConPTY, and a helper
+pointed back at the install directory keeps `conpty.dll` mapped there and
+blocks the installer. Each generation therefore gets a complete, private copy.
+
+The first package with this layout deliberately does not replace or remove the
+legacy `festerm-sessiond.exe` installed by versions 0.2.0 through 0.2.2, so
+their live protocol-compatible daemons cannot block the upgrade. The registry
+records the helper identity and protocol epoch. Unreferenced runtime and
+package copies are pruned opportunistically after their final daemon exits;
+locked legacy images are pruned on a later fesTerm/helper launch after process
+exit, including the first launch after reboot.
+
+The macOS packager builds its ICNS container from supported PNG sizes. Windows
+uses the checked-in `assets/app-icon/festerm.ico`, reproducibly generated with:
+
+```text
+python scripts/generate_windows_icon.py
+```
+
+Run `python scripts/check_packaging.py` after changing the workspace version,
+package metadata, formats, resources, or release workflow. Package only a
+release binary built with the matching installation marker:
+
+```text
+macOS:   FESTERM_INSTALLATION_KIND=app
+Windows: FESTERM_INSTALLATION_KIND=nsis
+Linux:   FESTERM_INSTALLATION_KIND=appimage  (AppImage)
+         FESTERM_INSTALLATION_KIND=managed   (Debian)
+```
+
+Before invoking cargo-packager for Windows, run
+`scripts/stage-windows-sessiond.ps1 -Configuration Release` after signing the
+ordinary `target/release/festerm-sessiond.exe`. The stable build output is not
+an installer payload.
+
+Packaged release builds also require `FESTERM_UPDATE_PUBLIC_KEY`, the public
+half of the updater signing key checked in as `packaging/updater.pub`. The
+endpoint is fixed in the application at fesTerm's public GitHub Releases
+`latest/download` URL. The private updater key and all platform-signing
+credentials remain outside the repository.
+
+Do not publish unsigned output as a production release. The release workflow
+must fail closed when its protected signing environment is incomplete.
+
+## Optional terminal font release assets
+
+JetBrains Mono remains embedded. Iosevka Term, JuliaMono, and Maple Mono are
+optional downloads, not resources installed by the default native packages.
+The pinned emoji and chrome fonts are not part of this download catalog.
+The app embeds the optional families' authoritative manifest metadata and
+complete license notices for offline About display, but not their TTF bytes.
+It also embeds the complete manifest notices for runtime-bundled JetBrains Mono
+and Noto Emoji. Runtime notice family/version labels must match the manifests.
+
+Stage the checked-in optional faces without network access or extraction:
+
+```text
+python scripts/manage_bundled_font.py --stage-downloads target/font-downloads --downloads-report target/font-downloads.json
+```
+
+The staging directory must contain only this catalog's assets. The command
+checks the manifests' exact SHA256 and byte sizes before writing anything,
+accepts identical staged files, and refuses to overwrite differing files.
+It stages twelve `festerm-font-<sha256>.ttf` files plus the three corresponding
+`festerm-font-<sha256>.license.txt` notices. The deterministic JSON report,
+also printed to stdout, lists source paths, names, hashes, sizes, font-only
+and total byte counts. Future pinned versions are derived from the manifests,
+not hard-coded into the release workflow. Iosevka must use the repository's
+custom-built TTFs, never substitute files from an upstream release archive.
+Normal `python scripts/manage_bundled_font.py` verification also rejects
+production Rust embeddings of optional faces, ignores `cfg(test)` fixtures,
+requires every complete optional notice to remain embedded in production, and
+requires every runtime-embedded font family to have all manifest notice files
+embedded with the manifest family/version label.
+
+Every tagged Release run stages these assets and uploads them alongside the
+native installers in the protected `release` publishing job before making
+the draft public. Dispatch-only packaging retains the same assets and JSON
+report as workflow artifacts without publishing a release. Font payloads
+are kept separate from installers and the signed application update manifest.
+The published license assets mirror the complete notices embedded in the app;
+runtime font acquisition does not download or cache those sidecars.
+The runtime download contract is strictly:
+
+```text
+https://github.com/fes/fesTerm/releases/download/v<CARGO_PKG_VERSION>/festerm-font-<sha256>.ttf
+```
+
+Keep each version's release assets indefinitely: older clients reconcile
+against their own compile-time catalog and application version, not `latest`
+or upstream URLs. Never replace bytes under an existing content-addressed
+name. Development builds before their version's first release may need a
+deliberately seeded verified font cache; staging alone does not publish assets
+or make an unreleased version downloadable. Runtime font fetching never
+extracts archives.
+
+## Planned desktop Store channels
+
+See the [desktop Store distribution plan](../docs/app-store-distribution-plan.md)
+for additive Windows MSIX/MSIXBundle packaging and the Mac App Store sandbox
+feasibility gate. No Store manifest or installation marker exists yet. The
+current `managed` marker prevents installation but still permits GitHub update
+checks; a Store build also needs channel-specific availability and routing.
+Preserve direct packages and the existing app/helper/ConPTY contracts while
+qualifying Store-specific lifecycle and update behavior.

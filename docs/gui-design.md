@@ -1,0 +1,3835 @@
+# fesTerm GUI Design
+
+**Status:** Normative product target with explicitly labeled implementation
+notes. Unqualified requirements describe the approved target; paragraphs that
+begin with “Current implementation” describe temporary repository state and
+must not override the target. Historical examples are labeled as such.
+
+This document defines the interaction model, visual hierarchy, and product-level GUI principles for fesTerm. It complements `ARCHITECTURE.md` and `docs/ui-test-plan.md`: architecture defines ownership and dependencies, the UI test plan defines validation, and this document defines the intended user experience.
+
+## Canonical Wireframe
+
+![fesTerm GUI wireframes v1.2](images/festerm-gui-wireframe-v1.2.png)
+
+The v1.2 wireframe is the current visual reference for application chrome, independent session chips, launcher and settings surfaces, the session inspector, reconnecting state, and optional wrapped chip rows. It communicates structure and interaction hierarchy rather than final colors, typography, or platform-specific window controls.
+
+The detailed PNGs linked throughout this document are target-state review
+assets, not application screenshots. They use the approved `752 × 516`
+baseline viewport, blue-graphite semantic colors, integrated chrome, compact
+status bar, and representative non-sensitive content. The narrow-window asset
+uses the `360 × 516` minimum-width case. Their stable filenames are intended
+for automated or agent-assisted comparisons against native Windows, macOS, and
+Linux captures.
+
+Editable SVG sources for mockups introduced or revised after this review live
+under `images/gui-mockups/source/`; the adjacent PNG remains the comparison
+artifact. Rasterization must preserve the baseline logical viewport and may
+not silently change prose-owned behavior.
+
+## Smart terminal selection
+
+Issue #397 is an explicitly owner-requested additive feature, not a change to
+M6 acceptance or a general AI assistant. The initial implementation is a local,
+deterministic baseline; no model, OCR, download, network or content collection.
+Renderer/core and application/session ownership are unchanged.
+
+The local terminal context menu offers **Smart Select Sentence**, **Smart
+Select Paragraph**, and **Smart Select Block**, after ordinary Copy and any
+detected-content actions (link, path, file), then Paste and Find. The same three
+commands are in the command palette and act on the keyboard target, current
+selection or cursor. Right-click remains terminal-owned under mouse reporting; Shift+right-click is the existing
+local override. Selection alone never copies or sends input. Inspect the
+highlight, then use existing Copy shortcuts/menu/native Edit. Drag replaces the
+inference with ordinary adjustable selection; Escape cancels inferred selection.
+A successful inference shows no notice; the highlight is the feedback. An
+unavailable result leaves an existing selection intact and explains that
+ordinary drag is available. Rows painted by a TUI (for example Copilot CLI's
+bulleted, hanging-indent prose) join as one paragraph, but same-indent lines
+without a marker row keep their line breaks so stack traces stay intact. A
+leading list marker (`●`, `•`, `1.` and similar) is layout, not content: the
+selection starts at the text after it, and later rows lose the same
+indentation. There is intentionally no immediate **Smart Copy**:
+it would skip the inspection step on unqualified layout inference.
+Instruction and refusal feedback expires automatically. Escape is consumed
+only while cancelling an inferred selection or keyboard target; otherwise it
+continues to the terminal normally.
+
+Keyboard-only: focus the terminal and use **Ctrl+Alt+Shift+S/P/B** for
+sentence/paragraph/block (also Control+Option+Shift on macOS). The target is
+the last keyboard target, otherwise the selection endpoint or terminal cursor;
+in scrolled history it starts at the viewport's upper-left cell.
+**Ctrl+Alt+Shift+arrows** move that target one cell, with an outline and
+row/column feedback.
+Escape clears the target. These fixed, local presentation gestures do not
+enter the application shortcut dispatcher or send their key events. They use the
+same application-owned terminal-input predicate as ordinary terminal routing,
+not transient widget-focus bookkeeping. Native Text and IME payloads remain
+terminal-owned even when emitted alongside a recognized gesture, so AltGr,
+Option, dead-key, and non-US layout characters are never silently discarded.
+Window focus loss, terminal-input blackout and a presentation gap clear held
+shortcut ownership. Held arrow repeats move the target while duplicate
+non-repeat shortcut presses remain local. Instructions, refusal feedback and
+passive overwrite/resize/eviction cancellation notices are visible and
+accessible without the application status bar, then expire automatically.
+Entering or leaving rectangle-copy mode also retires smart targeting and
+feedback. Ordinary clicks, drags, Copy and application shortcuts retain their
+meaning.
+
+Layout precedes segmentation. A vertical box/ASCII border or internal run of
+two spaces bounds the clicked row's text segment; the two blank cells must share
+a background, because inline code painted on a background (Copilot CLI) pads an
+ordinary space with a styled one and is not a column gap. A lone border or block glyph
+in the last column after blank padding is a TUI scrollbar (Copilot CLI paints
+`┃`); nothing lies beyond it, so it is excluded without bounding the row. Such
+layouts conservatively
+select only that visual row: full-width terminal soft-wrap metadata cannot
+certify a pane's logical wraps. Unbordered, one-space-separated columns cannot
+be reliably inferred and are **unsupported**, not validated pane recognition.
+Blank/border targets refuse. Full-width prose follows recorded soft wraps;
+paragraphs additionally group explicit adjacent lines with equal indentation.
+Blocks allow indentation transitions (for example an error plus indented
+details), stopping before the next unindented record and at blank lines. When
+the clicked row belongs to a marker-led record (the outermost marker row above
+it with every row between indented deeper, as in a Copilot CLI `●` message),
+the block is that whole record: it spans interior blank rows and nested bullets
+and stops before the next row indented at or left of the marker. Inside such a
+record only borders bound a row; a plain double space in its prose is not a
+pane gap.
+Sentence punctuation is `. ! ? 。 ！ ？` followed by whitespace/end, except
+where it is painted on a background different from the row's text (inline code
+such as an illustrative `1.`); abbreviations,
+language-specific sentence rules and semantic explanation understanding are
+not claimed. Explicit newlines are preserved; visual wraps are joined.
+Printed indentation and interior spaces are preserved, trailing row padding is
+excluded except where soft wrapping makes it content. Wide/combining graphemes
+remain indivisible. Regions are clipped to the visible viewport, including
+scrolled/disconnected history, and never flatten all panes into one string.
+
+Each request examines at most 128 rows, 32,768 cells and 128 KiB of cell text.
+Exceeding context limits refuses rather than silently exporting a partial
+inference. No background queue or retained history scan is introduced. Selected
+cell text, dimensions and wrap metadata are revalidated before painting/Copy;
+overwritten, evicted, resized or reflowed content cancels rather than copying a
+stale inference. Unchanged absolute history rows survive continued output.
+Validation also binds to a core-owned monotonic screen-buffer generation, so
+alternate-screen exit/re-entry or reset cannot resurrect an inference merely
+because the replacement buffer contains identical cells. The production frame
+performs this validation once after history synchronization and before context
+menu construction or painting, removing both stale state and highlight.
+
+**Quality gates:** deterministic fixture expectations must remain exact, with
+zero cross-pane exports for supported border/gap layouts. Native
+Windows/macOS/Linux clipboard, accessibility, DPI and layout usability remain
+TI-19 evidence, not accepted capability claims. Before any optional model:
+freeze a labeled multilingual/abbreviation/TUI evaluation corpus; require
+at least 95% exact boundaries, zero supported cross-pane false selections,
+and a measured improvement over heuristics on the same corpus. Record p50/p95
+cold/warm latency (warm p95 <= 50 ms), peak memory (<= 128 MiB added), complete
+weights/runtime/installer bytes (<= 30 MiB added), license/provenance verification,
+offline availability and explicit opt-in/unavailable-model policy. These are
+prospective gates, not measured results or approval to adopt a model.
+
+## Product Posture
+
+fesTerm should feel like a restrained, native-feeling terminal workstation:
+
+- denser than a consumer application;
+- quieter than a developer dashboard;
+- more integrated than a minimal terminal window;
+- less workflow-opinionated than command-block or cloud-dependent products; and
+- always centered on terminal interaction.
+
+The terminal viewport is the primary surface. Application chrome exists to help users create, identify, switch, restore, and diagnose sessions without competing with terminal content.
+
+## Core UX Principles
+
+### Stable application identity, dynamic terminal content
+
+The application should optimize for persistent identity while the terminal remains dynamic.
+
+Stable concepts include:
+
+- session identity;
+- profile identity;
+- workspace identity;
+- host identity; and
+- user-assigned names.
+
+Transient concepts include:
+
+- terminal-provided titles;
+- current directory;
+- foreground process;
+- alternate-screen content;
+- cursor state; and
+- connection transport details.
+
+Transient terminal state must not silently replace stable application identity.
+
+### One primary action per screen
+
+Each major screen should have one dominant purpose:
+
+- **Launcher:** start or connect to a session.
+- **Terminal tab:** interact with the terminal.
+- **Settings:** configure the application.
+- **Diagnostics:** inspect or troubleshoot state.
+
+Secondary actions should remain available but visually subordinate.
+
+### Quiet by default
+
+Normal operation should avoid persistent telemetry, cell grids, verbose status strings, or developer instrumentation.
+
+Diagnostics should be available through an explicit overlay, panel, or command. Errors should be concise and contextual, with details available on demand.
+
+### Information must earn its space
+
+Every persistent UI element must present reliable information that supports a
+user decision. Unknown, weak, duplicated, speculative, or merely decorative
+data is omitted; empty space is acceptable. Each visible value must have an
+identified source of truth in the terminal model, session controller,
+transport, profile/configuration, operating system, or application state.
+
+In particular, fesTerm must not infer semantic command boundaries from an
+undifferentiated terminal byte stream. Current time, last-input time, and
+last-output time do not earn permanent status-bar space. If future shell
+integration provides reliable command markers, contextual facts such as exit
+status or command duration may appear only when genuinely available.
+
+### Keyboard-first, mouse-friendly
+
+All primary workflows should be efficient from the keyboard while remaining discoverable and usable with a mouse.
+
+### Local-first
+
+The launcher, profiles, sessions, workspace restore, and settings must work
+without sign-in. Any future cross-machine portability should be explicit
+export/import, not a required account or cloud-sync prerequisite.
+
+## Root Application States
+
+![Empty-window Launcher target](images/gui-mockups/launcher-empty.png)
+
+The application should never present an undefined empty state. The root state is always one of:
+
+1. **Session launcher**
+2. **One or more open sessions**
+3. **One or more application surfaces such as Settings**
+4. **Workspace restoration in progress**
+
+When the last session or application surface closes, fesTerm returns to the
+launcher instead of showing a blank window or exiting unexpectedly. A possible
+future close-window-with-last-session preference remains a usability-testing
+question, not current configurable behavior.
+
+### Desktop pane groups
+
+Issue #65 and ADR 0078 reopen the former one-viewport-per-chip restriction.
+A chip can present a short independently named group of at most four live
+views. A bounded binary tree owns presentation only; existing window-owned
+tabs retain their terminal/controller or document-view state. Combine and
+Separate must not restart any session, transfer or document.
+
+Single/group chips remain in the integrated upper chrome. Adjacent panes
+share one physical-pixel rule with no gutter; focused panes have a subtle
+inset edge. Each terminal retains the single-view eight-point content padding
+on all four sides, inside its pane; this does not add a divider gutter.
+Resize uses the inset viewport and real cell metrics (52 columns by 12 rows
+minimum, excluding padding).
+A narrow window temporarily presents the focused member without changing the
+saved tree. Focus acknowledges only that member's unread output.
+
+Current implementation: **Pane Layout…** in a chip context menu or command
+palette moves an existing live view left/right/above/below the focused pane.
+The compact dialog offers selectable members, visual two-column/two-row/2×2
+presets, equalize/zoom, explicit **Rearrange panes**, grouped member/keyboard
+sizing actions, an existing-view destination picker and a separate destructive
+footer. Details use compact name/status columns and one quiet horizontal footer.
+Hover reveals a grip/name/menu handle in the top edge of each pane, not a
+permanent header row. The reveal strip does not capture terminal clicks outside
+the actual handle. **Settings > Panes** defaults hover handles off (also for
+legacy settings without a saved choice); an explicit saved choice is preserved.
+Disabling hover never disables explicit rearrangement.
+The pane-only high-contrast setting strengthens the focused inset edge without
+changing global control borders. Handles do not change the eight-point inset,
+cell dimensions, status geometry or physical-pixel dividers.
+
+Grip dragging or click-grip then click-target exposes Above/Left/Swap/Right/Below
+and an accessible target picker, plus separated **Moving: source**, Detach and
+guarded Close actions. A temporary owned chip-strip target permits detach when
+space exists without occupying native title-bar dragging or window controls.
+Standalone chips can enter this picker; whole-group chip drags are distinct.
+Atomic center exchanges support standalone↔group and group↔group, including full
+groups, without restarting controllers or changing shared document ownership.
+Stale/outside drops leave presentation unchanged. Handle/menu/movement input is
+window-local and quarantined from both terminal and document bodies; Escape
+first cancels movement/menu, then exits rearrangement. Focus loss cancels it.
+Close retires the gesture before opening the existing exact-source confirmation,
+so drag-end cannot dismiss it and Cancel never changes layout.
+Group labels can be renamed independently of sessions. Group chips retain
+their runtime identity when the first member moves or closes. Their geometry
+icon exposes unread members, hover/keyboard details and a pinned member list.
+When a group remains, detaching a member places its independent chip after it;
+separating a whole group replaces its chip in place without moving other chips.
+Chip reordering keeps every group's members together, including after a pane
+swap. A pane's context menu retains that pane's ownership even when the menu
+extends over a sibling.
+Pinned details and layout/close dialogs cannot send keystrokes to terminals.
+Primary, secondary and middle presses focus the pane they target before that
+pane handles the gesture, including its context menu or middle-click paste.
+Pane clicks respect queued input order: earlier text/paste stays with its
+original owner. Native IME composition is fenced by view, input epoch, session
+generation and viewport. Retired compositions cannot commit into another
+owner; if the native adapter never sends the old commit, the next composed
+attempt is discarded with a re-entry notice. Ordinary input/shortcuts remain
+usable; native IME timing remains PN-01 evidence.
+Close group preflights every member and session generation before teardown,
+including collectively final dirty document views across all windows. Cancel
+closes nothing; every discard requires explicit approval. Save-all failures or
+documents requiring Save As leave every view open.
+The original session registry and application-shared documents are unchanged.
+Workspace capture preserves groups for existing restorable session surfaces;
+untitled/unsaved editors remain excluded by the existing document policy.
+The full target additionally requires named recipes, richer recovery placeholders
+and independently opt-in capture/startup restore; these stages and native
+qualification must not be represented as complete by the initial slice.
+
+### Window ownership
+
+ADRs 0032/0033 govern implemented single-process multi-window ownership,
+live single-view transfer and all-window restoration. Single-view transfers
+continue moving the same runtime object. Grouped transfers refuse without
+mutation and ask the user to Separate first; new cross-window pane composition
+is deferred. Separate fesTerm processes remain independent.
+
+## Session Launcher
+
+### Launch behavior
+
+When fesTerm starts without a workspace to restore, it should open a lightweight session launcher rather than immediately launching the platform default shell.
+
+The launcher is not a wizard, dashboard, or onboarding flow. It should be fast, compact, and usable repeatedly.
+
+First run is the same ordinary Launcher used on every later invocation. There
+is no onboarding wizard, telemetry consent prompt when no telemetry is
+collected, default-terminal solicitation, automatic shell-discovery report,
+tips carousel, release-note interruption, or mandatory profile setup. Local
+Shell, SSH, and each other implemented transport appear as normal launch
+choices; unimplemented transports remain absent.
+
+A one-time command-palette hint may be considered only if discoverability
+testing demonstrates a real problem, and must then remain dismissible,
+nonmodal, and sourced from the actual platform binding. Startup/configuration
+failures use the normal actionable application-error treatment rather than
+diverting the user into a special first-run recovery flow.
+
+### Launcher content
+
+The launcher may contain:
+
+- **Local shell** — platform default and saved local profiles.
+- **SSH** — connect to a host or select a saved profile.
+- **SFTP** — open a text-mode file-transfer session over SSH using the same
+  connection metadata and trust/authentication flow.
+- **Serial** — open a local serial device with explicit line settings.
+- **Recent sessions or profiles**.
+- **Recent workspaces**.
+- **Settings** and limited help/documentation access.
+
+Unavailable categories may be omitted until implemented rather than shown as disabled clutter.
+
+The launcher is a three-region surface (`app/festerm/src/screens.rs`'s
+`show_launcher`), still backed by one keyboard selection model: Up/Down or
+Tab/Shift-Tab moves the highlighted launchable entry and Enter activates the
+same command a pointer click would. Local Shell has initial focus. The top
+region is a row of launch cards for the session types fesTerm can start from
+nothing: **Local Shell**, **SSH**, **SFTP**, **Serial**, and **Markdown**.
+Each card is a wide strip rather than a tall tile: a semantic session-type
+icon and the title share the top line, a two-line factual description sits
+below them, and a proceed arrow shares the description's vertical centre on
+the right. Icon slots are forty pixels high, or thirty-four in the compact
+layout. SSH and Serial use wider optical slots so the remote terminal does
+not shrink beside Local and the connector keeps its wide silhouette.
+Source strokes scale with the geometry; the SSH globe uses a lighter stroke
+to preserve its two parallels and meridian at both card and profile-row
+sizes. See [the icon system](icon-system.md) for the source/render contract.
+Stacking the mark above the title cost a card a whole mark's worth of height
+for no more information, and the card row is a navigation strip, not
+the surface's content. Every card wears the same quiet border whether or not
+it is the keyboard selection: selection and hover lift the card's fill and its
+arrow instead, because a heavier outline on one card reads as a modal or
+disabled state rather than as a cursor. The card
+row wraps to fewer columns at narrow widths rather than forcing horizontal
+scrolling, and the whole surface is inset from the window's content edge so
+the cards and panels read as objects on a background.
+
+**Density:** this landing surface matches the scale of the rest of fesTerm
+without changing the
+approved icon artwork or the connection forms. Card titles use 16 px text,
+panel headings 17 px, body/control text 13 px, and secondary text 12 px.
+Cards are 112 px high (96 px compact), profile rows 34 px, and labelled
+controls 32 px. Bare icon actions keep at least 24 px click targets.
+Below 600 px panel width, the Name column borrows space from Last Used so
+ordinary profile names remain distinguishable; headers and rows share the
+same column origins.
+The existing compact-layout preference remains a second, tighter option;
+no new preference or application-wide zoom factor is introduced.
+
+Below the launch cards, **Saved Profiles** and **Running Sessions** form two
+panels. At ordinary desktop widths Saved Profiles takes the left, wider share
+(about three fifths) and Running Sessions takes the right share; below the
+minimum width needed for both panels' own columns, they stack vertically with
+Saved Profiles first. Side by side, the panels fill the rest of the surface
+and each scrolls its own list internally: the launch cards and both panel
+footers stay in place however long the profile or session lists become,
+because the cards are the surface's primary actions and must not scroll out
+from under a user reading a list. Stacked, neither panel has a bounded height
+to scroll inside, so the surface as a whole scrolls instead. Either way the
+panels stay above footer/status chrome instead of running underneath it.
+
+Both panels reserve the same heading row and place their mark, title, and
+controls on the same line measured from the panel's top edge, so Running
+Sessions' subtitle does not lift its title above Saved Profiles'.
+
+The Saved Profiles panel uses the saved-profile collection icon, a search
+field, and a sort-order toggle. It is a table rather than a card grid, with
+left-aligned **Name**, **Type**, **Host / Path**, and **Last Used** columns
+and one 41 px row per saved profile. Each profile appears exactly once under
+the type it was saved as; an SSH profile's SFTP launch, and an SFTP profile's
+SSH launch, move to the row menu instead of duplicating the profile as a
+second row. Search filters by name, type, or host/path. The default order is
+recently used first, then never-launched profiles by name; the toggle switches
+between that order and plain name order. The Last Used value is `Never` until
+the profile has been launched on this installation, then a coarse relative
+age such as `Just now` or `3 days ago`. The panel footer offers **Manage
+Profiles…** (`AppCommand::OpenProfiles`) and a primary **New Profile** menu
+whose Local Shell, SSH, SFTP, and Serial entries dispatch
+`AppCommand::CreateProfile` with the selected kind.
+
+Each saved-profile row launches its normal profile command when activated:
+local, SSH, SFTP, and serial profiles dispatch their corresponding
+`StartConfigured*Profile` command. The row's `⋮` overflow control and a
+right-click anywhere on the row open the same menu. **Connect** dispatches the
+normal launch command; **Connect SFTP** appears only for SSH profiles and
+dispatches `AppCommand::StartConfiguredSftpProfile`; **Connect SSH** appears
+only for SFTP profiles and dispatches `AppCommand::StartConfiguredSshProfile`;
+**Edit** dispatches `AppCommand::OpenProfileEditor`. This replaces the old
+per-card edit icon.
+
+The Running Sessions panel uses the running-sessions identity icon and the
+subtitle “Local sessions available to reattach.” Its refresh control dispatches
+`AppCommand::RefreshRunningSessions`. Opt-in discovery runs outside rendering,
+coalesces repeated requests into one pending refresh, and refreshes approximately
+every two seconds without a restart. A superseded/disabled request cannot
+overwrite newer inventory. The worker waits between probes without scheduling
+GUI frames; only changed inventory or a changed error wakes the Launcher.
+Visible relative-age labels refresh at minute scale independently of discovery.
+Locally reattachable
+sessions are grouped by provider: **fesTerm Native (sessiond)**, **tmux**, and
+**screen**. Each nonempty group has a disclosure header, count badge, and one
+row per session. Rows show the session name, `Started N ago` when the provider
+reported a start time, otherwise the provider/status description, and a
+**Reattach** button. fesTerm-sessiond rows dispatch
+`AppCommand::ResumeUnattachedSession`; tmux and screen rows dispatch
+`AppCommand::ResumeMultiplexerSession` with the provider, match key, and
+user-facing display name plus the discovered generation. Native entries exclude
+attached clients; tmux/screen entries include them with **Attached elsewhere**
+even when a start time is shown. Counts describe eligible displayed entries,
+not a universally unattached-only population. Empty provider groups are omitted, and an entirely
+empty panel says that nothing local can be reattached right now.
+
+Native rows also offer the same **Reattach** / **Terminate session...** menu
+through an accessible overflow button or right-clicking the row. Terminate
+always asks for confirmation with Cancel initially focused, explains that
+the shell/processes and terminal state will be lost, and leaves saved profiles
+unchanged. The confirmed action targets the selected generation, not merely
+its name; if it was replaced or attached meanwhile, refuse and offer refresh.
+Termination runs asynchronously with bounded helper execution and refreshes
+inventory on completion. tmux and Screen do not offer this action.
+
+Reattach is asynchronous and attach-only, unlike saved profiles' intentional
+attach-or-create behavior. External tmux reattachment preserves the existing
+session's status/options; saved profiles retain their intentional status-off
+policy. Screen success requires the selected server to hold this new client's
+terminal, not merely an attached flag belonging to another client. Newer Screen
+uses a bounded quiet public query with stdin on the owned terminal. Both its
+exact terminal context and frontend PID must match; fallback to another display
+is not success. This does not require `/proc` access or inspection privileges for
+setgid Screen packages. Only an explicit unsupported-`-Q` response selects the
+older Screen `lsof` compatibility path. Query/inspection errors never imply
+success. Private short-lived query directories keep timeout reply sockets out
+of the user's inventory and are cleaned on success and failure.
+A stale/replaced selection or failed attachment stays
+on Launcher with an actionable diagnostic and refreshes inventory; it never
+opens a replacement shell or an error-only terminal. An attachment that succeeds
+and subsequently exits has the normal disconnected-terminal lifecycle.
+Native explicit reconnect retains both the discovered generation and registry
+root. It may take over that same generation, but cannot follow a same-name
+replacement; named saved-profile connection policy is unchanged.
+Closing a local multiplexer client does not send newline/EOF into its terminal:
+the server can retain that terminal after the client process exits. Unix PTY
+writer teardown closes only its owned descriptor. Both Running Sessions and
+saved local Screen profiles (including relaunch and workspace restoration)
+receive the provider's graceful SIGHUP detach signal, with bounded
+SIGTERM/SIGKILL escalation if the owned client ignores it. Process-group ownership
+and bounded output draining are unchanged; ordinary shell shutdown keeps its
+existing policy.
+Missing providers/no running server are ordinary empty results; permissions,
+malformed registries, command failures, output limits, and timeouts are visible
+provider errors, not silently successful empty inventories. Provider commands
+have two-second deadlines and 1 MiB output caps, native registry reads have a
+500 ms lock deadline and 4 MiB cap, and offscreen running rows skip widget/text
+layout. The opt-in setting gates all three providers.
+On macOS discovery and attach share the existing login-environment correction
+without changing an inherited executable path that already finds the provider.
+The cached login-shell probe is also bounded and terminates its owned process
+group on timeout, rather than leaving an orphaned reader thread.
+
+The initial launcher shows the usable top-level choices Local Shell, SSH,
+SFTP, Serial, and Markdown. A choice whose transport is not yet implemented
+remains absent from a shipped build rather than appearing as a disabled
+promise. By default, Local Shell immediately starts the configured platform
+shell in the user's home directory. The off-by-default **Customize local shell
+before launch** setting instead opens a focused form in the same launcher tab;
+the form accepts an executable, arguments, and an initial working directory,
+all prefilled with exactly what the immediate launch would have used - the
+same home directory included - so customizing a launch changes what can be
+edited rather than silently changing where the shell starts. Clearing the
+working-directory field restores that home-directory default. Pressing Enter
+in the working-directory field launches it.
+Executable and directory fields offer bounded filesystem-backed completion.
+SSH, SFTP, and Serial navigate within the same launcher tab to focused
+connection forms, while Markdown opens the Markdown workspace picker.
+Back or Escape returns from a form to the launcher without creating another
+chip. Escape closes a Launcher opened from
+another session and restores that session, but does nothing when Launcher is
+the window's only surface. Partially entered non-secret connection fields live
+only for that Launcher lifetime.
+
+The launcher uses no welcome copy, promotional cards, tips carousel, version
+number, or decorative empty-state content. Its job is simply to select a real
+session type, saved definition, file workspace, or local session to reattach.
+
+The current implementation still expands a compact one-off password form
+under the launcher choices. The approved target separates destination,
+host-key verification, and authentication into the focused stages specified
+in [SSH session creation](#ssh-session-creation). Saved profiles, agents,
+key-file selection, and OpenSSH-config import controls appear only when their
+capabilities are implemented and available, never as disabled placeholders.
+
+Selecting SSH opens the **Connect with SSH** form: a **Connection** section,
+then an **Authentication** section and an initially off **Durable remote
+session** control.
+
+The Connection section shows the destination in one of two interchangeable
+notations, never both at once: a single **Quick connect** `user@host[:port]`
+field, which is the default everywhere and takes the opening focus, or
+separate **Username**, **Host** and **Port** fields in that order. A toggle on
+the section heading switches between them, carries the destination across and
+moves focus onto whichever field now leads, so neither notation is
+second-class and neither duplicates the other on screen. The SSH launcher, the SFTP launcher and the Profiles
+editor for SSH/SFTP profiles all render this same pane, so the notation
+toggle, field order and focus behave identically wherever a destination is
+edited; each surface adds only its own surrounding controls. The SSH and SFTP
+launchers likewise share one **Authentication** section, differing only in
+which command a stored credential starts.
+Enabling it exposes the shared provider (`tmux` or GNU screen), validated
+session-name, and per-launch automatic-recovery controls, allowing an ad-hoc
+connection to attach to or create a durable session without first saving a
+profile. When fesTerm already has persisted host trust plus a non-interactive
+credential for that destination, it may run a best-effort background tmux
+probe and default the provider to `tmux` if detected or GNU Screen if not; an
+explicit user choice is never overwritten. The SSH form presents its
+destination and authentication-method controls directly, grouped into
+**Connection** and **Authentication** sections above the durable-session
+band, and folds only the port-forward controls behind an "Advanced settings"
+disclosure. A **Save as Profile...** action carries the connection, session
+and forward metadata -- deliberately never the password, private key or
+certificate -- into the Profiles editor
+(`app/festerm/src/screens.rs`'s `show_ssh_form`).
+The Launcher list, SSH connection surface, and profile editor use the same
+surface-owned scrollbar behavior as Settings: content reserves a right-side
+lane, the bar does not overlap controls, and ordinary content hover does not
+reveal it. Anything laid out beside that scrolling content -- the Profiles
+search row and its New Profile button, for instance -- reserves the same lane,
+so a surface's controls end flush with the table or card they introduce rather
+than overhanging it. Scrolled fully down, content keeps a bottom gutter
+matching the inset it has at the top, instead of resting against the bottom of
+the window.
+Submitting with no password (from either surface) starts the session
+immediately with no credential attached (`SshAuthentication::Interactive`)
+rather than collecting one blind beforehand, mirroring `ssh`'s own ordering:
+the worker connects and verifies the host key first (see
+[Host-key verification](#host-key-verification)), and only once
+authentication is actually needed does an in-terminal, pty-styled password
+prompt appear (`user@host's password:`, `show_ssh_live_password_prompt`),
+rendered in the selected terminal font in place of the terminal view with no
+textbox or button — typed characters are never echoed, matching real `ssh`,
+and Enter submits. A rejected password appends "Permission denied, please try
+again." plus a fresh prompt line below (matching `ssh`'s own
+`NumberOfPasswordPrompts` default of three in-connection attempts,
+`festerm_ssh::MAX_INTERACTIVE_PASSWORD_ATTEMPTS`) before falling back to the
+ordinary failed-session presentation. This deliberately does not implement
+server-driven keyboard-interactive prompts or 2FA; that remains a separate,
+larger feature (see the SSH keyboard-interactive/2FA follow-up issue).
+
+### Launcher as a tab
+
+The launcher should use the same tab model as sessions.
+
+Consequences:
+
+- Closing the final session returns to the launcher.
+- The New Session command opens the singleton launcher or focuses it when it
+  already exists.
+- Users can keep a launcher tab open while other sessions run.
+- The application does not need a separate home-window architecture.
+- Starting a session *from* the active launcher tab (e.g. "Local Shell") replaces that launcher tab in place with the new session tab, keeping the same position and chip identity, rather than leaving the spent launcher behind alongside a separate new tab (`app/festerm/src/tabs.rs`'s `start_local_session`). **Connect** for a saved profile from the active Profiles tab follows the same rule for local, SSH, terminal SFTP, serial, and graphical SFTP launches. A synchronous terminal startup failure leaves Profiles available and activates the ordinary error-bearing session in a separate tab. Graphical SFTP reuses the chip for its credential form, but the password/private-key/passphrase draft and each field's toolkit-owned edit/undo state are owned by that exact form instance, not the preserved chip identity. **Back to Profiles**, Escape, global/chrome **Open Profiles**, successful submission, close, and any other content replacement therefore zeroize repository-controlled live draft storage and scrub retained undo/redo snapshots before erasing those widget states; opening a different target in the same chip starts empty in password mode, and Undo cannot recover the prior target's credentials. Submitted password and passphrase copies remain in zeroizing application, worker, and vendored russh authentication owners through success, failure, cancellation, and reconnect; the russh queued method is retired as soon as authentication succeeds or fails, and its debug output and packet diagnostics expose metadata rather than credential or packet contents. These guarantees cover normal repository-controlled live buffers and teardown. They do not guarantee erasure of allocator slack or previously freed allocations, abrupt process termination or OS swap/core-dump state, native input/IME intermediates, clipboard/accessibility/recording capture, or third-party cryptographic-library internals. Submitting valid authentication continues in that same chip. Later host-key, authentication, and connection failures use the existing session's prompts, retry, and close paths. Other active surfaces, and ad-hoc launches while Profiles is active (e.g. a local-shell shortcut), still open a new tab rather than replacing unrelated content. Profiles can be reopened normally after a successful launch.
+
+### New Tab behavior
+
+The primary New Tab action should open the launcher rather than immediately creating one predetermined session type.
+
+The semantic Start Local Shell action opens the default local profile directly.
+It is initially unbound, remains available from the command palette, and may
+become user-bindable when shortcut customization exists.
+
+## Primary Layout
+
+![Active terminal and integrated chrome target](images/gui-mockups/terminal-active.png)
+
+![Optional compact single-line session chrome target](images/gui-mockups/compact-session-chrome.png)
+
+The default window has three conceptual zones:
+
+```text
++------------------------------------------------------+
+| Integrated chrome: session chips + global actions   |
++------------------------------------------------------+
+|                                                      |
+| Terminal viewport or launcher content                |
+|                                                      |
++------------------------------------------------------+
+| Contextual status only when needed                   |
++------------------------------------------------------+
+```
+
+### Tab strip
+
+The chip row provides session switching and identity. It is part of the upper application chrome, sharing the top-of-window band with New Tab and compact global controls. The chips remain visually independent through spacing, shape, border, and elevation—not by moving them onto a separate shelf.
+
+### Main content
+
+The main content is either a terminal viewport, launcher, or Settings page.
+Per-session diagnostics live in the temporary session inspector unless a
+future cross-session support workflow establishes a real need for a separate
+application surface. Terminal tabs should maximize terminal area.
+
+On CPU rendering adapters with an eight-bit gamma framebuffer, the default
+opaque terminal canvas uses a native solid-color paint callback rather than
+the general textured-rectangle shader. Colors, clipping, overlays, cell
+backgrounds, text, input processing, and redraw scheduling are unchanged.
+Translucent UI and other framebuffer formats retain ordinary egui painting.
+This is not retained-pixel or partial-frame rendering; CP-17 tracks its native
+performance and visual evidence.
+
+On supported Windows x64 DX12 CPU-adapter targets with `Bgra8Unorm` or
+`Rgba8Unorm`, Direct2D now replaces eligible root terminal content with an
+immutable shared surface automatically. No renderer/composition on/off
+setting remains. Chrome and composition remain in egui-wgpu, reusing the
+existing glyph/emoji pixels and cell geometry. The ordinary full background
+still clears old content before the cropped native surface is composed.
+Hardware, secondary windows, translucent or transformed painters, invalid
+and rejected native frames retain ordinary painting.
+Automatic unsupported-adapter cases stay quiet and keep ordinary painting;
+Input, session ownership and frame scheduling do not change. See
+ADR-0039 and CP-18; issue #244 keeps native qualification open.
+
+### Launcher lifecycle
+
+Launcher is a singleton task surface and the window's stable empty state, not a
+permanently pinned destination. New Session activates an existing Launcher chip
+or creates one at the end of the chip row. Choosing a local shell, or completing
+the SSH setup flow, converts that Launcher chip into the new session in place so
+its position remains stable and no redundant Launcher is left behind. Multiple
+Launcher chips and launcher pinning are not initial features.
+
+Closing the final terminal session does not close the fesTerm window or quit the
+application. If no other application surface remains, it returns the window to
+Launcher. If Settings or another valid application surface is still open, that
+surface remains visible and New Session remains available from the chrome.
+Closing the final remaining application surface likewise returns to Launcher,
+so an open window is never blank.
+
+This keeps three lifecycles explicit and consistent across every invocation
+path: **Close session** removes a session, **Close window** closes the native
+window, and **Quit fesTerm** terminates the application using the aggregate
+live-session confirmation rules. A future preference to close the window with
+its last session may be evaluated through usability testing, but it is not the
+default contract.
+
+### Application chrome and session context
+
+Global application actions and session-specific context are separate concerns.
+
+- The upper application chrome owns compact global actions: New Tab/Launcher,
+  command palette, context-sensitive terminal search when space permits, and
+  More actions.
+- Global controls are icon-only, using the canonical first-party forms in [the icon system](icon-system.md), with accessible labels and hover text carrying their meaning. Painter-drawn implementations may remain while runtime SVG integration is incremental, but their geometry should converge on the canonical sources rather than creating a second icon vocabulary.
+- The session chips live inside the upper application chrome, in the same top-of-window band as New Tab and compact global controls. They are independent because each lozenge has visible space around it—not because the row is separated from the chrome.
+- The right-side session inspector is normally hidden and overlays rather than
+  resizes the terminal viewport. It shows context for the active session:
+  connection state, host/profile metadata, diagnostics, and relevant actions.
+- Global Settings do not live in the inspector. Settings open as an application
+  surface represented by their own chip and remain reachable from More actions.
+
+More actions owns infrequent global application actions without duplicating them
+in the command palette.
+
+Its primary entries are **New File**, **Open File…**, **Open Profiles**,
+**Open Settings**, **Session inspector** (when a session is active), and
+**About fesTerm**. **New File** immediately opens a blank, dirty `UNTITLED`
+editor document; its first Save continues through the ordinary Save As sheet.
+Terminal-only **Find in terminal** and **Focus mode** may appear
+when applicable; **Command palette** follows after a separator only in compact
+layouts.
+
+The menu is not a second session switcher and does not contain Copy, Paste,
+Close session, Disconnect, Reconnect, host-trust, authentication, or appearance
+toggles. Those actions remain in their owned surface, direct keyboard path, or
+the command palette. Launcher and Settings omit terminal-only entries, and an
+unavailable action is omitted rather than shown as unexplained disabled text.
+Entries use text labels rather than another icon-only vocabulary. The current
+chip-layout and status-bar toggles in the implementation are transitional;
+they belong in Settings as the corresponding settings surface matures.
+
+### Terminal context menu
+
+![Terminal and session-chip context-menu targets](images/gui-mockups/context-menus.png)
+
+The terminal viewport's local context menu is deliberately about the text and
+target under the pointer, not application or session administration. An
+explicit OSC 8 link contributes **Open link** and **Copy link**. A detected
+file path contributes **Open in viewer** when fesTerm can resolve that target
+honestly; its preview line freezes the local or remote path under the pointer,
+and **Copy path** copies that resolved path (or the detected path when resolution
+is unavailable). A disabled Open button explains when trustworthy cwd, host-key,
+or credential metadata is missing. A plain-text HTTP(S) address contributes
+**Go** and **Copy URL**; Go passes through the same validated external-link
+handler as an OSC 8 link. Detection preserves bracketed IPv6 authorities,
+including ports and wrapped addresses, without copying surrounding markup.
+
+Path and URL previews are single-line, normally spaced, small monospace labels,
+not justified paragraphs. Target-bearing menus have at most 320 logical points
+of content width, reduced for a narrower viewport. Display-only middle elision
+favors the host/root and filename/extension; long web targets summarize query
+and fragment contents with explicit ellipses rather than filling the menu with
+opaque parameters. The full target remains available in a wrapping tooltip
+and accessible label. Control characters, line separators, and bidirectional
+controls are visibly escaped; ordinary filename spaces and complete grapheme
+clusters are preserved. None of this formatting changes the frozen Open/Go or
+Copy value. Logical-line detection uses the core's occupied row extent, so
+unprinted padding before a wrapped wide character is not mistaken for a
+filename space, including in retained history.
+
+A non-empty terminal selection contributes **Copy**. A live session that
+currently accepts input contributes **Paste**. **Find in terminal** remains available in every
+retained terminal viewport, including an exited or disconnected read-only
+history. When there is no active selection, the same menu also offers
+**Open Terminal History in Editor** and **Save Terminal History As…**. Both
+freeze the retained primary history plus the currently applicable screen into
+an independent plain-text snapshot with no ANSI/control-sequence export and no
+live link back to the session. **Open Terminal History in Editor** creates an
+untitled dirty editor document; **Save Terminal History As…** opens that same
+snapshot and immediately continues into the normal Save As sheet. The snapshot
+actions stay available for exited or disconnected retained history. If the
+retained text would exceed the editor's honest byte, line, or single-line
+bounds, fesTerm refuses before allocating a document and says so without
+quoting the history itself. Unavailable entries are omitted; in particular,
+Paste is absent for a read-only history, and the history-snapshot actions are
+omitted while a text selection is active so Copy remains the text action in
+that position.
+
+Clear, Close session, Disconnect, Reconnect, Settings, and appearance actions
+do not belong in this menu. **Select all** is also omitted initially because it
+can unexpectedly capture very large retained scrollback; it may be revisited
+only if usability testing establishes a concrete need. Opening the menu does
+not send terminal input or destroy the current selection.
+
+When terminal mouse reporting is inactive, right-click opens the local context
+menu. When an application in the terminal has mouse reporting enabled, ordinary
+right-click remains available to that application and **Shift+right-click**
+always invokes the local context menu. This is the same local-override principle
+used for Shift-modified selection and ensures Copy and Paste remain reachable
+without permanently taking mouse input away from terminal applications.
+
+### Session-chip context menu and rename
+
+A terminal session chip's context menu contains **Rename session**, applicable
+**Use default name** when an explicit alias exists, applicable
+**Move left** and **Move right** entries (omitted at the respective edge), a
+separator, and **Close session**. The menu targets the clicked chip without
+activating it. Close uses the same live-session consequence and confirmation
+rules as every other close path. Reconnect, Disconnect, diagnostics, and trust
+or authentication actions remain in the session inspector or relevant state
+overlay rather than being duplicated here.
+
+Application-surface chips such as Launcher and Settings do not offer Rename;
+they expose only movement and closing actions that actually apply. Duplicate,
+Pin, Save as Profile, per-chip color labels, and other organizational features
+are omitted until they have a defined product behavior.
+
+Double-clicking specifically on the stable primary session name starts an
+in-place rename. The text field occupies the existing label region so entering
+rename does not resize the row or chip. It selects the current user-controlled
+name, **Enter** commits, and **Escape** cancels; an empty or whitespace-only
+value does not replace the existing name. Moving focus elsewhere commits a
+valid value and otherwise restores the previous name. The resulting display text is
+sanitized and bounded by the same rules as other chip identity text. Rename
+never edits the terminal-provided secondary title.
+
+Rename changes only this session's explicit display alias. It never edits a
+reusable profile, provider attachment name, destination, shell input, or
+terminal contents. **Use default name** removes the override; it does not save
+the current default as another fixed alias. Existing sessions retain their
+original default when a profile is edited, while a newly launched unrelated
+session uses its ordinary default. Control, bidi-direction, and Unicode
+line/paragraph-separator characters are removed from user edits; names are
+trimmed and limited to 200 Unicode scalar
+values, and an empty result leaves the prior name unchanged. The existing
+configuration secret-material rejection also applies to saved aliases.
+Nonempty rejected edits show a bounded app notice without echoing the rejected
+text; the prior name and metadata remain unchanged and no save is attempted.
+
+Profile-backed local, SSH, terminal SFTP, and serial workspace tabs save optional
+aliases as logical-view metadata when Restore workspace is enabled, including
+local/SSH tmux and Screen and restored SSH/SFTP tabs awaiting authentication.
+Authentication retries, reconnect, backend recreation, and moving a tab between
+windows retain that view's override. A new attachment does not inherit another
+view's alias by profile or provider name. External OSC titles remain transient
+and are never an alias source. Disabling restoration never silently enables it;
+without a restorable descriptor or verified native seed, edits remain live-only
+with visible feedback.
+
+Native `festerm-sessiond` aliases also live in a bounded, local configuration
+seed registry keyed by the actual daemon PID, creation generation and generation
+endpoint, not a chip position, runtime TabId, profile name, or provider name
+alone. The same native generation reattached through Running Sessions recovers
+the last saved seed without workspace restoration. A replacement generation
+does not. The registry never overwrites a saved tab's or other existing view's
+explicit alias, even if both views attach to the same native session. Reset
+removes only the current logical view's override and its associated seed; other
+view aliases remain unchanged. All windows' pending edits and optional
+workspace metadata use one configuration replacement. An error returned by
+`Configuration::save_to_path` leaves the local naming change visible but has
+an indeterminate disk outcome; the application warns and blocks further saves
+until manual reconciliation and full restart. Missing paths, directory-creation
+failures, session-name validation failures, and busy refusals occur before that
+call and do not themselves latch the gate. Validation errors returned by
+`save_to_path` still latch. A request refused by a previously latched gate
+did not install its candidate, but the earlier unresolved save may still have
+changed the file. Distinct session-name warnings are queued in bounded,
+content-free categories and each gets a visible interval on first render.
+Pre-write and busy warnings describe only that attempt and do not offer retry
+instructions. While each is displayed, a nonblocking current gate check is
+shown alongside it, including in-progress or reconciliation-required states;
+live-only naming guidance uses the same check.
+
+**Qualification:** focused regressions and the Windows local CI-equivalent
+suite passed on 2026-10-02. Required remote platform checks and the
+native/accessibility/usability evidence in AS-10 remain pending.
+Alias ownership is deliberately frontend-tab ownership, not an arbitrary
+physical tmux/Screen instance naming service. No provider commands, remote
+helpers, platform prerequisites or attach-only stale-generation checks change.
+
+The name hit target consumes the double-click so it cannot become a custom
+title-bar maximize gesture or terminal input. Since the first click follows the
+normal chip activation behavior, double-clicking an inactive chip activates it
+before entering rename. Committing or cancelling returns keyboard focus to that
+session's terminal viewport. Rename remains available from the context menu for
+discoverability and non-pointer access.
+
+### Platform application menus
+
+macOS uses its native application menu bar without adding another visible menu
+row inside the fesTerm window. The implemented first slice is deliberately
+capability-truthful:
+
+- **fesTerm** contains Settings… (`Cmd+,`) and the standard native Services,
+  Hide, Hide Others, Show All, and Quit entries.
+- **File** contains New Session…, Start Local Shell, the active-surface close
+  action (`Cmd+W`), and Close Window (`Cmd+Shift+W`). The close label names its
+  result—Close Session, Close Launcher, or Close Settings—rather than pretending
+  every surface is the same object.
+- **Edit** contains focus-aware Copy and Paste on AppKit's responder chain.
+- **View** contains Command Palette and the dynamically enabled Session
+  Inspector action.
+- **Window** contains native Minimize and Zoom.
+- **Help** remains absent until fesTerm has real help content rather than an
+  empty or placeholder destination.
+
+Find in Terminal remains target behavior, not an inert menu placeholder. The
+implemented About, Focus Mode, and zoom commands must still pass native menu
+validation: confirm keyboard equivalents, dynamic Close/Inspector state, and
+that responder-chain Copy and Paste preserve the same terminal selection and
+paste-safety policy as the in-window routes.
+
+Fixed native menu entries may remain visible but disabled when their context
+does not apply, following platform menu stability conventions; their labels and
+enabled state still come from the same semantic application-command model as
+every other invocation surface. Trust decisions, authentication responses,
+reconnect detail, and other owned workflow actions do not move into the menu
+bar merely for completeness.
+
+Windows and Linux do not gain a persistent in-window menu bar. Overflow,
+command palette, shortcuts, and Settings provide those routes without consuming
+terminal space. Custom decorations must preserve native system-window access,
+including the expected `Alt+Space` system menu on Windows, alongside snapping,
+keyboard movement/resizing, and accessibility work tracked in issue #29.
+
+### About and updates
+
+![About fesTerm dialog target](images/gui-mockups/about-festerm.png)
+
+**About fesTerm** is a compact native-style dialog containing the same branded
+fesTerm application icon used by the native window, dock, and task switcher,
+`fesTerm`, exact application version, the description “An AI-friendly local,
+SSH, and serial terminal.”, the explicit disclosure “Entirely AI-written with
+human guidance.” plus concise GitHub Copilot/project-owner attribution,
+**Copy Version Information**, **Licenses**, the canonical project/source link,
+and Close. It does not include live session counts, decorative slogans,
+donation/promotional content, or an update control without an implemented
+update capability.
+
+Copy Version Information produces a bounded support-oriented summary: exact
+version, build/commit identifier when available, OS and architecture, and
+relevant renderer/backend versions, plus the same bounded authorship summary.
+It excludes usernames, hostnames, filesystem paths, serial-device identifiers,
+environment values, settings, profiles, workspace names, terminal content,
+and session diagnostics. Licenses shows the repository license and bundled
+dependency/asset notices, including the exact Inter font license once the font
+is shipped.
+
+Current implementation keeps the complete About disclosures in a bounded
+scrolling body and leaves Copy Version Information, Licenses, and Close outside
+that scroll. Actions reuse the existing semantic button roles and have at least
+28 px height; narrow layouts do not shorten authorship, diagnostic sensitivity,
+update eligibility, or transmitted-data disclosures.
+
+**Check for Updates** is present only in packaged builds carrying the updater
+verification public key. It contacts the fixed public fesTerm GitHub Releases
+`latest/download/festerm-update.json` endpoint after an explicit check, download,
+or install action, or an enabled automatic check; it sends no profile, session,
+terminal, device, or configuration data.
+Checking, verified download, and installation are separate user actions.
+Package-manager installations may report availability but defer installation
+to their package manager. Release notes never interrupt startup. Update state
+is quiet, factual, dismissible, and cannot block the Launcher or a terminal
+session. Developer and incompletely signed builds expose no network action.
+
+Download and install actions re-check the latest eligible release rather than
+pinning a stale notification. Download selects the refreshed release and never
+installs it. Install refreshes again after restart consent: the same version
+reuses its verified download; a newer version is downloaded and verified before
+installation proceeds under that consent. About names the actual downloading
+and installing version and shows a busy refresh state in between. Failed
+refresh, withdrawal, invalid version, rollback to an older offer, or failed
+verification never falls back to installing cached older bytes. A new explicit
+check is required to retry. This can require network access even when an older
+artifact is already downloaded; it does not enable unsolicited downloads.
+
+#### Automatic update checks
+
+fesTerm may also check on its own, so a user who never opens About is not left
+on an old build indefinitely. The check is deliberately rare and deliberately
+quiet:
+
+- **About once a day.** The first check of a run waits several minutes after
+  launch so it never competes with opening a session, and the interval is
+  measured from the last completed check, recorded in the configuration file -
+  restarting fesTerm does not restart the clock, so an install opened and
+  closed all day still checks once.
+- **Same endpoint, same data.** It contacts the same fixed
+  `latest/download/festerm-update.json` endpoint the manual button uses and
+  sends no profile, session, terminal, device, or configuration data.
+- **Only where it can act.** Package-managed and developer builds never check
+  automatically: the version is not fesTerm's to change there, so an
+  unsolicited announcement could only be noise.
+- **Nothing happens by itself.** An automatic check never downloads, never
+  installs, and never opens a dialog. A failed automatic check is silent -
+  the user did not ask, so an offline laptop must not produce an error
+  surface. Only a user-initiated check reports failure.
+- **One quiet notice.** When a newer release is found, the **More actions**
+  control in the chrome carries a single accent dot, and its menu gains an
+  **Update to fesTerm _version_…** entry that opens About, where the existing
+  download and install controls live. The control's accessible label names
+  the version too, so the notice is not colour-only. Opening About clears the
+  notice for that version; it is never shown twice.
+- **Reversible.** The **Check for fesTerm updates automatically** preference
+  in Settings › Interface controls this. It is on by default; turning it off
+  leaves only explicit check/download/install actions contacting the release
+  endpoint.
+  About discloses the automatic check while it is on.
+
+### Approved native Markdown viewing
+
+The post-transport product review accepts a bounded native Markdown viewer for
+fesTerm with **readability-first** as its named primary quality target. The
+approved first-release behavior, resource policy, lifecycle, keyboard model,
+and reviewable workflow are specified in
+[`markdown-viewer-design.md`](markdown-viewer-design.md). Implementation and
+native validation remain pending; builds must not show disabled or non-working
+viewer promises before the corresponding capability exists.
+
+The accepted design explicitly bounds:
+
+- Markdown dialect and extensions: CommonMark/GFM, tables, task lists,
+  footnotes, syntax highlighting, math, diagrams, embedded HTML, and any
+  unsupported construct treatment;
+- document ownership and entry routes: explicitly selected local files, files
+  referenced by local terminal output, and SSH-remote files. A remote path is
+  never treated as a local path, and Serial has no implied filesystem;
+- resource policy: scripts never execute, raw HTML is disabled or sanitized by
+  an explicit contract, and local files, remote images, network URLs, data
+  URLs, fonts, and includes do not load implicitly;
+- privacy and trust: opening a document cannot silently create network traffic,
+  expose a remote path locally, upload content, or place document data in
+  diagnostics, workspace metadata, or logs;
+- bounded behavior: file/line/image/resource limits, large-document
+  responsiveness, cancellation, error recovery, encoding, and binary-file
+  rejection;
+- navigation and accessibility: headings, landmarks, link destinations,
+  tables, code blocks, keyboard traversal, screen-reader semantics, text
+  selection, Copy, Find, source/rendered switching, and scroll restoration;
+- freshness and lifecycle: read-only versus editing, manual reload versus file
+  watching, conflict/deletion behavior, SSH disconnect handling, and whether a
+  viewer is a singleton task surface or one surface per document; and
+- product boundary: whether it remains a read-only companion surface rather
+  than expanding into an editor, preview server, web browser, notebook, or
+  general IDE.
+
+Any accepted viewer must follow the existing application-surface model: it
+cannot resize or take ownership of a live terminal session, terminal escape
+sequences cannot open it without an explicit user action, Escape/Close returns
+to a known prior surface, and closing the final viewer returns to Launcher.
+
+### Approved native text editing
+
+Product review accepts extending the viewer into a bounded native text editor
+for supported local and SFTP text and Markdown files. The architecture — shared
+mutable documents, identity, conditional publication, freshness, conflict, auto-save,
+per-view presentation, and the vi subset — is decided in
+[ADR 0034](adr/0034-shared-mutable-text-documents.md), and the product/UI
+specification is [`text-editor-design.md`](text-editor-design.md).
+Implementation and
+native validation remain pending; builds must not offer a disabled or
+non-working editing promise before the corresponding capability exists.
+
+The accepted shape is:
+
+- **One document, many views.** A file opened in several tabs or windows is one
+  document. Text, undo history, dirty state, save generation, conflict state,
+  and Auto-save belong to the document; caret, selection, scroll, find, line
+  numbers, fixed columns, syntax highlighting, and vi mode belong to each view. An editor and a
+  Markdown Preview of the same file are two views, and Preview shows unsaved
+  edits on the next frame without any disk or SFTP round trip.
+- **Editing surfaces.** A view is `Edit`, `Preview`, or `Split`; Split is one
+  view with two panes sharing that view's caret and settings. A Markdown file
+  opens in `Preview` in its editor tab rather than in a viewer tab of its own.
+  **Duplicate view** opens a second view of the same document, which can be dragged
+  to another window like any other tab.
+- **New files.** **New File** in More actions and the native File menu opens a
+  separate blank `UNTITLED` editor immediately. Each new document has its own
+  identity and `Untitled-N.txt` name, starts unsaved, cannot Auto-save before a
+  destination exists, and routes its first Save through Save As.
+- **Colour.** Source is highlighted by syntax, on by default, from one closed
+  grammar set shared with the Markdown preview's fenced code. Colour carries
+  syntax only: no document or application state is expressed through it, and a
+  file with no grammar, one past the parsing bound, or one whose parse fails
+  falls back to plain monospace and says which in the status bar.
+- **Commands.** Save, Save As…, Find, Replace, Duplicate view, and Refresh are
+  application commands shared by toolbar, menus, palette, keyboard bindings, and
+  vi's `:` equivalents. A disabled command explains why. Refresh never discards
+  a dirty buffer.
+- **Saving.** Saves revalidate the source first, privately capture the current
+  target, and publish without overwrite; the target name can be briefly absent.
+  An interrupted write never reports success, and nothing is ever overwritten
+  or merged silently. Auto-save belongs to the document, sits beside Save, is
+  debounced rather than per keystroke, and pauses on conflict, offline, or
+  error. Closing the final view of a dirty document still prompts.
+- **Freshness.** An externally changed clean document reloads every view and
+  keeps each view's position; an externally changed dirty document raises one
+  shared conflict offering Compare, Reload, Keep my version, and Save As.
+  Compare is a read-only, per-view, line-oriented look at the two versions with
+  the banner still pinned above it; it merges nothing and resolves nothing. A
+  deleted, renamed, or unreadable source keeps the buffer and says it is
+  unavailable, disabling only the commands that genuinely cannot run. A remote origin that drops keeps the buffer editable and marked
+  `Offline` until reconnection revalidates it.
+- **Legibility.** Document state is text first: the banner names it, the tab
+  chip carries it by shape plus accessible name rather than colour, and vi's
+  mode is spelled out in the status bar. The status bar's language, encoding,
+  line ending, and indentation are a read-out in this release.
+- **Presentation never edits.** Line numbers and fixed columns are per-view and
+  change nothing on disk; fixed columns wraps visually at the chosen column and
+  never inserts a line break.
+- **Save As.** The picker reuses the SFTP file-browser pattern for local
+  destinations. Its remote option remains visibly disabled in this release and
+  performs no remote listing or write. It states an existing target in words
+  before the explicit Save press and binds to an already-open document rather
+  than creating a second buffer for one file. It stays available whenever Save
+  cannot run.
+- **Closing.** Only the final view of a dirty document prompts. The prompt names
+  the file and its origin, defaults to Save, treats Escape as Cancel, and makes
+  Discard an explicit press that Return never triggers.
+- **Bounds.** Editable size and line limits are explicit; a document beyond them
+  is refused for editing before an unsafe buffer is allocated while remaining
+  readable where the viewer can show it. Nothing about an open document is
+  persisted in workspace state.
+The approved first release omits workspace persistence, recent-document
+history, file watching, and background remote fetch. Secondary resources never
+load implicitly; the narrow per-item local/remote image actions in the focused
+viewer specification are the only accepted resource-loading path.
+
+### Contextual status region
+
+The bottom status region should normally be absent. It may appear for actionable or transitional states such as:
+
+- reconnecting;
+- authentication required;
+- host-key decision required;
+- session startup failure;
+- transport failure; or
+- an available diagnostic detail.
+
+It should not display continuous byte counts, queue metrics, dimensions, or frame statistics during normal use.
+
+### Bottom status bar
+
+Distinct from the contextual status region above, a persistent 24 px bottom
+status bar (`crates/festerm-ui-egui/src/statusbar.rs`) runs along the bottom of
+the window by default and remains user-configurable on/off
+(`AppCommand::ToggleStatusBar`). It earns that permanent space by remaining
+strictly factual and nonduplicative:
+
+```text
+| 80×25   Local · Linux                                      ● Running |
+| 80×25   Remote · Linux                                   ● Connected |
+| 80×25   Serial · COM3                                         ● Open |
+| 80×25   Local · macOS   cargo test — fesTerm                ● Running |
+```
+
+The fourth row is the compact-chip variant; the first three show the default
+two-line-chip mode.
+
+- The left side shows actual measured terminal grid dimensions and locality.
+- The platform is concrete when reliably known: `Windows`, `Linux`, or
+  `macOS`. A remote session shows `Remote` alone until its host platform is
+  reliably detected; it is never inferred from shell syntax or line endings.
+- The right side shows the session state using a colored indicator plus an
+  accessible text label. Local sessions use `Running`, SSH sessions use
+  `Connected`, and serial sessions use `Open`; each term describes the fact
+  the owning transport can establish without implying a responsive peer.
+- When the active SSH session has one or more active forwards, the bar may add
+  a compact factual count such as `1 active forward` or `3 active forwards`.
+  This is presence/count only: it does not replace the Port Forward Manager as
+  the authoritative live-management surface.
+- Stable session identity and terminal title remain in the active chip and are
+  not repeated in the bar while session details are shown in chips. When the
+  **Show session details in chips** preference is off, the active session's
+  same sanitized secondary display value moves into the status bar instead;
+  this is the only intentional identity/title exception.
+- When the **Show durable session name in status bar** preference is on, a
+  session attached to tmux, GNU screen, or the fesTerm session daemon also
+  names that session as `provider · session name` (for example
+  `tmux · deploy-watch`), whether it is local or reached over SSH. This is the
+  durable session's stable identity, which the terminal-provided title cannot
+  supply, so it is a separate preference from **Show session details in
+  chips** and the two may appear together. It reuses the same non-secret
+  metadata Session Inspector already shows, sits with the left-hand session
+  facts in `text.muted`, and is absent — with no placeholder or empty
+  separator — for ordinary sessions and application surfaces. Off by default.
+- Client clock/date, shell version, encoding, line-ending convention, command
+  timing, and last-input/output timestamps are absent.
+
+The implementation follows this content contract. Terminal ANSI/indexed and
+explicit RGB colors remain unrelated to these application status roles.
+
+When Launcher or Settings is active, preserve the same 24 px footer geometry
+but leave its content empty. The stable footprint prevents vertical layout
+jumps when switching surface types; it does not justify invented `Ready`, app
+identity, time, or dimensions. The subtle top rule may remain. Disabling the
+status-bar preference removes the footer consistently on every surface.
+
+The relocated compact-mode detail sits after dimensions/locality and before
+the right-aligned state. It uses `text.muted`, never scrolls or animates, and
+ellipsizes before dimensions, session type, or lifecycle state are removed.
+Its complete sanitized value remains available to accessibility and hover
+presentation. It follows the same source precedence as chip secondary text:
+terminal-provided title first, then factual launch metadata. It is never named
+or inferred as the “current command,” “last command,” or “last response.” Only
+the active session contributes this value; Launcher and Settings continue to
+have empty footer content.
+
+If both session details and the status bar are disabled, fesTerm does not force
+either surface back on. The secondary value remains available through command
+palette session results, chip hover/accessibility, and Session Inspector. This
+is deliberate user-selected density, not loss of stable session identity.
+
+The terminal viewport itself (`crates/festerm-ui-egui/src/view.rs`) no longer draws its own inline "fesTerm / Diagnostics" header or expandable per-frame diagnostics footer — that duplicated chrome the application already owns and only its grid-dimensions field was in regular use, which now lives in the status bar instead. `TerminalView::show` fills all available space with just the terminal grid; `TerminalView::diagnostics()` remains available for tests and future tooling that need the raw per-frame `FrameDiagnostics`.
+
+## Tab Model
+
+### Independent session chips
+
+Session tabs are independent lozenges or chips, not connected browser-style or rolodex tabs. This is an interaction principle, not merely a corner-radius choice: every chip represents a persistent, independently managed session object.
+
+Implementation requirements:
+
+- Place the chip row inside the top window-chrome band; terminal, launcher, or settings content begins immediately below that integrated chrome.
+- Preserve visible space around every chip; adjacent chips must never merge into a continuous tab strip.
+- Keep chip surfaces neutral. Connection color belongs in a small status indicator, not across the whole chip.
+- Indicate the active chip with a slightly brighter surface, stronger border, subtle elevation, and optionally a small height difference. Do not depend on a saturated accent fill.
+- Keep stable session identity as the primary label and transient terminal state as secondary metadata.
+- Make Launcher and non-session application surfaces such as Settings visually distinct while keeping them in the same switching model.
+- Drag-and-drop reorders independent session objects and should preserve their identity and state.
+- Design chip layout for both horizontal overflow and an optional multi-row wrapping mode. Wrapping must remain user-configurable because some users will prefer a single scrolling row.
+- Preserve semantic tab roles, keyboard order, accessible names, focus indication, and close behavior even when the visual treatment is chip-like.
+
+The wireframe in [Canonical Wireframe](#canonical-wireframe) is the visual contract for these requirements. A detached chip shelf below a separate title bar, connected browser tabs, file-folder tabs, full-chip status colors, and constantly changing primary labels are non-conforming implementations.
+
+### Window chrome (integrated title-bar controls)
+
+The chip row and global actions occupy one integrated top band rather than a
+detached shelf. On Windows and Linux, the window disables native decorations
+(`app/festerm/src/main.rs`, `ViewportBuilder::with_decorations(false)`) and
+renders custom minimize/maximize/close controls in that band. On macOS,
+eframe's full-size content view keeps the native close/minimize/zoom traffic
+lights on the left over the integrated chip band; the application reserves
+their hit-test area, offsets them to the chip row's centered baseline, and
+does not render duplicate right-side controls.
+Implementation (`crates/festerm-ui-egui/src/chrome.rs::show`):
+
+- On Windows and Linux, the trailing icon block (right-to-left: close, maximize/restore, minimize, More actions, command palette) is painted in the same row as the chips through the semantic first-party [`Icon`](icon-system.md) layer. Each window-control icon calls `ui.ctx().send_viewport_cmd(ViewportCommand::Close/Maximized/Minimized)` directly rather than going through `ChromeAction`/`AppCommand`, since these are OS-window-level actions with no application-state implications.
+- The maximize/restore icon reads the viewport's real current state (`ui.input(|i| i.viewport().maximized)`) and paints a single square (maximize) or two overlapping squares (restore) accordingly, so the icon's own shape communicates state rather than a text label.
+- A background drag-to-move region is registered across the row's own compact content band (not the full remaining panel height, which - before any content is laid out - would otherwise swallow pointer events meant for the terminal view painted below) *before* the chips/icons are added, so those widgets' own click handling still takes priority over this catch-all background sense wherever they visually sit on top of it. Starting a primary-button drag on that background sends `ViewportCommand::StartDrag`; double-clicking it toggles `ViewportCommand::Maximized`.
+- `TRAILING_CONTROLS_RESERVED_WIDTH` accounts for platform-specific trailing icons so the chip row never overlaps them, extending the existing narrow-window overlap fix.
+
+### Tab anatomy
+
+A session tab conceptually contains:
+
+```text
+[session icon + status badge] [primary identity] [close]
+                             [secondary title or state]
+```
+
+Not every element must be visible at every density. The primary identity and active state take precedence.
+
+The semantic session-type icon renders at 16 px. A separate 6–7 px corner
+badge carries lifecycle/connection state without consuming another horizontal
+slot or tinting the icon or chip. The icon identifies durable type; the badge
+identifies transient state. The accessible chip name exposes both. The close
+control appears only on the active chip.
+
+### Identity precedence
+
+The primary tab label should follow this order:
+
+1. User-assigned tab name.
+2. Profile or connection name.
+3. Remote host alias for SSH.
+4. Local shell name or session type.
+5. Generic fallback such as `Local Shell` or `SSH Session`.
+
+The terminal-provided dynamic title must not replace the primary identity.
+The profile default, explicit logical-view alias, and durable attachment identity
+are separate values; naming a chip never changes the attachment target.
+
+### Dynamic terminal title
+
+A terminal-provided title may appear as secondary metadata when space permits, for example:
+
+```text
+production-db — nvim server.rs
+```
+
+The stable identity remains first. In compact layouts, the secondary title should be omitted before truncating the primary identity beyond usefulness.
+
+Inactive chips retain their secondary line when space permits because it helps
+distinguish similar sessions, but it remains visually quiet and disappears
+before stable identity, session type, or state. The secondary line follows
+this precedence:
+
+1. Actionable exception: host-key verification, authentication required,
+   disconnected, or failed to start.
+2. Transitional state: starting or reconnecting.
+3. Completed state: exited, including a known exit code.
+4. Otherwise, the sanitized terminal-provided title when nonempty and
+   meaningfully different from the primary identity.
+
+Terminal titles are untrusted protocol output. Strip control characters,
+normalize to one line, bound retained/displayed length, and coalesce rapid
+changes. A title cannot replace stable identity, impersonate state, or
+automatically become a profile/workspace name, notification, window title, or
+diagnostic field. A compact chip may reduce a path-like title to its useful
+final component while the inspector exposes the bounded sanitized value.
+
+Working directory requires an explicitly supported metadata protocol such as
+OSC 7 with strict URI and host validation; never parse prompts, titles, or
+process-list guesses. A local file URI may identify a client path. An SSH path
+remains remote metadata and is never opened through the local OS. Runtime
+directories are private in screenshots, notifications, copied diagnostics,
+and workspace metadata and are not persisted as though they were a profile's
+reliable initial directory. Relative terminal paths stay disabled unless the
+session itself reports a trustworthy current directory (for example a text-mode
+SFTP session's own cwd); launch-profile directories and guessed shell prompts
+do not count.
+
+### Session-type identity
+
+Icons may help distinguish local shell, SSH, serial, launcher, settings, or
+other future session types. Icons should aid recognition rather than decorate
+every control.
+
+The repository-owned source set and its semantic Rust names are defined in [Icon System](icon-system.md). Assets are monochrome and receive semantic color from UI code; status remains a separate accessible indicator instead of tinting the entire session icon or chip.
+
+Remote operating-system icons may be shown when reliable metadata is available, but the UI must always use `SshRemote` as a coherent generic remote-host identity. OS detection must not be required, and branded OS logos are outside the first-party set.
+
+### Icon systems and usage
+
+fesTerm has three related but deliberately distinct icon treatments:
+
+| System | Source and use | Color and sizing contract |
+| --- | --- | --- |
+| Application icon | The branded launch asset in [`assets/app-icon`](../assets/app-icon), used by the executable, installer, dock, taskbar, application switcher, and store/package metadata. The `AppMark` may also identify fesTerm in an About surface. | A fixed graphite, white, and cyan composition with platform-sized raster exports. It is not recolored by the application theme and is not used as a generic terminal or command icon. |
+| Semantic UI icons | The canonical first-party SVGs in [`assets/icons/source`](../assets/icons/source), requested by semantic Rust name rather than file path. They identify session types, actions, settings categories, connection/trust concepts, and window controls. | Monochrome `currentColor`, drawn on a 24 px source grid with a nominal 1.75 px stroke. Render at 16 px for compact chrome and 20 px where the surface has more room, normally inside a hit target of at least 24 × 24 logical px. |
+| Status indicators | A compact badge on the semantic session icon plus an accessible state label in chips; a small dot plus label in the status bar. Warning, error, authentication, and host-key icons may supplement a larger message where their shapes add meaning. | State colors come from the semantic `status.*` roles. Badges/dots remain separate from the neutral session-type icon and never tint the whole chip. Shape, text, or an accessible name must carry the state when color cannot. |
+
+Painter-drawn controls in the current egui chrome are a rendering technique,
+not a fourth icon set. They may migrate incrementally to the semantic SVG asset
+layer, but their geometry and naming must converge on the canonical source
+set. Platform-native controls remain native: macOS uses its traffic lights;
+Windows and Linux use fesTerm's `Minimize`, `Maximize`/`Restore`, and `Close`
+forms.
+
+Use the semantic name that describes the action or object, never the icon's
+location or construction. The main mappings are:
+
+| Surface | Semantic icons |
+| --- | --- |
+| Session chips and launcher | `LocalTerminal`, `SshRemote`, `FileTransfer`, `Serial`, `NewSession`, `Settings`, `Workspace`, `Profile`, `SavedProfiles`, `RunningSessions`, `Proceed`, `NewProfile`, `SortOrder`, `Reattach`, `SectionExpanded`, `SectionCollapsed` |
+| Upper chrome | `NewSession`, `CommandPalette`, `SessionInspector`, `Overflow`; reserve `Search` for literal search/filter UI rather than the command-palette trigger |
+| Window controls | `Close`, `Minimize`, and state-dependent `Maximize` or `Restore` on Windows/Linux; native traffic lights on macOS |
+| Connection and trust UI | `Reconnect`, `Disconnect`, `AuthRequired`, `HostKeyVerification`, `Warning`, `Error` |
+| Terminal and diagnostics actions | `Copy`, `Paste`, `Clear`, `Diagnostics` |
+| Settings categories | `KeyboardShortcuts`, `ThemeAppearance`, `TypographyFont`, `SecretStorage` |
+
+An icon-only action owns a localized accessible label and matching hover text;
+the SVG itself carries no fixed title because its meaning depends on the use
+site. Decorative icons next to complete visible text are hidden from the
+accessibility tree. See [Icon System](icon-system.md) for the full inventory,
+source rules, validation pipeline, and proposed Rust-facing `Icon` API.
+
+### Connection states
+
+The visual state vocabulary should include at least:
+
+- connected, running, or open as appropriate to the transport;
+- starting;
+- reconnecting;
+- disconnected;
+- authentication required;
+- failed; and
+- exited.
+
+State indicators should be compact, accessible, and not rely on color alone.
+
+### Active and inactive tabs
+
+The active tab must remain immediately distinguishable in the shipped dark
+theme and every future validated theme variant. Inactive tabs should be
+readable without competing visually with the active terminal. The application
+defaults to the blue-graphite semantic palette in
+`crates/festerm-ui-egui/src/theme.rs`, applied to egui in
+`app/festerm/src/app.rs`. Chrome uses those same roles explicitly rather than
+asking generic widget-state helpers such as `strong_text_color()` to decide
+static chip identity; those helpers describe momentary button interaction, not
+the chip hierarchy.
+
+- `CHIP_ACTIVE_OUTLINE` maps to `border.active`; the active chip and its close control share this cool light outline.
+- `CHIP_INACTIVE_OUTLINE` maps to `border.subtle`; inactive chips, the New Session control, and drag preview share it.
+- `CHIP_ACTIVE_FILL` maps to `surface.tab.active`, a restrained step above the inactive chip and shared window well. The active outline remains the stronger selection cue. The same quiet fill is the hover treatment for inactive chips and New Session.
+- `CHIP_INACTIVE_FILL` maps to `surface.tab.inactive`.
+- `CHIP_PRIMARY_TEXT` and `CHIP_SECONDARY_TEXT` map to `text.primary` and `text.secondary`.
+- `CHROME_ICON_COLOR` / `CHROME_ICON_COLOR_HOVERED` map to `text.secondary` / `text.primary`.
+- `CHROME_CLOSE_HOVER` maps to `status.error`.
+
+All chips sit on top of the terminal viewport's own near-black chrome-band
+background (`crates/festerm-ui-egui/src/lib.rs`'s `DEFAULT_BACKGROUND`, mapped
+to `surface.terminal`); against that shared dark surface, the
+active/selected chip is indicated by both its brighter `CHIP_ACTIVE_OUTLINE`
+border *and* its own lighter `CHIP_ACTIVE_FILL` fill — not by outline alone,
+and not by a saturated accent color or by highlighting the label text.
+Hovering an *inactive* chip, or the `+` new-chip button, previews that same
+`CHIP_ACTIVE_FILL` fill without changing its outline color at all: the
+outline stays fixed (`CHIP_INACTIVE_OUTLINE`) regardless of hover state, so
+hover and selection read as two different, non-conflicting signals — a
+consistent hover language shared by every chip-shaped control in the row
+(`paint_chip`'s `hovered` parameter and `paint_new_chip_button`, both in
+`crates/festerm-ui-egui/src/chrome.rs`).
+
+The top chrome band and terminal well intentionally share this exact surface
+color. There is no additional color border or separator between them. The
+chrome consumes only its 8px top inset plus the 34px chip row; the terminal's
+own 8px top margin is the single shared breathing space below the chips. This
+coalesces what would otherwise be two adjacent 8px gaps and reduces the real
+top stack from 50px to 42px without moving the terminal grid toward the chips.
+
+Every chip, active or not, is drawn with a visible border: the active chip's border is `CHIP_ACTIVE_OUTLINE` (1.5px) and inactive chips use `CHIP_INACTIVE_OUTLINE` (1.0px), so the distinction reads clearly without color being the only cue. Each chip is two lines and left-aligned. The approved target places a 16 px semantic session icon with its compact state badge before the stable identity; the second, smaller and muted line holds state text or terminal-provided metadata, indented under the primary label. The current implementation still reserves that leading strip for a standalone 8 px status dot and should migrate to the icon-plus-badge arrangement after semantic icon rendering lands. The close control, shown only on the active chip (never on inactive chips, even on hover), is positioned from the chip's own outer corner — evenly inset from the top and right edges — rather than flowing through the label's layout, so its position stays fixed and the label never shifts to accommodate it. Opening a new Launcher tab is done exclusively through the compact icon-only "New tab" control at the end of the chip row (`AGENTS.md`: no duplicate widget-specific copies of the same operation) — an earlier full chip-styled "+ Launcher" button duplicated this control and was removed as redundant.
+
+Chips without a secondary line (an open Launcher-type tab, which has no secondary terminal metadata) claim the chip's full footprint (`ui.set_min_size(outer_rect.size())`) before laying out their top-down content, rather than letting the shrink-wrapped one-line content block get vertically centered by the surrounding chip-row layout; without this, a one-line chip would render with visibly larger top/bottom padding than its two-line neighbors even though every chip in the row shares the same height (`CHIP_HEIGHT_FULL` when session details are shown, or the shorter `CHIP_HEIGHT_COMPACT` once that preference is off - see "Show session details in chips").
+
+The chip row is scoped to its own narrower top-aligned sub-layout (`Layout::left_to_right(Align::Min)`), rather than the *whole* top-level chrome row switching to `Align::Min`: an `Align::Min` layout at the very top level was tried and reverted, because it handed the full remaining panel height down to the trailing icon controls' own nested `Align::Center` sub-layout, centering the icons roughly mid-window instead of near the top and (in the real app, where the terminal view is painted immediately after the chrome row in the same `Ui`) starving the terminal view of any remaining vertical space. Only the outermost row keeps plain `Align::Center` (`ui.horizontal`); scoping `Align::Min` to just the chip-row sub-block fixes its top-alignment without that regression (`crates/festerm-ui-egui/src/chrome.rs`'s `chrome_row_stays_a_compact_band_even_with_a_tall_available_area` test guards this).
+
+Until that migration, the current status dot is allocated at the primary label's own text-line height (via `Ui::text_style_height`), not just its own diameter, so the row's `Align::Center` computes one shared center line for both the dot and the label text. The primary row has a one-pixel optical downward adjustment. That pixel is taken from the gap below the primary row, so the smaller secondary line retains its existing position.
+
+### Tab overflow and wrapping
+
+The default is a single row that behaves like a browser tab strip but keeps
+fesTerm's independent-chip visual treatment. Optional wrapping remains
+available for users who value simultaneous session visibility more than
+terminal height.
+
+The single-row behavior has three visually distinct horizontal states.
+Each mockup shows the same state in both approved vertical densities:
+**full-height 34 px chips** with primary and secondary lines, and
+**compact-height 28 px chips** with one line. The horizontal allocation policy
+does not change when the vertical-density preference changes: the focused chip
+keeps its normal width for that density, inactive chips compact first, and
+scrolling remains the last resort.
+
+![Roomy chip row: all chips at natural width](images/gui-mockups/chip-overflow-roomy.png)
+
+![Crowded chip row: focused chip remains normal while inactive chips compact](images/gui-mockups/chip-overflow-compacted.png)
+
+![Overflowing chip row: scrolling begins after inactive chips reach minimum](images/gui-mockups/chip-overflow-scrolling.png)
+
+Editable sources live beside the other reviewed mockups in
+`images/gui-mockups/source/`.
+
+#### Single-row allocation contract
+
+The **focused chip is the protected anchor**. At every supported window width,
+it keeps its normal chip width, including its type icon, state badge, stable
+primary identity, and active-only Close control. Crowding is absorbed by
+inactive chips before scrolling is introduced; the focused chip does not join
+a uniform proportional shrink.
+
+This contract applies independently to both vertical-density modes. Full-height
+chips are 34 px tall and may show two lines. Compact-height chips are 28 px tall
+and show one line, with active detail relocated according to the compact-chrome
+rules. Density may change measured natural text width, but it must not change
+the allocation order, permit the focused chip to shrink, or enable scrolling
+before inactive chips reach minimum width.
+
+For each layout pass:
+
+1. Reserve New Session, required platform window controls, inter-chip spacing,
+   and any global actions that have not already collapsed into overflow. The
+   remaining width is the chip-strip budget.
+2. Measure the focused chip at its ordinary natural width, capped only by the
+   normal maximum-width rule. Reserve that width first.
+3. Give each inactive chip its natural width when the remaining budget permits.
+4. When there is a shortage, remove or truncate inactive secondary metadata,
+   then distribute the shortage across **inactive chips only**. Use a
+   water-filling/equalized allocation so no inactive chip is pushed below its
+   minimum while another remains unnecessarily wide.
+5. If the focused width plus every inactive minimum, required gaps, and fixed
+   controls still exceed the row budget, keep the focused chip at normal width,
+   keep inactive chips at their minimums, and enable horizontal scrolling.
+6. On activation, expand the newly focused chip to normal width, allow the
+   previously focused chip to enter the inactive compaction pool, and adjust
+   the scroll offset so the new focused chip is fully visible. Widths are
+   derived from the current layout; a compacted width must not become a chip's
+   cached natural width.
+
+In formula form, scrolling begins only when:
+
+```text
+focused_normal_width
++ sum(inactive_minimum_widths)
++ required_gaps
+> chip_strip_budget
+```
+
+Before that threshold, the row compacts inactive chips and does not scroll.
+After that threshold, the focused chip remains fully visible and normal-sized
+while minimum-width inactive chips may move offscreen. Wheel/trackpad input over
+the row scrolls horizontally, dragging near an edge auto-scrolls during
+reorder, and activating, creating, restoring, or keyboard-switching to a
+surface reveals its focused chip completely.
+
+The following are non-conforming:
+
+- immediately enabling a horizontal scroll area while inactive chips are still
+  wider than their minimums;
+- shrinking focused and inactive chips together by one proportional scale;
+- shrinking the focused chip merely to postpone scrolling;
+- permanently caching a forced compact width as a chip's natural width; or
+- allowing a newly focused chip to remain clipped or compacted.
+
+Current implementation: `allocate_single_row_widths` (`crates/festerm-ui-egui/src/chrome.rs`)
+protects the focused chip's normal width and applies water-filling shortage
+distribution to inactive chips only, satisfying this contract; regression
+tests cover the natural-fit, inactive-only-compaction, minimum-width-scrolling,
+focus-change, and grow-back-after-close cases described above.
+
+The design remains usable with many sessions through:
+
+- stable minimum-width inactive chips and sensible ellipsis;
+- the compact-then-scroll single-row sequence above;
+- an optional multi-row wrapped-chip mode for wide displays;
+- keyboard switching in predictable logical order independent of wrapping or
+  scroll position;
+- the command palette as the searchable session switcher keyed primarily by
+  stable identity; and
+- graceful narrow-window collapse without merging chips into a connected strip.
+
+Chips clip overflowing text with an ellipsis rather than growing without bound.
+Where a terminal-provided title looks path-like, the secondary display may use
+its final path component; this is purely display reduction and never mutates
+the retained title.
+
+The chip row and trailing controls share one horizontal band. The chip-strip
+budget must account for platform-specific trailing controls rather than
+rendering beneath them. Less-used terminal actions, starting with Search and
+Focus mode, may move into More actions before the protected focused chip is
+compromised. New Session and required platform controls remain visible.
+
+Full chip text remains available through accessible naming and hover help.
+Duplicate visible names are allowed and never receive fabricated numeric
+suffixes. The overflow menu remains an application-action menu, not a duplicate
+hidden-tab list.
+
+Wrapping adds complete 34 px rows plus normal spacing and genuinely resizes the
+terminal viewport; it never floats over terminal content. The focused-chip
+priority still applies within presentation, but wrapping is a distinct explicit
+preference and must not be used as an automatic substitute for the default
+single-row compact-then-scroll behavior.
+
+#### Required compaction validation
+
+Structural tests must drive exact row budgets and prove all of the following:
+
+- all chips use natural widths when they fit;
+- reducing width changes inactive chip widths while focused width remains
+  exactly its normal width;
+- inactive chips reach their minimum before horizontal overflow becomes true;
+- crossing the threshold enables scrolling without changing focused width;
+- switching focus expands the new focused chip, releases the old one for
+  compaction, and reveals the new focused chip completely;
+- closing chips allows remaining inactive chips to grow back toward natural
+  widths; and
+- long or rapidly changing untrusted titles cannot alter the allocation order
+  or overlap fixed chrome controls.
+
+Rendered review should compare the three states above at the same scale in
+both 34 px full-height and 28 px compact-height modes. In each density,
+compaction must be visibly established before any scroll affordance appears,
+and switching density must not change the focused-chip-first priority.
+
+## Session Creation Workflow
+
+### Local session
+
+The launcher should allow users to:
+
+- open the platform default local profile;
+- choose a saved local profile; and
+- access additional options without requiring them for the common path.
+
+Create the chip and viewport immediately in `Starting` state. Fast startup
+needs no modal spinner; after a short visual threshold, a restrained
+`Starting local session…` message with Cancel may overlay the viewport. Output
+received during startup renders immediately, switching tabs does not cancel,
+and Cancel uses the bounded backend lifecycle.
+
+Failure before a process lifecycle is established is `Failed`, keeps stable
+identity, and offers Details plus Close Session without leaking executable
+paths or raw OS errors in the concise message. A successfully started process
+that later ends is `Exited` regardless of exit code. Show a known code as
+secondary state, but do not call nonzero exit a fesTerm failure. Preserve the
+approved read-only history, never auto-close, and expose Relaunch only when a
+real command can create a fresh generation.
+
+### SSH session creation
+
+![SSH destination-entry target](images/gui-mockups/ssh-destination.png)
+
+SSH is a first-class session type, not a local shell command presented as an
+application feature. A one-off connection proceeds through focused stages in
+the same launcher tab:
+
+```text
+Destination -> Host-key verification, when required
+            -> Authentication, when required
+            -> Running terminal
+```
+
+The Destination screen collects only host, port, and username. Host and
+username are required unless supplied by a real profile; port defaults to 22
+but remains explicit and editable. Terminal dimensions and `TERM` do not
+belong in this form because the viewport and session layer own them. Continue
+starts connection work asynchronously; validation stays beside the relevant
+field, and Back returns to the launcher without creating another chip.
+
+Authentication credentials are requested only after host identity has been
+accepted. This avoids retaining a password while the user decides whether to
+trust an unknown host and leaves room for future agent, key, and
+keyboard-interactive methods without redesigning destination entry.
+
+Once connected, SSH differs from a local terminal only where useful: it uses
+the generic `SshRemote` icon, `Connected` state language, and `Remote` locality.
+Username, host, port, cipher, latency, and key algorithm belong in the session
+inspector rather than permanent chrome. A user rename changes only stable
+display identity, never the destination or profile.
+
+Native SSH receive loops keep the existing 10 ms command-poll deadline across
+incoming messages. Due control work runs before another receive or liveness
+probe, and a shutdown request is eligible immediately at the next loop entry.
+This applies while waiting for channel replies, probing a persistence provider,
+and running the shell; continuous output cannot require an idle gap before
+input, resize, or shutdown progresses. Network operations and teardown retain
+their existing bounds; 10 ms is a control cadence, not a whole-worker exit
+guarantee.
+
+Selecting SFTP reuses the same destination-entry, host-key verification, and
+authentication sequence, but the resulting running surface is a terminal-style
+text-mode SFTP REPL rather than a remote shell. The supported command set is
+exactly `help`, `pwd`, `lpwd`, `cd`, `lcd`, `ls`, `mkdir`, `rmdir`, `rm`,
+`rename`, `chmod`, `get`, `put`, `quit`, and `exit`. Output is formatted into
+the ordinary terminal transcript, and restored workspace SFTP tabs come back
+as authentication-required placeholders instead of auto-reconnecting.
+
+Live SSH port forwarding is managed from a session-scoped **Port Forward
+Manager** overlay rather than the launcher or profile editor. It is available
+only while an authenticated SSH shell session is connected, opens from its
+dedicated shortcut or the command palette, and lists the live runtime snapshot:
+direction, bind, destination, source (`Profile` or `Ephemeral`), and
+active/failed state. Adding a forward here always targets only the current live
+session; it never rewrites the saved profile. Disconnecting clears the live
+runtime list, and reconnect does not silently restore prior ephemeral state.
+
+Each live SSH session admits at most 128 combined saved-profile and ephemeral
+mappings. Pending additions reserve a slot; active and failed rows keep theirs
+until explicitly removed. A full inventory refuses the new addition with a
+visible explanation and preserves the draft, rather than retiring failures or
+evicting a working tunnel. Removing a row makes room after its forwarding owner
+stops. A profile requesting more than 128 mappings is rejected before launch;
+this does not change the configuration schema or truncate saved metadata. The
+The same factual refusal appears for stored-credential and credential-free
+saved-profile launches. Removing and re-adding a bind does not reroute already
+queued connections to its replacement destination. The
+independent 32-in-flight forwarded-connection limit is unchanged.
+
+### Serial session creation
+
+![Serial connection form target](images/gui-mockups/serial-connection.png)
+
+Serial is a first-class session transport, not a local-shell option and not an
+SSH variant. Selecting it moves the same Launcher chip to one focused form:
+
+```text
+Serial device
+  Device       [ discovered device or explicit system identifier ]
+  Baud rate    [ 115200 ]
+  Data bits    [ 8 ]
+  Parity       [ None ]
+  Stop bits    [ 1 ]
+  Flow control [ None ]
+
+  Back                                      Open
+```
+
+Device is required. The picker refreshes discoverable ports and may show a
+friendly OS-supplied description, but it always exposes the exact system
+identifier (`COM3`, `/dev/ttyUSB0`, `/dev/cu.*`, or the platform equivalent)
+needed to distinguish devices. An explicit identifier remains possible when
+enumeration is incomplete. The initial line defaults are 115200 baud, 8 data
+bits, no parity, 1 stop bit, and no flow control; they are editable choices,
+not claims about the attached hardware. Baud accepts supported common values
+and a validated positive custom value. Data bits, parity, stop bits, and
+software/hardware flow-control choices appear only where the backend supports
+them.
+
+Open creates the chip and terminal viewport in an `Opening` state and acquires
+the device asynchronously. A busy, missing, unsupported, or permission-denied
+device produces a concise failure state with Details, Back/Edit Settings, and
+Close Session as applicable; raw OS errors and sensitive paths remain in the
+bounded diagnostic detail rather than the primary message. No probe bytes are
+sent merely to identify the device.
+
+An open serial session uses the semantic `Serial` icon and `Open` state
+language—never `Connected`, which would imply a handshake or responsive peer
+that a byte-stream port cannot prove. The default stable identity may use the
+exact device identifier or a reliable friendly device name. Port identifier,
+line settings, and any reliable hardware metadata belong in the session
+inspector rather than permanent chip text. The status bar may show a sourced
+`Serial · <device>` locality and `Open` state when space permits.
+
+Serial input, output, selection, Copy, Paste, Find, scrollback, exit handling,
+and read-only retained history follow the same terminal contracts as other
+sessions. Terminal grid resizing remains a local renderer fact; fesTerm does
+not claim to notify a serial peer of rows or columns. Closing releases the port
+through the bounded session lifecycle. Reopen is offered only when the backend
+can open the same configured identifier again, and never claims that a reused
+path names the same physical hardware without a reliable stable identity.
+
+Local echo, newline translation, character pacing, break signaling, modem-line
+controls, logging, file transfer, and device flashing are not initial launcher
+options. They require separate explicit behavior rather than silently changing
+the byte stream.
+
+### Host-key verification
+
+![Host-key verification target](images/gui-mockups/host-key-verification.png)
+
+Host-key verification is an in-tab decision that blocks only the affected
+connection, rendered pty-style (selected terminal font, terminal background)
+in place of the terminal view, mimicking `ssh`'s own prompt text rather than
+a dialog. It shows the canonical `host:port`, key algorithm, and full SHA-256
+fingerprint. It does not claim that the host is safe; it asks the user to
+confirm the fingerprint through a trusted source.
+
+For a previously unknown host, the implemented surface
+(`app/festerm/src/app.rs`'s `show_host_key_prompt_ui`) shows `ssh`'s own
+`Are you sure you want to continue connecting (yes/no)? [y/N] ` line with a
+blinking terminal cursor and captures `y`/`n`/`a`/Escape directly from the
+keyboard — no Reject/Accept Once buttons, matching the "feel" of answering a
+real terminal prompt. `y` accepts the connection for this attempt only;
+`a` accepts it and persists the fingerprint non-secretly in configuration
+(ADR 0020), so a future connection to this exact host:port skips the prompt
+entirely, mirroring `ssh`'s own `known_hosts`; `n`/Escape rejects it and
+returns to destination entry with non-secret fields retained.
+
+A changed previously trusted key (`show_changed_host_key_prompt_ui`) is a
+separate high-severity state showing both the previously trusted and
+newly presented fingerprints. It never offers an ordinary Accept Once: the
+only way to proceed is to type the literal word `yes` and press Enter, which
+replaces the stored trust record and continues; Escape, or Enter with
+anything else typed, cancels and returns to destination entry. Typed
+characters are echoed here (unlike the password prompt) since they are not
+secret, and this is a deliberate, visible act. Replacing established trust
+always requires this explicit typed override; there is no plain
+Accept-Once path for a changed key.
+Switching tabs remains allowed while either decision is pending; closing the
+chip cancels the attempt. Keyboard focus begins on the safe rejection/cancel
+action rather than acceptance.
+
+### Authentication
+
+![SSH authentication target](images/gui-mockups/ssh-authentication.png)
+
+Authentication remains in the same connection tab and displays the confirmed
+`username@host` target. It shows only methods that are genuinely available.
+For password authentication:
+
+- the password is masked, transient, and cleared after every submission,
+  successful or failed;
+- it never enters a profile, workspace, log, diagnostic, or ordinary config;
+- Connect is unavailable when the field is empty, and Enter submits;
+- Escape clears a nonempty password before a subsequent Escape returns to
+  destination entry;
+- an in-progress attempt exposes Cancel and does not accept duplicate submits;
+- failure remains on this surface with a concise correction prompt; and
+- an existing saved SSH profile may offer an explicit **Remember this password
+  in native secure storage** control and a separate **Use stored password**
+  action. One-off forms remain transient; private keys, passphrases, agents,
+  key files, and host trust are never included in this control.
+
+For private-key and certificate authentication:
+
+- the OpenSSH private key remains transient and is cleared after every
+  submission attempt;
+- encrypted keys require an explicit transient passphrase, while unencrypted
+  keys reject a stray passphrase;
+- certificate authentication adds a second transient multiline field for the
+  signed OpenSSH `-cert.pub` text paired with that private key; and
+- saved profiles still store only password or private-key credentials in
+  native secure storage, so certificate entry remains a one-off quick-connect
+  capability rather than a persisted profile field.
+
+### Profile editing
+
+![Profile editor target](images/gui-mockups/profile-editor.png)
+
+Profile creation and editing is separate from the immediate launch path. The
+common case requires one selection or a small amount of connection information,
+not completion of a large settings form.
+
+A profile is a persisted, reusable launch definition, never a running session
+or terminal-history container. Its name becomes the default stable chip
+identity. Renaming a running chip does not rename its profile; editing a
+profile does not mutate existing sessions. Launching uses a validated snapshot
+of the current definition.
+
+Local profiles contain name, executable, arguments, initial directory, and an
+initially-off durable local-session option. Enabling it selects the local
+`festerm-sessiond`, `tmux`, or GNU Screen provider plus a validated session
+name; it affects only future launches of that saved profile. The built-in
+**Local Shell** has no persistence control and always starts a fresh plain
+shell unless the user later resumes an already-running `festerm-sessiond`
+session from the Launcher. On Windows, each native persistent-session daemon
+allows at most 16 waiting attachment connections. Excess new connections
+close and report a retryable recovery disconnect without displacing the active
+client. This is not a limit on open terminals; command input/resize
+backpressure remains separate.
+
+Installed desktop builds add a default-off **Expose via Dev Tunnel** checkbox
+only for Local profiles using the native daemon. This explicit opt-in is the
+exception to metadata-only profile Save: saving can start the exact configured
+command and publish it without opening a local tab. The explanation identifies
+remote takeover, independent service lifetime and the absence of file/observation
+grants. Starting, sign-in, readiness and cleanup are distinct states; only
+verified ready hosts offer connection details. Browser sign-in is foreground
+and cancellable, never an invisible startup prompt.
+
+Disable/Save, provider removal and profile deletion revoke exposure before the
+config write, retain the shell and track pending cloud cleanup even when the
+profile no longer exists. Profiles lists that protected local cleanup with
+sign-in/Retry actions. Renaming retains ownership and the durable session name;
+duplication clears the hosting grant. Retry cannot authorize another shell or
+cloud object; separate confirmed actions explain each. See ADR 0072 and
+`TUNNEL-15`/`TUNNEL-16` for the lifecycle and failure contract.
+
+Local executable and initial-directory fields share
+bounded filesystem-backed completion. That completion is asynchronous: it
+caches exact prior queries, performs slow filesystem scans off the UI thread,
+admits at most one running scan plus the latest pending query, rejects stale
+results when typing moves on, and caps candidate memory while preserving sorted
+absolute-path suggestions for click selection. Suggestions and search feedback
+appear in a popup anchored to the field, never in the form's layout: arrival,
+dismissal, and focus changes must not move Save or other form controls underneath
+a pointer click. SSH profiles contain name, host, port, username,
+stored-password/private-key reference state, saved port-forward mappings, and an authentication
+preference. Serial profiles contain name, exact device
+identifier, baud rate, data bits, parity, stop bits, and flow control. Profiles
+never contain passwords, private-key contents, terminal output, scrollback, or
+diagnostics. Authentication may
+reference a supported agent, key location, or secure-storage record without
+storing the secret itself. Only available authentication choices appear.
+Terminal dimensions and inferred remote platform do not belong in profiles.
+
+The ADR 0053 experiment, included in default desktop builds, adds a peer **Dev Tunnel** kind to
+Launcher, Profiles and Inspector, ordered Local Shell, SSH, Dev Tunnel, then SFTP,
+Serial and Markdown, and marked with the `DevTunnel` tunnel icon rather than the
+SSH globe. The editor and import screens use the same bordered card, section
+headings and shared action buttons as the other profile editors, and the
+sign-in dialog uses the standard confirmation layout (Secondary Cancel first,
+Accent primary second). The preferred editor reuses the destination
+form's labeled **Name** and **Tunnel** fields, an **Account** selector
+(shared GitHub accounts, or Not signed in), **Add GitHub account**, **Pick from
+my tunnels** (shown once an account is selected, using that account without
+another sign-in), and a single action row of concise **Save**, **Save and
+Connect** and **Cancel** controls, reached from a standard **Back** control
+beside the editor heading. **Save** persists the profile through the
+application command model and, only on success, returns to the profile list
+without connecting or signing in. **Save and Connect** saves the profile,
+signs in first when it has no account, and connects, so nothing has to be saved
+before authenticating. **Cancel** and **Back** return to the list without
+saving or connecting; neither closes the window or ends a session. Advanced
+sits above this action row. Settings lists the shared accounts with how many
+profiles use each, **Sign out** and **Add GitHub account**. Device authorization displays the short code
+as a standard monospace button with a **Copy code and open GitHub** tooltip.
+One explicit activation copies the code and opens the fixed GitHub device URL,
+without advancing sign-in or approving a host. Merely displaying the dialog
+does neither. Name **Microsoft Dev Tunnels** as the application being authorized;
+keep ordinary labels/buttons, bounded progress and content-free errors concise.
+Use the shared viewport-bounded confirmation sizing with a preferred 520-point
+content width for every sign-in stage, rather than shrinking to the code or
+shortest status. Ordinary instructions remain on one line where space allows;
+narrow windows still constrain the dialog to the viewport.
+The SDK-published service GitHub App is included in default builds; no
+per-user app registration is required. An explicitly empty, invalid or different
+build override reports unavailable setup, not another app's consent flow.
+Legacy/unbound native-vault identities request a new explicit sign-in, not
+silent migration or cross-application refresh. Live native acceptance remains
+tracked in [#429](https://github.com/fes/fesTerm/issues/429).
+The verified account and host fingerprint require Cancel-default approval on
+first use/account change or changed host. Profiles using the same account share its
+identity/refresh reference; each profile has its own scoped-connect reference;
+there is no global current account.
+Rotation preserves live launch bindings; duplication or changing the tunnel
+clears bindings. **Save** persists the profile through the composition root and
+returns to the profile list only once the write succeeds, keeping the draft and
+an actionable error on failure; it never connects or signs in. **Save and
+Connect** runs the explicit save/authenticate/connect flow. **Cancel**/**Back**
+discard staged edits through standard editor navigation without saving or
+connecting. Advanced retains legacy destination-file/token input and a **Store
+token** action for the scoped connect credential; one-off transient attaches
+live on the New Session **Connect once** surface, not in the profile editor.
+Inventory/create/takeover/terminate and filesystem writes are unavailable.
+**Paste setup JSON** opens a bounded public-metadata input followed by
+**Preview**. Show the tunnel/server and host fingerprint, require explicit
+confirmation and **Save imported profile**, then return to the editor without
+connecting or signing in. Import rejects credentials, credential references,
+unknown fields, unsafe URLs and invalid host/generation bindings; invalid raw
+input never enters diagnostics or configuration. Save uses the application
+command model to publish managed metadata and a new credential-free profile
+transactionally; name collisions refuse, and Cancel discards the staged blob.
+Authentication and first/changed-host approval remain separate.
+Inspector shows the account captured by that launch, never the profile's later
+current account. GitHub principal metadata is not presented as the remote OS user.
+
+Multi-field edits are staged behind Save; Cancel discards them and validation
+stays beside the relevant field. Delete requires confirmation and reports
+workspace references. Duplicate creates a distinct profile with an editable
+name. OpenSSH import, if implemented, is a separate explicit operation and
+does not imply continued synchronization. Recent one-off destinations are not
+silently converted into profiles.
+
+A standalone **Profiles** surface (a singleton chip, opened from More actions'
+"Open Profiles" button, mirroring Settings) lists every saved profile in the
+same Name / Type / Host / Path / Last Used table the Launcher uses, above a
+"Search profiles..." field that narrows the list by name, kind, host and
+path. A single accent "+ New Profile" dropdown offers every creatable kind --
+local, SSH, SFTP, and serial when serial support is available -- in place of
+one button per kind. Each row carries an overflow menu offering Connect, Open
+SFTP, Edit, Duplicate, and Delete. Local editing currently covers
+name/executable/arguments/working directory and explicit local
+`festerm-sessiond`/tmux/screen persistence; SSH editing currently covers
+name/host/port/username, saved local/remote port forwards, stored
+password/private-key replacement and removal, and tmux/screen durable-session
+settings. As in the SSH connect form, a best-effort tmux probe may default a newly
+enabled durable remote session to `tmux` when detected or GNU Screen
+otherwise, but never overrides an explicit provider choice and never treats
+`festerm-sessiond` as a remote option. SSH-agent, key-file-path, and
+OpenSSH-import UI remain future work. A profile's name is also its
+identifier, so it is validated as kebab-case (lowercase letters, digits,
+hyphens); an invalid or empty name/executable surfaces a single inline
+validation message rather than field-specific errors. Delete asks for
+confirmation and, when the profile is still referenced by a saved workspace
+tab, reports the reference count and blocks the deletion (the same
+`UnknownWorkspaceProfileReference` validation workspaces already enforce)
+until the tab is removed or repointed. Rows can be dragged to reorder them;
+the new order persists to configuration immediately and the Launcher's saved
+profiles follow the same order.
+
+## Settings
+
+![Settings surface target](images/gui-mockups/settings.png)
+
+Settings is a singleton application surface represented by its own chip;
+invoking Settings again focuses it. It currently uses compact cards rather
+than a category sidebar, uniformly widthed and shown in this order:
+**Panes**, **Interface**, **Scrolling**, **Terminal typography**, **Quick switch**,
+**SFTP**, and **Keyboard bindings**. Keyboard bindings sits last because its
+searchable action table is the tallest card. Only implemented controls
+appear.
+
+The current **Interface** card groups the persistent chrome/session toggles as
+quiet rows with subtle dividers:
+
+- **Session chip layout** is an exposed two-choice control: **Single scrolling
+  row** (the default, with the explanation that it keeps terminal height
+  stable) or **Wrap to multiple rows** (which exposes more sessions but may
+  reduce terminal rows).
+- **Show session details in chips** is an on/off switch, off by default. It shows
+  the sanitized terminal title or factual launch context under stable session
+  identity. Turning it off makes every session, Launcher, and Settings chip a
+  compact single-line chip. When the status bar is visible, only the active
+  session's secondary value is shown there under the status-bar rules above.
+- **Show status bar** is an on/off switch, on by default, described factually as
+  displaying sourced session state, terminal dimensions, and the active
+  session detail when compact chips require that relocation.
+- **Confirm before closing live sessions** is an on/off switch, off by default.
+  It applies to every live-session close route through the central application
+  policy. Left off, a close takes effect immediately; turning it on asks first.
+  Either way it does not alter bounded backend shutdown or the separate
+  aggregate window/quit policy, which still confirms before ending several
+  sessions at once.
+- **Customize local shell before launch** is an off-by-default switch. When
+  off, choosing Local Shell immediately starts the configured platform shell
+  in the user's home directory. When on, it opens the focused executable,
+  arguments, and working-directory form before launch.
+- **Workspace restore** is an on/off switch, on by default (see
+  "Configuration" below): reopening a previous run's tabs - and the size and
+  position of the windows holding them - is what a terminal holding long-lived
+  work is expected to do. Turning it off starts every run clean and scrubs any
+  tab list already on disk.
+- **Compact New Session layout** is an on-by-default switch that shrinks the
+  Launcher's top launch cards' mark and padding while keeping their
+  descriptions, since a card that only says "SSH" does not tell a new user
+  what activating it will do; the Saved Profiles and Running Sessions panels
+  start higher as a result. The old multi-column saved-profile grid is
+  obsolete because Saved Profiles is now a table; the persisted
+  `compact_launcher_grid` configuration key is retained and repurposed
+  instead of removed so existing configuration files remain valid under
+  strict settings deserialization.
+- Background-session chips always show unread output as a static dot inside
+  a circle, preserving the connection color and existing footprint. The marker
+  schedules no animation repaints, regardless of focus or renderer. Activating
+  the tab clears it. There is no unread-output setting; older saved
+  `pulse_new_output_dot` booleans are accepted but ignored and not saved again.
+- **Resume unattached local sessions from New Session** is an on-by-default
+  switch that surfaces locally running, unattached `festerm-sessiond`
+  sessions as one-click Resume entries in the Launcher.
+
+The separate **Scrolling** card exposes a four-choice **Scrollback limit**
+control (`Disabled`, `16 MiB`, `64 MiB`, or `256 MiB`) and a five-step
+**Scroll speed** clickstop (`Very slow` through `Very fast`). The limit is a
+retained-history payload budget for sessions created after the setting changes;
+existing sessions keep their current budget. Scroll speed scales wheel/trackpad
+history motion relative to the original fixed mapping. It governs a
+mouse-reporting application's scrolling the same way: a full-screen program
+that captures the wheel is sent one wheel report per row the same gesture
+would have moved fesTerm's own scrollback, so a trackpad's stream of
+pixel-sized events is not reported as a full notch each, and the preference
+is not silently bypassed by the programs a user is most likely to scroll.
+
+The **Markdown images** card exposes **Image memory budget**: 64, 128, 256,
+512 (default), 1024 or 2048 MiB, without an unlimited option. The managed
+allowance applies immediately across windows, viewers and saved-local editor
+Preview; it preserves admitted images when lowered and explains that new loads
+are blocked while usage exceeds the limit. Four actual manual/automatic image
+workers share the same application quota. The choice autosaves; a failed save
+reports failure but preserves the live choice without broadcasting an unsaved
+configuration. Reset restores 512 MiB without evicting existing images.
+This allowance excludes decoder-private/native-GPU allocations and is not a
+process-RAM cap (ADR 0030).
+
+The **Terminal typography** card exposes the terminal-family selector plus the
+default-on ligature toggle. JetBrains Mono is embedded; other families download
+automatically on selection or restoration of a saved preference after upgrade.
+While preparing or unavailable, use an explicitly temporary JetBrains fallback
+without changing that preference. Show progress/failure here and above tab
+content, with an explicit **Retry font download** control on failure. Verified
+cached faces work offline. See ADR 0049 for release, privacy, and cache policy.
+The effective family and atlas generation belong to the shared egui context,
+not an individual window. A successful window therefore wins over a sibling
+that is still pending or has failed, and every terminal keeps painting while
+adopting that shared installation.
+The **Quick switch** card currently
+exposes the on-by-default quick-switch-number overlay preference; it no
+longer restates the Command palette/Open Settings chords the **Keyboard
+bindings** card below owns, so a customized binding is never shown twice with
+two different values.
+The **SFTP** card exposes the optional default local starting directory for new
+SFTP tabs. It saves immediately like the other Settings rows, stores any
+non-empty control-character-free path string without parse-time existence
+checks, applies only to future SFTP sessions, and is still overridable per
+session with `lcd`.
+
+The two layout choices remain visible rather than hiding a binary decision in a
+selector. Reversible settings apply immediately and save automatically as they
+change; Reset appears beside a changed setting at the narrowest useful scope.
+
+There is no separate **Configuration** card in Settings. Workspace
+persistence itself remains the explicit off-by-default **Workspace restore**
+toggle: unlike chip layout, status bar, and session-detail visibility (all of
+which apply and save immediately with no opt-in), resurrecting a previous
+run's open tabs is a bigger behavioral change than a cosmetic preference, so
+it stays off until the user turns it on. While off, fesTerm always starts at
+the Launcher and neither reads nor writes the open tab list, its order, or
+the active tab - any workspace snapshot left over from an earlier run (or an
+older fesTerm build that always persisted it) is dropped rather than silently
+resurfacing. Turning the toggle off also scrubs any already-saved workspace
+from disk immediately, so re-enabling it later starts clean instead of
+resurrecting a forgotten snapshot. Once turned on, workspace state (the open
+tab list, its order, the active tab, and each window's size and position)
+saves and restores automatically: every tab-list mutation (opening, closing,
+reordering, or activating a tab) triggers a write-through save on the next
+frame, and moving or resizing a window saves the new geometry once the window
+has settled - a window closing writes a resize that the settling delay is
+still holding. A restored window reopens at its saved size and position, and
+a platform that refuses to report a window's own geometry simply opens at the
+default size wherever it puts it. This is all part of the same opt-in: with
+Workspace restore off, no window geometry is written or read either. These
+write-through saves mirror how interface settings and profile CRUD already
+save immediately on every change. There is
+no manual **Reload configuration** or **Save workspace** action for the user
+to remember to invoke, and Settings does not describe persistence with
+reload/save language; ADR 0015 owns the startup contract that this automatic
+behavior relies on. No file watching, configuration editor, or
+credential-storage control is implied.
+
+There is still no category sidebar or general settings search. The
+**Keyboard bindings** card provides searchable application actions grouped
+under the scope each one applies in, per-action descriptions, effective and
+default bindings drawn as keycaps, a filter that narrows the catalogue to a
+single scope or to only the customized or unbound actions, assignment and
+unbinding, and individual/all-binding reset. Scope is presentation only: an
+action's context follows from the action itself and is reported with its
+meaning rather than offered as an editable field. Ctrl+Shift+F12 is the fixed
+keyboard recovery route. Widget navigation and terminal protocols are not
+arbitrary remapping targets. Each action's effective chord appears exactly
+once, in this card; the **Quick switch** card keeps only quick-switch-number
+presentation instead of restating chords the editor already owns, so a
+customized binding can never be shown twice with two different values.
+Modifier keycaps use the Command glyph on macOS and spell the remaining
+modifiers out, matching how the palette and chip hints already render chords
+and staying inside the bundled interface face's glyph coverage.
+The action table is not separately scrollable: the Settings page already
+scrolls, and a short nested viewport made the catalogue painful to page
+through. Selecting a row expands its editor in place, directly beneath that
+row, so assigning a binding never means scrolling away from the action being
+changed; choosing another action closes the one already open, and choosing the
+open action again closes it. Each row carries
+a gutter dot and a **Customized** badge when its chord differs from the
+default, so "what have I changed?" is answerable by scanning the list rather
+than by opening each action. Keycaps sit in fixed-width columns counted from
+the right — column zero is the key, and each chord fills leftwards from it —
+measured across every visible row. Anchoring on the key keeps the column
+people actually scan straight down the table while each chord stays one
+contiguous group; reserving a column per modifier instead would make every
+row hold space for modifiers it does not use and split short chords across
+gaps.
+A chord is set either by typing it or by **Record shortcut**, which
+captures the next combination pressed; while capturing, those keys are taken
+by the editor instead of being dispatched, so binding a shortcut cannot also
+fire it, and Escape cancels. Capture is re-armed on every frame the editor
+draws, so leaving Settings mid-capture releases the keyboard rather than
+swallowing input.
+See [the canonical keyboard inventory](keyboard-shortcuts.md).
+
+Chip rename and other focused editing surfaces retain native clipboard intent;
+terminal shortcuts and paste delivery cannot also act behind them. Input
+ownership is reevaluated after ordered tab-switch actions, and IME suppression
+ends when its originating widget/surface loses ownership. Diagnostics settle
+retained queued-input observations on eventual delivery, rejection or reconnect
+discard, including after recording stops, without recreating cleared records.
+
+Category icons support scanning but never replace labels. Reset appears only
+for a non-default value and at appropriate setting/category scope, except
+where hiding it would leave users unable to tell a reset exists at all: the
+keyboard editor's per-action and all-binding resets stay visible and are
+disabled, with a hover explaining that the value is already the default.
+Terminal
+font changes may alter cell geometry and resize active PTYs, so unusually
+disruptive changes require a clear consequence before application. Profile,
+credential, and trust-record edits use their own staged and security-aware
+flows. Closing Settings returns focus to the previously active session and
+never restarts sessions; Settings never lives in the session inspector.
+
+The detail, status-bar, close-confirmation, and workspace switches are
+independent. Changing detail visibility
+does not rewrite a session name, terminal title, profile, or workspace, and it
+does not change the chip width range. A live change produces one coherent
+terminal resize after the chrome height settles; it must not resize once per
+chip or over multiple intermediate frames. Wrapped rows use the selected chip
+height consistently across every row.
+
+### Configuration recovery
+
+![Configuration recovery target](images/gui-mockups/configuration-recovery.png)
+
+Configuration loading is transactional and non-destructive. fesTerm parses and
+validates a complete candidate before it becomes active. If the candidate
+cannot be used, the error surface says **Configuration needs attention**, gives
+one concise source-owned explanation, and states that the user's file was not
+changed. It offers **Open Configuration Folder** when supported, **Copy
+Details**, and the primary recovery action **Continue with Safe Defaults**.
+
+Safe Defaults keeps the Launcher and terminal access usable for the current
+run without overwriting, renaming, moving, or silently repairing the invalid
+source. The ordinary Settings UI must not imply those fallback values were
+successfully persisted. There is no initial Reset Configuration shortcut.
+Exact paths and bounded parser/schema detail appear only through deliberate
+expansion or Copy Details; raw parser stacks, secrets, environment values, and
+unreviewed source content do not appear in the concise error.
+
+When schema boundaries permit it safely, unsupported fields generate bounded
+warnings while valid settings load, and invalid profiles or workspace entries
+are quarantined individually with their exact reason rather than invalidating
+unrelated configuration. fesTerm never guesses how to reinterpret an invalid
+security-, transport-, or identity-relevant value. The next startup and any
+explicit save/retry follow the same complete-candidate validation and attempt
+a complete replacement. An error from an attempted write does not establish
+which document is on disk, even when the replacement mechanism is atomic.
+
+The broader recovery target preserves reversible in-memory changes, displays
+bounded details, and offers **Retry** only when non-installation of that
+candidate is safely established and no earlier save is unresolved. A request
+refused before writing did not install that candidate; the last successfully
+committed document is still only last-known state, not proof of current disk
+contents. Closing with unsaved configuration should give a focused consequence
+prompt, without claiming settings will survive the next launch. A successful
+admitted retry clears the warning only after the save completes.
+
+In the present app-side containment layer, every error returned by
+`Configuration::save_to_path` has an indeterminate outcome. Missing paths,
+directory-creation failures, session-name validation failures, and busy refusals
+occur before that call and do not themselves latch the gate; validation errors
+returned by `save_to_path` still do. A prior latched or poisoned
+gate refuses a later candidate before writing, but still requires
+reconciliation. After an indeterminate outcome, further in-process saves are
+blocked; potentially referenced resources are retained and windows show
+reconciliation warnings. Do not offer blind Retry or label the last in-memory
+document as disk truth. Manually reconcile the configuration and affected
+resources, then restart the entire application; restart alone does not prove
+reconciliation. Filesystem namespace/alias safety, external writers, stale
+cross-window saves, and durable recovery remain unresolved.
+
+## Windows
+
+fesTerm opens one window at startup and can open more. **New Window** is
+available from the command palette and, on macOS, from the **File** menu and
+`Cmd+Shift+N`; it is
+unbound by default on Windows and Linux, where `Ctrl+Shift+N` already starts a
+local shell, and can be bound in Settings.
+
+Every window lives in one process and renders as its own OS window (ADR 0032).
+A new window opens on the Launcher with the current profiles and preferences.
+It never clones the originating window's tabs: a live local process, SSH
+connection, or serial device has exactly one owning session, and a session is
+not duplicated into a second window.
+
+Each window owns its own tab order, active tab, focus, scroll position,
+selection, and in-progress text entry. The first window additionally owns the
+macOS menu bar, workspace restore, and the application quit path: closing it
+quits fesTerm, with the same aggregate live-session confirmation as before.
+Closing a later window ends only that window's sessions, so it follows the
+"confirm before closing a live session" preference: with that preference off
+it closes immediately, and with it on it asks whether to close *this window*
+rather than claiming fesTerm is about to quit.
+
+Configuration is shared. A setting, profile, or keyboard binding changed in
+one window applies in every window on its next frame, with no restart. That
+propagation happens only after the change has been written successfully, so a
+failed save never reaches another window, and it never disturbs another
+window's focus, scroll position, selection, open editor row, or in-progress
+text entry. The first window performs the single workspace write, which now
+covers every window.
+
+### Moving tabs between windows
+
+A tab chip can be dragged out of its window's chip row and dropped on another
+window (ADR 0033). Dropping it on that window's chip row inserts it where the
+pointer is; dropping it anywhere else in that window appends it. The tab
+itself moves: its shell, SSH connection, or serial port keeps running, with
+its scrollback and its state, and is never restarted.
+
+Dropping a chip clear of every fesTerm window detaches it into a new window of
+its own, opened where it was dropped and sized like the window it left.
+Detaching the only tab of a later window does nothing, since that would only
+move the window. Dragging within a window's own chip row reorders as before.
+
+A window that gives up its last tab collapses: a later window closes - which
+is how dragging a window's last tab into another window merges the two - and
+the first window returns to the Launcher, exactly as closing its last tab
+does. Nothing is confirmed, because nothing is closed: the session moved.
+
+While a chip is being dragged, terminals ignore the pointer: a drag on its way
+to another window crosses whatever is underneath it, and the press began on
+the chip row, so it never selects terminal text along the way.
+
+The Launcher, Settings, and Profiles do not move between windows. Each window
+opens its own on demand and they all edit the same shared configuration, so
+carrying one across would move nothing while taking that surface away from the
+window it was dragged out of. Their chips still reorder inside their own
+window, they simply never leave it or detach into one of their own.
+
+On platforms that refuse to tell an application where its own windows are
+(Wayland), a drag stays an in-window reorder rather than guessing a
+destination.
+
+## Workspace Workflow
+
+### Restore
+
+![Mixed-result workspace restoration target](images/gui-mockups/workspace-restore.png)
+
+When workspace restore is enabled, startup clearly indicates restoration while
+sessions are recreated. A workspace is a recipe for reopening sessions, not a
+snapshot of processes. Restore always launches new local processes, new SSH
+connections, and new serial-device opens; the UI never calls this process
+resumption.
+
+A restored workspace reopens every window it recorded, each with its own tabs,
+selected tab, and - where the platform reports it - its position and size.
+A window whose geometry was never reported reopens at the default size
+wherever the platform puts it.
+
+Workspace data may include profile references or validated launch definitions,
+tab order, stable names, selected tab, supported window geometry/state, and
+applicable layout preferences. It never includes process memory, terminal
+content, scrollback, passwords, authentication responses, or private keys. A
+one-off SSH launch may contribute host, port, and username only; a one-off
+serial launch may contribute its non-secret device identifier and line
+settings. An initial directory is saved only from a reliable profile/launch
+definition, never guessed from prompt text or terminal title.
+
+Each tab independently enters starting/opening,
+authentication/trust-required, failed, or running/connected/open state.
+Progress presents exact completed/total counts
+only while restoration is active. Selecting an actionable chip opens its
+focused decision surface. The previously selected session becomes active when
+practical, but required action on it takes precedence.
+
+### Failure handling
+
+One failed session must not block restoration of the rest of the workspace. Failed tabs retain their stable identity and expose retry or diagnostic actions.
+
+Missing profiles or unsupported definitions remain visible as failed entries
+with explanations rather than being silently dropped. Exited/failed sessions
+are excluded when saving by default but may be explicitly included if their
+launch definitions remain valid. Launcher and Settings tabs are not workspace
+sessions.
+
+### Restored identity
+
+Workspace restoration should preserve:
+
+- tab order;
+- stable tab/session names;
+- selected tab;
+- window dimensions and supported window state; and
+- profile references or launch definitions.
+
+Transient terminal titles should not become the restored primary identity.
+
+Saving and updating are explicit rather than continuous. Deleting a workspace
+does not delete referenced profiles. Automatic startup restore is a separate
+preference and retains the same fresh-launch semantics.
+
+## Diagnostics and Error UX
+
+### Three levels
+
+1. **Normal mode** — quiet terminal workstation.
+2. **Contextual notification** — brief actionable state near the affected session.
+3. **Inspector diagnostics** — detailed lifecycle, queue, dimensions, byte
+   counts, timing, and error information for the active session.
+
+### Error presentation
+
+Errors should answer:
+
+- What failed?
+- Which session is affected?
+- Is retry possible?
+- What is the primary next action?
+
+Technical details should be expandable or copyable without occupying the main terminal surface permanently.
+
+### Session inspector
+
+![Session Inspector overlay target](images/gui-mockups/session-inspector.png)
+
+The inspector is a hidden-by-default right-side overlay. At ordinary window
+widths it is exactly 320 logical px wide and inset 8 px from the top, right, and
+bottom of the content viewport between application chrome and the status bar.
+At 480 logical px window width or below it becomes a near-full-width overlay
+with 16 px left and right margins. It never resizes the terminal, generates a
+PTY resize, or reflows a full-screen TUI. There is no scrim; terminal output
+remains visible where the overlay does not cover it.
+
+The header remains fixed and contains stable identity, semantic type/state,
+and Close. The body scrolls internally rather than growing outside the content
+viewport. Its section order is: an actionable state message when one exists,
+**Session**, the applicable **Process**, **Connection**, or **Serial device**
+section, **Trust** when applicable, **Actions**, then collapsed **Diagnostics**.
+The inspector follows the active chip while open. Its heading may repeat stable
+identity because that identifies the temporary panel's subject.
+
+Only applicable sections appear. A normal SSH inspector may show destination,
+username, connected state, reliably known remote platform, actual grid, full
+selectable terminal title, host-key algorithm/fingerprint and trust scope.
+Local sessions omit Connection and Trust. Working directory appears only with
+reliable shell integration. Unknown rows are omitted unless absence itself is
+decision-relevant, such as `Remote platform not reported`.
+
+A serial inspector shows the exact device identifier, open state, baud rate,
+data bits, parity, stop bits, and flow control, plus only reliable OS-supplied
+hardware identity. It has no remote-platform, host-trust, username, cipher, or
+latency rows. Serial line settings describe the configuration fesTerm applied,
+not a claim that an attached device recognized or accepted it.
+
+The full fingerprint is selectable and copyable, and trust text states the
+actual scope (for example, Accepted once). Diagnostics begins collapsed.
+Actions are capability-dependent and transport-specific: **Stop Process** for
+a local process, **Disconnect** for SSH, and **Close Port** for serial stop the
+live transport while preserving the approved read-only history. **Close
+Session** destroys the chip and unsaved history. **Reconnect** or **Reopen**
+appears only when the backend can perform the corresponding operation. Settings
+and unrelated global actions never appear in the inspector.
+
+Opening the inspector moves keyboard focus into it without changing the active
+session. Escape or its Close control dismisses it and restores focus to the
+previously focused terminal or application control. Clicking the uncovered
+terminal dismisses the inspector but consumes that click so it cannot
+accidentally select, paste, report a mouse event, or reposition an application
+cursor; a subsequent click interacts normally. Switching chips keeps the
+inspector open, replaces its contents with the newly active session's sourced
+facts, and focuses its header rather than retaining a stale row or action.
+
+The current implementation uses a foreground `egui::Area` with the specified
+desktop and narrow-window geometry, so opening it does not change the terminal
+grid or issue a PTY resize. Escape and the first pointer click outside the
+panel are consumed before terminal input routing; tests verify that dismissal
+does not alter terminal selection. The panel exposes only non-secret metadata
+owned by the application tab, keeps Diagnostics collapsed/selectable, restores
+focus where the invoking control remains viable, and closes rather than hiding
+and resurrecting when a non-session surface becomes active. Stop/Disconnect,
+destructive Close Session, and error-event emphasis remain staged behind their
+respective read-only-history, confirmation, and diagnostic-event work rather
+than appearing as misleading controls.
+
+### Diagnostic content
+
+Details from an error overlay opens the inspector with Diagnostics expanded
+and the relevant event emphasized. Diagnostics shows only measurements and
+events fesTerm owns: lifecycle state/generation, client-observed event times,
+grid and cell geometry, active buffer, bounded scrollback usage, cursor/title,
+transport/queue state, reconnect details, renderer timing, and the last error
+when available. Timestamps are explicitly client-observed, not remote event
+times. Sections remain capability-dependent and raw errors are collapsed and
+selectable.
+
+Opening Diagnostics does not pause or resize the session. Copy Details emits a
+bounded structured summary with hostnames, usernames, and filesystem paths
+redacted by default. Terminal contents, commands, passwords, tokens, private
+keys, authentication responses, and environment values are excluded by
+default. Any future support bundle follows the same policy and requires a
+separate explicit warning before terminal content is included. A dedicated
+cross-session diagnostics workspace remains deferred. About provides only the
+small application-level support facts that do not belong to a session: whether
+the previous run shut down cleanly, its recorded exit reason, and whether a
+local panic report exists. Bounded logs and panic reports remain on the device
+and exclude terminal contents by default.
+
+### Reconnect presentation
+
+![Reconnecting-session overlay target](images/gui-mockups/reconnecting-session.png)
+
+A reconnecting SSH session should retain its tab and stable identity. The tab may show a compact reconnecting state, while the viewport presents a restrained overlay or message that does not destroy prior terminal content unnecessarily.
+
+The overlay may show attempt count and retry delay only when the reconnect
+controller supplies those exact values. Stop Retrying transitions to a stable
+Disconnected state; switching tabs does not interrupt retries. Details opens
+the inspector at the relevant event. Reconnect appears only when the backend
+can actually create a new connection attempt. The disconnected/failed
+viewport overlay places **Reconnect** beside **Open Diagnostics** when that
+capability is available; otherwise it keeps only **Open Diagnostics**, with
+Close Session available from the tab. An in-flight reconnect does not offer a
+second Reconnect button.
+
+For native persistent local sessions, Reconnect reattaches the existing named
+daemon in the same tab. It never starts a replacement shell if that daemon is
+gone; failure remains visible and retryable. The Inspector exposes the same
+application command as **Resume** for a durable session. Input waiting from
+the previous connection is discarded rather than replayed into the resumed
+shell, and accepted recovery returns keyboard focus to the terminal.
+An early recovery disconnect explains that the daemon may be busy or shutting
+down and directs the user to retry Reconnect/Resume. It does not assert a
+particular refusal cause or change the recovery protocol. This content-free
+guidance is visible in the viewport overlay and the Inspector's state message
+without expanding Diagnostics. Other raw backend details remain in Diagnostics.
+
+Reconnection must not imply that remote process state survived. Unless
+continuity is guaranteed, the UI describes reconnecting to the host rather
+than restoring the shell, and a successful attempt starts a new terminal
+lifecycle while retaining user-assigned chip identity.
+
+That new lifecycle remains in the same chip and viewport. fesTerm seals the
+previous generation's retained output as read-only history, resets terminal
+modes for a clean new terminal model, and presents new output beneath the old
+scrollback. A subtle generation boundary distinguishes the two. The boundary
+is UI-owned metadata rather than terminal cells: terminal output cannot forge
+or erase it, Find does not match it, and Copy never emits its label. A selection
+that crosses the boundary receives one structural line break so unrelated old
+and new text cannot be concatenated.
+
+There is no initial generation picker or separate history browser in the
+inspector. Ordinary scrolling reaches prior output; scroll, selection, Copy,
+Find, and explicit links retain their normal read-only behavior. A Find match
+cannot span the generation boundary. New terminal output follows the existing
+follow/suspend rules, and input always targets only the current live
+generation. The chip and status bar report the current transport state even
+while the user has scrolled into older output, just as they do during ordinary
+live-session scrollback review.
+
+All retained generations share the session's bounded in-memory history budget;
+oldest content is evicted predictably and nothing is persisted to disk. Escape
+sequences from a fresh generation may clear only that generation's terminal
+content, never sealed prior history. Failed connection attempts do not create
+empty generations or boundaries; the boundary is committed only once a new
+terminal channel or process is actually established. Local Relaunch and serial
+Reopen follow the same rule. True continuity is claimed only when a future
+multiplexer-aware backend can prove that it reattached to the same remote
+terminal lifecycle.
+
+The current floating overlay (`crates/festerm-ui-egui/src/overlay.rs`) already
+draws above rather than instead of terminal content, but currently offers only
+View Diagnostics and Close Tab because restart capability does not yet exist.
+
+### Disconnected and exited history
+
+![Disconnected read-only history target](images/gui-mockups/disconnected-history.png)
+
+A disconnected or exited session becomes a read-only terminal history surface:
+
+- Preserve exactly the terminal content and bounded scrollback fesTerm already
+  holds; do not synthesize missing history.
+- Keep scrolling, selection, and copying available. Stop cursor blinking and
+  disable typing, paste, and terminal mouse reporting because no process can
+  receive input. Local mouse selection/scrolling works without the terminal's
+  former mouse-reporting modifiers.
+- `Ctrl+Shift+C`, the Copy command, and context-menu Copy copy a selection.
+  Plain `Ctrl+C` with no selection does nothing rather than pretending to send
+  an interrupt (there is no live process to receive it in this state).
+- The compact overlay must not capture interaction across the viewport.
+- History remains only until the tab is closed and is not automatically saved
+  to disk. Any future transcript export is explicit and warns about sensitive
+  content.
+
+If reconnection creates a fresh terminal lifecycle, do not inject a fabricated
+divider into the terminal byte stream. Seal the prior generation into the
+same bounded read-only scrollback and mark its transition to the fresh terminal
+model with the UI-owned, non-content boundary specified above.
+
+### Sensitive data
+
+Diagnostic views and exported bundles must avoid exposing secrets, credentials, private keys, tokens, or unreviewed terminal content by default.
+
+## Visual Language
+
+### General style
+
+- Blue-graphite terminal-first default: cool undertones in neutral surfaces,
+  with cyan reserved for small, high-information accents.
+- Minimal borders and separators.
+- Compact controls and tab chrome.
+- Purposeful accent color.
+- No visible cell grid in normal mode.
+- Limited animation, used only for meaningful state changes.
+- Terminal content visually dominates application chrome.
+
+The initial product ships only the approved blue-graphite dark application
+theme. Do not show a one-option selector or claim light/System support before
+complete semantic tokens, accessibility checks, and visual baselines exist.
+OS appearance changes do not silently select an unsupported theme. High
+contrast is a separate accessibility requirement, and arbitrary UI color
+editors remain out of scope. Semantic roles preserve a future path to validated
+System/Dark/Light choices without changing widget behavior.
+
+### Density
+
+The default density should support many tabs and long work sessions without feeling cramped. Touch-sized controls are not required as the desktop default, but critical actions must remain usable and accessible.
+
+### Implemented geometry and spacing
+
+The following logical-pixel values describe the current default UI. They are
+the baseline for visual review and tests, not an instruction to duplicate
+literals across modules; implementation code should centralize shared tokens
+as those APIs mature.
+
+| Element | Current value |
+| --- | --- |
+| Initial viewport | Approximately `752 × 516`, targeting an `80 × 25` terminal at the default font estimate; minimum `360 × 240` |
+| Upper chrome | `42` high: `8` top inset plus one `34` chip row; no lower separator or differently colored title band |
+| Window/content inset | `8` from the left and right edges in chrome; terminal viewport uses `8` on every side, with its top inset forming the single gap below the chips |
+| Session chip | `132..220 × 34`, `6` corner radius, `8` between siblings; `1` inactive outline and `1.5` active outline |
+| Chip content | `8` leading inset; `6` icon/text spacing; currently an `8` px standalone status dot, with an approved migration to a `16` px session icon carrying a `6..7` px state badge; primary row shifted down `1` optical px without moving the secondary row |
+| Active-chip close control | `16 × 16`, inset `8` from the chip's top-right corner; only shown on the active chip |
+| New-session control | `34 × 34`, matching the chip height and `6` corner radius |
+| Trailing chrome controls | Currently `22 × 22` control boxes with `8` spacing. Windows/Linux show six; macOS shows the three application controls and reserves `76` on the left for native traffic lights. The current boxes are a known `2` px shortfall from the icon system's `24 × 24` minimum target and should not become the asset-layer default |
+| Status bar | `24` high with a `1` top rule, `20` leading inset, `8` between items, `7` px status dot, and `1` px downward optical adjustment |
+| Command palette | Up to `840 × 600` content, centered `48` below the top edge (`16` in short roots), bounded by viewport/frame/title margins; category sidebar at `620` content width, dropdown below; remaining-height scrolling results |
+| Connection overlay | Bottom-center, `24` above the bottom anchor, maximum content width `360`, with `6` before its actions |
+| Launcher/settings surfaces | `24` top padding and `12` between primary groups; the current SSH text fields request `220` width |
+
+The initial viewport estimate uses a `9 × 18` cell at the default 14 pt
+monospace font; actual grid dimensions remain renderer-measured and must not
+be forced to those estimates. Chip wrapping and single-row scrolling may
+change the chrome's occupied height when explicitly selected, but neither may
+cover or fragment the terminal viewport.
+
+When **Show session details in chips** is off, the corresponding compact
+geometry is `36` px upper chrome (`8` top inset plus one `28` px chip row),
+`132..220 × 28` session/application chips, and a `28 × 28` New Session
+control. Chip widths deliberately stay in the default range so toggling detail
+does not cause a second horizontal reflow. The 16 px type icon/state badge and
+active close control remain, and every interactive target retains at least the
+icon system's 24 px target. Trailing controls remain vertically centered in the
+occupied band. On macOS the 76 px traffic-light reserve remains unchanged and
+must be reviewed optically against both heights.
+
+### Semantic color roles
+
+Use semantic roles rather than scattered literal colors:
+
+```text
+surface.window
+surface.chrome
+surface.terminal
+surface.tab.active
+surface.tab.inactive
+surface.overlay
+surface.selection
+text.primary
+text.secondary
+text.muted
+border.subtle
+border.active
+accent.primary
+status.running
+status.starting
+status.reconnecting
+status.disconnected
+status.error
+status.attention
+status.exited
+```
+
+Themes should map these roles to concrete colors while preserving contrast and state distinctions.
+
+The default mapping is centralized in `crates/festerm-ui-egui/src/theme.rs`:
+
+| Role | Default |
+| --- | --- |
+| `surface.window` | `#0e1319` |
+| `surface.terminal` | `#11161e` |
+| `surface.chrome` | `#11161e` (same as terminal) |
+| `surface.tab.inactive` | `#1a222c` |
+| `surface.tab.active` | `#29333e` |
+| `surface.overlay` | `#26313d` |
+| `surface.selection` | `#28516b` |
+| `text.primary` | `#e8edf2` |
+| `text.secondary` | `#a7b2bd` |
+| `text.muted` | `#788592` |
+| `border.subtle` | `#35414e` |
+| `border.active` | `#91a7b8` |
+| `accent.primary` | `#42bfd0` |
+| `status.running` | `#4fc17d` |
+| `status.starting` | `#d2a94b` |
+| `status.reconnecting` | `#42bfd0` (same as accent) |
+| `status.disconnected` | `#7c8794` |
+| `status.attention` | `#b58ad4` |
+| `status.error` | `#d96868` |
+| `status.exited` | `#657280` |
+
+The accent is not a general surface fill. Use it for links, focus/selection
+details, active controls, and reconnecting activity. Terminal ANSI/indexed and
+explicit RGB colors remain a separate protocol palette and are never remapped
+through these application roles.
+
+The default egui mapping is also intentional: panels use `surface.window`,
+popup windows use `surface.overlay` with a `1` px `border.subtle` stroke,
+text edits and code blocks use `surface.tab.inactive`, hovered/open widgets use
+`surface.tab.active` with `border.active`, pressed widgets use
+`surface.selection` with an accent border, and selection uses
+`surface.selection` with a `1` px `text.primary` stroke. Warning and error text
+map to `status.starting` and `status.error`. Icon color is supplied at the use
+site: compact chrome is `text.secondary`, becomes `text.primary` on hover,
+and uses `status.error` for destructive close hover. Do not create separate
+colored SVG files for any of these states.
+
+### Typography roles
+
+At minimum, define:
+
+- terminal text;
+- tab primary identity;
+- tab secondary title;
+- launcher heading;
+- launcher item title;
+- launcher item description;
+- contextual status text; and
+- diagnostic text.
+
+Terminal typography may use separate font and shaping rules from application chrome.
+
+The terminal renderer defaults to bundled **JetBrains Mono NL 2.304** at `14`
+pt and lets Settings select JetBrains Mono, Iosevka Term, JuliaMono, or Maple
+Mono. Only JetBrains Mono is embedded; the other families are pinned downloads
+with automatic startup reconciliation (ADR 0049). Each family includes regular, bold, italic, and bold-italic static
+faces; missing glyphs continue through an owned Noto Emoji monochrome face and
+then the separate monospace fallback chain. Emoji-presentation graphemes use
+the pinned Noto Color Emoji renderer path, while VS15 requests monochrome text
+presentation. Both paths remain clipped to core-owned cell spans under ADRs
+0012 and 0026.
+Changing the primary family rebuilds egui's atlas, advances a font generation,
+invalidates terminal glyph caches, recalculates primary-face cell metrics, and
+coalesces the resulting PTY resize through the existing viewport path.
+The approved application chrome will bundle **Inter** for consistent metrics
+across Windows, Linux, and macOS. Inter is an application asset, not a terminal
+font default: it serves chips, launcher and Settings content, overlays, menus,
+status text, and diagnostics, while terminal shaping and user-selected terminal
+fonts remain completely independent.
+
+Application chrome continues to use egui's semantic `Body` role for primary
+chip identity and `Small` for secondary chip metadata and status-bar content.
+Those named roles and the geometry they produce are the layout contract rather
+than scattered widget-specific font sizes. Use regular weight for ordinary
+body/description text, medium for compact control and identity labels, and
+semibold only for real headings. Unsupported scripts and glyphs fall through
+to a platform-appropriate UI fallback without changing the terminal font
+fallback chain. The bundled font's license and exact source version must be
+recorded with the asset when it is added to the binary.
+
+Do not show an application-font selector while Inter is the only supported
+choice. Before the application typography is frozen, usability and visual-
+baseline review must compare Inter at supported DPI scales and on every native
+platform, with particular attention to the smallest secondary/status text,
+long and duplicate chip identities, dense menus, non-Latin fallback, and
+letterform ambiguity. Evidence from that review may replace the bundled face
+without changing the semantic typography roles or terminal-font contract.
+
+## Terminal Typography
+
+### Goals
+
+- High readability for long sessions.
+- Reliable cross-platform glyph coverage.
+- Correct width and continuation mapping.
+- Deterministic monochrome and color emoji fallback without breaking cell
+  geometry.
+- Ligature support after the shaping-to-cell mapping contract is validated.
+
+### Ligatures
+
+Ligatures are a planned capability, but they must never alter terminal cell ownership, cursor placement, selection boundaries, or mouse coordinates.
+
+The bundled default deliberately uses JetBrains Mono's `NL` faces and
+one-cell layout. A default-off Settings toggle enables shaping only for
+contiguous, compatible ASCII cells. JetBrains then uses its ordinary faces;
+Iosevka uses the reproducible `calt` build recorded with its assets; JuliaMono
+and Maple Mono use their pinned upstream feature sets. Empty, wide,
+combining/non-ASCII, fallback, selected, linked, and style-transition cells
+remain hard shaping boundaries.
+
+### User control
+
+Users can configure the terminal family, ligature preference, and
+deterministic color-versus-monochrome emoji presentation through versioned
+configuration and GUI Settings. Font size remains per-session runtime zoom;
+configurable fallback ordering, arbitrary font paths, and line height are
+future controls.
+
+Runtime zoom is per session. `Ctrl++`, `Ctrl+-`, and `Ctrl+0` on Windows/Linux
+(`Cmd` equivalents on macOS) change only the active terminal's font size.
+Each change recalculates cell geometry and emits one coalesced PTY/SSH resize
+after layout settles, preserving bottom-follow or the viewed logical region.
+A temporary noninteractive overlay reports the factual result, for example
+`14 pt · 80×25`, without stealing focus or entering scrollback.
+
+Zoom clamps to a tested readable range. Reset returns to the applicable
+profile/application default. Application chrome does not scale with terminal
+zoom, and runtime zoom never silently rewrites the source profile. Profiles
+may later define an initial size or accept an explicit apply-as-default action.
+High-DPI moves preserve point size while recalculating physical pixels and
+cell geometry.
+
+### Terminal color schemes
+
+Terminal schemes are independent of application theme. A scheme supplies
+default foreground/background, ANSI colors 0–15, and optional cursor/selection
+defaults. Explicit RGB and indexed protocol colors remain terminal output and
+are rendered faithfully rather than remapped by chrome.
+
+Runtime scheme changes are per session, like zoom, and do not rewrite a source
+profile. A profile may reference a stable scheme identifier and later accept
+an explicit apply-as-default action. Built-ins are complete tested definitions;
+imports require schema validation, bounded names, and safe fallback roles.
+Previews show representative text and all ANSI colors without starting a
+process or fabricating session output. Cursor/selection visibility receives a
+documented accessibility fallback. History can be re-presented under another
+scheme without mutating cell data. A scheme change must also be pushed into
+the session's terminal with `Terminal::set_color_scheme`: `festerm-core`
+answers `OSC 4/10/11/12` queries from the scheme it was last given (ADR 0036),
+so a scheme applied only in the renderer would leave the terminal reporting
+colors it no longer paints. No automatic scheme changes derive from
+remote host, shell, or command, and no selector appears while only one real
+scheme exists.
+
+### Cursor appearance
+
+The terminal-correctness spec default cursor style is `BlinkingBlock` (per real xterm/VT100 behavior), which the core terminal model (`crates/festerm-core/src/terminal.rs`) always reports faithfully once a program has requested a style. However, as an additive, GUI-only presentation choice, the renderer (`crates/festerm-ui-egui/src/renderer.rs`) shows a steady vertical bar cursor by default — until the terminal program in the session explicitly requests a style via DECSCUSR (tracked separately via `Terminal::cursor_style_requested_by_program()`), at which point the program's requested style is honored exactly. This avoids the hollow, unfocused-looking empty box appearing by default while never altering the spec-observable `cursor_style()` value itself. When a block-style cursor is in effect and the view is focused, it renders filled (solid) rather than a hollow outline, matching conventional terminal-emulator focus affordance; the character glyph underneath a filled cursor is redrawn in the background color on top so it stays legible.
+
+## Interaction Conventions
+
+### Keyboard
+
+Expected commands include:
+
+- New Tab opens the session launcher.
+- **Start Local Shell** opens the default local profile directly with the
+  platform shortcut shown below and remains available from the command palette.
+- Close Tab closes the current launcher or session tab. Closing the active tab
+  returns to the tab it was opened from — the most recently left tab that is
+  still open — because opening a file, reading it and closing it should put a
+  reader back where they were rather than wherever the closed tab happened to
+  sit. Launcher/New Session, Settings and Profiles are passed through rather
+  than returned to, so they are never recorded as that place; they remain
+  ordinary fallbacks when nothing better is open. With no remembered tab, focus
+  falls to the neighbour on the left, or to the rightmost tab when the leftmost
+  one is what closed. The history is per window and deliberately not persisted:
+  "where I just was" does not survive a restart.
+- Next/Previous Tab switch predictably.
+- The combined command palette/session switcher finds tabs by stable identity
+  and optional secondary content and exposes applicable application commands.
+- Terminal-content search is a separate local operation over retained rendered
+  text, not a command-palette mode.
+- Plain Page Up/Down belong to the terminal program (`ESC[5~` / `ESC[6~`),
+  including alternate-screen TUIs. Shift+Page Up/Down retain local primary
+  history navigation; other modified Page chords remain unsupported rather
+  than becoming unmodified paging.
+
+Application bindings must respect terminal-native editors. On Windows/Linux,
+avoid reserving plain `Ctrl+letter` chords whenever a Shift-modified or
+platform-level alternative exists; in particular, plain `Ctrl+T` and
+`Ctrl+W` remain available to Vim's tag and window commands. macOS uses Command
+for application chrome because it is ordinarily distinct from terminal Ctrl
+input. The current platform defaults are:
+
+| Command | Windows/Linux | macOS |
+| --- | --- | --- |
+| New Session… | `Ctrl+Shift+T` | `Cmd+T` |
+| Start Local Shell directly | `Ctrl+Shift+N` | `Cmd+N` |
+| Close active tab | `Ctrl+Shift+W` | `Cmd+W` |
+| Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` | `Ctrl+Tab` / `Ctrl+Shift+Tab` (pending native-convention review) |
+| Command palette / session switcher | `Ctrl+Shift+P` | `Cmd+Shift+P` |
+| Open Settings | `Ctrl+Shift+S` | `Cmd+Shift+S` (also `Cmd+,`, the macOS "Preferences" convention, via the native app menu) |
+| Manage Port Forwards | `Ctrl+Shift+M` | `Cmd+Shift+M` |
+| Find in terminal | `Ctrl+Shift+F` | `Cmd+F` |
+| Copy / Paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` | `Cmd+C` / `Cmd+V` |
+| Clear terminal (display and scrollback) | `Ctrl+Shift+K` | `Cmd+K` |
+| Reset terminal display state | `Ctrl+Shift+R` | `Option+Cmd+R` |
+| Enter / exit Focus Mode | `Ctrl+Shift+F11` | `Cmd+Shift+F` |
+| Zoom in / out / reset | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | `Cmd++` / `Cmd+-` / `Cmd+0` |
+
+The application observes physical GUI modifiers before terminal encoding, so
+it can reserve `Ctrl+Shift+T` while forwarding plain `Ctrl+T` even on legacy
+terminal protocols that could not distinguish them after encoding. Every
+essential command retains a menu/palette route, and configurable bindings may
+later free a reserved chord. Before defaults are frozen, validate them against
+Vim, Emacs, Readline, tmux, common shells, and extended keyboard protocols.
+Bindings dispatch through the semantic application command model rather than
+widget-specific paths.
+
+### Command palette and session switcher
+
+![Combined command palette and session switcher target](images/gui-mockups/command-palette.png)
+
+The command palette and session switcher remain one overlay. Session switching
+is an application command, and a second nearly identical search surface would
+add a shortcut and mental model without adding capability.
+
+The palette opens with `Ctrl+Shift+P` or `CommandPalette`, overlays without
+resizing the terminal. The owner-approved larger layout supersedes the compact
+mockup above: up to 840 × 600 logical points of content, bounded by the root
+viewport and frame/title margins. At 620 points of content width, a category
+sidebar appears; narrower windows use a category dropdown. Search, category
+context and a keyboard footer stay visible while results scroll. The sidebar
+also scrolls in short windows. Search matches all whitespace-delimited words
+across command names, stable identities, secondary text and category names.
+It is scoped to the selected category; **All categories** is the opening default.
+
+Selecting a session activates it; selecting a command routes through the same
+application command path as every other invocation surface. Only implemented,
+applicable commands and actually bound platform shortcuts appear. Up/Down
+moves selection, Page Up/Down moves by a result page, and keyboard selection
+scrolls into view. Active IME composition retains navigation, Enter and Escape
+ownership without palette refocusing. Enter activates the selected command, not a focused category
+control. Escape closes an open category popup first, then the palette, restoring
+previous focus. Query/category state clears on close and is never logged or
+persisted. Selection follows opaque item identity across catalog changes; a
+removed selection cannot silently become a different command.
+
+Current implementation bounds the palette against the full root viewport,
+including frame margins and short-window title/search space. Long row text
+and shortcuts elide in separate columns rather than painting over each other;
+the complete stable identity and secondary text remain the accessible label.
+
+Current implementation on eligible Windows WARP roots paints the opaque palette
+frame/shadow and opaque untextured search/selection rectangles through the
+existing textureless panel shader. Egui's tessellated geometry, clips, paint
+order, layout, focus and commands are unchanged. Textured/translucent candidates
+and unsupported roots, transforms, viewports, adapters or formats retain
+ordinary painting; overlays still decline final-terminal copying/retention.
+
+Results are grouped as **Open views**, **Sessions & connections**, **Terminal**,
+**Panes**, **Files & documents**, and **Application**, retaining catalog order
+within each group. Open views retain chip order and stable identity as their
+primary label; dynamic text is secondary searchable context. Quick-switch
+labels use the presented chip position and appear only on a group's currently
+focused member, matching the view the shortcut activates. Empty groups
+disappear. Standalone composable views offer **Pane Layout…**, not inapplicable
+group focus/resize/separate operations. **Rearrange panes** and **Finish
+rearranging panes** are mutually exclusive according to the current mode.
+
+The initial command inventory, subject to actual implementation and active-
+surface applicability, is:
+
+- **New Session…** and **Start Local Shell**;
+- **Find in Terminal**, **Open Terminal History in Editor**, **Save Terminal
+  History As…**, **Manage Port Forwards…** for a live SSH shell session,
+  **Rename Session…**, a capability-backed **Reconnect Session**, and **Close
+  Session…**;
+- **Enter Focus Mode** or **Exit Focus Mode**, **Zoom In**, **Zoom Out**, and
+  **Reset Zoom**; and
+- **Open Settings**.
+
+Labels name the resulting action rather than exposing implementation language
+such as “toggle.” An unfinished command—including Focus mode before it exists—
+is absent. Chip-layout and status-bar controls remain in Settings. Existing
+Copy/Paste commands remain under **Terminal**, and **New Window** under
+**Application**; grouping changes no command authority. Host-trust decisions
+and authentication responses remain on their owned surfaces.
+The implementation uses **New Session…**
+and keeps chip-layout controls in Settings rather than duplicating them in the
+palette.
+
+The palette does not search terminal history. Its trigger uses
+`CommandPalette`; the ordinary `Search` icon is reserved for terminal-content
+search.
+
+**Redraw Terminal** is available for an active terminal, including retained
+disconnected history. It has no keyboard binding and does not reserve common
+TUI keys such as Ctrl+L or Ctrl+R. It rebuilds the visible presentation and
+forces retained native regions to repaint even when their contents are
+unchanged. It sends no terminal input, resize, or recovery control request,
+and preserves content, modes, selection, scroll position and zoom.
+**Reset Terminal** is different: it resets terminal state, not just painting.
+
+### Terminal-content search
+
+![Terminal-content search target](images/gui-mockups/terminal-search.png)
+
+Find overlays the viewport without changing grid dimensions and searches the
+terminal's rendered text model rather than raw transport bytes. It covers
+retained scrollback and the current primary screen. In alternate-screen mode,
+it searches only the retained alternate-screen content and does not pretend
+that the inaccessible primary buffer is simultaneously visible. Wrapped rows
+are treated as logical text only where the model reliably preserves wrapping;
+wide and combining characters retain cell ownership.
+
+The initial behavior is literal, case-insensitive search, per-row (matching
+does not span a row boundary). Regex, whole-word, and case toggles remain
+absent until deliberately implemented. Enter/Down advances, Shift+Enter/Up
+reverses (both wrap past the last/first match), and Escape clears the
+transient query/highlights and restores terminal focus. No result uses
+`No matches` rather than a fabricated `0 of 0` position; the find bar shows
+`N of M` while a match is selected.
+
+Search focus prevents input from reaching the PTY (the same
+`terminal_input_enabled` blackout used by confirmation dialogs, so `Ctrl+C`
+and other keystrokes while the bar has focus never leak into the shell).
+Navigation scrolls locally and never sends mouse or keyboard reporting. New
+output may extend or remove results. While the find bar is visible, rescans
+are coalesced until 100 ms after the last observed change, with a maximum
+250 ms delay from the first observed change during continuous output, provided
+the UI continues to update. Query edits scan immediately and navigation
+flushes a pending scan. Live-screen edits and history eviction are included
+even when the number of retained rows stays constant. A surviving selected
+primary match is preserved by content-row coordinate across output and
+eviction while the layout is unchanged; reflow can change its row. Buffer
+transitions and replacement terminals start selection in the new content
+rather than reusing an old buffer's row identity. Search state (query,
+matches) is never logged or persisted. Search may collapse into overflow at
+narrow widths while remaining available through `Ctrl+Shift+F`/`Cmd+F` and
+the command palette ("Find in Terminal…").
+
+**Known implementation gap:** matches do not currently receive an in-grid
+visual highlight (subtle for all matches, stronger for the active one).
+Implementing that would require plumbing a second highlight kind through the
+renderer's per-cell and shaped-run paint paths (`crates/festerm-ui-egui/src/
+renderer.rs`) alongside the existing selection highlight, which was judged too
+invasive for this pass. Instead, navigating to a match scrolls it into view
+(the retained-scrollback case brings it to the top of the viewport; a
+live-screen match returns to the latest position) and the find bar's `N of M`
+counter is the sole indicator of which match is current. This is a deliberate,
+disclosed scope reduction, not an oversight.
+
+### Reserved local input and clipboard
+
+Copy, Paste, forced local selection, and the local context menu are application
+escape hatches intercepted before terminal input encoding. Raw mode,
+alternate-screen mode, mouse reporting, or extended keyboard protocols cannot
+disable them.
+
+- Windows/Linux reserve `Ctrl+Shift+C` and `Ctrl+Shift+V`; macOS reserves
+  `Cmd+C` and `Cmd+V` by default, with configurable application bindings.
+  The pinned adapter preserves per-event clipboard-key provenance. Copy only
+  copies/clears a selection; without a selection it does nothing. It never
+  synthesizes a terminal interrupt. Actual Ctrl+C remains terminal input.
+- Shift+left-drag forces local selection even while terminal mouse reporting is
+  enabled; ownership is latched from press through release so changing
+  modifiers mid-gesture cannot leak a partial report to the terminal
+  application. Shift+right-click opens the local context menu. Without terminal
+  mouse reporting, ordinary drag selects and ordinary right-click opens the
+  menu; with reporting, unmodified mouse events go to the terminal application.
+  Middle-click follows the same
+  reporting-aware rule and pastes locally (the common X11/terminal-emulator
+  convention) when not claimed by terminal mouse reporting; Shift+middle-click
+  always pastes locally even while the terminal application is tracking the
+  mouse.
+- When an application text field owns focus, standard Copy/Paste applies to
+  that field instead of the terminal.
+- Copy reads selected cells from fesTerm's model and remains available for any
+  retained selectable buffer. It joins soft-wrapped rows, preserves real line
+  breaks, omits unused trailing cells, and preserves displayed wide/combining
+  Unicode. At the native Windows clipboard boundary, text line breaks are
+  normalized to the CRLF representation required by `CF_UNICODETEXT`; internal
+  selection text and non-Windows clipboards retain their native representation.
+  Copying a selection clears it afterward, matching other terminal programs.
+- Paste reads the OS clipboard and uses the ordered bounded session input path.
+  It remains available whenever a live session accepts input and compatible
+  clipboard text exists. A terminal program cannot disable it.
+- Disconnected/exited sessions retain Copy for an existing selection and Find,
+  but omit Paste.
+- The context menu contains only the applicable terminal-local operations
+  specified above: explicit-link actions, Copy, Paste, and Find. Session/global
+  actions remain elsewhere. Select All is not an initial action; copy-on-select
+  and right-click-to-paste are not defaults.
+- Clipboard contents are never logged, persisted, or included in diagnostics.
+
+### Bounded rectangle copy
+
+**Bounded rectangle copy** is a terminal-scoped application command, available
+from the palette and by configurable **Ctrl+Shift+B** on Windows/Linux or
+**Cmd+Shift+B** on macOS. It also works on retained disconnected/exited content.
+Release mouse buttons before starting; a gesture already in progress is refused
+visibly rather than split between owners.
+
+The command freezes the **currently visible cell grid**, including a scrolled
+history viewport, in the UI-owned presentation cache. A persistent border and
+**FROZEN** badge indicate the mode even with the status bar hidden. The status
+bar, hover instructions and accessible viewport label describe the next action.
+There is no added layout row or activation-time terminal resize. Incoming
+output, terminal parsing/replies, bounded transport queues and ordinary live
+resize/reflow continue; freezing never creates an output backlog or a second
+terminal writer. Conservative cell/text/link/row admission is limited to
+**16 MiB** before materialization; a refusal preserves ordinary selection and
+reports a content-free reason. This is not a bound on the application's total
+renderer, font or process memory.
+
+Admission includes CompactString's minimum heap capacity for long graphemes,
+exact-capacity cell/row vectors and their metadata, and conservative hyperlink
+ownership overhead; it does not equate UTF-8 length with allocated capacity.
+The capture also pins the application-owned filesystem origin, verified host
+identity, transport/lifecycle generation, availability and trustworthy cwd.
+Any change cancels frozen mode before resolving another menu; a stale action
+cannot upgrade old or disconnected content to new transport authority.
+Cancellation also retires frozen context text/target/link metadata and queued
+Open/link activation, and closes that view's owned popup. An already-open
+frozen menu cannot migrate into live resolution after cancellation. Ordinary
+live context menus are not invalidated by a no-op frozen cancellation.
+Local terminal-path resolution rejects UNC/network and device namespaces
+before filesystem access, including mixed separators and decoded file URIs.
+Ordinary local absolute/drive paths and `file://localhost` retain their policy;
+relative paths still require trustworthy cwd, never terminal-text inference.
+
+Click a character cell for the first corner and another for the opposite corner.
+Later clicks alternate updates to those two corners. Either corner order works,
+and two clicks on the same cell select that one cell. Selection is inclusive.
+Alternatively, press the primary mouse button on a cell and drag to the
+opposite corner. Moving into another cell starts a fresh rectangle anchored at
+the press, regardless of the previous corners. The rectangle updates during
+the drag; captured movement/release outside the grid clamps to its nearest
+cell. Releasing finishes drawing without copying or resuming live display.
+A press/release within one cell remains an ordinary alternating corner click.
+After a drag, clicks update the anchor first, then the opposite corner.
+Losing focus/pointer or opening a foreground overlay ends the current drawing
+gesture without discarding the selected rectangle or letting later hover
+resume it.
+**Enter** or reserved **Copy** copies after both corners exist, then resumes the
+live display. A complete **right-click** instead opens a frozen context menu
+with **Copy** always available. Menu Copy uses the current inclusive bounds
+(a single first-corner cell is valid); with no corner it copies the entire
+frozen visible viewport. It then resumes. **Escape** cancels without copying.
+Incomplete keyboard Copy leaves the mode active with its instructions.
+
+Inside the current rectangle, the menu also offers the normal detected
+path/URL and explicit OSC 8 Open/Copy actions. Detection joins cropped rows at
+the rectangle's left/right edges, regardless of the original terminal soft-wrap
+flags; this does not join clipboard rows. With no rectangle, detection uses
+the frozen full-width terminal's original soft-wrap metadata and occupied
+extents. Clicking outside an existing rectangle offers only Copy. Captured
+text and OSC 8 targets come from the frozen cache, never changed live rows.
+Detection retains the shared 16-row/8-KiB limit and existing application-owned
+destination, local/remote-origin and verified-transport policy. Oversize
+detection leaves Copy available. Copy path/URL/link closes the menu but retains
+the frozen rectangle; opening uses the existing application commands.
+Menu clicks/keyboard navigation cannot redraw the rectangle.
+
+Typing, Paste, wheel/history navigation, middle-click paste and TUI
+mouse reporting do not operate on the frozen grid. Copy/cancel consumes the rest
+of that input batch and terminating key repeats/releases or held mouse releases
+cannot become shell input. Foreground palettes/overlays retain their own input.
+Leaving the tab/view or resetting recovery layout cancels the mode.
+The same exit barrier discards the original batch's application-deferred
+shortcut suffix, including paired Paste and UI shortcuts, across later frames.
+Paired releases still reach held-input cleanup. A fresh independent authorized
+paste remains available after exit; normal live paste ordering is unchanged.
+
+Each selected physical screen row becomes one clipboard line, including blank
+rows; soft wraps are not joined. Interior spaces are retained. **Trim trailing
+spaces in rectangle copy**, enabled by default under Settings' **Terminal
+mouse** card, removes only ASCII spaces at each row end; disable it to preserve
+the selected width. The policy is captured on entry. Wide/combining graphemes
+remain indivisible: touching either half of a wide glyph copies the whole
+grapheme once, potentially extending that row's copied width beyond an edge.
+Visible text never exports hyperlink targets or terminal protocol sequences.
+On Windows, the shared clipboard boundary converts those top-to-bottom logical
+rows to CRLF without changing their order, including when pasted into another
+terminal application.
+On exit the next paint refreshes from current live state; a resized window may
+clip the frozen grid until that refresh. Native clipboard delivery and
+cross-renderer/DPI/keyboard usability remain pending under `TI-17`.
+
+### IME and composed input
+
+IME pre-edit text is a transient local overlay anchored to the terminal cursor.
+It does not mutate the terminal model, enter scrollback, claim terminal cells,
+or reach transport. Only committed text enters normal terminal text encoding;
+it is typing, not clipboard Paste, and receives no paste warning.
+
+Platform composition/candidate presentation remains visible near viewport
+edges and under DPI scaling. Escape is offered to the IME before terminal
+encoding. Switching/closing sessions or moving focus to an application field
+cancels uncommitted composition rather than sending it to the wrong owner.
+Disconnected history rejects composition. Pre-edit content is never logged,
+persisted, diagnosed, or exposed as terminal history, while screen readers use
+the platform composition state rather than duplicated terminal output.
+
+### Paste safety
+
+![Multiline paste-confirmation target](images/gui-mockups/paste-confirmation.png)
+
+If bracketed-paste mode is enabled, paste uses the protocol markers. Without
+it, a single line pastes directly; multiline text requires confirmation because
+line breaks may immediately execute commands. While the shared terminal-ingest
+budget still holds earlier output for the target session, a mode change in
+that output may not be applied yet, so multiline text requires the same
+confirmation even when bracketed-paste mode appears enabled. Very large pastes
+require confirmation even in bracketed-paste mode because they may flood
+queues. The initial large-paste threshold remains an implementation constant
+pending the usability testing specified below, not a user-facing preference or
+a fabricated safety boundary.
+
+The modal title is `Paste <exact line count> into “<stable identity>”?` and its
+body explains that a line may execute immediately when bracketed paste is not
+active, or may not be active because earlier output is still being processed.
+It shows an exact plain-text preview bounded by both lines and
+characters, states the exact total line and character counts, and explicitly
+counts omitted content. Spaces and tabs remain faithful; non-tab/newline control
+characters use an unambiguous escaped representation. The dialog also exposes
+the current transport state so the target cannot be mistaken for a stale or
+inactive session. Its actions are **Cancel** and **Paste**.
+
+Cancel has initial focus, Escape cancels, clicking outside does not dismiss,
+and Enter cannot submit until the user deliberately focuses Paste. The dialog
+captures the original clipboard text and binds it to the exact session identity
+and lifecycle generation. A clipboard change, session switch, reconnect,
+disconnect, close, or any transition that stops input invalidates and cancels
+the operation rather than sending different content or targeting another
+session. It never follows activation to a different chip.
+
+This ownership rule starts before asynchronous clipboard delivery, not only
+when a confirmation opens. Explicit terminal reads carry a unique request ID,
+originating tab, transport generation and ownership epoch. A newer request
+supersedes the old one; late or duplicate replies cannot fulfil another
+request. Returning to the original tab after switching away does not revive
+it. Native keyboard payloads already available with their key go straight to
+this policy without a second clipboard read. Unowned widget Paste callbacks
+never authorize terminal input; native menu, palette and local terminal
+gestures converge through the same identified-read path.
+
+Following keyboard input waits in the existing bounded session queue until
+that read resolves. Successful paste precedes waiting keys; cancellation,
+failure or overflow discards them with a content-free notification rather
+than executing Enter without its paste. A newly opened asynchronous-paste
+confirmation captures its opening frame's keyboard input and has inert
+controls for that rendering; Cancel is focused on the next frame. Its hint
+explains that deliberate Paste releases waiting keyboard input afterward,
+whereas Cancel discards it. Mouse/focus reports and terminal replies retain
+their existing independent behavior.
+
+Normalize CRLF and CR to LF for preview, counting and captured application
+text. The core encodes each ordinary-mode line break as one Enter (CR), not
+LF control-key input; line order, blank lines and trailing breaks are retained.
+Bracketed mode wraps the captured text without rewriting its payload. Neither
+path trims whitespace, rewrites shell syntax, or claims content is safe. A confirmed
+paste sends the captured original text—not an escaped or truncated preview—as
+one ordered input operation and cannot interleave with ordinary keystrokes. If
+the session stops accepting input, submission becomes unavailable. There is no
+initial don't-ask-again control.
+
+### Scrollback and follow-output
+
+Output follows the bottom only while the viewport is already at the bottom.
+Deliberate scrolling, Page Up, search navigation, or text selection away from
+the bottom suspends follow-output; new output enters bounded scrollback without
+yanking the reading position. A compact lower-corner `Jump to latest` control
+appears only after unseen output arrives. It may show an exact new logical-line
+count only when reliably measurable.
+
+Activating the control or `Ctrl+End` returns to the bottom and resumes follow.
+Shift+Page Up/Down and Shift-modified wheel behavior are guaranteed local
+scroll escape hatches even when a TUI owns normal paging/mouse input. Resize
+preserves the viewed logical region and maps selection endpoints through their
+logical lines; Copy omits synthetic newlines at soft-wrap boundaries. Search leaves follow
+suspended after navigating backward, and scroll position is per session across
+chip switches but not persisted after closure. Disconnected/exited sessions
+have no live-follow state or new-output indicator.
+
+If bounded scrollback evicts content above the current view, preserve the
+nearest retained position and announce that older history was discarded;
+never display stale rows.
+
+Terminal-history snapshot export uses the same retained-text model. The frozen
+text is the retained primary history plus the currently applicable visible
+screen, rendered as logical plain text: hard line breaks remain line breaks,
+soft wraps do not become synthetic newlines, grapheme clusters stay intact, and
+ANSI/control sequences are never exported. When the alternate screen is active,
+the snapshot still includes retained primary history but only the visible
+alternate screen; it does not fabricate hidden primary rows or off-screen TUI
+content. The resulting snapshot is immutable even if later output arrives or
+the saved copy is edited.
+
+The terminal uses a thin right-edge overlay scrollbar that does not consume a
+grid column. It appears on hover, scroll, selection drag, or whenever the view
+is away from the bottom. Its thumb represents only the bounded retained buffer,
+uses a practical minimum size, and becomes full/hidden when nothing can scroll.
+Dragging suspends follow; track interaction pages toward a location rather than
+claiming one-pixel precision. It remains fully usable for disconnected history
+and is application-reserved even when a TUI has mouse reporting enabled.
+Keyboard scrolling remains available, and accessibility/high-contrast scaling
+may widen the hit target without changing grid geometry. There is no minimap
+or search/command/diagnostic decoration on the track.
+
+### Background output hypothesis
+
+The initial design does not mark an inactive chip for ordinary output bytes.
+Generic output has no reliable message/read boundary, and log streams would
+make an unread badge or row count permanently noisy. Bell attention and
+reliable lifecycle transitions remain the signals that change a chip.
+
+This is explicitly a usability-test hypothesis, not an irreversible product
+rule. Testing should determine whether users lose important background context.
+If a future preference is justified, it must define the truthful event it
+represents (for example, activity since last activation) and must not label
+bytes/rows as “unread,” infer task completion, or compete with higher-priority
+attention and lifecycle states. Ordinary output remains silent by default.
+
+Activating a background session restores its own scroll/follow position. A
+session left at live bottom shows the current bottom; one deliberately left in
+history returns there with Jump to Latest. Activation does not fabricate a
+read acknowledgment.
+
+### Explicit terminal hyperlinks
+
+Explicit OSC 8 hyperlinks and plain-text path and URL detection remain separate
+features. OSC 8 parsing stays restricted to explicit hyperlinks; plain-text
+target detection is bounded by visible terminal cells, frozen when the context
+menu opens, and resolved without shell evaluation.
+
+Explicit links expose a bounded preview of their normalized ASCII target in
+the context menu, with the full target in the tooltip and accessible label,
+following the display-only elision rules above. `Ctrl+click` on Windows/Linux
+or `Cmd+click` on macOS opens a validated target through the application-owned
+OS-handler command; ordinary
+clicks retain terminal selection/mouse behavior. Context actions **Open link**
+and **Copy link** appear only over a real link range. Copying terminal text
+copies visible text, not the hidden URI. Only absolute HTTP and HTTPS URLs with
+a host may reach the OS URL handler; malformed, whitespace-bearing, non-ASCII,
+mail, script, and unknown-scheme targets are rejected. Parser filtering is
+repeated authoritatively at launch time. Links remain usable in read-only
+history and are excluded from diagnostics.
+
+ADR 0052 adds absolute local `file:` OSC 8 metadata with empty or localhost
+authority. Local File-link Open opens an internal text/Markdown document,
+never an OS file association. The command pins the originating tab and
+lifecycle generation; stale, closed, SSH/SFTP, Dev Tunnel and serial sources
+cannot authorize a client-local file read. Hover/menu previews and
+**Copy path** expose the strictly decoded destination (native Windows drive
+spelling where applicable), not the producer's label. Ordinary clicking does
+not activate it.
+
+Raw Windows paths and relative OSC 8 targets, foreign hosts, UNC/device
+namespaces, alternate streams, malformed encoding, control/bidi characters and
+query/fragment semantics are not supported. No-follow directory/file handles
+refuse symlinks and junctions before content reads; Windows mapped network
+roots are refused. The existing regular-file, text and document-size limits
+apply. Refusal never invokes a shell, remote fetch or external application.
+Copy remains available for syntactically valid but unavailable file targets.
+
+ADR 0053 extends this through a shared source-bound filesystem capability.
+Detected paths and explicit OSC 8 file metadata from SSH/SFTP or Dev Tunnel
+use only that originating live authenticated capability and remote OS path
+semantics. Empty/localhost file authorities mean the source host, not the
+client. Provider, endpoint, profile and connection generations bind read-only
+text/Markdown snapshots. Missing/stale capabilities, foreign authorities and
+unsupported namespaces refuse without local, OS-handler or shell fallback.
+Bridge reads require explicit operator enablement and are bounded regular-file
+reads, not arbitrary filesystem commands. See `DT-06` for native qualification.
+
+The no-follow policy persists for background freshness checks, refresh/reload,
+save-conflict source reads and ordinary saves, including reused document
+buffers. Reads stay bound to the retained canonical source and original parent
+identity; only a new explicit Save As authorizes a different destination.
+
+An unterminated OSC 8 range is cleared by a hard line/index boundary, SGR
+reset, terminal reset, or primary/alternate-screen transition, and is capped
+at 4,096 printed cells. This prevents a hostile remote producer from silently
+annotating unrelated later prompts or output.
+
+Plain-text path opening may route to the existing local text/Markdown surfaces
+or to a verified SSH/SFTP snapshot, but an SSH path is always remote metadata
+and must never be passed to the local OS. Relative paths remain disabled until
+the session reports trustworthy cwd metadata; absent OSC 7 or an application-
+owned SFTP cwd, fesTerm must say cwd is unknown rather than guess.
+
+### Bell and attention
+
+A terminal bell requests attention; it does not prove success, failure,
+completion, or command identity. For an inactive session, set the
+`status.attention` badge and secondary text `Attention requested` until the
+chip is activated. Repeated bells coalesce rather than forming a speculative
+counter. A higher-priority lifecycle state wins.
+
+For an active session, briefly pulse only its status badge. There is no
+whole-window flash, focus stealing, tab switching, scrolling, or cursor
+movement. The pulse is rate-limited and becomes a static temporary color
+change when reduced motion is requested. Sound and OS notifications are off by
+default until persisted preferences and an explicit privacy/rate-limit policy
+exist. Disconnected history cannot generate new attention events.
+
+Diagnostics may retain a client-observed bell event without terminal content.
+Future visual/audio/background-alert controls appear only with real choices
+and configuration persistence.
+
+### Mouse
+
+- Clicking a tab activates it.
+- Tab close controls should avoid accidental activation or closure.
+- Reordering may be supported through drag-and-drop.
+- Session tabs may be renamed by double-clicking the chip's label, editing inline, and committing with Enter or by clicking away; Escape cancels. Launcher and Settings chips are not renamable.
+- Terminal mouse reporting and local selection remain governed by terminal mode and modifier policy.
+
+Chip reordering is implemented by making the whole chip press-and-hold draggable (`crates/festerm-ui-egui/src/chrome.rs`) rather than via a dedicated drag-handle glyph: no explicit move icon is shown, and pressing anywhere on the chip body (outside the label, close button, and current status indicator, which keep their own click targets) starts a drag. While dragging, the chip itself floats at the cursor and sibling chips live-shuffle to preview the resulting order as the pointer moves, rather than only showing a static insertion marker.
+
+### Focus
+
+Opening or activating a terminal tab should focus the terminal unless a modal action, authentication prompt, or launcher control explicitly owns focus. Implemented in `crates/festerm-ui-egui/src/view.rs`'s `TerminalView::show_in_ui`: each view claims keyboard focus once automatically on its first rendered frame (tracked via a `has_requested_initial_focus` flag), in addition to the existing click-to-focus behavior, so a freshly started session is immediately typeable without requiring an extra click into the terminal.
+
+### Fullscreen and focus mode
+
+![Focus-mode target](images/gui-mockups/focus-mode.png)
+
+OS fullscreen retains application chrome and the 24 px status bar. Focus mode
+is a separate explicit window-level command that hides both for a terminal-only
+view; terminal alternate-screen mode affects only terminal buffers and cannot
+enter or exit either application mode.
+
+Entering/exiting focus mode preserves the active session and per-session zoom,
+recalculates the grid, and emits one coalesced resize. A brief noninteractive
+overlay names the mode and its exit shortcut. Exceptional trust,
+authentication, disconnect, and failure overlays remain available, and
+background attention may use a small non-content-bearing indicator without
+switching sessions. Platform window controls remain reachable through native
+conventions. Escape alone does not exit, terminal escape sequences cannot
+control it, and focus mode is not initially persisted in workspaces.
+
+### Closing sessions and quitting
+
+![Live-session close-confirmation target](images/gui-mockups/close-session-confirmation.png)
+
+Closing Launcher, Settings, or an already exited/disconnected history surface
+is immediate. By default, closing a live local, SSH, or serial session requires
+confirmation from every invocation path. Settings exposes **Confirm before
+closing live sessions** for users who prefer immediate one-click closing; when
+off, every close invocation bypasses this session confirmation consistently.
+When confirmation is enabled, its title is `Close “<stable
+identity>”?`; its body names the exact transport consequence—terminate the
+owned local process, disconnect from the remote host, or close the serial
+port—and states that the session's unsaved terminal history will be discarded.
+The actions are **Cancel** and destructive **Close Session**.
+
+Inspector transport actions preserve the chip and history and therefore use
+different language. **Stop Process** says the process will terminate and its
+history become read-only; **Disconnect** says the SSH transport will close and
+history become read-only; **Close Port** says the serial device will be
+released and history become read-only. Their confirmation actions repeat the
+specific verb rather than using a generic OK.
+
+Closing the application window presents one aggregate confirmation when live
+sessions remain, summarizing exact counts of local processes, SSH connections,
+and open serial devices rather than opening one dialog per chip. It states that
+unsaved history will be discarded and uses **Close Window**. **Quit fesTerm**
+uses the same aggregate model across every window owned by that application
+process and names its destructive action **Quit fesTerm**; on macOS, Close
+Window and Quit retain their distinct native lifecycle meanings.
+
+fesTerm currently opens exactly one native window per process, so its window
+close button, its native "Quit fesTerm" menu command, and platform shortcuts
+such as Cmd+Q all surface to the application as the same OS
+`close_requested` viewport event — there is no separate signal to
+distinguish "close this window" from "quit the application" while only one
+window exists. The implemented dialog therefore always reads **Quit
+fesTerm**, covering both cases with the single aggregate summary described
+above. If a future release adds independent windows, the window-close path
+should regain its own **Close Window** wording and only the last window's
+close should trigger the process-wide **Quit fesTerm** language.
+
+All destructive confirmations are modal to their owning window. Cancel has
+initial focus, Escape cancels, clicking outside does not dismiss, and Enter
+cannot confirm destruction unless the user has explicitly moved focus to the
+destructive action. A dialog binds to the exact session identity and lifecycle
+generation it describes, then revalidates state at confirmation time; it must
+not stop a freshly reconnected process or transport through a stale prompt. If
+the consequence disappears while open, the dialog closes safely or updates
+before accepting action.
+
+Accessibility invocation of a foreground confirmation action follows the same
+Cancel or deliberate-confirm path as pointer and keyboard activation. Terminal
+input blackout must not consume those requests before the dialog renders, nor
+allow terminal-local accessibility controls to activate behind its backdrop.
+
+Cleanup follows bounded backend shutdown policy and cannot hang indefinitely.
+Workspace definitions survive runtime closure; history does not. No
+always-close-without-asking, close-protection, or “don't ask again” preference
+appears before persisted configuration exists. Closing the final chip returns
+to Launcher under the root-state rule above.
+
+### OS window title
+
+Use `fesTerm` as the native title for every application surface and session.
+Stable session identity remains in the active chip rather than being exposed
+to task switchers, window managers, screenshots, or screen sharing by default.
+Terminal-provided titles, transient state, bells, workspace names, and rapid
+output never rewrite the OS title. No dynamic suffix is used initially, and the
+app icon remains stable taskbar/dock identity.
+
+Usability testing must include multiple independent fesTerm instances and
+task-switcher/window-overview navigation to validate whether a fixed title
+causes meaningful identification problems. If evidence establishes that need,
+consider an explicit opt-in preference to expose stable active-session identity
+in the native title. Never fall back to terminal-provided title text or enable
+identity exposure silently.
+
+### Privacy outside the terminal viewport
+
+fesTerm does not claim that terminal use is private merely because sensitive
+values are omitted from ordinary chrome. OS screenshot, screen-recording,
+window-management, accessibility, and clipboard facilities may capture visible
+terminal or application content. The application does not attempt to intercept
+those facilities, and Focus mode is not a privacy mode. An initial masking mode
+is omitted because it could hide app-owned labels while leaving arbitrary
+terminal output exposed, creating false confidence.
+
+OS notifications and sound remain off by default. If notifications are later
+implemented behind persisted preferences, their default external text is
+generic: application identity plus a factual message such as “A session
+requires attention.” They omit stable session names, terminal-provided titles,
+hostnames, usernames, paths, commands, output, authentication method, trust
+fingerprints, and error details. Activating a notification focuses the affected
+session, where the owned UI can present the necessary context. Any future
+identity-bearing notification option must be an explicit privacy tradeoff with
+rate limiting, not an inferred convenience.
+
+Copied diagnostics are bounded and redact stable/user-provided identity,
+hostnames, usernames, filesystem paths, serial-device identifiers, host-key
+fingerprints, environment values, and terminal content by default. Dedicated
+explicit actions such as Copy Fingerprint or ordinary terminal Copy remain
+literal because the user selected that exact content. Logs, crash metadata, and
+telemetry follow the diagnostic exclusion rules and never become a second,
+less-protected transcript channel.
+
+Workspace and profile files may necessarily contain validated launch metadata,
+including host, username, path, or serial-device configuration. That data is
+private local configuration: it uses user-scoped storage, is not advertised as
+secret storage, and is never automatically synchronized, uploaded, attached to
+diagnostics, or shared. Passwords, authentication responses, private-key
+contents, environment values, terminal output, and scrollback remain excluded.
+Workspace sharing/export is not an initial feature. A future export must show
+an exact metadata preview and offer explicit redaction before creating a
+shareable artifact; it cannot reuse the ordinary internal workspace file and
+call it safe.
+
+### Drag-and-drop input
+
+Plain-text drops follow the same ordering and safety rules as Paste.
+
+For a local live session, a file drop inserts absolute client paths as one
+ordered input operation and never sends Enter, reads file contents, or
+uploads automatically. fesTerm has no reliably known per-profile shell
+family yet, so it always takes the documented fallback: a bounded preview
+(escaping control characters the same way the large-paste preview does)
+offers raw-path insertion or Cancel rather than ever guessing
+PowerShell/POSIX-shell/`cmd.exe` quoting. Multiple paths retain drop order,
+space-joined and unquoted, in the inserted text and in the preview.
+
+A local file dropped on SSH or serial must not insert a misleading
+client-local path, so drops onto anything other than a local session are
+rejected with a factual transient notice instead of a dialog. A future
+transfer workflow may explicitly upload and then insert a verified remote
+path, but those remain two visible operations and are not implemented yet.
+Disconnected/exited terminals and any session that does not currently
+accept input also reject input drops. Paths remain transient input and
+never enter logs, diagnostics, profiles, or workspaces.
+
+fesTerm currently routes every OS file drop to the active tab's session
+regardless of where over the window it lands (there is no per-widget drop
+target yet, so a drop over a settings text field, for instance, still
+reaches the active terminal instead). This is a known scoping gap versus
+"application text fields receive drops targeted to them" and should be
+revisited if per-widget targeting becomes necessary.
+
+## Accessibility
+
+The GUI should provide:
+
+- semantic roles and accessible names for tabs and controls;
+- non-color state indicators;
+- sufficient contrast;
+- keyboard traversal for launcher, tabs, settings, and diagnostics;
+- clear focus indication outside the terminal viewport;
+- meaningful truncation or tooltips for shortened identity text; and
+- scalable application chrome independent of terminal font size where practical.
+
+Headless GUI tests should assert semantic names and roles for major controls before pixel snapshots are treated as authoritative.
+
+Application and terminal accessibility remain separate trust domains. Chips
+expose tab role, stable name, selected state, session type, and lifecycle;
+icon-only controls expose actions rather than picture descriptions. Reliable
+exceptional transitions announce once, while ordinary output and repeated
+bells do not flood announcements. Terminal escape sequences cannot create
+application controls, replace trusted identity, or generate arbitrary
+application-level announcements.
+
+The terminal accessibility layer exposes bounded visible logical lines, cursor,
+selection, and focused-line changes without mirroring the full changing screen
+into generic labels. Alternate-screen transitions expose only the active
+buffer. Decision dialogs trap focus; temporary nonmodal surfaces restore the
+exact prior focus owner. Chrome focus is visibly non-color-only, while terminal
+focus uses the active cursor rather than a bright viewport border. Truncated
+text retains full sanitized accessible naming. UI scale affects chrome
+independently of terminal zoom; high contrast may strengthen tokens without
+changing geometry, and reduced motion removes pulses/fades without hiding
+persistent state. No essential action depends on hover, drag, precision, or
+color.
+
+### Terminal selection
+
+Drag creates linear selection; double-click selects a Unicode-aware terminal
+word, and triple-click selects a logical line by joining soft wraps but not
+real breaks. Shift+click extends. Alt+drag (Option on macOS) creates rectangular
+cell selection; Shift forces either local mode while mouse reporting is active.
+Primary-screen resize preserves an existing selection by remapping both
+endpoints through stable logical-line positions rather than retaining stale
+physical row coordinates.
+Word rules may recognize common path punctuation but never infer shell syntax.
+
+Wide glyphs are indivisible, combining marks stay with their bases, and
+rectangular copy omits continuation cells without duplicating glyphs. Selection
+may span retained scrollback, auto-scrolls predictably at edges, persists per
+session and across new output, and remains tied to its buffer across alternate-
+screen transitions. Overwrite or eviction invalidates only affected content
+and never permits stale copying. Search highlight stays visually distinct.
+Linear copy joins soft wraps; rectangular copy preserves rows. There is no
+initial primary-selection clipboard behavior or dedicated Clear Selection
+command.
+
+## Responsive and Narrow-Window Behavior
+
+![Minimum-width responsive target](images/gui-mockups/narrow-window.png)
+
+When horizontal space is constrained, remove or collapse information in this order:
+
+1. Optional inactive-chip secondary metadata; when compact active detail has
+   been relocated to the status bar, that relocated value ellipsizes first.
+2. Inactive chip width toward its minimum, then inactive stable-identity
+   ellipsis. The focused chip remains at its normal width.
+3. Less-used terminal actions into More actions, starting with terminal Search
+   and Focus mode.
+4. Horizontal scrolling after all visible inactive chips have reached minimum
+   width; never skip inactive compaction by creating a scroll area immediately.
+5. Status-bar locality/platform, retaining grid dimensions and accessible
+   state.
+
+The focused chip's stable primary identity, type icon, state badge, and Close
+control remain fully visible at normal width. New Session and platform-required
+window controls remain visible as long as possible. Activating an offscreen
+chip expands it to normal focused width and scrolls it fully into view while
+the old focused chip becomes eligible for inactive compaction. The command
+palette—not an overflow menu—is the session switcher when many chips are
+offscreen.
+
+The terminal viewport must never become fragmented or uncovered because chrome, diagnostics, or footer geometry was calculated after terminal dimensions.
+
+Current implementation gives Open File and Save As one popup frame and
+calculates their content size after subtracting that frame and a 16 px root
+gutter. At the supported `360 × 240` root, the sheet content scrolls rather than
+forcing a 420 px width or 360 px height. Save As retains its existing file-name,
+overwrite/blocker notice, and action footer inside the scrollable sheet.
+Safety dialogs keep their full disclosures in a bounded body, with wrapped
+28 px actions outside it; existing safe/default focus and cancellation policy
+remain authoritative.
+
+The first matched headless review still blocks acceptance of this implementation:
+short Save As child content can paint outside its bounded sheet, and the deep
+Open File breadcrumb occupies the initial narrow ready/error viewport.
+Passing rectangle/interaction tests do not replace clipped-paint and usable
+initial-presentation evidence.
+
+The follow-up Save As layout pins the filename, overwrite notice and actions
+before allocating the remaining viewport to scrollable navigation and rows.
+Nested panels intersect their clip with the inherited viewport before creating
+widgets, preserving both paint and pointer clipping rather than masking drawing
+after interaction. Picker sizing uses the full client root, not the editor or
+terminal's smaller content area. Open File keeps all breadcrumb ancestors in a
+height-bounded horizontal scroll region; a new path starts at its current
+directory, and full paths remain available on hover with exact navigation
+targets. Open File pins Cancel before allocating its remaining space to the
+path/filter controls and bounded error/list body; short roots use compact
+insets/gaps without changing typography or reducing disclosures. Tests prove
+initial modal-owned fields/actions at all three roots and both densities,
+initial error visibility, restored terminal input focus and refusal of clipped
+Save As row/action pointer clicks. Save uses an explicit stable response ID
+on the filename's modal layer, not a background button label match. Fresh
+matched drawing must still pass before visual acceptance.
+
+The fresh `style-pair-20261002-r2` comparison subsequently rendered the corrected
+`426c458` source and the retained production-f0 runner at identical physical
+inputs/settings. All 23 AFTER images were inspected: observed off-root sheets
+fell from eight to zero, and observed off-root action scenes from seven to zero.
+Save As filename/notice/Save/Cancel and Open File path/filter/Cancel are initially
+visible without scrolling the whole sheet. At 360×240, the Open File body starts
+with the table header/item count; rows, Save As navigation and long About/safety
+disclosures use their bounded body scroll regions. This is a geometry/action
+slice, not a native/usability acceptance or a claim that every body item is
+initially visible. Raw missing/null/duplicate-label observations remain
+unqualified; see the evidence boundaries in `docs/manual-validation.md`.
+
+Byte-identical [focused BEFORE/AFTER review images](images/dialog-style-review/style-pair-20261002-r2/)
+retain their exact [source/physical-input provenance](images/dialog-style-review/style-pair-20261002-r2/provenance.json);
+they are separate from the original gallery and are not platform snapshots.
+
+The shared owned-modal helper lets Open File and Save As use the installed
+Windows DX12 CPU panel renderer for their unique complete opaque popup frame
+and original black shadow. The ordinary live Modal still owns sizing, content,
+IDs, focus, input and responses. Fill, stroke, rounding, shadow blur and the
+existing backdrop/dimming remain unchanged. Unsupported, clipped, ambiguous,
+translucent, shadowless or ineligible frames retain ordinary painting.
+Consolidation preserves the newer shared helper, not the draft's picker-only
+wrapper. Its actual-modal pixel/response/callback regression uses a fresh
+RenderState per comparison arm and independent test-only backdrop/frame
+controls at 100%, 125% and 200% scale. Historical eight-picker measurements
+remain bound to their recorded source, not the consolidated head; native
+interaction remains separate. See
+the [qualification boundary](../validation/windows-warp/README.md#prepared-owned-picker-frame-production-successor).
+
+## Future Populated Launcher Example
+
+![Future populated Launcher target](images/gui-mockups/launcher-populated.png)
+
+Once persisted profiles and workspaces exist and contain real entries, a
+populated launcher may resemble:
+
+```text
+fesTerm
+
+New Session
+  Local Shell
+    PowerShell
+    Bash
+
+  SSH
+    Connect to host...
+
+Recent
+  production-db
+  staging
+  dev-vm
+
+Workspaces
+  Yesterday
+  Kubernetes
+```
+
+This is information architecture, not a pixel specification. The final implementation should remain compact and terminal-oriented.
+
+## Validation Strategy
+
+The complete traversable state/action model is maintained in
+[`gui-action-graph.md`](gui-action-graph.md). It assigns stable edge IDs to
+every workflow in this document, including cancellation, inverse, cleanup, and
+return-to-known-state paths. Test plans and VM drivers should reference those
+edges rather than inventing isolated sequences.
+
+GUI behavior should be validated in layers:
+
+1. Pure layout, geometry, state, and input tests.
+2. Headless egui frame tests.
+3. Structural viewport and clipping assertions.
+4. Stable visual snapshots.
+5. Native-window platform smoke tests.
+6. Workflow review using screenshots or recordings.
+
+Important GUI states should include:
+
+- launcher with no saved profiles;
+- launcher with recent profiles and workspaces;
+- multiple local, SSH, and serial tabs when their transports are implemented;
+- active, inactive, reconnecting, failed, and exited sessions;
+- long and duplicate session names;
+- narrow and high-DPI windows;
+- diagnostics collapsed and expanded; and
+- workspace restoration with mixed success.
+
+## Iteration Process
+
+GUI work should proceed in short design rounds:
+
+1. **Workflow:** define user goal, primary action, keyboard path, failure state, and required information.
+2. **Information architecture:** define tabs, menus, panels, and state ownership.
+3. **Visual language:** define density, spacing, typography, color roles, and icon policy.
+4. **Prototype:** build a narrow vertical slice with fake session metadata where appropriate.
+5. **Evaluation:** review screenshots, recordings, structural tests, and interaction behavior.
+6. **Specification:** update this document and create focused implementation issues.
+
+Implementation should not attempt the entire future UI at once. The first prototype should prove the launcher, tab identity model, session states, hidden inspector diagnostics, and terminal dominance before broader settings or workspace UI is built.
+
+### Mockup-comparison review process
+
+Step 5 (**Evaluation**) above is deliberately not "eyeball the screenshot and move on." Early GUI rounds relied on a general-purpose coding agent doing its own ad hoc visual comparison against the wireframe in the same context as the implementation work, and that repeatedly produced two failure modes: the agent anchored on whichever detail it had just been told to check (missing unrelated regressions elsewhere in the same screenshot), and its pixel-level size/spacing estimates from the image were unreliable — two independent passes over the same screenshot region gave materially different numbers, and at least one flagged "deviation" (an 18px vs. 24px chip-inset asymmetry) turned out to be a false positive once actually measured.
+
+That motivated splitting mockup analysis into its own persisted, reusable custom agent definition (`~/.copilot/agents/mockup-analyst.md`, user-scoped so it is available across repositories/sessions) whose sole job is deep, disinterested visual/UX comparison — not implementation. Its design settled on:
+
+- **Workflow- and aesthetics-first reading, not pattern matching.** It is instructed to first form an understanding of the mockup's intent (border spacing and offsets, alignment axes, typography, color semantics, navigation paradigms, element grouping, and permanent-vs-transient elements) before diffing against any implementation, and to recognize when a single image is a composite of multiple independent screens/states that must be analyzed separately.
+- **A structured Match / Deviation / Ambiguous protocol** for every comparison, rather than free-form prose, so findings are consistently actionable.
+- **A negotiated-deviations ledger** (`~/.copilot/agents/mockup-analyst-deviations.md`): some departures from the mockup are conscious product decisions (for example, the status bar deliberately omitting fabricated shell-version/encoding fields). The agent reads this ledger before every review and reports conformance to a negotiated preference as **Match (negotiated)**, distinct from a plain mockup match, instead of re-flagging an accepted decision as a fresh deviation every round.
+- **Explicit evidence-sufficiency checks.** The agent must say when a screenshot cannot answer the question being asked (e.g. a single-chip screenshot cannot prove active-vs-inactive contrast, an empty terminal cannot prove viewport padding on all four sides, no hover/focus captured cannot assess transient states) and name the specific follow-up screenshot needed, rather than silently passing or failing on insufficient evidence.
+- **Preferring objective pixel measurement over visual estimation for close calls** — script-sampling the actual mockup/screenshot image file (e.g. via a short Python/Pillow snippet run through `powershell`) rather than trusting an LLM's visual read of a rendered image, directly because of the false-positive case above.
+
+The agent is invoked today by pasting its full definition into a fresh general-purpose background-agent context for each review (custom agent definitions are not yet directly selectable as a `task`-tool agent type), so each run is a clean, disinterested pass with no bias carried over from the implementation work in the same session. A comparative run using two different underlying models (Claude and GPT) on the same mockup found they can disagree on the same evidence — for example, only one correctly recognized a status-bar field omission as an already-negotiated decision rather than a fresh deviation — which is the concrete case the negotiated-deviations ledger now exists to prevent.
+
+#### Drive-and-measure is required for pixel-accurate rounds
+
+The GUI SFTP split-pane layout re-proved the point above at scale: twenty-two review rounds across two models failed to close a nine-item annotated-defect list, and the round that closed it began by building a harness instead of editing layout code. See `docs/milestone-progress.md`, "September 2026 GUI SFTP layout: three models, twenty-eight rounds, and why measurement won," for the full account and the recorded per-model cost.
+
+The operative rule that came out of it: **a model reviewing its own screenshot has no error signal.** It will read its own output as aligned and report success sincerely. For any round whose acceptance criterion is spacing, alignment, or containment, the round must produce numbers, not impressions:
+
+- **Rasterize the reference mockup** so it can be sampled numerically rather than described from memory.
+- **Capture the real build in the real state.** Launch the actual release binary and drive it to the state under review with OS-level automation (on Windows, synthesized input plus `PrintWindow`), rather than reasoning about a headless render or an older screenshot.
+- **Sample both images with a script** (Pillow via `powershell` works well) and compare specific edges, insets, gaps, and row pitches as numbers. A defect is not fixed until a measurement matches.
+- **Prefer a structural cause over a spacing tweak.** Recurring geometry defects in this project have almost always had one structural cause — a minimum applied after a width budget, a forced height, a `ScrollArea` auto-shrinking to content width — that no amount of padding adjustment can reach. If a round is adjusting constants and the same annotation returns, stop and measure for the cause.
+- **Pin each measured invariant in a regression test**, so a number that was expensive to establish cannot silently regress.
+
+For screen-specific review, use the nearest linked PNG in this document rather
+than cropping the older composite wireframe. Capture the native application at
+the corresponding logical viewport and state when practical, retain the OS and
+DPI/scale in the evidence record, and compare workflow and semantics before
+pixel detail. A mockup is authoritative only for the contract described by its
+adjacent section; prose and recorded negotiated deviations win when a static
+image cannot express focus, timing, platform convention, accessibility, or
+implemented-capability conditions.
+
+## Historical First GUI Prototype Scope
+
+The completed first design prototype was scoped to include:
+
+- a launcher tab;
+- two or three mock session tabs;
+- local and SSH identities;
+- active and inactive states;
+- disconnected and reconnecting states;
+- stable primary identity plus optional dynamic secondary title;
+- a compact New Session action;
+- hidden diagnostics within the session inspector; and
+- terminal viewport dominance.
+
+It used fake metadata where necessary so interaction and hierarchy could be
+settled before M7 and M8 implementation details constrained the design. This
+section is retained as design history, not as the current implementation plan.
+
+## Current Implementation Priorities
+
+The command-label/palette alignment, Launcher lifecycle, responsive Session
+Inspector overlay, first native macOS application-menu slice, and truthful
+terminal/session-chip context menus are implemented. Remaining approved target
+behavior should proceed in this order unless an active milestone or regression
+requires a different sequence:
+
+1. Add bounded scrollback under the M9 design gate, then represent reconnect,
+   relaunch, and reopen boundaries as non-terminal UI metadata within it.
+2. **Initial slice implemented:** live-session close and risky-paste
+   confirmations use application-owned policy with stable tab identity and
+   transport-generation binding. Escape is consumed before terminal routing,
+   Cancel owns initial focus, backdrop clicks do not dismiss, and terminal
+   input is suppressed while a prompt is open. Paste normalizes only line
+   endings, shows exact bounded counts/preview, and submits one ordered
+   captured operation after revalidation. Native narrow-window, clipboard,
+   threshold, wording, and focus usability remain in `manual-validation.md`;
+   aggregate multi-session window quit remains staged.
+3. **Initial Focus Mode and zoom slices implemented:** Focus Mode is an
+   explicit palette command that hides chrome/footer, preserves the active
+   terminal, leaves Escape to terminal content, and exposes its exit route in
+   a brief overlay. Runtime zoom uses the documented platform chords and
+   palette commands, is bounded and per-session, and never scales application
+   chrome. Native DPI, resize-coalescing, anchor, focus, and accessibility
+   evidence remains in `manual-validation.md`.
+4. **Initial About and update surface implemented:** the compact
+   application-owned modal
+   exposes exact version/platform information, a bounded privacy-safe Copy
+   summary, the canonical source link, and complete embedded optional-font
+   license notices that remain available in packaged/offline applications;
+   configured packaged builds additionally expose the explicit signed-update
+   state machine from ADR 0021. Developer/incomplete builds fail closed without
+   a network action. Native update, link handoff, accessibility, and visual
+   evidence remain in `manual-validation.md`.
+5. **Semantic icon layer implemented:** `festerm-ui-egui::icon::Icon` owns the
+   complete first-party inventory and dependency-free canonical geometry;
+   Launcher session types and persistent chrome controls use it with semantic
+   colors and accessible control labels. Remaining one-off sites and native
+   cross-platform visual evidence are tracked separately. The terminal now
+   provides four selectable pinned families with real
+   regular/bold/italic/bold-italic faces: JetBrains Mono is embedded, while
+   Iosevka Term, JuliaMono, and Maple Mono are verified matching-release
+   downloads. Runtime switching is generation-safe, fallback chains remain
+   independent, and ligatures default off. Bundle Inter through the owned
+   application-font layer next, retaining fallback contracts.
+6. Implement **Show session details in chips** as the presentation-only live
+   preference defined above: grouped Settings row, `34→28` chip geometry,
+   `42→36` single-row chrome geometry, active-only status-bar relocation, and
+   one coalesced terminal resize. Cover `CHIP-11`, `STATUS-03`, `SET-02`, and
+   manual scenario `AS-09`; do not turn it into a general density or theming
+   system.
+7. Schedule the serial backend as a focused capability track with platform
+   discovery, permissions, exclusive ownership, and deterministic loopback
+   evidence; its GUI contract is already defined here.
+
+## Open Questions
+
+Manual/native checks and usability hypotheses in this section are inventoried
+in [`manual-validation.md`](manual-validation.md) and coordinated through
+[issue #43](https://github.com/fes/fesTerm/issues/43). A focused issue is added
+only when a check has its own environment, owner, acceptance boundary, or
+discovered defect.
+
+- Cross-platform custom-title-bar behavior: drag, double-click maximize/restore,
+  snapping, multi-monitor DPI, accessibility, and native convention alignment
+  are tracked in [issue #29](https://github.com/fes/fesTerm/issues/29).
+- Usability and cross-platform visual-baseline review of bundled Inter for
+  application chrome, especially small text, DPI scaling, and non-Latin
+  fallback; future configurable theme variants remain separate.
+- Usability validation of paste confirmation: multiline and large-paste
+  thresholds, exact-preview comprehension at narrow sizes, keyboard focus and
+  Enter safety, bracketed-paste explanation, and clear cancellation when the
+  clipboard or target session changes.
+- Incremental migration of remaining one-off painter-drawn presentation sites
+  through the semantic icon layer; revisit raster caching only if measured
+  performance or additional asset complexity justifies it.
+- Usability validation of the fixed `fesTerm` native title across multiple
+  independent instances and OS task-switcher/window-overview workflows; any
+  identity-bearing title remains an explicit future opt-in.
+- Backend capability and command semantics for a real Reconnect action; the UX
+  contract is specified above, while the current overlay correctly omits an
+  action it cannot perform.
+- Native Markdown-viewer implementation and validation against the approved
+  readability-first boundary in `docs/markdown-viewer-design.md`; no current
+  milestone depends on it.

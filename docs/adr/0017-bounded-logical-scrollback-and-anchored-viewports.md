@@ -1,0 +1,177 @@
+# ADR 0017: Bounded Logical Scrollback and Anchored Viewports
+
+- **Status:** Accepted
+- **Date:** 2026-08-12
+
+## Context
+
+The current terminal core owns two rectangular screens. Rows that scroll above
+the primary screen are discarded, resize preserves only the upper-left
+intersection, and the UI can display and select only visible cells. That model
+cannot support M9 history, reflow, search, or the approved read-only surface for
+an exited or disconnected session.
+
+Scrollback must remain deterministic and session-backend-independent. It must
+preserve cell attributes, hyperlinks, wide-cell ownership, and combining text;
+must not retain alternate-screen output; and must have a real memory bound even
+when one logical line or one grapheme cluster is unusually large. Viewport and
+selection positions also need identities that survive physical-row changes.
+
+## Decision
+
+### Canonical primary-screen content
+
+The terminal core owns primary-screen history as ordered logical lines. Each
+line has a monotonically increasing, session-local identity, an ordered stream
+of terminal cells, and an explicit ending:
+
+- **hard break** for LF, IND, NEL, or another operation that advances to a new
+  line without auto-wrap; or
+- **open** while output may continue the same logical line through one or more
+  soft wraps.
+
+Physical rows retain continuation metadata and an occupied extent. Auto-wrap
+joins adjacent physical rows into one logical line. A hard break ends the
+logical line. Structurally unused right-side padding is not logical content;
+explicit spaces, styled cells, hyperlinks, wide cells, and combining text are.
+Grid editing updates this metadata with the same single-writer ownership as
+cells.
+
+Only a primary-screen scroll of the complete vertical viewport transfers rows
+into history. Scrolling inside a partial margin remains a rectangular screen
+operation and does not create global history. The visible primary screen and
+retained history form one logical content sequence for reflow, selection, Copy,
+and Find.
+
+The alternate screen remains a separate rectangular buffer with no history and
+no reflow. Entering it suspends the primary viewport state; leaving it restores
+that state. Alternate output can neither enter nor clear primary history.
+
+### Bound and accounting
+
+Each terminal has a configurable retained-history payload budget in binary
+bytes. The default is **64 MiB per session**, allocated only as content is
+retained; `0` disables history. Configuration changes apply to future sessions
+unless an explicit action says otherwise.
+
+The charged size includes logical-line and cell storage, vector capacity,
+owned cell text capacity, and hyperlink target bytes. Shared allocations may be
+charged conservatively more than once. Allocator bookkeeping and the live
+visible grids are reported separately and are not claimed as exact process
+RSS. Diagnostics expose only configured bytes, charged bytes, retained logical
+lines/physical rows, and eviction counts—never terminal text.
+
+Eviction removes complete oldest logical lines until the charged size is at or
+below the limit. If one still-open logical line alone exceeds the budget, its
+oldest physical rows are trimmed in amortized batches while its most recent
+suffix remains available. Stable offsets retain the number of cells trimmed
+from the front so stale anchors fail closed instead of resolving onto shifted
+text. A content-free oversize-line counter increments once per affected logical
+line, not once per trim. Capacity compaction and incremental owned-payload
+accounting keep the bound strict without rescanning or shifting the full
+retained line for every appended row.
+
+### Stable positions and reflow
+
+Cursor, selection, search matches, and viewport anchors use a stable logical
+position: logical-line identity plus cell-stream offset and boundary affinity.
+Wide characters map through their owning cell; continuation cells are never
+independent anchors. Combining text remains attached to its owning cell.
+
+Primary resize reconstructs physical rows from logical lines at the new width,
+then maps the cursor, selection endpoints, search matches, and viewport anchor
+through those stable positions. Hard breaks remain hard breaks. Alternate
+resize keeps the existing rectangular semantics and relies on the application
+to redraw after the PTY resize.
+
+The application UI owns one transient viewport state per session:
+
+- **following** means the bottom remains visible as new output arrives;
+- deliberate history navigation changes it to **anchored** at the top visible
+  logical position; and
+- `Jump to latest` or `Ctrl+End` returns it to following.
+
+When anchored, new output does not move the anchor. If eviction removes the
+anchor, the viewport clamps to the nearest retained position and raises a
+content-free “older history discarded” notice. If an operation cannot map a
+cursor or selection endpoint, it clamps to the nearest valid owning cell and
+records a content-free fallback counter; it never uses stale coordinates.
+Viewport position is preserved across chip switches but is not persisted after
+session closure.
+
+### Clear behavior
+
+An explicit Clear Scrollback action and primary-screen `CSI 3 J` discard all
+retained history, reset accounting and stale history selections/search matches,
+and keep the current visible primary grid and cursor. If the first visible row
+continued cleared content, it becomes a new logical-line start. Ordinary
+screen erase (`ED 0`, `ED 1`, or `ED 2`) does not clear history. A full terminal
+reset clears history and both screen buffers. Clearing while the alternate
+screen is active affects only that screen unless a full reset is requested;
+the hidden primary history remains intact.
+
+No ordinary scrollback is written to disk. Completed transport generations may
+later be sealed into the same budget as UI-owned read-only history boundaries,
+as specified by ADR 0014 and `docs/gui-design.md`; those boundaries are not
+terminal cells or searchable/copied text.
+
+## Consequences
+
+- M9 was implemented incrementally: logical storage/accounting first, then
+  viewport projection/navigation, then primary-screen resize reflow and stable
+  selection remapping. Search over history remains future work.
+- The renderer consumes a borrowed viewport projection rather than treating
+  `Screen` row numbers as durable content identities.
+- Existing visible-grid APIs remain useful for protocol fixtures, but new M9
+  fixtures must inspect logical history and accounting explicitly.
+- History limits are predictable across window widths; resizing does not change
+  the configured budget merely because it changes physical row count.
+- Native usability and performance validation is still required near the
+  default limit on every supported desktop.
+
+## Validation impact
+
+- **Invariants introduced or changed:** Scrollback remains within its configured
+  charged-byte limit without coordinate gaps. Oversized open lines are trimmed
+  in amortized batches and counted once per logical line. Anchors preserve
+  endpoint affinity and fail safely after trimming or resize-time eviction
+  instead of aliasing shifted content. Primary-screen resize remaps stable
+  cursor and selection positions through logical history and preserves the
+  visible screen even when history is disabled.
+- **GUI/action edges affected:** `HIST-*` (scrollback retention, viewport
+  navigation, and follow/anchor behavior), `SSH-*` (reconnect/liveness history
+  continuity), `SEARCH-*` (terminal-content search over retained history),
+  `GEN-*` (reconnect/relaunch generation boundaries within history), `STOP-*`
+  (closing/quitting sessions with retained history).
+- **Automated tests required:**
+  `history_snapshot_projects_retained_rows_without_moving_the_live_cursor`,
+  `scrollback_limit_changes_apply_only_to_subsequent_sessions`,
+  `resize_remaps_content_positions_through_logical_lines`,
+  `resize_does_not_alias_blank_trailing_rows_to_real_content`,
+  `terminal_view_preserves_selected_text_across_primary_reflow`,
+  `alternate_screen_selection_uses_rectangular_resize_coordinates`,
+  `selection_copy_does_not_insert_newlines_at_soft_wraps`,
+  `selection_copy_treats_trimmed_history_cells_as_blank_padding`,
+  `evicted_selection_positions_never_alias_new_history_content`,
+  `discarded_scrollback_rows_never_alias_new_screen_content`,
+  `retention_after_an_oversized_gap_does_not_reuse_discarded_coordinates`,
+  `an_unrelated_oversized_line_does_not_evict_prior_in_budget_history`,
+  `a_fully_trimmed_open_line_counts_as_one_oversize_event`,
+  `fully_trimmed_open_line_rejects_stale_anchor_after_recreation`,
+  `trimmed_end_boundary_does_not_alias_recreated_content`,
+  `end_boundary_affinity_stays_on_the_preceding_soft_wrapped_row`,
+  `large_history_anchor_lookup_avoids_full_line_walks`,
+  `wrapped_anchor_lookup_avoids_full_row_boundary_walks`,
+  `indexed_history_anchors_match_linear_oracle_across_layout_mutations`,
+  `history_anchor_hint_revalidates_identity_after_eviction_and_id_rollover`,
+  `height_only_resize_preserves_large_history_cursor_and_selection_with_bounded_anchor_work`,
+  `generated_output_resize_and_clear_sequences_keep_scrollback_strictly_bounded`,
+  `resize_eviction_rejects_stale_positions_instead_of_aliasing`,
+  `zero_scrollback_resize_preserves_the_visible_screen`,
+  `local_wheel_anchors_history_and_ctrl_end_resumes_following`,
+  `scrollbar_thumb_maps_oldest_and_latest_without_consuming_grid_width`.
+- **Native/manual evidence required:** `TI-04`, `TI-05`, `TI-07`, `CP-05`
+  (native usability/performance validation of history retention, reconnect
+  presentation, terminal-content search near the default limit, sustained
+  unbroken output near the configured bound, and resize with history disabled).
+- **Coverage superseded:** None.

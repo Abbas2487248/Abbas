@@ -1,0 +1,13400 @@
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    io::{Cursor, Read},
+    path::{Path, PathBuf},
+    sync::{
+        mpsc::{self, Receiver, TryRecvError},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use eframe::egui::{
+    self, emath::GuiRounding, text::LayoutJob, text::TextFormat, vec2, Align, Color32, FontId,
+    RichText, Sense, WidgetInfo, WidgetType,
+};
+use festerm_markdown::{
+    Block, CodeBlock, ContainerInline, HeadingBlock, HighlightedCodeLine, ImageInline, Inline,
+    LinkInline, ListBlock, ListKind, LocalMarkdownSource, MarkdownDocument, MarkdownLoadError,
+    MarkdownLoader, MarkdownSource, MarkdownSourceError, RawHtmlBlock, RemoteMarkdownSource,
+    ResourceReferenceClass, ResourceReferenceKind, SourceSpan, TableAlignment, TableBlock,
+    TaskState, TextBlock, TextMatch,
+};
+use festerm_ui_egui::{icon, icon::Icon, theme};
+use image::ImageDecoder;
+
+use crate::document_layout::{galley_payload_bytes, LayoutEpoch};
+use crate::document_store::{DirectoryIdentity, Generation};
+use crate::markdown_images::{
+    DecodedImage, ImageLoadFailure, ImageMemoryBudget, ImageReservation, ImageRetry, ImageWorker,
+    MAX_CONCURRENT_IMAGE_LOADS, RETAINED_IMAGE_OVERHEAD,
+};
+use crate::tabs::{AppCommand, ExternalLinkTarget, TabId};
+
+mod clipboard;
+
+pub(crate) fn install_clipboard(context: &egui::Context) {
+    clipboard::install(context);
+}
+
+pub(crate) fn selection_drag_autoscroll<R>(
+    ui: &egui::Ui,
+    output: &mut egui::scroll_area::ScrollAreaOutput<R>,
+    dragging: bool,
+    horizontal: bool,
+    vertical: bool,
+) {
+    let (pointer, origin, primary_down, primary_pressed, dt) = ui.input(|input| {
+        (
+            input.pointer.interact_pos(),
+            input.pointer.press_origin(),
+            input.pointer.button_down(egui::PointerButton::Primary),
+            input.pointer.button_pressed(egui::PointerButton::Primary),
+            input.unstable_dt.min(0.05),
+        )
+    });
+    let owner_id = selection_drag_owner_id(ui, output.id);
+    if !primary_down {
+        ui.ctx().data_mut(|data| data.remove::<bool>(owner_id));
+        return;
+    }
+    // The returned inner rect is measured before a horizontal area's
+    // auto-shrink establishes its content height.
+    let owner_rect = if horizontal && !vertical {
+        egui::Rect::from_min_size(
+            output.inner_rect.min,
+            vec2(output.inner_rect.width(), output.content_size.y),
+        )
+    } else {
+        output.inner_rect
+    };
+    let started_here = ui.ctx().data_mut(|data| {
+        if primary_pressed || data.get_temp::<bool>(owner_id).is_none() {
+            let started_here =
+                origin.is_some_and(|pos| owner_rect.intersect(ui.clip_rect()).contains(pos));
+            data.insert_temp(owner_id, started_here);
+            started_here
+        } else {
+            data.get_temp::<bool>(owner_id).unwrap_or(false)
+        }
+    });
+    let Some(pointer) = pointer.filter(|_| dragging && started_here) else {
+        return;
+    };
+
+    let mut delta = egui::Vec2::ZERO;
+    for (axis, enabled, coordinate, low, high, content, viewport) in [
+        (
+            0,
+            horizontal,
+            pointer.x,
+            output.inner_rect.left(),
+            output.inner_rect.right(),
+            output.content_size.x,
+            output.inner_rect.width(),
+        ),
+        (
+            1,
+            vertical,
+            pointer.y,
+            output.inner_rect.top(),
+            output.inner_rect.bottom(),
+            output.content_size.y,
+            output.inner_rect.height(),
+        ),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let max_offset = (content - viewport).max(0.0);
+        if max_offset <= 0.0 {
+            continue;
+        }
+        let distance = if coordinate < low {
+            coordinate - low
+        } else if coordinate > high {
+            coordinate - high
+        } else {
+            0.0
+        };
+        if distance == 0.0 {
+            continue;
+        }
+        let speed =
+            (distance.abs() / SELECTION_AUTOSCROLL_EDGE).min(1.0) * SELECTION_AUTOSCROLL_SPEED;
+        let change = distance.signum() * speed * dt;
+        if axis == 0 {
+            delta.x = change;
+        } else {
+            delta.y = change;
+        }
+    }
+
+    let max_offset = (output.content_size - output.inner_rect.size()).max(egui::Vec2::ZERO);
+    let new_offset = (output.state.offset + delta).clamp(egui::Vec2::ZERO, max_offset);
+    if new_offset != output.state.offset {
+        output.state.offset = new_offset;
+        output.state.store(ui.ctx(), output.id);
+        ui.ctx().request_repaint();
+    }
+}
+
+fn label_selection_dragging(ui: &egui::Ui) -> bool {
+    ui.ctx()
+        .plugin::<egui::text_selection::LabelSelectionState>()
+        .lock()
+        .is_dragging(ui.ctx().viewport_id())
+}
+
+fn selection_drag_owner_id(ui: &egui::Ui, scroll_id: egui::Id) -> egui::Id {
+    scroll_id.with(("selection-drag-autoscroll-owner", ui.ctx().viewport_id()))
+}
+
+fn begin_horizontal_selection(ui: &egui::Ui, scroll_id: egui::Id) {
+    let owner_id = selection_drag_owner_id(ui, scroll_id);
+    if ui.ctx().data(|data| data.get_temp::<bool>(owner_id)) == Some(true) {
+        ui.ctx()
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .begin_horizontal_drag_selection(ui);
+    }
+}
+
+fn end_horizontal_selection(ui: &egui::Ui) {
+    if ui
+        .ctx()
+        .plugin::<egui::text_selection::LabelSelectionState>()
+        .lock()
+        .end_horizontal_drag_selection(ui.ctx().viewport_id())
+    {
+        ui.ctx().request_repaint();
+    }
+}
+
+fn horizontal_scroll_id(ui: &egui::Ui, salt: impl egui::AsIdSalt) -> egui::Id {
+    // ScrollArea turns its salt into an IdSalt before deriving the ID.
+    ui.make_persistent_id(egui::IdSalt::new(salt))
+}
+
+const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+/// How many images a local document may load without the reader asking
+/// (`docs/adr/0030-native-markdown-viewer.md`, "Automatic loading of local
+/// relative images"). A document with more image references than this shows
+/// its remaining images as explicit "Load local image" placeholders, so a
+/// pathological document cannot turn one open into unbounded filesystem
+/// work.
+const MAX_AUTOMATIC_IMAGE_LOADS: usize = 64;
+/// Per-view pending results are bounded as well as the shared running workers.
+const MAX_CONCURRENT_AUTOMATIC_IMAGE_LOADS: usize = MAX_CONCURRENT_IMAGE_LOADS;
+const IMAGE_READ_RESERVATION: u64 = 2 * (MAX_IMAGE_BYTES + 1) + 16 * 1024;
+const OUTLINE_WIDTH: f32 = 216.0;
+/// Narrower than this and the outline is hidden for the frame: the reading
+/// column matters more than the navigation aid on a cramped window.
+const OUTLINE_MIN_DOCUMENT_WIDTH: f32 = 360.0;
+const READING_WIDTH: f32 = 860.0;
+/// Horizontal breathing room kept on each side of the reading column, from
+/// the mockup's `width: min(720px, calc(100% - 54px))`: the column never
+/// runs edge to edge even in a narrow well.
+const READING_COLUMN_SIDE_GUTTER: f32 = 27.0;
+const READING_COLUMN_TOP_PADDING: f32 = 26.0;
+const READING_COLUMN_BOTTOM_PADDING: f32 = 56.0;
+const BODY_TEXT_SIZE: f32 = 15.0;
+/// `p / li { line-height: 1.55 }` in the mockup.
+const BODY_LINE_HEIGHT: f32 = BODY_TEXT_SIZE * 1.5;
+/// Headings set their own, tighter leading; 1.55 around a 30px H1 left a
+/// visible hole between the heading and its rule.
+const HEADING_LINE_HEIGHT_RATIO: f32 = 1.25;
+const PARAGRAPH_BLOCK_SPACING: f32 = 16.0;
+const HEADING_PARAGRAPH_SPACING: f32 = 8.0;
+const LIST_ITEM_SPACING: f32 = 6.0;
+const CODE_BLOCK_PADDING_X: i8 = 14;
+const CODE_BLOCK_PADDING_Y: i8 = 12;
+/// `CODE_LINE_HEIGHT` adds its extra leading *below* each row's glyphs, so
+/// the last line of a fenced block already carries part of the bottom
+/// padding with it. Measured against the top inset, the surplus is 4pt;
+/// taking it off the bottom margin makes the block's optical padding even.
+const CODE_BLOCK_TRAILING_LEAD: i8 = 4;
+const CODE_BLOCK_HEAD_HEIGHT: f32 = 30.0;
+/// Fenced-code text size. Slightly smaller than the 15px body, matching the
+/// mockup's `pre { font: 11px/1.55 }` against its 13px body.
+const CODE_TEXT_SIZE: f32 = 13.0;
+/// Line pitch inside a fenced block. Code lines are separate widgets, so the
+/// container's default vertical item spacing would double-space them.
+const CODE_LINE_SPACING: f32 = 0.0;
+/// `pre { font: 11px/1.55 }` in the mockup, applied here against the 13px
+/// code size.
+const CODE_LINE_HEIGHT: f32 = CODE_TEXT_SIZE * 1.55;
+const TABLE_CELL_PADDING_X: i8 = 10;
+const TABLE_CELL_PADDING_Y: i8 = 6;
+/// Narrowest a table column is allowed to become when a table has to be
+/// squeezed into the reading column. Wide enough for a short word plus its
+/// cell padding, so a squeezed table still wraps on word boundaries.
+const TABLE_MIN_COLUMN_WIDTH: f32 = 72.0;
+const MARKDOWN_PANEL_RADIUS: f32 = 6.0;
+/// Toolbar control metrics, from the mockup's `.fmd-tool` rule
+/// (`height: 30px; min-width: 30px; padding: 0 8px; border-radius: 5px`).
+pub(crate) const TOOLBAR_BUTTON_HEIGHT: f32 = 30.0;
+pub(crate) const TOOLBAR_BUTTON_PADDING_X: f32 = 8.0;
+pub(crate) const TOOLBAR_BUTTON_GAP: f32 = 5.0;
+pub(crate) const TOOLBAR_BUTTON_RADIUS: f32 = 5.0;
+const TOOLBAR_ICON_SIZE: f32 = 15.0;
+/// Gap between a toolbar control's icon and its text, matching the
+/// mockup's `gap: 5px`.
+const TOOLBAR_ICON_TEXT_GAP: f32 = 5.0;
+pub(crate) const TOOLBAR_TEXT_SIZE: f32 = 11.0;
+/// `.fmd-outline { padding: 13px 9px }` plus the title's own `0 7px 10px`.
+const OUTLINE_PADDING_X: f32 = 9.0;
+const OUTLINE_PADDING_Y: f32 = 13.0;
+const OUTLINE_TITLE_INSET_X: f32 = 7.0;
+const OUTLINE_TITLE_GAP_BELOW: f32 = 10.0;
+const OUTLINE_ITEM_PADDING_X: f32 = 7.0;
+const OUTLINE_ITEM_PADDING_Y: f32 = 6.0;
+/// `.fmd-outline-item.fmd-depth2 { padding-left: 19px }` measured from the
+/// item's own left edge, so each further level adds the same step.
+const OUTLINE_ITEM_INDENT: f32 = 12.0;
+const OUTLINE_ITEM_ACCENT_WIDTH: f32 = 2.0;
+const OUTLINE_ITEM_RADIUS: f32 = 3.0;
+const MAX_PREPARED_OUTLINE_ROWS: usize = 4096;
+const MAX_PREPARED_SOURCE_JOBS: usize = 8192;
+const MAX_PREPARED_SOURCE_JOB_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PREPARED_CODE_JOBS: usize = 4096;
+const MAX_PREPARED_CODE_JOB_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PREPARED_CODE_GALLEY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SOURCE_PREPARATION_QUERY_BYTES: usize = 4096;
+const MAX_GEOMETRY_FONT_MAP_ENTRIES: usize = 128;
+const MAX_GEOMETRY_FONT_NAME_BYTES: usize = 8 * 1024;
+const MAX_GEOMETRY_FONT_FAMILY_REFERENCES: usize = 256;
+const MAX_PREPARED_TABLE_CELLS: usize = 32;
+const MAX_PREPARED_TABLE_CELL_INPUT_BYTES: usize = 256;
+const MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_PREPARED_TABLE_LAYOUTS: usize = 512;
+const MAX_PREPARED_TABLE_LAYOUT_CELLS: usize = 8192;
+const MAX_PREPARED_TABLE_LAYOUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LAYOUT_FIND_MATCHES: usize = 8192;
+const SELECTION_AUTOSCROLL_EDGE: f32 = 36.0;
+const SELECTION_AUTOSCROLL_SPEED: f32 = 900.0;
+/// Height reserved for the viewer's own footer, used only when the shared
+/// application status bar is hidden. Matches the status bar's own geometry
+/// so toggling it doesn't reflow the document.
+const VIEWER_FOOTER_HEIGHT: f32 = 25.0;
+/// Find is a floating card over the document, matching the mockup's
+/// `.fmd-find` (`position: absolute; top: 16px; right: 16px`).
+const FIND_CARD_WIDTH: f32 = 340.0;
+const FIND_CARD_HEIGHT: f32 = 36.0;
+const FIND_CARD_MARGIN: f32 = 16.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MarkdownViewerMode {
+    Preview,
+    Source,
+}
+
+/// How far above the top of the preview a heading may have scrolled and still
+/// count as the section being read. A heading sitting just above the fold is
+/// the one the paragraphs on screen belong to.
+const PREVIEW_SECTION_TOLERANCE: f32 = 8.0;
+
+/// How many frames a requested section has to arrive in before the pane goes
+/// back to reporting what it can actually see.
+const PREVIEW_SCROLL_FRAMES: u32 = 30;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingScroll {
+    Heading(usize),
+    Byte(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScrollAnchor {
+    heading_index: Option<usize>,
+    section_offset_numerator: usize,
+    section_offset_denominator: usize,
+}
+
+impl ScrollAnchor {
+    fn top() -> Self {
+        Self {
+            heading_index: None,
+            section_offset_numerator: 0,
+            section_offset_denominator: 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LocalLoadError {
+    NotFound,
+    PermissionDenied,
+    NotAFile,
+    Io,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MarkdownViewerLoadFailure {
+    Source(MarkdownSourceError),
+    Load(MarkdownLoadError),
+    Local(LocalLoadError),
+    /// Reload isn't implemented for a Markdown file opened from a remote
+    /// SFTP snapshot (see issue #133): unlike a local file, refreshing it
+    /// would require locating (or re-establishing) a live SFTP transport to
+    /// the same verified origin the snapshot was pinned to, which the
+    /// viewer does not yet do. The initial open still succeeds; only the
+    /// explicit reload/refresh action hits this.
+    RemoteReloadUnsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownViewerErrorState {
+    pub title: &'static str,
+    pub detail: String,
+    pub stale_snapshot: bool,
+    pub source_unavailable: bool,
+}
+
+impl MarkdownViewerErrorState {
+    fn from_source_error(error: MarkdownSourceError, stale_snapshot: bool) -> Self {
+        let detail = error.to_string();
+        match error {
+            MarkdownSourceError::EmptyPath => Self {
+                title: "Markdown source is unavailable",
+                detail,
+                stale_snapshot,
+                source_unavailable: true,
+            },
+            MarkdownSourceError::EmptyRemoteHost
+            | MarkdownSourceError::WhitespaceRemoteHost
+            | MarkdownSourceError::ZeroRemotePort
+            | MarkdownSourceError::EmptyRemoteUsername
+            | MarkdownSourceError::EmptyRemoteProfileIdentifier
+            | MarkdownSourceError::EmptyVerifiedFingerprint => Self {
+                title: "Markdown source identity is invalid",
+                detail,
+                stale_snapshot,
+                source_unavailable: true,
+            },
+        }
+    }
+
+    fn from_load_error(error: MarkdownLoadError, stale_snapshot: bool) -> Self {
+        let title = match error {
+            MarkdownLoadError::Cancelled => "Markdown loading was cancelled",
+            MarkdownLoadError::InvalidUtf8 => "Markdown source is not valid UTF-8",
+            MarkdownLoadError::BinaryContent => "Markdown source appears to contain binary content",
+            MarkdownLoadError::OversizeInput { .. } => "Markdown source exceeds the size limit",
+            MarkdownLoadError::TooManyLines { .. } => "Markdown source exceeds the line limit",
+            MarkdownLoadError::ExcessiveNesting { .. } => {
+                "Markdown source exceeds the nesting limit"
+            }
+            MarkdownLoadError::TooManyTableCells { .. } => {
+                "Markdown source exceeds the table limit"
+            }
+            MarkdownLoadError::CodeBlockTooLarge { .. } => {
+                "Markdown source exceeds the code-block limit"
+            }
+            MarkdownLoadError::TooManyResourceReferences { .. } => {
+                "Markdown source exceeds the resource-reference limit"
+            }
+            MarkdownLoadError::ParseModelInvariant => {
+                "Markdown source could not be rendered safely"
+            }
+        };
+        Self {
+            title,
+            detail: error.to_string(),
+            stale_snapshot,
+            source_unavailable: false,
+        }
+    }
+
+    fn from_local_error(error: LocalLoadError, stale_snapshot: bool) -> Self {
+        let (title, detail, unavailable) = match error {
+            LocalLoadError::NotFound => (
+                "Markdown source is unavailable",
+                "The local file no longer exists.".to_owned(),
+                true,
+            ),
+            LocalLoadError::PermissionDenied => (
+                "Markdown source could not be read",
+                "The local file could not be read because permission was denied.".to_owned(),
+                false,
+            ),
+            LocalLoadError::NotAFile => (
+                "Markdown source is unavailable",
+                "The selected path is not a regular file.".to_owned(),
+                true,
+            ),
+            LocalLoadError::Io => (
+                "Markdown source could not be read",
+                "The local file could not be read.".to_owned(),
+                false,
+            ),
+        };
+        Self {
+            title,
+            detail,
+            stale_snapshot,
+            source_unavailable: unavailable,
+        }
+    }
+
+    fn from_failure(failure: MarkdownViewerLoadFailure, stale_snapshot: bool) -> Self {
+        match failure {
+            MarkdownViewerLoadFailure::Source(error) => {
+                Self::from_source_error(error, stale_snapshot)
+            }
+            MarkdownViewerLoadFailure::Load(error) => Self::from_load_error(error, stale_snapshot),
+            MarkdownViewerLoadFailure::Local(error) => {
+                Self::from_local_error(error, stale_snapshot)
+            }
+            MarkdownViewerLoadFailure::RemoteReloadUnsupported => Self {
+                title: "Reloading isn't supported for this file yet",
+                detail: "This Markdown file was opened from a remote SFTP snapshot. Close and \
+                         double-click it again in the SFTP file manager to refresh its content."
+                    .to_owned(),
+                stale_snapshot,
+                source_unavailable: false,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResourceApprovalState {
+    approved: HashSet<usize>,
+    local_image_reads_blocked: bool,
+    local_image_block_reason: Option<String>,
+}
+
+impl ResourceApprovalState {
+    fn is_approved(&self, reference_index: usize) -> bool {
+        self.approved.contains(&reference_index)
+    }
+
+    fn approve(&mut self, reference_index: usize) {
+        self.approved.insert(reference_index);
+    }
+
+    fn clear(&mut self) {
+        self.approved.clear();
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MarkdownFindState {
+    open: bool,
+    query: String,
+    matches: Vec<TextMatch>,
+    current_index: Option<usize>,
+    focus_requested: bool,
+}
+
+impl MarkdownFindState {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    fn open(&mut self) {
+        self.open = true;
+        self.focus_requested = true;
+    }
+
+    fn query(&self) -> &str {
+        &self.query
+    }
+
+    fn set_query(&mut self, document: &MarkdownDocument, query: String) {
+        self.query = query;
+        self.recompute(document, None);
+        self.open = true;
+    }
+
+    fn clear(&mut self) {
+        self.query.clear();
+        self.matches.clear();
+        self.current_index = None;
+        self.open = false;
+        self.focus_requested = false;
+    }
+
+    fn take_focus_request(&mut self) -> bool {
+        std::mem::take(&mut self.focus_requested)
+    }
+
+    fn matches(&self) -> &[TextMatch] {
+        &self.matches
+    }
+
+    fn current_match(&self) -> Option<&TextMatch> {
+        self.current_index.and_then(|index| self.matches.get(index))
+    }
+
+    fn next(&mut self) -> Option<&TextMatch> {
+        self.advance(false)
+    }
+
+    fn previous(&mut self) -> Option<&TextMatch> {
+        self.advance(true)
+    }
+
+    fn current_label(&self) -> String {
+        match (self.current_index, self.matches.len()) {
+            (Some(index), total) if total > 0 => format!("{} of {}", index + 1, total),
+            _ => "0 of 0".to_owned(),
+        }
+    }
+
+    fn recompute(&mut self, document: &MarkdownDocument, preserved_span: Option<SourceSpan>) {
+        self.matches = document.find_matches(&self.query);
+        self.current_index = if self.matches.is_empty() {
+            None
+        } else if let Some(span) = preserved_span {
+            self.matches
+                .iter()
+                .position(|candidate| candidate.span() == span)
+                .or(Some(0))
+        } else {
+            Some(0)
+        };
+    }
+
+    fn restore_for_reload(&mut self, document: &MarkdownDocument) {
+        let preserved_span = self.current_match().map(TextMatch::span);
+        if self.query.is_empty() {
+            self.matches.clear();
+            self.current_index = None;
+            return;
+        }
+        self.recompute(document, preserved_span);
+        self.open = true;
+    }
+
+    fn advance(&mut self, reverse: bool) -> Option<&TextMatch> {
+        let total = self.matches.len();
+        if total == 0 {
+            self.current_index = None;
+            return None;
+        }
+        let current = self.current_index.unwrap_or(0);
+        self.current_index = Some(if reverse {
+            (current + total - 1) % total
+        } else {
+            (current + 1) % total
+        });
+        self.current_match()
+    }
+}
+
+struct LoadedImage {
+    // Release the texture handle before its reservation's retirement check.
+    texture: egui::TextureHandle,
+    size: [usize; 2],
+    _reservation: ImageReservation,
+}
+
+struct PendingImageLoad {
+    receiver: Receiver<Result<DecodedImage, ImageLoadFailure>>,
+}
+
+pub struct MarkdownViewerTab {
+    #[cfg(test)]
+    table_cell_probe: Option<TableCellProbe>,
+    source: MarkdownSource,
+    title: String,
+    display_path: String,
+    mode: MarkdownViewerMode,
+    outline_open: bool,
+    outline_selected: Option<usize>,
+    document: Option<MarkdownDocument>,
+    clipboard_owner: u64,
+    document_revision: u64,
+    error: Option<MarkdownViewerErrorState>,
+    stale_snapshot: bool,
+    find: MarkdownFindState,
+    resource_approvals: ResourceApprovalState,
+    loaded_images: BTreeMap<usize, LoadedImage>,
+    pending_image_loads: BTreeMap<usize, PendingImageLoad>,
+    image_errors: BTreeMap<usize, String>,
+    /// How many image loads this document has started on its own (see
+    /// `start_automatic_image_loads`). Counted rather than derived from
+    /// `loaded_images`/`image_errors` so the `MAX_AUTOMATIC_IMAGE_LOADS`
+    /// budget is spent once per document and cannot be replenished by, say,
+    /// an image that fails to decode.
+    automatic_image_loads: usize,
+    automatic_image_references: HashSet<usize>,
+    image_retries: BTreeMap<usize, ImageRetry>,
+    pending_scroll: Option<PendingScroll>,
+    line_heading_indices: Vec<Option<usize>>,
+    source_syntax: Option<Vec<festerm_syntax::Span>>,
+    source_preparation: SourcePreparation,
+    code_preparation: CodeLinePreparation,
+    table_layouts: TableLayoutPreparation,
+    outline_preparation: OutlinePreparation,
+    outline_keyboard_focus: bool,
+    status_bar_visible: bool,
+}
+
+impl MarkdownViewerTab {
+    /// A viewer reading a local file. Local Markdown now opens in the editor,
+    /// which previews it in the same tab (ADR 0034 §4), so this remains only
+    /// for tests and gallery renders of the viewer's own chrome.
+    #[cfg(test)]
+    pub fn open_local(path: PathBuf) -> Self {
+        let display_path = display_local_path(&path);
+        let title = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Markdown")
+            .to_owned();
+        let source_path = fs::canonicalize(&path).unwrap_or(path.clone());
+        let source = LocalMarkdownSource::new(source_path.clone())
+            .map(MarkdownSource::from)
+            .unwrap_or_else(|_| {
+                MarkdownSource::from(
+                    LocalMarkdownSource::new(PathBuf::from("Markdown"))
+                        .expect("fallback path is valid"),
+                )
+            });
+        let mut tab = Self {
+            #[cfg(test)]
+            table_cell_probe: None,
+            source,
+            title,
+            display_path,
+            mode: MarkdownViewerMode::Preview,
+            outline_open: true,
+            outline_selected: None,
+            document: None,
+            clipboard_owner: clipboard::new_surface_owner(),
+            document_revision: 0,
+            error: None,
+            stale_snapshot: false,
+            find: MarkdownFindState::default(),
+            resource_approvals: ResourceApprovalState::default(),
+            loaded_images: BTreeMap::new(),
+            pending_image_loads: BTreeMap::new(),
+            image_errors: BTreeMap::new(),
+            automatic_image_loads: 0,
+            automatic_image_references: HashSet::new(),
+            image_retries: BTreeMap::new(),
+            pending_scroll: None,
+            line_heading_indices: Vec::new(),
+            source_syntax: None,
+            source_preparation: SourcePreparation::default(),
+            code_preparation: CodeLinePreparation::default(),
+            table_layouts: TableLayoutPreparation::default(),
+            outline_preparation: OutlinePreparation::default(),
+            outline_keyboard_focus: false,
+            status_bar_visible: true,
+        };
+        tab.reload();
+        tab
+    }
+
+    /// Retargets this viewer at a different local file in place, so `Ctrl+O`
+    /// from inside a viewer replaces the document being read rather than
+    /// opening another tab.
+    ///
+    /// The user's *view* preferences (preview-vs-source mode, outline and
+    /// status-bar visibility) carry over because they are properties of how
+    /// this person likes to read, not of the document. Everything else —
+    /// notably `resource_approvals` — is rebuilt from scratch: an approval
+    /// is granted for one document's resources and must never be inherited
+    /// by a different document (`docs/adr/0030-native-markdown-viewer.md`,
+    /// "Explicit, non-persisted resource approval only").
+    /// Opens a Markdown document already fetched from a remote SFTP
+    /// session, holding its bytes in memory rather than writing them to a
+    /// temp file (issue #133). `content` is the file's full bytes as read
+    /// by `SftpSession::read_markdown_snapshot` over the caller's
+    /// already-authenticated connection; `display_path` is the canonical
+    /// remote path to show in the UI.
+    pub fn open_remote(
+        source: RemoteMarkdownSource,
+        display_path: String,
+        content: Vec<u8>,
+    ) -> Self {
+        let title = Path::new(source.remote_path())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Markdown")
+            .to_owned();
+        let mut tab = Self {
+            #[cfg(test)]
+            table_cell_probe: None,
+            source: MarkdownSource::from(source.clone()),
+            title,
+            display_path: display_path.clone(),
+            mode: MarkdownViewerMode::Preview,
+            outline_open: true,
+            outline_selected: None,
+            document: None,
+            clipboard_owner: clipboard::new_surface_owner(),
+            document_revision: 0,
+            error: None,
+            stale_snapshot: false,
+            find: MarkdownFindState::default(),
+            resource_approvals: ResourceApprovalState::default(),
+            loaded_images: BTreeMap::new(),
+            pending_image_loads: BTreeMap::new(),
+            image_errors: BTreeMap::new(),
+            automatic_image_loads: 0,
+            automatic_image_references: HashSet::new(),
+            image_retries: BTreeMap::new(),
+            pending_scroll: None,
+            line_heading_indices: Vec::new(),
+            source_syntax: None,
+            source_preparation: SourcePreparation::default(),
+            code_preparation: CodeLinePreparation::default(),
+            table_layouts: TableLayoutPreparation::default(),
+            outline_preparation: OutlinePreparation::default(),
+            outline_keyboard_focus: false,
+            status_bar_visible: true,
+        };
+        let result = load_remote_document(source, display_path, content);
+        tab.apply_load_result(result);
+        tab
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn chip_secondary(&self) -> &'static str {
+        match self.source {
+            MarkdownSource::Local(_) => "Markdown · Local",
+            MarkdownSource::Remote(_) => "Markdown · Remote",
+        }
+    }
+
+    pub fn display_path(&self) -> &str {
+        &self.display_path
+    }
+
+    /// The local file this viewer is showing, if it is showing one. Editing
+    /// is only offered for local sources for now; a remote snapshot has no
+    /// write path yet (ADR 0034 §3).
+    pub(crate) fn local_path(&self) -> Option<&Path> {
+        match &self.source {
+            MarkdownSource::Local(local) => Some(local.path()),
+            MarkdownSource::Remote(_) => None,
+        }
+    }
+
+    /// Whether this tab already shows the same validated remote Markdown
+    /// source identity, so refreshing one remote origin never overwrites a
+    /// different owner/fingerprint/generation that happens to share a path.
+    pub fn matches_remote_source(&self, source: &RemoteMarkdownSource) -> bool {
+        matches!(&self.source, MarkdownSource::Remote(remote) if remote == source)
+    }
+
+    /// Left-hand status-bar context, mirroring the mockup's
+    /// `Local Markdown · UTF-8` / `Remote Markdown · production-db` line.
+    pub fn status_bar_context(&self) -> &'static str {
+        match self.source {
+            MarkdownSource::Local(_) => "Local Markdown",
+            MarkdownSource::Remote(_) => "Remote Markdown",
+        }
+    }
+
+    /// Encoding is fixed for v1 (`docs/markdown-viewer-design.md`: "The first
+    /// pass accepts UTF-8 with an optional BOM"), so this is a constant
+    /// rather than a decoded-per-document value.
+    pub fn status_bar_encoding(&self) -> &'static str {
+        "UTF-8"
+    }
+
+    /// Right-hand status-bar state. A stale snapshot or a load error outranks
+    /// the steady-state "Read only", because those are the states a reader
+    /// has to act on.
+    pub fn status_bar_label(&self) -> &'static str {
+        if let Some(error) = &self.error {
+            if error.source_unavailable {
+                return "Source unavailable";
+            }
+            return error.title;
+        }
+        if self.stale_snapshot {
+            return "Offline snapshot · stale";
+        }
+        if self.document.is_some() {
+            "Read only"
+        } else {
+            "Loading"
+        }
+    }
+
+    pub fn status_bar_status(&self) -> festerm_ui_egui::chrome::ChipStatus {
+        use festerm_ui_egui::chrome::ChipStatus;
+        // A healthy read-only document has nothing to act on, so it shows no
+        // status dot — the mockup's `.fmd-status` is plain text. The dot is
+        // reserved for the states a reader has to notice.
+        if self.error.is_some() {
+            ChipStatus::Failed
+        } else if self.stale_snapshot {
+            ChipStatus::Starting
+        } else {
+            ChipStatus::Neutral
+        }
+    }
+
+    /// Mirrors `SftpFileManagerTab`: the viewer's own footer only appears
+    /// when the shared status bar is hidden, so the same facts are never
+    /// shown twice.
+    pub fn set_status_bar_visible(&mut self, visible: bool) {
+        self.status_bar_visible = visible;
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui, tab_id: TabId) -> Option<AppCommand> {
+        #[cfg(test)]
+        if let Some(probe) = &mut self.table_cell_probe {
+            let ordinary = probe.ordinary;
+            *probe = TableCellProbe {
+                ordinary,
+                ..Default::default()
+            };
+        }
+        self.poll_background_work(ui.ctx());
+        self.start_automatic_image_loads(ui.ctx());
+        let mut command = self.consume_shortcuts(ui.ctx(), tab_id);
+        crate::software_background::show_frame(
+            ui,
+            egui::Frame::new().fill(theme::SURFACE_WINDOW),
+            |ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    // `.fmd-toolbar { padding: 5px 9px }` over the full
+                    // width, with its own hairline: the outline and document
+                    // below run edge to edge, so the toolbar owns the inset
+                    // rather than the whole viewer sharing one margin.
+                    // `.fmd-toolbar` carries only a bottom hairline in the
+                    // mockup; a filled band read as a second title bar.
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(9, 5))
+                        .show(ui, |ui| {
+                            if command.is_none() {
+                                command = self.show_toolbar(ui, tab_id);
+                            }
+                        });
+                    let hairline = ui
+                        .allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover())
+                        .0;
+                    ui.painter().line_segment(
+                        [hairline.left_center(), hairline.right_center()],
+                        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+                    );
+
+                    let footer_height = if self.status_bar_visible {
+                        0.0
+                    } else {
+                        VIEWER_FOOTER_HEIGHT
+                    };
+                    let body_height = (ui.available_height() - footer_height).max(120.0);
+                    let mut document_rect = None;
+                    ui.allocate_ui(vec2(ui.available_width(), body_height), |ui| {
+                        ui.set_height(body_height);
+                        if let Some(document) = self.document.as_ref() {
+                            if document.source_text().is_empty() {
+                                ui.vertical_centered(|ui| {
+                                    ui.add_space(24.0);
+                                    ui.heading("This Markdown file is empty");
+                                });
+                            } else {
+                                let mut render_state = MarkdownRenderState {
+                                    table_cells: TableCellPreparation::default(),
+                                    code_copy_caption: CodeCopyCaptionPreparation::default(),
+                                    mode: self.mode,
+                                    outline_open: self.outline_open,
+                                    outline_selected: &mut self.outline_selected,
+                                    find: &self.find,
+                                    resource_approvals: &self.resource_approvals,
+                                    loaded_images: &self.loaded_images,
+                                    pending_image_loads: &self.pending_image_loads,
+                                    image_errors: &self.image_errors,
+                                    pending_scroll: &mut self.pending_scroll,
+                                    line_heading_indices: &self.line_heading_indices,
+                                    source_syntax: &mut self.source_syntax,
+                                    source_preparation: &mut self.source_preparation,
+                                    code_preparation: &mut self.code_preparation,
+                                    table_layouts: &mut self.table_layouts,
+                                    outline_preparation: &mut self.outline_preparation,
+                                    outline_keyboard_focus: &mut self.outline_keyboard_focus,
+                                    heading_tops: None,
+                                };
+                                #[cfg(test)]
+                                {
+                                    render_state.table_cells.probe = self.table_cell_probe.take();
+                                }
+                                document_rect = Some(
+                                    ui.push_id(("markdown-viewer", tab_id), |ui| {
+                                        render_state
+                                            .show_document(
+                                                ui,
+                                                document,
+                                                self.clipboard_owner,
+                                                self.document_revision,
+                                            )
+                                            .document_rect
+                                    })
+                                    .inner,
+                                );
+                                #[cfg(test)]
+                                {
+                                    self.table_cell_probe = render_state.table_cells.probe.take();
+                                }
+                            }
+                        } else if let Some(error) = self.error.as_ref().cloned() {
+                            self.show_error(ui, &error, tab_id, &mut command);
+                        } else {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(24.0);
+                                ui.heading("Loading Markdown");
+                            });
+                        }
+                    });
+                    if let Some(rect) = document_rect {
+                        if let Some(find_command) = self.show_find_overlay(ui, rect) {
+                            command = Some(find_command);
+                        }
+                    }
+                    if !self.status_bar_visible {
+                        self.show_footer(ui);
+                    }
+                });
+            },
+        );
+        command
+    }
+
+    pub fn reload(&mut self) {
+        let result = match &self.source {
+            MarkdownSource::Local(local) => load_local_document(local.path().clone()),
+            MarkdownSource::Remote(_) => Err(MarkdownViewerLoadFailure::RemoteReloadUnsupported),
+        };
+        self.apply_load_result(result);
+    }
+
+    /// Shared by `reload()` and `open_remote()`: applies a load outcome
+    /// (freshly parsed document or failure) to `self`, preserving the
+    /// current scroll/outline anchor across the swap when possible. On a
+    /// brand-new tab (`self.document` is still `None`), `current_anchor()`
+    /// resolves to the top of the document, so this doubles as the
+    /// "initial load" path without needing a separate first-load branch.
+    fn apply_load_result(
+        &mut self,
+        result: Result<(String, MarkdownDocument), MarkdownViewerLoadFailure>,
+    ) {
+        let anchor = self.current_anchor();
+        match result {
+            Ok((display_path, document)) => {
+                self.display_path = display_path;
+                self.outline_selected = anchor
+                    .heading_index
+                    .or_else(|| document.headings().first().map(|_| 0));
+                self.pending_scroll = Some(pending_scroll_for_anchor(&document, anchor));
+                self.line_heading_indices = build_line_heading_index_lookup(&document);
+                self.source_syntax = None;
+                self.source_preparation.clear();
+                self.code_preparation.clear();
+                self.table_layouts.clear();
+                self.outline_preparation.clear();
+                self.document = Some(document);
+                self.document_revision = self.document_revision.wrapping_add(1);
+                self.error = None;
+                self.stale_snapshot = false;
+                self.resource_approvals.clear();
+                self.loaded_images.clear();
+                self.pending_image_loads.clear();
+                self.image_errors.clear();
+                self.automatic_image_loads = 0;
+                self.automatic_image_references.clear();
+                self.image_retries.clear();
+                self.outline_keyboard_focus = false;
+                if let Some(document) = &self.document {
+                    self.find.restore_for_reload(document);
+                }
+            }
+            Err(failure) => {
+                let has_snapshot = self.document.is_some();
+                self.stale_snapshot = has_snapshot;
+                self.error = Some(MarkdownViewerErrorState::from_failure(
+                    failure,
+                    has_snapshot,
+                ));
+            }
+        }
+    }
+
+    pub fn toggle_mode(&mut self) {
+        let anchor = self.current_anchor();
+        self.mode = match self.mode {
+            MarkdownViewerMode::Preview => MarkdownViewerMode::Source,
+            MarkdownViewerMode::Source => MarkdownViewerMode::Preview,
+        };
+        if let Some(document) = &self.document {
+            self.pending_scroll = Some(pending_scroll_for_anchor(document, anchor));
+        }
+    }
+
+    pub fn toggle_outline(&mut self) {
+        self.outline_open = !self.outline_open;
+    }
+
+    pub fn open_find(&mut self) {
+        self.find.open();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_find_query_for_test(&mut self, query: &str) -> usize {
+        let document = self.document.as_ref().expect("loaded Markdown fixture");
+        self.find.set_query(document, query.to_owned());
+        self.find.matches().len()
+    }
+
+    pub fn handle_escape(&mut self) -> bool {
+        if self.find.is_open() || !self.find.query().is_empty() {
+            self.find.clear();
+            return false;
+        }
+        true
+    }
+
+    pub fn advance_find(&mut self, reverse: bool) {
+        let next = if reverse {
+            self.find.previous()
+        } else {
+            self.find.next()
+        };
+        if let (Some(document), Some(found)) = (&self.document, next) {
+            self.pending_scroll = Some(PendingScroll::Byte(found.span().start().byte_offset()));
+            self.outline_selected =
+                document.nearest_heading_index_at_byte(found.span().start().byte_offset());
+        }
+    }
+
+    pub fn load_local_image(&mut self, reference_index: usize, context: &egui::Context) {
+        self.image_state()
+            .try_load_local_image(reference_index, context, false);
+    }
+
+    fn start_automatic_image_loads(&mut self, context: &egui::Context) {
+        self.image_state().start_automatic_image_loads(context);
+    }
+
+    fn poll_background_work(&mut self, context: &egui::Context) {
+        self.image_state().poll_background_work(context);
+    }
+
+    fn image_state(&mut self) -> MarkdownImageState<'_> {
+        MarkdownImageState {
+            source: &self.source,
+            source_generation: None,
+            source_parent_identity: None,
+            document: self.document.as_ref(),
+            texture_label: &self.title,
+            resource_approvals: &mut self.resource_approvals,
+            loaded_images: &mut self.loaded_images,
+            pending_image_loads: &mut self.pending_image_loads,
+            image_errors: &mut self.image_errors,
+            automatic_image_loads: &mut self.automatic_image_loads,
+            automatic_image_references: &mut self.automatic_image_references,
+            image_retries: &mut self.image_retries,
+        }
+    }
+}
+
+struct MarkdownImageState<'a> {
+    source: &'a MarkdownSource,
+    source_generation: Option<Generation>,
+    source_parent_identity: Option<DirectoryIdentity>,
+    document: Option<&'a MarkdownDocument>,
+    texture_label: &'a str,
+    resource_approvals: &'a mut ResourceApprovalState,
+    loaded_images: &'a mut BTreeMap<usize, LoadedImage>,
+    pending_image_loads: &'a mut BTreeMap<usize, PendingImageLoad>,
+    image_errors: &'a mut BTreeMap<usize, String>,
+    automatic_image_loads: &'a mut usize,
+    automatic_image_references: &'a mut HashSet<usize>,
+    image_retries: &'a mut BTreeMap<usize, ImageRetry>,
+}
+
+impl MarkdownImageState<'_> {
+    fn try_load_local_image(
+        &mut self,
+        reference_index: usize,
+        context: &egui::Context,
+        automatic: bool,
+    ) -> bool {
+        if self.loaded_images.contains_key(&reference_index)
+            || self.pending_image_loads.contains_key(&reference_index)
+        {
+            return false;
+        }
+        let Some(document) = self.document else {
+            return false;
+        };
+        let Some(reference) = document.resource_references().get(reference_index) else {
+            return false;
+        };
+        if reference.kind() != ResourceReferenceKind::Image {
+            return false;
+        }
+        let intrinsic = reference.class() == ResourceReferenceClass::IntrinsicSvg;
+        if !intrinsic && self.resource_approvals.local_image_reads_blocked {
+            self.image_errors.insert(
+                reference_index,
+                "Only saved local Markdown documents can load local images.".to_owned(),
+            );
+            return false;
+        }
+        let local = local_document_source(self.source);
+        if !intrinsic && local.is_none() {
+            self.image_errors.insert(
+                reference_index,
+                "Only local Markdown documents can load local images.".to_owned(),
+            );
+            return false;
+        }
+        if !intrinsic && reference.class() != ResourceReferenceClass::LocalRelative {
+            self.image_errors.insert(
+                reference_index,
+                resource_placeholder_action(reference.class()).to_owned(),
+            );
+            return false;
+        }
+        if self.pending_image_loads.len() >= MAX_CONCURRENT_IMAGE_LOADS {
+            self.image_errors
+                .insert(reference_index, ImageLoadFailure::Busy.message().to_owned());
+            self.image_retries
+                .insert(reference_index, ImageRetry::PendingQueue);
+            return false;
+        }
+        let budget = ImageMemoryBudget::for_context(context, Default::default());
+        let worker = match budget.start_worker(context) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.record_image_failure(reference_index, error);
+                return false;
+            }
+        };
+        let captured_bytes = reference.target().len() as u64
+            + if intrinsic {
+                reference.inline_svg().map_or(0, |xml| xml.len()) as u64
+            } else {
+                local
+                    .expect("local image source admitted")
+                    .path()
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len() as u64
+            };
+        let mut admission_bytes = IMAGE_READ_RESERVATION + captured_bytes;
+        if automatic {
+            if let Some(ImageRetry::Memory(required)) = self.image_retries.get(&reference_index) {
+                admission_bytes = admission_bytes.max(*required);
+            }
+        }
+        let scratch = match budget.reserve(admission_bytes, Some(context)) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                drop(worker);
+                self.record_image_failure(reference_index, error);
+                return false;
+            }
+        };
+        let markdown_path =
+            (!intrinsic).then(|| local.expect("local image source admitted").path().clone());
+        let inline_svg = reference.inline_svg().cloned();
+        let source_generation = self.source_generation;
+        let source_parent_identity = self.source_parent_identity;
+        let target = reference.target().to_owned();
+        let texture_side = context.input(|input| input.max_texture_side);
+        match spawn_image_worker(
+            budget,
+            worker,
+            scratch,
+            context.clone(),
+            move |scratch, _, budget| {
+                if let Some(xml) = inline_svg {
+                    crate::markdown_svg::decode(
+                        xml.as_bytes(),
+                        scratch,
+                        IMAGE_READ_RESERVATION + captured_bytes,
+                        texture_side,
+                    )
+                } else {
+                    read_local_image_with_budget(
+                        markdown_path
+                            .as_deref()
+                            .expect("local image source admitted"),
+                        source_generation,
+                        source_parent_identity,
+                        &target,
+                        budget,
+                        scratch,
+                        texture_side,
+                    )
+                }
+            },
+            |work| {
+                thread::Builder::new()
+                    .name(format!("festerm-markdown-image-{reference_index}"))
+                    .spawn(work)
+            },
+        ) {
+            Ok(receiver) => {
+                self.resource_approvals.approve(reference_index);
+                self.image_errors.remove(&reference_index);
+                self.image_retries.remove(&reference_index);
+                self.pending_image_loads
+                    .insert(reference_index, PendingImageLoad { receiver });
+                true
+            }
+            Err(_) => {
+                self.resource_approvals.approve(reference_index);
+                self.image_errors.insert(
+                    reference_index,
+                    "A background image loader could not be started.".to_owned(),
+                );
+                self.image_retries.remove(&reference_index);
+                false
+            }
+        }
+    }
+
+    fn record_image_failure(&mut self, index: usize, error: ImageLoadFailure) {
+        let retry = match &error {
+            ImageLoadFailure::Budget { required_bytes, .. } => {
+                Some(ImageRetry::Memory(*required_bytes))
+            }
+            ImageLoadFailure::Busy => Some(ImageRetry::Workers),
+            ImageLoadFailure::Permanent(_) => None,
+        };
+        if let Some(retry) = retry {
+            self.image_retries.insert(index, retry);
+        } else {
+            self.image_retries.remove(&index);
+        }
+        self.image_errors.insert(index, error.message().to_owned());
+    }
+
+    /// Automatically loads only authorized relative files and intrinsic SVG
+    /// bytes. Neither path grants external-resource authority (ADRs 0030/0048);
+    /// all loads share the manual path's worker, reference and memory bounds.
+    fn start_automatic_image_loads(&mut self, context: &egui::Context) {
+        let local_allowed = !self.resource_approvals.local_image_reads_blocked
+            && local_document_source(self.source).is_some();
+        let Some(document) = self.document else {
+            return;
+        };
+        let (available, workers) =
+            ImageMemoryBudget::for_context(context, Default::default()).availability();
+        let mut candidates = Vec::new();
+        let mut new_references = 0;
+        for (index, reference) in document.resource_references().iter().enumerate() {
+            if self.pending_image_loads.len() + candidates.len()
+                >= MAX_CONCURRENT_AUTOMATIC_IMAGE_LOADS
+            {
+                break;
+            }
+            if reference.kind() != ResourceReferenceKind::Image
+                || !(reference.class() == ResourceReferenceClass::IntrinsicSvg
+                    || (local_allowed
+                        && reference.class() == ResourceReferenceClass::LocalRelative))
+            {
+                continue;
+            }
+            // `image_errors` is the re-entry guard for a reference that has
+            // already been tried and failed: without it a missing image
+            // would be re-read from disk on every single frame.
+            if self.loaded_images.contains_key(&index)
+                || self.pending_image_loads.contains_key(&index)
+            {
+                continue;
+            }
+            if self.image_errors.contains_key(&index) {
+                match self.image_retries.get(&index) {
+                    Some(ImageRetry::Memory(required)) if available >= *required => {}
+                    Some(ImageRetry::Workers) if workers < MAX_CONCURRENT_IMAGE_LOADS => {}
+                    Some(ImageRetry::PendingQueue) => {}
+                    _ => continue,
+                }
+            }
+            if !self.automatic_image_references.contains(&index) {
+                if *self.automatic_image_loads + new_references >= MAX_AUTOMATIC_IMAGE_LOADS {
+                    continue;
+                }
+                new_references += 1;
+            }
+            candidates.push(index);
+        }
+        for index in candidates {
+            if self.try_load_local_image(index, context, true)
+                && self.automatic_image_references.insert(index)
+            {
+                *self.automatic_image_loads += 1;
+            }
+        }
+    }
+
+    fn poll_background_work(&mut self, context: &egui::Context) {
+        let mut finished = Vec::new();
+        for (&reference_index, pending) in self.pending_image_loads.iter() {
+            match pending.receiver.try_recv() {
+                Ok(result) => {
+                    match result {
+                        Ok(mut image) => {
+                            let pixels = Arc::new(image.pixels);
+                            image
+                                .reservation
+                                .track_texture_pixels(Arc::downgrade(&pixels));
+                            let texture = context.load_texture(
+                                format!(
+                                    "markdown-image-{}-{}",
+                                    self.texture_label, reference_index
+                                ),
+                                egui::ImageData::Color(pixels),
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.loaded_images.insert(
+                                reference_index,
+                                LoadedImage {
+                                    size: texture.size(),
+                                    texture,
+                                    _reservation: image.reservation,
+                                },
+                            );
+                            self.image_errors.remove(&reference_index);
+                            self.image_retries.remove(&reference_index);
+                        }
+                        Err(error) => {
+                            if let ImageLoadFailure::Budget { required_bytes, .. } = &error {
+                                self.image_retries
+                                    .insert(reference_index, ImageRetry::Memory(*required_bytes));
+                            } else {
+                                self.image_retries.remove(&reference_index);
+                            }
+                            self.image_errors
+                                .insert(reference_index, error.message().to_owned());
+                        }
+                    }
+                    finished.push(reference_index);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.image_errors.insert(
+                        reference_index,
+                        "The background image loader stopped unexpectedly.".to_owned(),
+                    );
+                    self.image_retries.remove(&reference_index);
+                    finished.push(reference_index);
+                }
+            }
+        }
+        for reference_index in finished {
+            self.pending_image_loads.remove(&reference_index);
+        }
+    }
+}
+
+impl MarkdownViewerTab {
+    fn move_outline_selection(&mut self, delta: isize) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+        if document.headings().is_empty() {
+            return;
+        }
+        let current = self.outline_selected.unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, document.headings().len() as isize - 1) as usize;
+        self.outline_selected = Some(next);
+    }
+
+    fn consume_shortcuts(&mut self, context: &egui::Context, tab_id: TabId) -> Option<AppCommand> {
+        if self.outline_keyboard_focus {
+            if context
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
+            {
+                self.move_outline_selection(1);
+                return None;
+            }
+            if context
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
+            {
+                self.move_outline_selection(-1);
+                return None;
+            }
+            if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+            {
+                if let Some(index) = self.outline_selected {
+                    self.pending_scroll = Some(PendingScroll::Heading(index));
+                }
+                return None;
+            }
+        }
+        if self.find.is_open() && context.input(|input| input.key_pressed(egui::Key::Enter)) {
+            return Some(AppCommand::NavigateMarkdownFind {
+                reverse: context.input(|input| input.modifiers.shift),
+            });
+        }
+        if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            && self.handle_escape()
+        {
+            return Some(AppCommand::CloseTab(tab_id));
+        }
+        None
+    }
+
+    fn show_toolbar(&mut self, ui: &mut egui::Ui, tab_id: TabId) -> Option<AppCommand> {
+        let mut command = None;
+        let bindings = ui
+            .ctx()
+            .data(|data| {
+                data.get_temp::<festerm_config::KeyboardBindings>(egui::Id::new(
+                    "effective-keyboard-bindings",
+                ))
+            })
+            .unwrap_or_default();
+        let hint = |title: &str, action| {
+            crate::keyboard::label(&bindings, action)
+                .map_or_else(|| title.to_owned(), |chord| format!("{title} ({chord})"))
+        };
+        use festerm_config::KeyboardAction as A;
+        // Origin and path claim the left edge; every control is right
+        // aligned, matching the mockup's `.fmd-toolbar` flex row rather than
+        // trailing the path in reading order.
+        ui.horizontal(|ui| {
+            ui.set_height(TOOLBAR_BUTTON_HEIGHT);
+            ui.spacing_mut().item_spacing.x = TOOLBAR_BUTTON_GAP;
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                // `docs/markdown-viewer-design.md`: the toolbar ends in an
+                // overflow menu, not a second close affordance - the tab
+                // chip already carries this tab's close control, so a bare
+                // "x" here duplicated it and displaced the menu the spec
+                // and mockup both put in this slot.
+                let overflow =
+                    toolbar_button_response(ui, Some(Icon::Overflow), "", "Viewer menu", false);
+                egui::Popup::menu(&overflow)
+                    .id(egui::Id::new(("markdown-overflow", self.clipboard_owner)))
+                    .show(|ui| {
+                        copy_path_menu(ui, self.display_path());
+                        if ui.button("Reload").clicked() {
+                            command = Some(AppCommand::ReloadMarkdown);
+                            ui.close();
+                        }
+                        if let Some(path) = self.local_path().map(Path::to_path_buf) {
+                            if ui.button("Edit").clicked() {
+                                command = Some(AppCommand::OpenTextEditor { path });
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Close viewer").clicked() {
+                            command = Some(AppCommand::CloseTab(tab_id));
+                            ui.close();
+                        }
+                    });
+                if toolbar_button(
+                    ui,
+                    Some(Icon::Outline),
+                    "",
+                    &hint(
+                        if self.outline_open {
+                            "Hide outline"
+                        } else {
+                            "Show outline"
+                        },
+                        A::MarkdownOutline,
+                    ),
+                    self.outline_open,
+                ) {
+                    command = Some(AppCommand::ToggleMarkdownOutline);
+                }
+                if toolbar_button(
+                    ui,
+                    Some(Icon::Search),
+                    "",
+                    &hint("Find", A::MarkdownFind),
+                    self.find.is_open(),
+                ) {
+                    command = Some(AppCommand::OpenMarkdownFind);
+                }
+                // One segmented Preview/Source pair whose active half is
+                // filled. The previous pair of buttons swapped their own
+                // labels, so in Source mode the toolbar read "Rendered |
+                // Preview" and neither half showed the current mode.
+                let source_mode = matches!(self.mode, MarkdownViewerMode::Source);
+                if toolbar_button(
+                    ui,
+                    Some(Icon::SourceView),
+                    "Source",
+                    &hint("Show the Markdown source", A::MarkdownPreviewSource),
+                    source_mode,
+                ) && !source_mode
+                {
+                    command = Some(AppCommand::ToggleMarkdownPreviewSource);
+                }
+                if toolbar_button(
+                    ui,
+                    Some(Icon::RenderedView),
+                    "Preview",
+                    &hint("Show the rendered document", A::MarkdownPreviewSource),
+                    !source_mode,
+                ) && source_mode
+                {
+                    command = Some(AppCommand::ToggleMarkdownPreviewSource);
+                }
+                if toolbar_button(
+                    ui,
+                    Some(Icon::Refresh),
+                    "",
+                    &hint("Reload", A::MarkdownReload),
+                    false,
+                ) {
+                    command = Some(AppCommand::ReloadMarkdown);
+                }
+                ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+                    icon_label(
+                        ui,
+                        // The same origin vocabulary the SFTP panes use, so
+                        // "local" and "remote" read identically everywhere.
+                        match self.source {
+                            MarkdownSource::Local(_) => Icon::LocalTerminal,
+                            MarkdownSource::Remote(_) => Icon::SshRemote,
+                        },
+                        RichText::new(match self.source {
+                            MarkdownSource::Local(_) => "LOCAL",
+                            MarkdownSource::Remote(_) => "REMOTE",
+                        })
+                        .size(TOOLBAR_TEXT_SIZE)
+                        .color(theme::TEXT_PRIMARY),
+                        theme::TEXT_SECONDARY,
+                    );
+                    // `.fmd-path { overflow: hidden; text-overflow:
+                    // ellipsis }`. Eliding to a fixed character count
+                    // ignored how much room the controls had actually left,
+                    // so on a narrow window the path drew straight through
+                    // the Preview/Source/Find buttons.
+                    let path = ui.add(
+                        egui::Label::new(
+                            RichText::new(elide_middle(self.display_path(), 72))
+                                .size(TOOLBAR_TEXT_SIZE)
+                                .monospace()
+                                .color(theme::TEXT_SECONDARY),
+                        )
+                        .sense(Sense::click())
+                        .truncate(),
+                    );
+                    path.widget_info(|| {
+                        WidgetInfo::labeled(WidgetType::Label, ui.is_enabled(), self.display_path())
+                    });
+                    let path = path.on_hover_text(self.display_path());
+                    egui::Popup::context_menu(&path)
+                        .id(egui::Id::new(("markdown-path", self.clipboard_owner)))
+                        .show(|ui| copy_path_menu(ui, self.display_path()));
+                });
+            });
+        });
+        command
+    }
+
+    /// Find is a compact card floating over the top-right of the document,
+    /// as in the mockup, not a full-width bar wedged between the toolbar and
+    /// the body: a bar pushed the whole document down every time Find opened
+    /// and its default-framed buttons read as a different application.
+    fn show_find_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        document_rect: egui::Rect,
+    ) -> Option<AppCommand> {
+        if !self.find.is_open() {
+            return None;
+        }
+        let mut command = None;
+        let card_size = vec2(FIND_CARD_WIDTH, FIND_CARD_HEIGHT);
+        let origin = egui::pos2(
+            (document_rect.right() - FIND_CARD_MARGIN - card_size.x).max(document_rect.left()),
+            document_rect.top() + FIND_CARD_MARGIN,
+        );
+        egui::Area::new(egui::Id::new("markdown-find-overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(origin)
+            .constrain_to(document_rect)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::SURFACE_OVERLAY)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                    .corner_radius(TOOLBAR_BUTTON_RADIUS + 1.0)
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        // `set_width` sizes the *content*, so the card's own
+                        // margins and border have to come off or the card
+                        // overhangs the right edge it was inset from.
+                        ui.set_width(card_size.x - 22.0);
+                        ui.horizontal(|ui| {
+                            // 4px margins top and bottom plus the 1px border
+                            // make up the card's declared height.
+                            ui.set_height(card_size.y - 10.0);
+                            ui.spacing_mut().item_spacing.x = TOOLBAR_BUTTON_GAP;
+                            // The controls are declared first, right to left,
+                            // so they claim their intrinsic width and the
+                            // query field absorbs whatever is left. Sizing
+                            // the field first instead let the controls push
+                            // the card past `set_width`, which ate the inset
+                            // it was positioned with.
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if toolbar_button(ui, Some(Icon::Close), "", "Close Find", false) {
+                                    self.find.clear();
+                                }
+                                if toolbar_button(
+                                    ui,
+                                    Some(Icon::NextMatch),
+                                    "",
+                                    "Next match (Enter)",
+                                    false,
+                                ) {
+                                    command =
+                                        Some(AppCommand::NavigateMarkdownFind { reverse: false });
+                                }
+                                if toolbar_button(
+                                    ui,
+                                    Some(Icon::PreviousMatch),
+                                    "",
+                                    "Previous match (Shift+Enter)",
+                                    false,
+                                ) {
+                                    command =
+                                        Some(AppCommand::NavigateMarkdownFind { reverse: true });
+                                }
+                                ui.label(
+                                    RichText::new(self.find.current_label())
+                                        .size(TOOLBAR_TEXT_SIZE)
+                                        .color(theme::TEXT_SECONDARY),
+                                );
+                                ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+                                    ui.spacing_mut().item_spacing.x = TOOLBAR_ICON_TEXT_GAP;
+                                    let (icon_rect, _) = ui.allocate_exact_size(
+                                        vec2(TOOLBAR_ICON_SIZE, TOOLBAR_ICON_SIZE),
+                                        Sense::hover(),
+                                    );
+                                    icon::paint(
+                                        ui.painter(),
+                                        Icon::Search,
+                                        icon_rect,
+                                        theme::TEXT_SECONDARY,
+                                    );
+                                    let mut query = self.find.query().to_owned();
+                                    let response = ui.add(
+                                        egui::TextEdit::singleline(&mut query)
+                                            .id(egui::Id::new("markdown-find-query"))
+                                            .desired_width(ui.available_width())
+                                            .frame(egui::Frame::NONE)
+                                            .hint_text("Find"),
+                                    );
+                                    response.widget_info(|| {
+                                        WidgetInfo::labeled(
+                                            WidgetType::TextEdit,
+                                            true,
+                                            "Find Markdown",
+                                        )
+                                    });
+                                    if self.find.take_focus_request() {
+                                        response.request_focus();
+                                    }
+                                    if response.changed() {
+                                        if let Some(document) = &self.document {
+                                            self.find.set_query(document, query);
+                                        } else {
+                                            self.find.query = query;
+                                        }
+                                    }
+                                });
+                            });
+                        });
+                    });
+            });
+        command
+    }
+
+    fn show_error(
+        &mut self,
+        ui: &mut egui::Ui,
+        error: &MarkdownViewerErrorState,
+        _tab_id: TabId,
+        command: &mut Option<AppCommand>,
+    ) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(24.0);
+            ui.heading(error.title);
+            ui.add_space(6.0);
+            ui.label(&error.detail);
+            if error.stale_snapshot {
+                ui.label(
+                    RichText::new("Showing the last complete snapshot.")
+                        .small()
+                        .color(theme::TEXT_SECONDARY),
+                );
+            }
+            ui.add_space(8.0);
+            if ui.button("Retry").clicked() {
+                *command = Some(AppCommand::ReloadMarkdown);
+            }
+        });
+    }
+
+    fn show_footer(&self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(match self.source {
+                    MarkdownSource::Local(_) => "Local",
+                    MarkdownSource::Remote(_) => "Remote",
+                })
+                .small()
+                .color(theme::TEXT_SECONDARY),
+            );
+            ui.label(RichText::new("UTF-8").small().color(theme::TEXT_SECONDARY));
+            if self.stale_snapshot {
+                let label = if self
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.source_unavailable)
+                {
+                    "Source unavailable"
+                } else {
+                    "Stale snapshot"
+                };
+                ui.label(RichText::new(label).small().color(theme::STATUS_STARTING));
+            }
+            if let Some(error) = &self.error {
+                ui.label(
+                    RichText::new(error.title)
+                        .small()
+                        .color(theme::STATUS_ERROR),
+                );
+            }
+        });
+    }
+
+    fn current_anchor(&self) -> ScrollAnchor {
+        if let (Some(document), Some(current)) = (&self.document, self.find.current_match()) {
+            return scroll_anchor_for_offset(document, current.span().start().byte_offset());
+        }
+        if let (Some(document), Some(index)) = (&self.document, self.outline_selected) {
+            if let Some(heading) = document.headings().get(index) {
+                return scroll_anchor_for_offset(document, heading.section_start_byte());
+            }
+        }
+        self.document
+            .as_ref()
+            .map(|document| scroll_anchor_for_offset(document, 0))
+            .unwrap_or_else(ScrollAnchor::top)
+    }
+}
+
+struct MarkdownRenderState<'a> {
+    table_cells: TableCellPreparation,
+    code_copy_caption: CodeCopyCaptionPreparation,
+    mode: MarkdownViewerMode,
+    outline_open: bool,
+    outline_selected: &'a mut Option<usize>,
+    find: &'a MarkdownFindState,
+    resource_approvals: &'a ResourceApprovalState,
+    loaded_images: &'a BTreeMap<usize, LoadedImage>,
+    pending_image_loads: &'a BTreeMap<usize, PendingImageLoad>,
+    image_errors: &'a BTreeMap<usize, String>,
+    pending_scroll: &'a mut Option<PendingScroll>,
+    line_heading_indices: &'a [Option<usize>],
+    source_syntax: &'a mut Option<Vec<festerm_syntax::Span>>,
+    source_preparation: &'a mut SourcePreparation,
+    code_preparation: &'a mut CodeLinePreparation,
+    table_layouts: &'a mut TableLayoutPreparation,
+    outline_preparation: &'a mut OutlinePreparation,
+    outline_keyboard_focus: &'a mut bool,
+    /// Shared Preview measures section positions; the standalone viewer has
+    /// no consumer and does not collect them.
+    heading_tops: Option<&'a mut Vec<(usize, f32)>>,
+}
+
+#[derive(Default)]
+struct TableLayoutPreparation {
+    epoch: LayoutEpoch,
+    find: Option<(Vec<TextMatch>, Option<usize>)>,
+    tables: BTreeMap<usize, Arc<PreparedTable>>,
+    cells: usize,
+    payload_bytes: usize,
+    #[cfg(test)]
+    ordinary: bool,
+    #[cfg(test)]
+    preparations: usize,
+}
+
+struct PreparedTable {
+    available_width: f32,
+    style: InlineRenderStyle,
+    widths: Vec<f32>,
+    rows: Vec<PreparedTableRow>,
+    cells: usize,
+    payload_bytes: usize,
+}
+
+struct PreparedTableRow {
+    galleys: Vec<Arc<egui::Galley>>,
+    height: f32,
+}
+
+impl TableLayoutPreparation {
+    fn clear(&mut self) {
+        self.find = None;
+        self.tables.clear();
+        self.cells = 0;
+        self.payload_bytes = 0;
+    }
+
+    fn begin(&mut self, ui: &egui::Ui, find: &MarkdownFindState) {
+        #[cfg(test)]
+        {
+            self.preparations = 0;
+        }
+        let epoch_current = self.epoch.refresh(ui);
+        let find_current = self.find.as_ref().is_some_and(|(matches, current)| {
+            matches == find.matches() && *current == find.current_index
+        });
+        if !epoch_current || !find_current {
+            self.clear();
+            if find.matches().len() <= MAX_LAYOUT_FIND_MATCHES {
+                self.find = Some((find.matches().to_vec(), find.current_index));
+            }
+        }
+    }
+
+    fn get(
+        &mut self,
+        start: usize,
+        available_width: f32,
+        style: InlineRenderStyle,
+    ) -> Option<Arc<PreparedTable>> {
+        #[cfg(test)]
+        if self.ordinary {
+            return None;
+        }
+        let table = self.tables.get(&start)?;
+        if table.available_width == available_width && table.style == style {
+            return Some(table.clone());
+        }
+        let previous = self.tables.remove(&start).unwrap();
+        self.cells -= previous.cells;
+        self.payload_bytes -= previous.payload_bytes;
+        None
+    }
+
+    fn retain(&mut self, start: usize, table: &Arc<PreparedTable>) {
+        #[cfg(test)]
+        if self.ordinary {
+            return;
+        }
+        if self.find.is_some()
+            && self.tables.len() < MAX_PREPARED_TABLE_LAYOUTS
+            && table.cells <= MAX_PREPARED_TABLE_LAYOUT_CELLS.saturating_sub(self.cells)
+            && table.payload_bytes
+                <= MAX_PREPARED_TABLE_LAYOUT_BYTES.saturating_sub(self.payload_bytes)
+        {
+            self.cells += table.cells;
+            self.payload_bytes += table.payload_bytes;
+            self.tables.insert(start, table.clone());
+        }
+    }
+}
+
+impl PreparedTable {
+    fn accounted_payload(&self) -> Option<usize> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(
+                self.widths
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<f32>())?,
+            )?
+            .checked_add(
+                self.rows
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<PreparedTableRow>())?,
+            )?;
+        for row in &self.rows {
+            bytes = bytes.checked_add(
+                row.galleys
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Arc<egui::Galley>>())?,
+            )?;
+            for galley in &row.galleys {
+                bytes = bytes.checked_add(galley_payload_bytes(galley)?)?;
+            }
+        }
+        Some(bytes)
+    }
+}
+
+#[derive(Default)]
+struct CodeLinePreparation {
+    diagrams: crate::markdown_diagrams::MermaidDiagrams,
+    jobs: BTreeMap<(usize, usize), Arc<LayoutJob>>,
+    payload_bytes: usize,
+    epoch: LayoutEpoch,
+    galleys: BTreeMap<(usize, usize), PreparedCodeLine>,
+    galley_payload_bytes: usize,
+    #[cfg(test)]
+    probe: Option<CodeLinePreparationProbe>,
+}
+
+struct PreparedCodeLine {
+    width: f32,
+    halign: Align,
+    justify: bool,
+    galley: Arc<egui::Galley>,
+    payload_bytes: usize,
+}
+
+impl CodeLinePreparation {
+    fn clear(&mut self) {
+        self.diagrams.clear();
+        self.jobs.clear();
+        self.payload_bytes = 0;
+        self.clear_galleys();
+    }
+
+    fn clear_galleys(&mut self) {
+        self.galleys.clear();
+        self.galley_payload_bytes = 0;
+    }
+
+    fn begin(&mut self, ui: &egui::Ui) {
+        if !self.epoch.refresh(ui) {
+            self.clear_galleys();
+        }
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.layouts = 0;
+            probe.clone_payload_bytes = 0;
+            probe.galley_hits = 0;
+            probe.observations.clear();
+        }
+    }
+
+    fn label(
+        &mut self,
+        ui: &mut egui::Ui,
+        block_start: usize,
+        index: usize,
+        line: &HighlightedCodeLine,
+    ) -> egui::Response {
+        #[cfg(test)]
+        let ordinary = self.probe.as_ref().is_some_and(|probe| probe.ordinary);
+        #[cfg(not(test))]
+        let ordinary = false;
+        // render_code_block owns fresh Frame/ScrollArea children, so its
+        // ordinary top-down placer cannot inherit a grid. Other layouts keep
+        // Label's complete fallback, including wrapping multi-rect rows.
+        let width = ui.available_width();
+        let supported = *ui.layout() == egui::Layout::top_down(Align::Min) && width >= 0.0;
+        if ordinary || !supported {
+            let job = self.line(block_start, index, line);
+            return ui.add(egui::Label::new(job).selectable(true).wrap());
+        }
+        let key = (block_start, index);
+        let halign = ui.layout().horizontal_placement();
+        let justify = ui.layout().horizontal_justify();
+        let current = self.galleys.get(&key).filter(|prepared| {
+            prepared.width == width && prepared.halign == halign && prepared.justify == justify
+        });
+        let galley = if let Some(prepared) = current {
+            #[cfg(test)]
+            if let Some(probe) = &mut self.probe {
+                probe.galley_hits += 1;
+            }
+            prepared.galley.clone()
+        } else {
+            if let Some(previous) = self.galleys.remove(&key) {
+                self.galley_payload_bytes -= previous.payload_bytes;
+            }
+            let job = self.line(block_start, index, line);
+            #[cfg(test)]
+            let shared = Arc::strong_count(&job) > 1;
+            let mut job = Arc::unwrap_or_clone(job);
+            #[cfg(test)]
+            if let Some(probe) = &mut self.probe {
+                probe.layouts += 1;
+                if shared {
+                    probe.clone_payload_bytes += job.text.capacity()
+                        + job.sections.capacity()
+                            * std::mem::size_of::<egui::text::LayoutSection>();
+                }
+            }
+            job.wrap.max_width = width;
+            job.halign = halign;
+            job.justify = justify;
+            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+            self.retain(key, width, halign, justify, &galley);
+            galley
+        };
+        let intrinsic_size = galley.intrinsic_size();
+        let mut response = ui.add(egui::Label::new(galley).selectable(true).wrap());
+        // Label's Galley arm omits the ordinary job arm's intrinsic-size update.
+        response.set_intrinsic_size(intrinsic_size);
+        response
+    }
+
+    fn retain(
+        &mut self,
+        key: (usize, usize),
+        width: f32,
+        halign: Align,
+        justify: bool,
+        galley: &Arc<egui::Galley>,
+    ) {
+        let Some(payload_bytes) = galley_payload_bytes(galley)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<PreparedCodeLine>()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<(usize, usize)>()))
+        else {
+            return;
+        };
+        if self.galleys.len() < MAX_PREPARED_CODE_JOBS
+            && payload_bytes
+                <= MAX_PREPARED_CODE_GALLEY_BYTES.saturating_sub(self.galley_payload_bytes)
+        {
+            self.galley_payload_bytes += payload_bytes;
+            self.galleys.insert(
+                key,
+                PreparedCodeLine {
+                    width,
+                    halign,
+                    justify,
+                    galley: galley.clone(),
+                    payload_bytes,
+                },
+            );
+        }
+    }
+
+    fn line(
+        &mut self,
+        block_start: usize,
+        index: usize,
+        line: &HighlightedCodeLine,
+    ) -> Arc<LayoutJob> {
+        let key = (block_start, index);
+        #[cfg(test)]
+        let ordinary = self.probe.as_ref().is_some_and(|probe| probe.ordinary);
+        #[cfg(not(test))]
+        let ordinary = false;
+        if !ordinary {
+            if let Some(job) = self.jobs.get(&key) {
+                return job.clone();
+            }
+        }
+        let job = Arc::new(highlighted_line_job(line));
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.preparations += 1;
+            probe.prepared_text_bytes += job.text.len();
+        }
+        let payload_bytes = job.text.capacity()
+            + job.sections.capacity() * std::mem::size_of::<egui::text::LayoutSection>();
+        if !ordinary
+            && self.jobs.len() < MAX_PREPARED_CODE_JOBS
+            && payload_bytes
+                <= MAX_PREPARED_CODE_JOB_PAYLOAD_BYTES.saturating_sub(self.payload_bytes)
+        {
+            // Immutable snapshot instructions also serve the conservative
+            // fallback when a galley cannot fit its separate payload budget.
+            self.jobs.insert(key, job.clone());
+            self.payload_bytes += payload_bytes;
+        }
+        job
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CodeLinePreparationProbe {
+    ordinary: bool,
+    preparations: usize,
+    prepared_text_bytes: usize,
+    layouts: usize,
+    clone_payload_bytes: usize,
+    galley_hits: usize,
+    observations: Vec<(egui::Id, egui::Rect, Option<egui::Vec2>, egui::Sense)>,
+}
+
+#[derive(Default)]
+struct SourcePreparation {
+    query: Option<String>,
+    jobs: BTreeMap<usize, PreparedSourceLine>,
+    payload_bytes: usize,
+    geometry_key: Option<OutlineGeometryKey>,
+    #[cfg(test)]
+    probe: Option<SourcePreparationProbe>,
+}
+
+struct PreparedSourceLine {
+    span: SourceSpan,
+    current_match: Option<usize>,
+    job: Arc<LayoutJob>,
+    payload_bytes: usize,
+    geometry: Option<SourceRowGeometry>,
+}
+
+#[derive(Clone, Copy)]
+struct SourceRowGeometry {
+    size: egui::Vec2,
+    intrinsic_size: egui::Vec2,
+    wrap_width: f32,
+}
+
+impl SourcePreparation {
+    fn clear(&mut self) {
+        self.query = None;
+        self.jobs.clear();
+        self.payload_bytes = 0;
+        self.geometry_key = None;
+    }
+
+    fn begin(&mut self, find: &MarkdownFindState) {
+        if find.query().len() > MAX_SOURCE_PREPARATION_QUERY_BYTES {
+            self.clear();
+        } else if self.query.as_deref() != Some(find.query()) {
+            self.clear();
+            self.query = Some(find.query().to_owned());
+        }
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.visited_lines = 0;
+            probe.preparations = 0;
+            probe.prepared_text_bytes = 0;
+            probe.rebased_roles = 0;
+            probe.layouts = 0;
+            probe.layout_text_bytes = 0;
+            probe.shared_label_inputs = 0;
+            probe.label_clone_payload_bytes = 0;
+            probe.explicit_job_clones = 0;
+            probe.explicit_clone_capacity_bytes = 0;
+            probe.geometry_key_resets = 0;
+            probe.geometry_key_clones = 0;
+            probe.geometry_metadata_rejections = 0;
+            probe.geometry_clone_string_capacity_bytes = 0;
+            probe.geometry_clone_family_vector_capacity_bytes = 0;
+            probe.geometry_clone_custom_family_name_bytes = 0;
+            probe.observations.clear();
+        }
+    }
+
+    fn begin_geometry(&mut self, ui: &egui::Ui) {
+        let width = ui.available_width();
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let font = FontId::monospace(CODE_TEXT_SIZE);
+        let current = ui.painter().fonts(|fonts| {
+            geometry_font_metadata(fonts.definitions()).map(|_| {
+                self.geometry_key.as_ref().is_some_and(|key| {
+                    key.matches(
+                        width,
+                        pixels_per_point,
+                        &font,
+                        fonts.definitions(),
+                        *fonts.options(),
+                    )
+                })
+            })
+        });
+        if current == Some(true) {
+            return;
+        }
+        self.geometry_key = None;
+        for prepared in self.jobs.values_mut() {
+            prepared.geometry = None;
+        }
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.geometry_key_resets += 1;
+        }
+        let replacement = current.and_then(|_| {
+            ui.painter().fonts(|fonts| {
+                OutlineGeometryKey::admitted(
+                    width,
+                    pixels_per_point,
+                    font,
+                    fonts.definitions(),
+                    *fonts.options(),
+                    |definitions| {
+                        #[cfg(test)]
+                        if let Some(probe) = &mut self.probe {
+                            probe.record_geometry_definition_clone(definitions);
+                        }
+                        #[cfg(not(test))]
+                        let _ = definitions;
+                    },
+                )
+            })
+        });
+        if let Some(key) = replacement {
+            self.geometry_key = Some(key);
+        } else {
+            #[cfg(test)]
+            if let Some(probe) = &mut self.probe {
+                probe.geometry_metadata_rejections += 1;
+            }
+        }
+    }
+
+    fn line(
+        &mut self,
+        line_start: usize,
+        line: &str,
+        document: &MarkdownDocument,
+        find: &MarkdownFindState,
+        syntax: &[festerm_syntax::Span],
+    ) -> (SourceSpan, Arc<LayoutJob>) {
+        let range = line_start..line_start + line.len();
+        let current_match = find.current_index.filter(|_| {
+            find.current_match().is_some_and(|matched| {
+                let matched = matched.span().byte_range();
+                matched.start < range.end && matched.end > range.start
+            })
+        });
+        #[cfg(test)]
+        let ordinary = self.probe.as_ref().is_some_and(|probe| probe.ordinary);
+        #[cfg(not(test))]
+        let ordinary = false;
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.visited_lines += 1;
+        }
+        if !ordinary {
+            if let Some(prepared) = self.jobs.get(&line_start) {
+                if prepared.current_match == current_match {
+                    return (prepared.span, prepared.job.clone());
+                }
+            }
+        }
+        if let Some(previous) = self.jobs.remove(&line_start) {
+            self.payload_bytes -= previous.payload_bytes;
+        }
+        let span = document
+            .source_span(range.clone())
+            .unwrap_or_else(|| document.source_span(0..0).expect("empty span"));
+        let roles = roles_within(syntax, range);
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.preparations += 1;
+            probe.rebased_roles += roles.len();
+            probe.prepared_text_bytes += trim_line_ending(line).len().max(1);
+        }
+        let job = Arc::new(source_line_job(line, span, find, roles));
+        let payload_bytes = job.text.capacity()
+            + job.sections.capacity() * std::mem::size_of::<egui::text::LayoutSection>();
+        if !ordinary
+            && self.query.is_some()
+            && self.jobs.len() < MAX_PREPARED_SOURCE_JOBS
+            && payload_bytes
+                <= MAX_PREPARED_SOURCE_JOB_PAYLOAD_BYTES.saturating_sub(self.payload_bytes)
+        {
+            // Formatting instructions and finite local geometry are bounded by
+            // the same admitted owner. No galley or atlas reference survives.
+            self.jobs.insert(
+                line_start,
+                PreparedSourceLine {
+                    span,
+                    current_match,
+                    job: job.clone(),
+                    payload_bytes,
+                    geometry: None,
+                },
+            );
+            self.payload_bytes += payload_bytes;
+        }
+        (span, job)
+    }
+
+    fn label(
+        &mut self,
+        ui: &mut egui::Ui,
+        line_start: usize,
+        job: Arc<LayoutJob>,
+        selection_active: bool,
+    ) -> egui::Response {
+        #[cfg(test)]
+        let ordinary = self
+            .probe
+            .as_ref()
+            .is_some_and(|probe| probe.ordinary || probe.geometry_ordinary);
+        #[cfg(not(test))]
+        let ordinary = false;
+        // render_source owns a fresh Frame child; its placer cannot inherit a grid.
+        let supported = *ui.layout() == egui::Layout::top_down(Align::Min)
+            && ui.available_width().is_finite()
+            && ui.available_width() > 0.0;
+        let geometry = (!ordinary && supported && self.geometry_key.is_some())
+            .then(|| {
+                self.jobs
+                    .get(&line_start)
+                    .and_then(|prepared| prepared.geometry)
+            })
+            .flatten()
+            .filter(|geometry| geometry.wrap_width == ui.available_width())
+            .filter(|geometry| {
+                let frame =
+                    egui::Rect::from_min_size(ui.next_widget_position(), geometry.size).round_ui();
+                let rect = ui.layout().align_size_within_rect(geometry.size, frame);
+                !rect.intersects(ui.clip_rect())
+                    && (!selection_active
+                        || !ui
+                            .ctx()
+                            .plugin::<egui::text_selection::LabelSelectionState>()
+                            .lock()
+                            .needs_offscreen_label(ui.ctx().viewport_id(), ui.next_auto_id()))
+            });
+        if let Some(geometry) = geometry {
+            // Label's selection/painting branch only runs for visible response
+            // rectangles. Keep its live allocation/info and exact measured sizes.
+            let mut sense = if ui.memory(|memory| memory.options.screen_reader) {
+                Sense::focusable_noninteractive()
+            } else {
+                Sense::hover()
+            };
+            let mut selection = if ui.input(|input| input.has_touch_screen()) {
+                Sense::click()
+            } else {
+                Sense::click_and_drag()
+            };
+            selection -= Sense::FOCUSABLE;
+            sense |= selection;
+            let (_, mut response) = ui.allocate_exact_size(geometry.size, sense);
+            debug_assert!(!ui.is_rect_visible(response.rect));
+            response.set_intrinsic_size(geometry.intrinsic_size);
+            response
+                .widget_info(|| WidgetInfo::labeled(WidgetType::Label, ui.is_enabled(), &job.text));
+            return response;
+        }
+        let width = ui.available_width();
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.layouts += 1;
+            probe.layout_text_bytes += job.text.len();
+        }
+        if ordinary
+            || !supported
+            || self.geometry_key.is_none()
+            || !self.jobs.contains_key(&line_start)
+        {
+            #[cfg(test)]
+            if let Some(probe) = &mut self.probe {
+                // The pinned Label unwraps/clones this shared job before its
+                // memoized fonts call. Count that actual input condition, not
+                // the descriptor cache hit or the retained Vec capacities.
+                if Arc::strong_count(&job) > 1 {
+                    probe.shared_label_inputs += 1;
+                    probe.label_clone_payload_bytes += job.text.len()
+                        + job.sections.len() * std::mem::size_of::<egui::text::LayoutSection>();
+                }
+            }
+            return ui.add(egui::Label::new(job).selectable(true).wrap());
+        }
+        #[cfg(test)]
+        let shared = Arc::strong_count(&job) > 1;
+        let text = egui::WidgetText::from(job);
+        let mut job = Arc::unwrap_or_clone(text.into_layout_job(
+            ui.style(),
+            egui::FontSelection::Default,
+            ui.text_valign(),
+        ));
+        #[cfg(test)]
+        if shared {
+            if let Some(probe) = &mut self.probe {
+                probe.explicit_job_clones += 1;
+                probe.explicit_clone_capacity_bytes += job.text.capacity()
+                    + job.sections.capacity() * std::mem::size_of::<egui::text::LayoutSection>();
+            }
+        }
+        job.wrap.max_width = width;
+        job.halign = Align::Min;
+        job.justify = false;
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        // Capture the exact local desired size before world-coordinate rounding.
+        // The galley is frame-local; Label keeps its normal painting/selection.
+        let size = galley.size();
+        let intrinsic_size = galley.intrinsic_size();
+        let mut response = ui.add(egui::Label::new(galley).selectable(true).wrap());
+        response.set_intrinsic_size(intrinsic_size);
+        if size.is_finite()
+            && intrinsic_size.is_finite()
+            && size.x >= 0.0
+            && size.y > 0.0
+            && intrinsic_size.x >= 0.0
+            && intrinsic_size.y > 0.0
+        {
+            if let Some(prepared) = self.jobs.get_mut(&line_start) {
+                prepared.geometry = Some(SourceRowGeometry {
+                    size,
+                    intrinsic_size,
+                    wrap_width: width,
+                });
+            }
+        }
+        response
+    }
+
+    #[cfg(test)]
+    fn record(&mut self, span: SourceSpan, response: &egui::Response) {
+        if let Some(probe) = &mut self.probe {
+            probe.observations.push(SourceRowObservation {
+                span,
+                id: response.id,
+                rect: response.rect,
+                interact_rect: response.interact_rect,
+                intrinsic_size: response.intrinsic_size(),
+                sense: response.sense,
+                focused: response.has_focus(),
+                hovered: response.hovered(),
+                clicked: response.clicked(),
+                dragged: response.dragged(),
+                drag_started: response.drag_started(),
+                drag_stopped: response.drag_stopped(),
+                changed: response.changed(),
+                enabled: response.enabled(),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SourcePreparationProbe {
+    ordinary: bool,
+    geometry_ordinary: bool,
+    visited_lines: usize,
+    preparations: usize,
+    prepared_text_bytes: usize,
+    rebased_roles: usize,
+    layouts: usize,
+    layout_text_bytes: usize,
+    shared_label_inputs: usize,
+    label_clone_payload_bytes: usize,
+    explicit_job_clones: usize,
+    explicit_clone_capacity_bytes: usize,
+    geometry_key_resets: usize,
+    geometry_key_clones: usize,
+    geometry_metadata_rejections: usize,
+    geometry_clone_string_capacity_bytes: usize,
+    geometry_clone_family_vector_capacity_bytes: usize,
+    geometry_clone_custom_family_name_bytes: usize,
+    observations: Vec<SourceRowObservation>,
+}
+
+#[cfg(test)]
+impl SourcePreparationProbe {
+    fn record_geometry_definition_clone(&mut self, definitions: &egui::FontDefinitions) {
+        self.geometry_key_clones += 1;
+        self.geometry_clone_string_capacity_bytes += definitions
+            .font_data
+            .keys()
+            .chain(definitions.families.values().flatten())
+            .map(String::capacity)
+            .sum::<usize>();
+        self.geometry_clone_family_vector_capacity_bytes += definitions
+            .families
+            .values()
+            .map(|names| names.capacity() * std::mem::size_of::<String>())
+            .sum::<usize>();
+        self.geometry_clone_custom_family_name_bytes += definitions
+            .families
+            .keys()
+            .filter_map(|family| match family {
+                egui::FontFamily::Name(name) => Some(name.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+struct SourceRowObservation {
+    span: SourceSpan,
+    id: egui::Id,
+    rect: egui::Rect,
+    interact_rect: egui::Rect,
+    intrinsic_size: Option<egui::Vec2>,
+    sense: Sense,
+    focused: bool,
+    hovered: bool,
+    clicked: bool,
+    dragged: bool,
+    drag_started: bool,
+    drag_stopped: bool,
+    changed: bool,
+    enabled: bool,
+}
+
+#[derive(Default)]
+struct OutlinePreparation {
+    key: Option<OutlineGeometryKey>,
+    rows: Vec<Option<OutlineRowGeometry>>,
+    #[cfg(test)]
+    probe: Option<OutlinePreparationProbe>,
+}
+
+#[derive(Clone)]
+struct OutlineGeometryKey {
+    width: f32,
+    pixels_per_point: f32,
+    font: FontId,
+    definitions: egui::FontDefinitions,
+    options: egui::epaint::text::TextOptions,
+}
+
+impl PartialEq for OutlineGeometryKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.matches(
+            other.width,
+            other.pixels_per_point,
+            &other.font,
+            &other.definitions,
+            other.options,
+        )
+    }
+}
+
+impl OutlineGeometryKey {
+    fn matches(
+        &self,
+        width: f32,
+        pixels_per_point: f32,
+        font: &FontId,
+        definitions: &egui::FontDefinitions,
+        options: egui::epaint::text::TextOptions,
+    ) -> bool {
+        self.width == width
+            && self.pixels_per_point == pixels_per_point
+            && &self.font == font
+            && self.options == options
+            && self.definitions.font_data.len() == definitions.font_data.len()
+            && self
+                .definitions
+                .font_data
+                .iter()
+                .zip(&definitions.font_data)
+                .all(|((name, data), (other_name, other_data))| {
+                    // Do not traverse font bytes; replacement conservatively invalidates.
+                    name == other_name && Arc::ptr_eq(data, other_data)
+                })
+            && self.definitions.families == definitions.families
+    }
+
+    fn admitted(
+        width: f32,
+        pixels_per_point: f32,
+        font: FontId,
+        definitions: &egui::FontDefinitions,
+        options: egui::epaint::text::TextOptions,
+        on_clone: impl FnOnce(&egui::FontDefinitions),
+    ) -> Option<Self> {
+        geometry_font_metadata(definitions)?;
+        let definitions = definitions.clone();
+        on_clone(&definitions);
+        geometry_font_metadata(&definitions)?;
+        Some(Self {
+            width,
+            pixels_per_point,
+            font,
+            definitions,
+            options,
+        })
+    }
+}
+
+#[derive(Default)]
+struct GeometryFontMetadata {
+    string_capacity_bytes: usize,
+    custom_family_name_bytes: usize,
+    family_reference_capacity: usize,
+}
+
+fn geometry_font_metadata(definitions: &egui::FontDefinitions) -> Option<GeometryFontMetadata> {
+    if definitions.font_data.len() > MAX_GEOMETRY_FONT_MAP_ENTRIES
+        || definitions.families.len() > MAX_GEOMETRY_FONT_MAP_ENTRIES
+    {
+        return None;
+    }
+    let mut metadata = GeometryFontMetadata::default();
+    for name in definitions.font_data.keys() {
+        metadata.string_capacity_bytes = metadata
+            .string_capacity_bytes
+            .checked_add(name.capacity())?;
+        if metadata.string_capacity_bytes > MAX_GEOMETRY_FONT_NAME_BYTES {
+            return None;
+        }
+    }
+    for (family, names) in &definitions.families {
+        metadata.family_reference_capacity = metadata
+            .family_reference_capacity
+            .checked_add(names.capacity())?;
+        if metadata.family_reference_capacity > MAX_GEOMETRY_FONT_FAMILY_REFERENCES {
+            return None;
+        }
+        if let egui::FontFamily::Name(name) = family {
+            metadata.custom_family_name_bytes =
+                metadata.custom_family_name_bytes.checked_add(name.len())?;
+        }
+        for name in names {
+            metadata.string_capacity_bytes = metadata
+                .string_capacity_bytes
+                .checked_add(name.capacity())?;
+            if metadata
+                .string_capacity_bytes
+                .checked_add(metadata.custom_family_name_bytes)?
+                > MAX_GEOMETRY_FONT_NAME_BYTES
+            {
+                return None;
+            }
+        }
+        if metadata
+            .string_capacity_bytes
+            .checked_add(metadata.custom_family_name_bytes)?
+            > MAX_GEOMETRY_FONT_NAME_BYTES
+        {
+            return None;
+        }
+    }
+    Some(metadata)
+}
+
+#[derive(Clone, Copy)]
+struct OutlineRowGeometry {
+    height: f32,
+    text_bounds: egui::Rect,
+}
+
+impl OutlinePreparation {
+    fn clear(&mut self) {
+        self.key = None;
+        self.rows.clear();
+    }
+
+    fn begin(&mut self, ui: &egui::Ui, rows: usize) {
+        let width = ui.available_width();
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let font = FontId::proportional(TOOLBAR_TEXT_SIZE);
+        let current = ui.painter().fonts(|fonts| {
+            geometry_font_metadata(fonts.definitions()).map(|_| {
+                self.key.as_ref().is_some_and(|key| {
+                    key.matches(
+                        width,
+                        pixels_per_point,
+                        &font,
+                        fonts.definitions(),
+                        *fonts.options(),
+                    )
+                })
+            })
+        });
+        if current != Some(true) {
+            self.clear();
+            self.key = current.and_then(|_| {
+                ui.painter().fonts(|fonts| {
+                    OutlineGeometryKey::admitted(
+                        width,
+                        pixels_per_point,
+                        font,
+                        fonts.definitions(),
+                        *fonts.options(),
+                        |_| {},
+                    )
+                })
+            });
+        }
+        let rows = if self.key.is_some() {
+            rows.min(MAX_PREPARED_OUTLINE_ROWS)
+        } else {
+            0
+        };
+        if self.rows.capacity() < rows {
+            self.rows.reserve_exact(rows - self.rows.len());
+        }
+        self.rows.resize(rows, None);
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.rows = 0;
+            probe.layouts = 0;
+            probe.prepared_text_bytes = 0;
+            probe.observations.clear();
+        }
+    }
+
+    fn offscreen_geometry(&self, ui: &egui::Ui, index: usize) -> Option<OutlineRowGeometry> {
+        #[cfg(test)]
+        if self.probe.as_ref().is_some_and(|probe| probe.ordinary) {
+            return None;
+        }
+        let geometry = self.rows.get(index).copied().flatten()?;
+        let rect = egui::Rect::from_min_size(
+            ui.next_widget_position(),
+            vec2(ui.available_width(), geometry.height),
+        );
+        let text_rect = geometry.text_bounds.translate(rect.min.to_vec2());
+        (!ui.is_rect_visible(rect.union(text_rect))).then_some(geometry)
+    }
+
+    fn item(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        heading: &festerm_markdown::Heading,
+        selected: bool,
+    ) -> egui::Response {
+        let geometry = self.offscreen_geometry(ui, index);
+        let (response, measured) = outline_item_with_geometry(ui, heading, selected, geometry);
+        if let Some(cached) = self.rows.get_mut(index) {
+            *cached = Some(measured);
+        }
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.rows += 1;
+            if geometry.is_none() {
+                probe.layouts += 1;
+                probe.prepared_text_bytes += heading.text().len();
+            }
+            probe.observations.push((
+                response.id,
+                response.rect,
+                response.interact_rect,
+                response.has_focus(),
+                response.clicked(),
+            ));
+        }
+        response
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct OutlinePreparationProbe {
+    ordinary: bool,
+    rows: usize,
+    layouts: usize,
+    prepared_text_bytes: usize,
+    observations: Vec<(egui::Id, egui::Rect, egui::Rect, bool, bool)>,
+}
+
+#[derive(Default)]
+struct CodeCopyCaptionPreparation {
+    prepared: Option<PreparedCodeCopyCaption>,
+    #[cfg(test)]
+    probe: Option<CodeCopyProbe>,
+}
+
+struct TableCellPreparation {
+    key: Option<TableCellPainterKey>,
+    cells: [Option<Arc<egui::Galley>>; MAX_PREPARED_TABLE_CELLS],
+    len: usize,
+    payload_bytes: usize,
+    #[cfg(test)]
+    probe: Option<TableCellProbe>,
+}
+
+impl Default for TableCellPreparation {
+    fn default() -> Self {
+        Self {
+            key: None,
+            cells: std::array::from_fn(|_| None),
+            len: 0,
+            payload_bytes: 0,
+            #[cfg(test)]
+            probe: None,
+        }
+    }
+}
+
+#[derive(PartialEq)]
+struct TableCellPainterKey {
+    context: egui::Context,
+    viewport: egui::ViewportId,
+    pass: u64,
+    pixels_per_point: f32,
+    options: egui::epaint::text::TextOptions,
+}
+
+impl TableCellPreparation {
+    fn begin_table(&mut self, ui: &egui::Ui) {
+        let context = ui.painter().ctx();
+        let (viewport, pixels_per_point) =
+            context.input(|input| (input.raw.viewport_id, input.pixels_per_point));
+        let key = TableCellPainterKey {
+            context: context.clone(),
+            viewport,
+            pass: context.cumulative_pass_nr_for(viewport),
+            pixels_per_point,
+            options: ui.painter().fonts(|fonts| *fonts.options()),
+        };
+        // Definitions and atlas resets activate at begin-pass. The renderer
+        // owns this preparation only for one invocation, across all its tables.
+        if self.key.as_ref() != Some(&key) {
+            self.cells.fill(None);
+            self.len = 0;
+            self.payload_bytes = 0;
+            self.key = Some(key);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unwrapped(
+        &mut self,
+        ui: &egui::Ui,
+        inlines: &[Inline],
+        document: &MarkdownDocument,
+        find: &MarkdownFindState,
+        font: FontId,
+        style: InlineRenderStyle,
+    ) -> Arc<egui::Galley> {
+        #[cfg(test)]
+        let ordinary = self.probe.as_ref().is_some_and(|probe| probe.ordinary);
+        #[cfg(not(test))]
+        let ordinary = false;
+        let plain = match inlines {
+            [Inline::Text(text)]
+                if !ordinary
+                    && self.key.is_some()
+                    && !text.text().is_empty()
+                    && text.text().len() <= MAX_PREPARED_TABLE_CELL_INPUT_BYTES
+                    && !matches!(font.family, egui::FontFamily::Name(_)) =>
+            {
+                let span = text.text_span();
+                let first = find.matches().partition_point(|matched| {
+                    matched.span().end().byte_offset() <= span.start().byte_offset()
+                });
+                (!find.matches().get(first).is_some_and(|matched| {
+                    matched.span().start().byte_offset() < span.end().byte_offset()
+                }))
+                .then_some(text.text())
+            }
+            _ => None,
+        };
+        if let Some(text) = plain {
+            let format = base_text_format(font.clone(), style);
+            for galley in self.cells[..self.len].iter().flatten() {
+                // These entries all came from the same ordinary default,
+                // unwrapped, single-section job. Compare borrowed text and the
+                // complete section format before constructing another job.
+                if galley.job.text == text && galley.job.sections[0].format == format {
+                    return galley.clone();
+                }
+            }
+        }
+        let job = inline_layout_job(inlines, document, find, font, style);
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.preparations += 1;
+            probe.prepared_text_bytes += job.text.len();
+            probe.job_capacity_bytes += job.text.capacity()
+                + job.sections.capacity() * std::mem::size_of::<egui::text::LayoutSection>();
+            probe.unwrapped_layouts += 1;
+        }
+        let galley = ui.painter().layout_job(job);
+        if plain.is_some() {
+            self.retain(&galley);
+        }
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.retained_entries = self.len;
+            probe.retained_payload_bytes = self.payload_bytes;
+        }
+        galley
+    }
+
+    fn retain(&mut self, galley: &Arc<egui::Galley>) -> bool {
+        if self.len >= MAX_PREPARED_TABLE_CELLS {
+            return false;
+        }
+        let Some(total) = table_cell_payload_bytes(galley)
+            .and_then(|bytes| self.payload_bytes.checked_add(bytes))
+            .filter(|total| *total <= MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES)
+        else {
+            return false;
+        };
+        self.cells[self.len] = Some(galley.clone());
+        self.len += 1;
+        self.payload_bytes = total;
+        true
+    }
+
+    fn constrained(
+        &mut self,
+        ui: &egui::Ui,
+        unwrapped: Arc<egui::Galley>,
+        width: f32,
+    ) -> Arc<egui::Galley> {
+        table_cell_galley(ui, unwrapped, width, |_job| {
+            #[cfg(test)]
+            if let Some(probe) = &mut self.probe {
+                probe.wrap_layouts += 1;
+                probe.wrap_clone_capacity_bytes += _job.text.capacity()
+                    + _job.sections.capacity() * std::mem::size_of::<egui::text::LayoutSection>();
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn record(&mut self, span: SourceSpan, response: &egui::Response) {
+        if let Some(probe) = &mut self.probe {
+            probe.observations.push(TableCellObservation {
+                span,
+                id: response.id,
+                rect: response.rect,
+                interact_rect: response.interact_rect,
+                intrinsic_size: response.intrinsic_size(),
+                sense: response.sense,
+                focused: response.has_focus(),
+                hovered: response.hovered(),
+                clicked: response.clicked(),
+                dragged: response.dragged(),
+                drag_started: response.drag_started(),
+                drag_stopped: response.drag_stopped(),
+                changed: response.changed(),
+                enabled: response.enabled(),
+            });
+        }
+    }
+}
+
+fn table_cell_payload_bytes(galley: &egui::Galley) -> Option<usize> {
+    if galley.job.text.len() > MAX_PREPARED_TABLE_CELL_INPUT_BYTES
+        || galley.job.sections.len() != 1
+        || galley.rows.len() > MAX_PREPARED_TABLE_CELL_INPUT_BYTES + 1
+    {
+        return None;
+    }
+    galley_payload_bytes(galley)
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TableCellProbe {
+    ordinary: bool,
+    preparations: usize,
+    prepared_text_bytes: usize,
+    job_capacity_bytes: usize,
+    unwrapped_layouts: usize,
+    wrap_layouts: usize,
+    wrap_clone_capacity_bytes: usize,
+    retained_entries: usize,
+    retained_payload_bytes: usize,
+    observations: Vec<TableCellObservation>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+struct TableCellObservation {
+    span: SourceSpan,
+    id: egui::Id,
+    rect: egui::Rect,
+    interact_rect: egui::Rect,
+    intrinsic_size: Option<egui::Vec2>,
+    sense: Sense,
+    focused: bool,
+    hovered: bool,
+    clicked: bool,
+    dragged: bool,
+    drag_started: bool,
+    drag_stopped: bool,
+    changed: bool,
+    enabled: bool,
+}
+
+struct PreparedCodeCopyCaption {
+    key: CodeCopyCaptionKey,
+    galley: Arc<egui::Galley>,
+}
+
+#[derive(PartialEq)]
+struct CodeCopyCaptionKey {
+    context: egui::Context,
+    viewport: egui::ViewportId,
+    pass: u64,
+    pixels_per_point: f32,
+    font: FontId,
+    color: Color32,
+}
+
+impl CodeCopyCaptionPreparation {
+    fn galley(&mut self, ui: &egui::Ui, font: FontId, color: Color32) -> Arc<egui::Galley> {
+        // Match the actual factory's painter, not the parent UI. Font definitions,
+        // text options and atlas resets activate at begin-pass in egui. This
+        // single entry belongs only to the freshly constructed renderer.
+        let context = ui.painter().ctx();
+        let (viewport, pixels_per_point) =
+            context.input(|input| (input.raw.viewport_id, input.pixels_per_point));
+        let key = CodeCopyCaptionKey {
+            context: context.clone(),
+            viewport,
+            pass: context.cumulative_pass_nr_for(viewport),
+            pixels_per_point,
+            font,
+            color,
+        };
+        if let Some(prepared) = &self.prepared {
+            if prepared.key == key {
+                return prepared.galley.clone();
+            }
+        }
+        let galley = ui
+            .painter()
+            .layout_no_wrap("Copy".to_owned(), key.font.clone(), key.color);
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            probe.preparations += 1;
+        }
+        self.prepared = Some(PreparedCodeCopyCaption {
+            key,
+            galley: galley.clone(),
+        });
+        galley
+    }
+
+    fn button(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        #[cfg(test)]
+        if let Some(probe) = &mut self.probe {
+            if probe.ordinary {
+                probe.preparations += 1;
+                return toolbar_button_response(
+                    ui,
+                    Some(Icon::Copy),
+                    "Copy",
+                    "Copy the code block",
+                    false,
+                );
+            }
+        }
+        let galley = self.galley(
+            ui,
+            FontId::proportional(TOOLBAR_TEXT_SIZE),
+            theme::TEXT_SECONDARY,
+        );
+        toolbar_button_with_galley(
+            ui,
+            Some(Icon::Copy),
+            None,
+            "Copy the code block",
+            false,
+            galley,
+        )
+    }
+
+    #[cfg(test)]
+    fn record(&mut self, block: &CodeBlock, response: &egui::Response) {
+        if let Some(probe) = &mut self.probe {
+            probe.buttons.push(CodeCopyObservation {
+                source: block.span().byte_range(),
+                id: response.id,
+                rect: response.rect,
+                interact_rect: response.interact_rect,
+                enabled: response.enabled(),
+                hovered: response.hovered(),
+                focused: response.has_focus(),
+                clicked: response.clicked(),
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CodeCopyProbe {
+    ordinary: bool,
+    preparations: usize,
+    buttons: Vec<CodeCopyObservation>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+struct CodeCopyObservation {
+    source: std::ops::Range<usize>,
+    id: egui::Id,
+    rect: egui::Rect,
+    interact_rect: egui::Rect,
+    enabled: bool,
+    hovered: bool,
+    focused: bool,
+    clicked: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct MarkdownDocumentLayout {
+    outline_rect: Option<egui::Rect>,
+    document_rect: egui::Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeadingStyle {
+    size: f32,
+    text_color: Color32,
+    underline: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InlineRenderStyle {
+    text_color: Color32,
+    link_color: Color32,
+    code_background: Color32,
+    strong: bool,
+    italics: bool,
+    strikethrough: bool,
+    code_like: bool,
+    link_like: bool,
+    /// Row height for this run. Body prose is laid out one inline widget at a
+    /// time, so the wrapped-row pitch comes from the tallest galley in the
+    /// row rather than from the container's item spacing - pinning it here is
+    /// the only lever that actually moves body leading.
+    line_height: Option<f32>,
+}
+
+impl InlineRenderStyle {
+    fn body() -> Self {
+        Self {
+            text_color: theme::TEXT_PRIMARY,
+            link_color: theme::ACCENT_PRIMARY,
+            code_background: theme::SURFACE_TAB_ACTIVE.gamma_multiply(0.85),
+            strong: false,
+            italics: false,
+            strikethrough: false,
+            code_like: false,
+            link_like: false,
+            line_height: Some(BODY_LINE_HEIGHT),
+        }
+    }
+
+    fn with_line_height(self, line_height: f32) -> Self {
+        Self {
+            line_height: Some(line_height),
+            ..self
+        }
+    }
+
+    fn blockquote() -> Self {
+        Self {
+            text_color: theme::TEXT_SECONDARY,
+            italics: true,
+            ..Self::body()
+        }
+    }
+
+    fn with_strong(self) -> Self {
+        Self {
+            strong: true,
+            ..self
+        }
+    }
+
+    fn with_italics(self) -> Self {
+        Self {
+            italics: true,
+            ..self
+        }
+    }
+
+    fn with_strikethrough(self) -> Self {
+        Self {
+            strikethrough: true,
+            ..self
+        }
+    }
+
+    fn as_inline_code(self) -> Self {
+        Self {
+            code_like: true,
+            italics: false,
+            ..self
+        }
+    }
+
+    fn as_link(self) -> Self {
+        Self {
+            link_like: true,
+            ..self
+        }
+    }
+}
+
+fn heading_style(level: u8) -> HeadingStyle {
+    // VS Code's Markdown preview uses a 14px body and a 2em/1.5em/1.25em
+    // heading ladder. fesTerm keeps its own typeface, but matches that scale
+    // against a 15px body size so documents keep the same visual hierarchy.
+    match level {
+        // Only H2 carries a rule, as in the mockup (`.fmd-document h2 {
+        // border-bottom }`). An underlined H1 immediately above an
+        // underlined H2 read as two competing section dividers.
+        1 => HeadingStyle {
+            size: BODY_TEXT_SIZE * 2.0,
+            text_color: theme::TEXT_PRIMARY,
+            underline: false,
+        },
+        2 => HeadingStyle {
+            size: BODY_TEXT_SIZE * 1.5,
+            text_color: theme::TEXT_PRIMARY,
+            underline: true,
+        },
+        3 => HeadingStyle {
+            size: BODY_TEXT_SIZE * 1.25,
+            text_color: theme::TEXT_PRIMARY,
+            underline: false,
+        },
+        4 => HeadingStyle {
+            size: BODY_TEXT_SIZE,
+            text_color: theme::TEXT_PRIMARY,
+            underline: false,
+        },
+        5 => HeadingStyle {
+            size: BODY_TEXT_SIZE * 0.9,
+            text_color: theme::TEXT_PRIMARY,
+            underline: false,
+        },
+        _ => HeadingStyle {
+            size: BODY_TEXT_SIZE * 0.85,
+            text_color: theme::TEXT_SECONDARY,
+            underline: false,
+        },
+    }
+}
+
+fn inter_block_spacing(previous: &Block, next: &Block) -> f32 {
+    match next {
+        Block::Heading(heading) => {
+            if heading.level() <= 2 {
+                24.0
+            } else {
+                18.0
+            }
+        }
+        _ if matches!(previous, Block::Heading(_)) => HEADING_PARAGRAPH_SPACING,
+        Block::List(_) => 12.0,
+        Block::Table(_) | Block::CodeBlock(_) | Block::BlockQuote(_) | Block::Html(_) => 14.0,
+        Block::Rule { .. } => 18.0,
+        _ => PARAGRAPH_BLOCK_SPACING,
+    }
+}
+
+impl MarkdownRenderState<'_> {
+    fn render_blocks(
+        &mut self,
+        ui: &mut egui::Ui,
+        blocks: &[Block],
+        document: &MarkdownDocument,
+        text_style: InlineRenderStyle,
+    ) {
+        for (index, block) in blocks.iter().enumerate() {
+            if let Some(previous) = index
+                .checked_sub(1)
+                .and_then(|previous| blocks.get(previous))
+            {
+                ui.add_space(inter_block_spacing(previous, block));
+            }
+            let pending = *self.pending_scroll;
+            let top = ui.cursor().min;
+            self.render_block(ui, block, document, text_style);
+            if pending == *self.pending_scroll
+                && matches!(pending, Some(PendingScroll::Byte(target)) if byte_range_contains(block.span(), target))
+            {
+                let bottom = egui::pos2(
+                    ui.max_rect().right(),
+                    ui.cursor().top().max(top.y + BODY_TEXT_SIZE),
+                );
+                ui.scroll_to_rect(egui::Rect::from_min_max(top, bottom), Some(Align::Center));
+                *self.pending_scroll = None;
+            }
+        }
+    }
+
+    /// Paints one outline row: a full-width band with a 2px leading accent
+    /// rail, per the mockup's `.fmd-outline-item`. `selectable_label` cannot
+    /// express this -- it sizes itself to its text and rounds a pill around
+    /// it, so the selection hugged the heading instead of marking the row.
+    fn show_outline_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        heading: &festerm_markdown::Heading,
+    ) {
+        let selected = *self.outline_selected == Some(index);
+        if self
+            .outline_preparation
+            .item(ui, index, heading, selected)
+            .clicked()
+        {
+            *self.outline_selected = Some(index);
+            *self.pending_scroll = Some(PendingScroll::Heading(index));
+            *self.outline_keyboard_focus = true;
+        }
+    }
+
+    fn show_outline(
+        &mut self,
+        ui: &mut egui::Ui,
+        document: &MarkdownDocument,
+        viewport_height: f32,
+    ) -> egui::Rect {
+        let (panel_rect, mut content) = outline_panel(ui, viewport_height);
+        egui::ScrollArea::vertical()
+            .id_salt("markdown-outline")
+            .max_height(content.available_height())
+            .show(&mut content, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                self.outline_preparation
+                    .begin(ui, document.headings().len());
+                for (index, heading) in document.headings().iter().enumerate() {
+                    self.show_outline_item(ui, index, heading);
+                }
+            });
+        panel_rect
+    }
+
+    fn show_document(
+        &mut self,
+        ui: &mut egui::Ui,
+        document: &MarkdownDocument,
+        clipboard_owner: u64,
+        document_revision: u64,
+    ) -> MarkdownDocumentLayout {
+        clipboard::begin(ui);
+        self.table_layouts.begin(ui, self.find);
+        self.code_preparation.begin(ui);
+        let viewport_height = ui.available_height().max(120.0);
+        let layout = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.set_height(viewport_height);
+                let mut outline_rect = None;
+                // Below this the outline would starve the reading column (at 400
+                // logical points the 216pt outline left a 184pt well, which wraps
+                // prose to two or three words a row). Collapse it for the frame
+                // without disturbing the user's own toggle.
+                if self.outline_open
+                    && ui.available_width() >= OUTLINE_WIDTH + OUTLINE_MIN_DOCUMENT_WIDTH
+                {
+                    outline_rect = Some(self.show_outline(ui, document, viewport_height));
+                }
+                let document_width = ui.available_width();
+                let mut document_rect = egui::Rect::NOTHING;
+                ui.allocate_ui_with_layout(
+                    vec2(document_width, viewport_height),
+                    egui::Layout::top_down(Align::Min),
+                    |ui| {
+                        document_rect = ui.max_rect();
+                        let mut scroll = egui::ScrollArea::vertical()
+                            .id_salt("markdown-document")
+                            .max_height(viewport_height)
+                            .min_scrolled_height(viewport_height)
+                            // Without this the scroll area shrinks to the width
+                            // of its content, which parks the scrollbar against
+                            // the reading column instead of the right edge of
+                            // the well.
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                // The reading column is centred in the well, as
+                                // `.fmd-document { margin: 0 auto }` does. Laying
+                                // it out top-down from the left edge left the
+                                // whole right half of a wide window empty.
+                                let column_width = READING_WIDTH
+                                    .min(ui.available_width() - READING_COLUMN_SIDE_GUTTER * 2.0)
+                                    .max(160.0);
+                                let leading =
+                                    ((ui.available_width() - column_width) / 2.0).max(0.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.add_space(leading);
+                                    ui.allocate_ui_with_layout(
+                                        vec2(column_width, 0.0),
+                                        egui::Layout::top_down(Align::Min),
+                                        |ui| {
+                                            ui.set_max_width(column_width);
+                                            ui.add_space(READING_COLUMN_TOP_PADDING);
+                                            match self.mode {
+                                                MarkdownViewerMode::Preview => self.render_blocks(
+                                                    ui,
+                                                    document.blocks(),
+                                                    document,
+                                                    InlineRenderStyle::body(),
+                                                ),
+                                                MarkdownViewerMode::Source => {
+                                                    self.render_source(ui, document);
+                                                }
+                                            }
+                                            ui.add_space(READING_COLUMN_BOTTOM_PADDING);
+                                        },
+                                    );
+                                });
+                            });
+                        selection_drag_autoscroll(
+                            ui,
+                            &mut scroll,
+                            label_selection_dragging(ui),
+                            false,
+                            true,
+                        );
+                        if self.mode == MarkdownViewerMode::Preview {
+                            tracing::debug!(target: "festerm::markdown_scroll",
+                                markdown_preview_offset_y = scroll.state.offset.y,
+                                markdown_preview_content_height = scroll.content_size.y,
+                                markdown_preview_viewport_height = scroll.inner_rect.height(),
+                                markdown_preview_left = scroll.inner_rect.left(),
+                                markdown_preview_top = scroll.inner_rect.top(),
+                                markdown_preview_right = scroll.inner_rect.right(),
+                                markdown_preview_bottom = scroll.inner_rect.bottom(),
+                                markdown_preview_hovered = ui.rect_contains_pointer(scroll.inner_rect),
+                                markdown_preview_pointer = ?ui.input(|input| input.pointer.hover_pos()),
+                                "Markdown viewer scroll state");
+                        }
+                    },
+                );
+                MarkdownDocumentLayout {
+                    outline_rect,
+                    document_rect,
+                }
+            })
+            .inner;
+        match self.mode {
+            MarkdownViewerMode::Preview => clipboard::finish(
+                ui,
+                document,
+                clipboard_owner,
+                document_revision,
+                layout.document_rect,
+            ),
+            MarkdownViewerMode::Source => clipboard::finish_plain(
+                ui,
+                clipboard_owner,
+                document_revision,
+                layout.document_rect,
+            ),
+        }
+        layout
+    }
+
+    fn render_block(
+        &mut self,
+        ui: &mut egui::Ui,
+        block: &Block,
+        document: &MarkdownDocument,
+        text_style: InlineRenderStyle,
+    ) {
+        match block {
+            Block::Paragraph(block) => render_text_block(
+                ui,
+                block,
+                document,
+                self.find,
+                self.resource_approvals,
+                self.loaded_images,
+                self.pending_image_loads,
+                self.image_errors,
+                self.pending_scroll,
+                self.outline_selected,
+                text_style,
+            ),
+            Block::Heading(block) => self.render_heading_block(ui, block, document, text_style),
+            Block::BlockQuote(block) => {
+                // VS Code's preview uses a 5px quote bar with muted, inset
+                // text. Keep the same proportions while staying on fesTerm's
+                // palette instead of introducing an unrelated Markdown theme.
+                let quote = egui::Frame::new()
+                    .fill(theme::SURFACE_TAB_INACTIVE.gamma_multiply(0.45))
+                    .corner_radius(MARKDOWN_PANEL_RADIUS)
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        // Wrapped prose only reports the width of its widest
+                        // row, so without this the panel shrank to the
+                        // paragraph's ragged right edge and stopped short of
+                        // the reading column that every other block spans.
+                        ui.set_min_width(ui.available_width());
+                        self.render_blocks(
+                            ui,
+                            block.blocks(),
+                            document,
+                            InlineRenderStyle::blockquote(),
+                        );
+                    });
+                let bar_rect = egui::Rect::from_min_max(
+                    quote.response.rect.left_top(),
+                    egui::pos2(
+                        quote.response.rect.left() + 5.0,
+                        quote.response.rect.bottom(),
+                    ),
+                );
+                ui.painter()
+                    .rect_filled(bar_rect, 2.0, theme::BORDER_ACTIVE.gamma_multiply(0.7));
+            }
+            Block::List(block) => self.render_list(ui, block, document, text_style),
+            Block::Table(block) => self.render_table(ui, block, document, text_style),
+            Block::CodeBlock(block) => self.render_code_block(ui, block, document),
+            Block::Html(block) => self.render_html_block(ui, block),
+            Block::Rule { .. } => {
+                ui.separator();
+            }
+        }
+    }
+
+    fn render_heading_block(
+        &mut self,
+        ui: &mut egui::Ui,
+        block: &HeadingBlock,
+        document: &MarkdownDocument,
+        text_style: InlineRenderStyle,
+    ) {
+        let style = heading_style(block.level());
+        let heading_index = block.heading_index();
+        let job = inline_layout_job(
+            block.inlines(),
+            document,
+            self.find,
+            FontId::proportional(style.size),
+            InlineRenderStyle {
+                text_color: style.text_color,
+                ..text_style
+                    .with_strong()
+                    .with_line_height(style.size * HEADING_LINE_HEIGHT_RATIO)
+            },
+        );
+        let response = ui.add(egui::Label::new(job).selectable(true).wrap());
+        clipboard::inlines(
+            ui,
+            &response,
+            document,
+            block.inlines(),
+            text_style.with_strong(),
+            Some(block.span()),
+        );
+        response.widget_info(|| {
+            WidgetInfo::labeled(
+                WidgetType::Label,
+                true,
+                format!("Heading level {}: {}", block.level(), block.plain_text()),
+            )
+        });
+        if style.underline {
+            ui.add_space(4.0);
+            let underline = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+            ui.painter().line_segment(
+                [underline.0.left_center(), underline.0.right_center()],
+                egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+            );
+        }
+        if let Some(heading_tops) = self.heading_tops.as_mut() {
+            heading_tops.push((heading_index, response.rect.top()));
+        }
+        if matches!(*self.pending_scroll, Some(PendingScroll::Heading(index)) if index == heading_index)
+        {
+            response.scroll_to_me(Some(Align::Center));
+            *self.pending_scroll = None;
+        }
+        if response.clicked() {
+            *self.outline_selected = Some(heading_index);
+            *self.outline_keyboard_focus = false;
+        }
+        if let Some(current) = self.find.current_match() {
+            if overlaps(block.span(), current.span()) {
+                *self.outline_selected =
+                    document.nearest_heading_index_at_byte(current.span().start().byte_offset());
+            }
+        }
+    }
+
+    fn render_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        block: &ListBlock,
+        document: &MarkdownDocument,
+        text_style: InlineRenderStyle,
+    ) {
+        for (index, item) in block.items().iter().enumerate() {
+            ui.horizontal_top(|ui| {
+                let marker = match item.task_state() {
+                    Some(TaskState::Checked) => "☑".to_owned(),
+                    Some(TaskState::Unchecked) => "☐".to_owned(),
+                    None => match block.kind() {
+                        ListKind::Bullet => "•".to_owned(),
+                        ListKind::Ordered { first_item_number } => {
+                            let number = first_item_number + index as u64;
+                            format!("{number}.")
+                        }
+                    },
+                };
+                ui.add_sized(
+                    [24.0, BODY_TEXT_SIZE + 4.0],
+                    egui::Label::new(
+                        RichText::new(marker)
+                            .size(BODY_TEXT_SIZE)
+                            .color(text_style.text_color),
+                    ),
+                );
+                ui.vertical(|ui| {
+                    self.render_blocks(ui, item.blocks(), document, text_style);
+                });
+            });
+            if index + 1 < block.items().len() {
+                ui.add_space(LIST_ITEM_SPACING);
+            }
+        }
+    }
+
+    fn prepare_table(
+        &mut self,
+        ui: &egui::Ui,
+        block: &TableBlock,
+        document: &MarkdownDocument,
+        style: InlineRenderStyle,
+        column_count: usize,
+    ) -> PreparedTable {
+        #[cfg(test)]
+        {
+            self.table_layouts.preparations += 1;
+        }
+        let padding_x = f32::from(TABLE_CELL_PADDING_X);
+        let padding_y = f32::from(TABLE_CELL_PADDING_Y);
+        let font = FontId::proportional(BODY_TEXT_SIZE - 1.0);
+        // Natural measurements never feed last frame's wrapped widths back
+        // into layout. Final galleys and row heights share this exact key.
+        let mut cell_galleys = Vec::with_capacity(block.rows().len());
+        let mut natural = vec![0.0_f32; column_count];
+        for row in block.rows() {
+            let mut cells = Vec::with_capacity(row.cells().len());
+            for (column, cell) in row.cells().iter().enumerate() {
+                let unwrapped = self.table_cells.unwrapped(
+                    ui,
+                    cell.inlines(),
+                    document,
+                    self.find,
+                    font.clone(),
+                    if row.is_header() {
+                        style.with_strong()
+                    } else {
+                        style
+                    },
+                );
+                if let Some(slot) = natural.get_mut(column) {
+                    *slot = slot.max(unwrapped.size().x + padding_x * 2.0);
+                }
+                cells.push(unwrapped);
+            }
+            cell_galleys.push(cells);
+        }
+        let widths = table_column_widths(&natural, (ui.available_width() - 2.0).max(0.0));
+        let mut count = 0;
+        let rows = cell_galleys
+            .into_iter()
+            .map(|cells| {
+                let mut height = 0.0_f32;
+                let galleys = cells
+                    .into_iter()
+                    .enumerate()
+                    .map(|(column, unwrapped)| {
+                        let width = widths
+                            .get(column)
+                            .copied()
+                            .unwrap_or(TABLE_MIN_COLUMN_WIDTH);
+                        let galley = self.table_cells.constrained(
+                            ui,
+                            unwrapped,
+                            (width - padding_x * 2.0).max(1.0),
+                        );
+                        height = height.max(galley.size().y + padding_y * 2.0);
+                        count += 1;
+                        galley
+                    })
+                    .collect();
+                PreparedTableRow { galleys, height }
+            })
+            .collect();
+        let mut table = PreparedTable {
+            available_width: ui.available_width(),
+            style,
+            widths,
+            rows,
+            cells: count,
+            payload_bytes: 0,
+        };
+        table.payload_bytes = table.accounted_payload().unwrap_or(usize::MAX);
+        table
+    }
+
+    fn render_table(
+        &mut self,
+        ui: &mut egui::Ui,
+        block: &TableBlock,
+        document: &MarkdownDocument,
+        text_style: InlineRenderStyle,
+    ) {
+        let column_count = block
+            .rows()
+            .iter()
+            .map(|row| row.cells().len())
+            .max()
+            .unwrap_or_default();
+        if column_count == 0 {
+            return;
+        }
+
+        let padding_x = f32::from(TABLE_CELL_PADDING_X);
+        let padding_y = f32::from(TABLE_CELL_PADDING_Y);
+        self.table_cells.begin_table(ui);
+        let start = block.span().byte_range().start;
+        let table = self
+            .table_layouts
+            .get(start, ui.available_width(), text_style)
+            .unwrap_or_else(|| {
+                let table =
+                    Arc::new(self.prepare_table(ui, block, document, text_style, column_count));
+                self.table_layouts.retain(start, &table);
+                table
+            });
+        let widths = &table.widths;
+        let total_width: f32 = widths.iter().sum();
+
+        egui::Frame::new()
+            .fill(theme::SURFACE_TAB_INACTIVE.gamma_multiply(0.35))
+            .corner_radius(MARKDOWN_PANEL_RADIUS)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .inner_margin(egui::Margin::same(1))
+            .show(ui, |ui| {
+                let scroll_salt = ("markdown-table", block.span().byte_range().start);
+                let scroll_id = horizontal_scroll_id(ui, scroll_salt);
+                let mut scroll =
+                    egui::ScrollArea::horizontal()
+                        .id_salt(scroll_salt)
+                        .show(ui, |ui| {
+                            if total_width > ui.clip_rect().width() {
+                                begin_horizontal_selection(ui, scroll_id);
+                            }
+                            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                            let mut cell_rects: Vec<Vec<egui::Rect>> =
+                                Vec::with_capacity(table.rows.len());
+                            for (row, prepared) in block.rows().iter().zip(&table.rows) {
+                                let row_height = prepared.height;
+                                let (row_rect, _) = ui.allocate_exact_size(
+                                    vec2(total_width, row_height),
+                                    egui::Sense::hover(),
+                                );
+                                if row.is_header() {
+                                    ui.painter().rect_filled(
+                                        row_rect,
+                                        0.0,
+                                        theme::SURFACE_TAB_ACTIVE.gamma_multiply(0.55),
+                                    );
+                                }
+
+                                let mut row_rects = Vec::with_capacity(prepared.galleys.len());
+                                let mut left = row_rect.left();
+                                for (column, galley) in prepared.galleys.iter().enumerate() {
+                                    let width = widths
+                                        .get(column)
+                                        .copied()
+                                        .unwrap_or(TABLE_MIN_COLUMN_WIDTH);
+                                    let cell_rect = egui::Rect::from_min_size(
+                                        egui::pos2(left, row_rect.top()),
+                                        vec2(width, row_height),
+                                    );
+                                    left += width;
+                                    let layout = match block
+                                        .alignments()
+                                        .get(column)
+                                        .copied()
+                                        .unwrap_or(TableAlignment::None)
+                                    {
+                                        TableAlignment::Right => {
+                                            egui::Layout::right_to_left(Align::Center)
+                                        }
+                                        TableAlignment::Center => {
+                                            egui::Layout::left_to_right(Align::Center)
+                                                .with_main_align(Align::Center)
+                                        }
+                                        _ => egui::Layout::left_to_right(Align::Center),
+                                    };
+                                    let mut cell_ui = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .max_rect(cell_rect.shrink2(vec2(padding_x, padding_y)))
+                                            .layout(layout),
+                                    );
+                                    let response = cell_ui
+                                        .add(egui::Label::new(galley.clone()).selectable(true));
+                                    clipboard::inlines(
+                                        &cell_ui,
+                                        &response,
+                                        document,
+                                        row.cells()[column].inlines(),
+                                        text_style,
+                                        Some(row.cells()[column].span()),
+                                    );
+                                    #[cfg(test)]
+                                    self.table_cells
+                                        .record(row.cells()[column].span(), &response);
+                                    #[cfg(not(test))]
+                                    let _ = response;
+                                    row_rects.push(cell_rect);
+                                }
+                                cell_rects.push(row_rects);
+                            }
+
+                            let mut cells = cell_rects.iter().flatten();
+                            if let Some(first_cell) = cells.next() {
+                                let table_rect =
+                                    cells.fold(*first_cell, |rect, next| rect.union(*next));
+                                ui.painter().rect_stroke(
+                                    table_rect,
+                                    0.0,
+                                    egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+                                    egui::StrokeKind::Inside,
+                                );
+                                // Full-height dividers belong to columns, not rows.
+                                let mut right = table_rect.left();
+                                for width in widths.iter().take(widths.len().saturating_sub(1)) {
+                                    right += width;
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(right, table_rect.top()),
+                                            egui::pos2(right, table_rect.bottom()),
+                                        ],
+                                        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+                                    );
+                                }
+                                for row in
+                                    cell_rects.iter().take(cell_rects.len().saturating_sub(1))
+                                {
+                                    let Some(first_cell) = row.first() else {
+                                        continue;
+                                    };
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(table_rect.left(), first_cell.bottom()),
+                                            egui::pos2(table_rect.right(), first_cell.bottom()),
+                                        ],
+                                        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+                                    );
+                                }
+                            }
+                            end_horizontal_selection(ui);
+                        });
+                selection_drag_autoscroll(
+                    ui,
+                    &mut scroll,
+                    label_selection_dragging(ui),
+                    true,
+                    false,
+                );
+            });
+    }
+
+    fn render_code_block(
+        &mut self,
+        ui: &mut egui::Ui,
+        block: &CodeBlock,
+        document: &MarkdownDocument,
+    ) {
+        // The mockup separates the language/Copy head from the code with a
+        // hairline (`.fmd-code-head { border-bottom }`) instead of stacking
+        // both inside one padded box, which is what made the label look like
+        // a stray first line of code.
+        egui::Frame::new()
+            .fill(theme::SURFACE_TERMINAL)
+            .corner_radius(MARKDOWN_PANEL_RADIUS)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let head_rect = ui
+                    .allocate_exact_size(
+                        vec2(ui.available_width(), CODE_BLOCK_HEAD_HEIGHT),
+                        Sense::hover(),
+                    )
+                    .0;
+                let mut head = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(head_rect.shrink2(vec2(CODE_BLOCK_PADDING_X as f32, 0.0)))
+                        .layout(egui::Layout::left_to_right(Align::Center)),
+                );
+                head.add(
+                    egui::Label::new(RichText::new(block.language().unwrap_or("text"))
+                        .size(BODY_TEXT_SIZE - 4.0)
+                        .monospace()
+                        .color(theme::TEXT_SECONDARY)).selectable(false),
+                );
+                head.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    let response = self.code_copy_caption.button(ui);
+                    #[cfg(test)]
+                    self.code_copy_caption.record(block, &response);
+                    if response.clicked() {
+                        ui.ctx().copy_text(block.code_text().to_owned());
+                    }
+                });
+                ui.painter().line_segment(
+                    [head_rect.left_bottom(), head_rect.right_bottom()],
+                    egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+                );
+
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: CODE_BLOCK_PADDING_X,
+                        right: CODE_BLOCK_PADDING_X,
+                        top: CODE_BLOCK_PADDING_Y,
+                        bottom: CODE_BLOCK_PADDING_Y - CODE_BLOCK_TRAILING_LEAD,
+                    })
+                    .show(ui, |ui| {
+                        if block.language() == Some("mermaid") {
+                            let reveal_source = self.find.matches().iter().any(|found| {
+                                byte_range_contains(block.span(), found.span().start().byte_offset())
+                            }) || self.code_preparation.diagrams.has_find_match(block.span().byte_range())
+                                || matches!(*self.pending_scroll, Some(PendingScroll::Byte(target)) if byte_range_contains(block.span(), target));
+                            if !self.code_preparation.diagrams.show(
+                                ui,
+                                block.span().start().byte_offset(),
+                                block.code_text(),
+                                reveal_source,
+                            ) {
+                                return;
+                            }
+                        }
+                        let mut vertical_scroll_target = None;
+                        let scroll_salt = ("markdown-code", block.span().byte_range().start);
+                        let mut scroll = egui::ScrollArea::horizontal()
+                            .id_salt(scroll_salt)
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = CODE_LINE_SPACING;
+                                let mut code_offset = 0;
+                                for (index, line) in block.highlighted_lines().iter().enumerate() {
+                                    let response = self.code_preparation.label(
+                                        ui,
+                                        block.span().start().byte_offset(),
+                                        index,
+                                        line,
+                                    );
+                                    #[cfg(test)]
+                                    if let Some(probe) = &mut self.code_preparation.probe {
+                                        probe.observations.push((
+                                            response.id,
+                                            response.rect,
+                                            response.intrinsic_size(),
+                                            response.sense,
+                                        ));
+                                    }
+                                    let text = trim_line_ending(line.text());
+                                    clipboard::code_line(ui, &response, document, block, text, code_offset);
+                                    code_offset += line.text().len();
+                                    if matches!(*self.pending_scroll, Some(PendingScroll::Byte(target)) if byte_range_contains(block.span(), target))
+                                    {
+                                        response.scroll_to_me(Some(Align::Center));
+                                        vertical_scroll_target = Some(response.rect);
+                                        *self.pending_scroll = None;
+                                    }
+                                }
+                            });
+                        selection_drag_autoscroll(
+                            ui,
+                            &mut scroll,
+                            label_selection_dragging(ui),
+                            true,
+                            false,
+                        );
+                        if let Some(mut target) = vertical_scroll_target {
+                            // The horizontal child consumes both target axes.
+                            // Reissue the selected line to the outer vertical
+                            // viewport without requesting horizontal movement.
+                            target.min.x = ui.clip_rect().min.x;
+                            target.max.x = ui.clip_rect().max.x;
+                            ui.scroll_to_rect(target, Some(Align::Center));
+                        }
+                    });
+            });
+    }
+
+    fn render_html_block(&mut self, ui: &mut egui::Ui, block: &RawHtmlBlock) {
+        egui::Frame::new()
+            .fill(theme::SURFACE_TAB_INACTIVE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.label(RichText::new("HTML not rendered").strong());
+                ui.add(
+                    egui::Label::new(RichText::new(block.literal()).monospace().small())
+                        .selectable(true)
+                        .wrap(),
+                );
+            });
+    }
+
+    fn render_source(&mut self, ui: &mut egui::Ui, document: &MarkdownDocument) {
+        egui::Frame::new()
+            .fill(theme::SURFACE_TERMINAL)
+            .corner_radius(MARKDOWN_PANEL_RADIUS)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .inner_margin(egui::Margin {
+                left: CODE_BLOCK_PADDING_X,
+                right: CODE_BLOCK_PADDING_X,
+                top: CODE_BLOCK_PADDING_Y,
+                bottom: CODE_BLOCK_PADDING_Y - CODE_BLOCK_TRAILING_LEAD,
+            })
+            .show(ui, |ui| {
+                // Fill the reading column instead of shrinking to the widest
+                // source line, and use the same line pitch as a fenced block
+                // - the container default double-spaced every line.
+                ui.set_min_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = CODE_LINE_SPACING;
+                // Source is source: the viewer colours it with the same
+                // Markdown grammar the editor uses, so one window does not
+                // show the same file coloured on one surface and flat on the
+                // other (ADR 0035 §8).
+                let syntax = source_syntax_spans(self.source_syntax, document.source_text());
+                self.source_preparation.begin(self.find);
+                self.source_preparation.begin_geometry(ui);
+                let selection_active = ui
+                    .ctx()
+                    .plugin::<egui::text_selection::LabelSelectionState>()
+                    .lock()
+                    .has_selection();
+                let mut line_start = 0usize;
+                for (line_index, line) in document.source_text().split_inclusive('\n').enumerate() {
+                    let (span, job) = self.source_preparation.line(
+                        line_start, line, document, self.find, syntax,
+                    );
+                    let response =
+                        self.source_preparation
+                            .label(ui, line_start, job, selection_active);
+                    clipboard::plain_label(ui, &response);
+                    #[cfg(test)]
+                    self.source_preparation.record(span, &response);
+                    if matches!(*self.pending_scroll, Some(PendingScroll::Byte(target)) if byte_range_contains(span, target))
+                    {
+                        response.scroll_to_me(Some(Align::Center));
+                        *self.pending_scroll = None;
+                    }
+                    if let Some(index) = self.line_heading_indices.get(line_index).copied().flatten() {
+                        if matches!(*self.pending_scroll, Some(PendingScroll::Heading(target)) if target == index)
+                        {
+                            response.scroll_to_me(Some(Align::Center));
+                            *self.pending_scroll = None;
+                        }
+                    }
+                    line_start += line.len();
+                }
+            });
+    }
+}
+
+fn fragment_scroll(document: &MarkdownDocument, name: &str) -> Option<PendingScroll> {
+    if let Some(span) = document.named_anchor(name) {
+        return Some(PendingScroll::Byte(span.start().byte_offset()));
+    }
+    document
+        .headings()
+        .iter()
+        .position(|heading| heading.anchor() == name)
+        .map(PendingScroll::Heading)
+}
+
+fn pending_scroll_for_anchor(document: &MarkdownDocument, anchor: ScrollAnchor) -> PendingScroll {
+    PendingScroll::Byte(byte_offset_for_anchor(document, anchor))
+}
+
+pub fn scroll_anchor_for_offset(document: &MarkdownDocument, byte_offset: usize) -> ScrollAnchor {
+    let heading_index = document.nearest_heading_index_at_byte(byte_offset);
+    let (section_start, section_end) = heading_index
+        .and_then(|index| document.headings().get(index))
+        .map(|heading| (heading.section_start_byte(), heading.section_end_byte()))
+        .unwrap_or((0, document.source_text().len()));
+    let denominator = section_end.saturating_sub(section_start).max(1);
+    let numerator = byte_offset.saturating_sub(section_start).min(denominator);
+    ScrollAnchor {
+        heading_index,
+        section_offset_numerator: numerator,
+        section_offset_denominator: denominator,
+    }
+}
+
+pub fn byte_offset_for_anchor(document: &MarkdownDocument, anchor: ScrollAnchor) -> usize {
+    let (section_start, section_end) = anchor
+        .heading_index
+        .and_then(|index| document.headings().get(index))
+        .map(|heading| (heading.section_start_byte(), heading.section_end_byte()))
+        .unwrap_or((0, document.source_text().len()));
+    let span = section_end.saturating_sub(section_start);
+    if span == 0 {
+        return section_start;
+    }
+    section_start
+        + span.saturating_mul(anchor.section_offset_numerator)
+            / anchor.section_offset_denominator.max(1)
+}
+
+fn load_local_document(
+    path: PathBuf,
+) -> Result<(String, MarkdownDocument), MarkdownViewerLoadFailure> {
+    let canonical = fs::canonicalize(&path).map_err(map_local_io_error)?;
+    let metadata = fs::metadata(&canonical).map_err(map_local_io_error)?;
+    if !metadata.is_file() {
+        return Err(MarkdownViewerLoadFailure::Local(LocalLoadError::NotAFile));
+    }
+    let bytes = fs::read(&canonical).map_err(map_local_io_error)?;
+    let source =
+        LocalMarkdownSource::new(canonical.clone()).map_err(MarkdownViewerLoadFailure::Source)?;
+    let document = MarkdownLoader::default()
+        .load(
+            source.into(),
+            metadata.len() as usize,
+            &bytes,
+            &Default::default(),
+        )
+        .map_err(MarkdownViewerLoadFailure::Load)?;
+    Ok((display_local_path(&canonical), document))
+}
+
+/// Mirrors `load_local_document`, but for bytes already fetched from a
+/// remote SFTP session (issue #133) instead of the local filesystem: no
+/// disk I/O, no canonicalization, just parsing already-in-memory content
+/// against the caller-supplied `RemoteMarkdownSource` identity.
+fn load_remote_document(
+    source: RemoteMarkdownSource,
+    display_path: String,
+    content: Vec<u8>,
+) -> Result<(String, MarkdownDocument), MarkdownViewerLoadFailure> {
+    let byte_len = content.len();
+    let document = MarkdownLoader::default()
+        .load(
+            MarkdownSource::from(source),
+            byte_len,
+            &content,
+            &Default::default(),
+        )
+        .map_err(MarkdownViewerLoadFailure::Load)?;
+    Ok((display_path, document))
+}
+
+fn display_local_path(path: &Path) -> String {
+    let display = path.display().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(unc) = display.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(ordinary) = display.strip_prefix(r"\\?\") {
+            return ordinary.to_owned();
+        }
+    }
+    display
+}
+
+fn local_document_source(source: &MarkdownSource) -> Option<&LocalMarkdownSource> {
+    match source {
+        MarkdownSource::Local(local) => Some(local),
+        MarkdownSource::Remote(_) => None,
+    }
+}
+
+fn map_local_io_error(error: std::io::Error) -> MarkdownViewerLoadFailure {
+    use std::io::ErrorKind;
+    MarkdownViewerLoadFailure::Local(match error.kind() {
+        ErrorKind::NotFound => LocalLoadError::NotFound,
+        ErrorKind::PermissionDenied => LocalLoadError::PermissionDenied,
+        _ => LocalLoadError::Io,
+    })
+}
+
+#[cfg(test)]
+fn read_local_image(markdown_path: &Path, target: &str) -> Result<egui::ColorImage, String> {
+    let context = egui::Context::default();
+    let budget = ImageMemoryBudget::for_context(&context, Default::default());
+    let mut scratch = budget.reserve(IMAGE_READ_RESERVATION, None).unwrap();
+    read_local_image_with_budget(
+        markdown_path,
+        None,
+        None,
+        target,
+        &budget,
+        &mut scratch,
+        MAX_IMAGE_PIXELS as usize,
+    )
+    .map(|image| image.pixels)
+    .map_err(|error| error.message().to_owned())
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCAL_IMAGE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_LOCAL_IMAGE_DIRECTORY_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+fn before_local_image_open() {
+    #[cfg(test)]
+    BEFORE_LOCAL_IMAGE_OPEN.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[inline]
+fn before_local_image_directory_open() {
+    #[cfg(test)]
+    BEFORE_LOCAL_IMAGE_DIRECTORY_OPEN.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+fn validate_markdown_generation(
+    directory: &cap_std::fs::Dir,
+    markdown_path: &Path,
+    generation: Generation,
+    parent_identity: DirectoryIdentity,
+) -> std::io::Result<()> {
+    if !parent_identity.matches_directory(directory) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Markdown source parent no longer matches the loaded document authority",
+        ));
+    }
+    let file = crate::document_store::open_canonical_file(directory, markdown_path)?;
+    if generation.matches_file(&file) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Markdown source no longer matches the loaded document generation",
+        ))
+    }
+}
+
+fn read_local_image_with_budget(
+    markdown_path: &Path,
+    source_generation: Option<Generation>,
+    source_parent_identity: Option<DirectoryIdentity>,
+    target: &str,
+    budget: &ImageMemoryBudget,
+    scratch: &mut ImageReservation,
+    texture_side: usize,
+) -> Result<DecodedImage, ImageLoadFailure> {
+    let permanent = |message: &str| ImageLoadFailure::Permanent(message.to_owned());
+    let Some(parent) = markdown_path.parent() else {
+        return Err(permanent(
+            "The Markdown file has no parent directory for relative resources.",
+        ));
+    };
+    if Path::new(target).has_root() || Path::new(target).is_absolute() {
+        return Err(permanent(
+            "Only relative local image paths can be loaded here.",
+        ));
+    }
+    before_local_image_directory_open();
+    let directory = crate::document_store::open_canonical_directory(parent)
+        .map_err(|_| permanent("The Markdown image directory could not be opened safely."))?;
+    if let (Some(generation), Some(parent_identity)) = (source_generation, source_parent_identity) {
+        validate_markdown_generation(&directory, markdown_path, generation, parent_identity)
+            .map_err(|_| {
+                permanent("Local images are unavailable because the saved Markdown file changed.")
+            })?;
+    }
+    let candidate = parent.join(target);
+    let canonical = fs::canonicalize(&candidate)
+        .map_err(|_| permanent("The requested local image could not be found."))?;
+    let relative = canonical
+        .strip_prefix(parent)
+        .map_err(|_| permanent("Local images must remain inside the Markdown file's directory."))?;
+    before_local_image_open();
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOCTTY | nix::libc::O_NONBLOCK);
+    }
+
+    // Pathname admission is not an authority: resolve again beneath the
+    // captured directory handle, including intermediate symlinks/reparse points.
+    let file = directory
+        .open_with(relative, &options)
+        .map_err(|_| permanent("The requested local image could not be read."))?;
+    drop(directory);
+    let metadata = file
+        .metadata()
+        .map_err(|_| permanent("The requested local image could not be read."))?;
+    if !metadata.is_file() {
+        return Err(permanent(
+            "The requested local image is not a regular file.",
+        ));
+    }
+    let extension = canonical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if metadata.len() > MAX_IMAGE_BYTES {
+        return Err(ImageLoadFailure::Permanent(format!(
+            "Local images must not exceed {} bytes.",
+            MAX_IMAGE_BYTES
+        )));
+    }
+    let bytes = if extension == "svg" {
+        read_bounded_image_bytes_with_limit(file, festerm_markdown::MAX_INLINE_SVG_BYTES)?
+    } else {
+        read_bounded_image_bytes(file)?
+    };
+    if extension == "svg" {
+        let captured_bytes =
+            target.len() as u64 + markdown_path.as_os_str().as_encoded_bytes().len() as u64;
+        return crate::markdown_svg::decode(
+            &bytes,
+            scratch,
+            IMAGE_READ_RESERVATION + captured_bytes,
+            texture_side,
+        );
+    }
+    let mut reader = image::ImageReader::new(Cursor::new(bytes.as_slice()))
+        .with_guessed_format()
+        .map_err(|_| permanent("Only bounded local raster images can be loaded here."))?;
+    let mut limits = image::Limits::default();
+    let axis_limit = u32::try_from(texture_side.min(MAX_IMAGE_PIXELS as usize))
+        .map_err(|_| permanent("The local image texture limit is unavailable."))?;
+    limits.max_image_width = Some(axis_limit);
+    limits.max_image_height = Some(axis_limit);
+    // This decoder hint is non-strict; only dimensions and our own
+    // reservations provide a hard application-managed admission boundary.
+    limits.max_alloc = Some(budget.limit());
+    reader.limits(limits);
+    let decoder = reader.into_decoder().map_err(|_| {
+        permanent("Only bounded local raster images within the texture limits can be loaded here.")
+    })?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(permanent(
+            "The requested local image exceeds the raster-area limit.",
+        ));
+    }
+    let rgba_bytes = u64::from(width) * u64::from(height) * 4;
+    let captured_bytes =
+        target.len() as u64 + markdown_path.as_os_str().as_encoded_bytes().len() as u64;
+    let retained_bytes = RETAINED_IMAGE_OVERHEAD + 2 * rgba_bytes;
+    scratch.resize(
+        IMAGE_READ_RESERVATION
+            + captured_bytes
+            + decoder.total_bytes()
+            + rgba_bytes
+            + retained_bytes,
+    )?;
+    let reservation = scratch.split(retained_bytes);
+    let decoded = image::DynamicImage::from_decoder(decoder)
+        .map_err(|_| permanent("Only bounded local raster images can be loaded here."))?
+        .into_rgba8();
+    if decoded.dimensions() != (width, height) {
+        return Err(permanent(
+            "The local image dimensions changed during decoding.",
+        ));
+    }
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact((u64::from(width) * u64::from(height)) as usize)
+        .map_err(|_| permanent("Local image pixel storage could not be allocated."))?;
+    pixels.extend(
+        decoded
+            .as_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|rgba| egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])),
+    );
+    let pixels = egui::ColorImage::new([width as usize, height as usize], pixels);
+    Ok(DecodedImage {
+        pixels,
+        reservation,
+    })
+}
+
+fn read_bounded_image_bytes(reader: impl Read) -> Result<Vec<u8>, ImageLoadFailure> {
+    read_bounded_image_bytes_with_limit(reader, MAX_IMAGE_BYTES as usize)
+}
+
+fn read_bounded_image_bytes_with_limit(
+    mut reader: impl Read,
+    limit: usize,
+) -> Result<Vec<u8>, ImageLoadFailure> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let remaining = (limit + 1 - bytes.len()).min(chunk.len());
+        let read = match reader.read(&mut chunk[..remaining]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return Err(ImageLoadFailure::Permanent(
+                    "The requested local image could not be read.".to_owned(),
+                ))
+            }
+        };
+        if read == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len() + read > limit {
+            return Err(ImageLoadFailure::Permanent(format!(
+                "Local images must not exceed {} bytes.",
+                limit
+            )));
+        }
+        let needed = bytes.len() + read;
+        if needed > bytes.capacity() {
+            let capacity = needed.max(bytes.capacity().saturating_mul(2)).min(limit);
+            bytes
+                .try_reserve_exact(capacity - bytes.len())
+                .map_err(|_| {
+                    ImageLoadFailure::Permanent(
+                        "Local image input storage could not be allocated.".to_owned(),
+                    )
+                })?;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn spawn_image_worker(
+    budget: ImageMemoryBudget,
+    worker: ImageWorker,
+    mut scratch: ImageReservation,
+    context: egui::Context,
+    read: impl FnOnce(
+            &mut ImageReservation,
+            &egui::Context,
+            &ImageMemoryBudget,
+        ) -> Result<DecodedImage, ImageLoadFailure>
+        + Send
+        + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
+) -> std::io::Result<Receiver<Result<DecodedImage, ImageLoadFailure>>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let viewport = context.viewport_id();
+    spawn(Box::new(move || {
+        let result = read(&mut scratch, &context, &budget);
+        drop(scratch);
+        drop(worker);
+        let _ = sender.send(result);
+        context.request_repaint_of(viewport);
+        crate::markdown_images::wake_image_viewports(&context);
+    }))?;
+    Ok(receiver)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_text_block(
+    ui: &mut egui::Ui,
+    block: &TextBlock,
+    document: &MarkdownDocument,
+    find: &MarkdownFindState,
+    approvals: &ResourceApprovalState,
+    loaded_images: &BTreeMap<usize, LoadedImage>,
+    pending_image_loads: &BTreeMap<usize, PendingImageLoad>,
+    image_errors: &BTreeMap<usize, String>,
+    pending_scroll: &mut Option<PendingScroll>,
+    outline_selected: &mut Option<usize>,
+    text_style: InlineRenderStyle,
+) {
+    let response = ui
+        .horizontal_wrapped(|ui| {
+            // Inline runs are separate widgets, so egui's default item
+            // spacing would be injected between every one of them: text like
+            // "(see [#50](...))" rendered as "#50   )". The source text
+            // already carries the spaces that belong between runs.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            // Row pitch comes from `TextFormat::line_height` on each section
+            // (see `InlineRenderStyle::line_height`). `item_spacing.y` does
+            // not move wrapped rows inside `horizontal_wrapped`.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            render_inline_flow(
+                ui,
+                block.inlines(),
+                document,
+                find,
+                approvals,
+                loaded_images,
+                pending_image_loads,
+                image_errors,
+                FontId::proportional(BODY_TEXT_SIZE),
+                text_style,
+                pending_scroll,
+                outline_selected,
+            );
+        })
+        .response;
+    if let Some(current) = find.current_match() {
+        if overlaps(block.span(), current.span()) {
+            response.scroll_to_me(Some(Align::Center));
+            *pending_scroll = None;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_inline_flow(
+    ui: &mut egui::Ui,
+    inlines: &[Inline],
+    document: &MarkdownDocument,
+    find: &MarkdownFindState,
+    approvals: &ResourceApprovalState,
+    loaded_images: &BTreeMap<usize, LoadedImage>,
+    pending_image_loads: &BTreeMap<usize, PendingImageLoad>,
+    image_errors: &BTreeMap<usize, String>,
+    font: FontId,
+    style: InlineRenderStyle,
+    pending_scroll: &mut Option<PendingScroll>,
+    outline_selected: &mut Option<usize>,
+) {
+    for inline in inlines {
+        if matches!(
+            inline,
+            Inline::Text(_) | Inline::Code(_) | Inline::RawHtml(_)
+        ) && matches!(*pending_scroll, Some(PendingScroll::Byte(target)) if byte_range_contains(inline.span(), target))
+        {
+            // Named targets retain an empty source-spanned run even when
+            // their opening tag has no painted text or widget of its own.
+            let target = egui::Rect::from_min_size(ui.cursor().min, vec2(1.0, font.size));
+            ui.scroll_to_rect(target, Some(Align::Center));
+            *pending_scroll = None;
+        }
+        match inline {
+            Inline::Text(text) => {
+                render_text_run(
+                    ui,
+                    text.text(),
+                    text.text_span(),
+                    find,
+                    font.clone(),
+                    style,
+                    document,
+                );
+            }
+            Inline::Code(text) => {
+                let response = ui.add(
+                    egui::Label::new(text_job(
+                        text.text(),
+                        text.text_span(),
+                        find,
+                        FontId::monospace(font.size),
+                        style.as_inline_code(),
+                    ))
+                    .selectable(true)
+                    .wrap(),
+                );
+                clipboard::text(
+                    ui,
+                    &response,
+                    document,
+                    text.text(),
+                    text.text_span(),
+                    style.as_inline_code(),
+                );
+            }
+            Inline::Emphasis(container) => render_inline_flow(
+                ui,
+                container.inlines(),
+                document,
+                find,
+                approvals,
+                loaded_images,
+                pending_image_loads,
+                image_errors,
+                FontId::proportional(font.size),
+                style.with_italics(),
+                pending_scroll,
+                outline_selected,
+            ),
+            Inline::Strong(container) => render_inline_flow(
+                ui,
+                container.inlines(),
+                document,
+                find,
+                approvals,
+                loaded_images,
+                pending_image_loads,
+                image_errors,
+                font.clone(),
+                style.with_strong(),
+                pending_scroll,
+                outline_selected,
+            ),
+            Inline::Strikethrough(container) => {
+                render_struck_inline_flow(
+                    ui,
+                    container,
+                    document,
+                    find,
+                    approvals,
+                    loaded_images,
+                    pending_image_loads,
+                    image_errors,
+                    font.clone(),
+                    style,
+                    pending_scroll,
+                    outline_selected,
+                );
+            }
+            Inline::Link(link) => {
+                render_link(
+                    ui,
+                    link,
+                    document,
+                    find,
+                    font.clone(),
+                    style,
+                    pending_scroll,
+                    outline_selected,
+                );
+            }
+            Inline::Image(image) => {
+                render_image(
+                    ui,
+                    image,
+                    document,
+                    approvals,
+                    loaded_images,
+                    pending_image_loads,
+                    image_errors,
+                    pending_scroll,
+                );
+            }
+            Inline::RawHtml(html) => {
+                let response = ui.add(
+                    egui::Label::new(text_job(
+                        html.literal(),
+                        html.span(),
+                        find,
+                        FontId::monospace(font.size),
+                        style.as_inline_code(),
+                    ))
+                    .selectable(true)
+                    .wrap(),
+                );
+                clipboard::text(
+                    ui,
+                    &response,
+                    document,
+                    html.literal(),
+                    html.span(),
+                    style.as_inline_code(),
+                );
+            }
+            // CommonMark: a single newline inside a paragraph is a *soft*
+            // break and renders as a space, so the text reflows to the
+            // reading column's width. Treating it as a row break made every
+            // paragraph inherit the source file's hard wrapping and left a
+            // ragged right edge far short of the column. Advancing the
+            // cursor rather than adding a space-only widget keeps the space
+            // from being pushed onto the next row as a leading indent, and
+            // the space is dropped entirely when the row is already full for
+            // the same reason.
+            Inline::SoftBreak { .. } => {
+                let width = ui.ctx().fonts_mut(|fonts| fonts.glyph_width(&font, ' '));
+                if ui.available_width() > width * 2.0 {
+                    ui.add_space(width);
+                }
+            }
+            Inline::HardBreak { .. } => {
+                ui.end_row();
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_struck_inline_flow(
+    ui: &mut egui::Ui,
+    container: &ContainerInline,
+    document: &MarkdownDocument,
+    find: &MarkdownFindState,
+    approvals: &ResourceApprovalState,
+    loaded_images: &BTreeMap<usize, LoadedImage>,
+    pending_image_loads: &BTreeMap<usize, PendingImageLoad>,
+    image_errors: &BTreeMap<usize, String>,
+    font: FontId,
+    style: InlineRenderStyle,
+    pending_scroll: &mut Option<PendingScroll>,
+    outline_selected: &mut Option<usize>,
+) {
+    for inline in container.inlines() {
+        match inline {
+            Inline::Text(text) | Inline::Code(text) => {
+                let mono = matches!(inline, Inline::Code(_));
+                let response = ui.add(
+                    egui::Label::new(text_job(
+                        text.text(),
+                        text.text_span(),
+                        find,
+                        if mono {
+                            FontId::monospace(font.size)
+                        } else {
+                            font.clone()
+                        },
+                        if mono {
+                            style.as_inline_code().with_strikethrough()
+                        } else {
+                            style.with_strikethrough()
+                        },
+                    ))
+                    .selectable(true)
+                    .wrap(),
+                );
+                clipboard::text(
+                    ui,
+                    &response,
+                    document,
+                    text.text(),
+                    text.text_span(),
+                    if mono {
+                        style.as_inline_code().with_strikethrough()
+                    } else {
+                        style.with_strikethrough()
+                    },
+                );
+            }
+            _ => render_inline_flow(
+                ui,
+                std::slice::from_ref(inline),
+                document,
+                find,
+                approvals,
+                loaded_images,
+                pending_image_loads,
+                image_errors,
+                font.clone(),
+                style.with_strikethrough(),
+                pending_scroll,
+                outline_selected,
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_link(
+    ui: &mut egui::Ui,
+    link: &LinkInline,
+    document: &MarkdownDocument,
+    find: &MarkdownFindState,
+    font: FontId,
+    style: InlineRenderStyle,
+    pending_scroll: &mut Option<PendingScroll>,
+    outline_selected: &mut Option<usize>,
+) {
+    let reference = &document.resource_references()[link.reference_index()];
+    let safe_local_target = reference.class() == ResourceReferenceClass::LocalRelative
+        && document.source().classify_target(reference.target())
+            == ResourceReferenceClass::LocalRelative
+        && Path::new(reference.target()).is_relative()
+        && !Path::new(reference.target()).has_root();
+    let enabled = reference.class() != ResourceReferenceClass::DangerousScheme
+        && (reference.class() != ResourceReferenceClass::LocalRelative || safe_local_target);
+    let accessible_text = if link.plain_text().is_empty() {
+        reference.target().to_owned()
+    } else {
+        link.plain_text().to_owned()
+    };
+    let job = if link.inlines().is_empty() {
+        text_job(&accessible_text, link.span(), find, font, style.as_link())
+    } else {
+        inline_layout_job(link.inlines(), document, find, font, style.as_link())
+    };
+    let response = ui.add_enabled(
+        enabled,
+        egui::Label::new(job)
+            .selectable(true)
+            .sense(Sense::click_and_drag()),
+    );
+    clipboard::link(ui, &response, document, link, style.as_link());
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Button,
+            enabled,
+            format!("Link: {accessible_text}"),
+        )
+    });
+    let response = if enabled {
+        response.on_hover_text(reference.target())
+    } else {
+        response.on_disabled_hover_text(format!(
+            "{}\nUnsafe or rooted destinations are blocked.",
+            reference.target()
+        ))
+    };
+    if matches!(pending_scroll, Some(PendingScroll::Byte(target)) if byte_range_contains(link.span(), *target))
+    {
+        response.scroll_to_me(Some(Align::Center));
+        *pending_scroll = None;
+    }
+    if response.clicked() {
+        match reference.class() {
+            ResourceReferenceClass::DocumentFragment => {
+                let anchor = reference.target().trim_start_matches('#');
+                *pending_scroll = fragment_scroll(document, anchor);
+                *outline_selected = match pending_scroll {
+                    Some(PendingScroll::Heading(index)) => Some(*index),
+                    _ => None,
+                };
+            }
+            ResourceReferenceClass::HttpsAbsolute => {
+                ui.ctx().memory_mut(|memory| {
+                    memory.data.insert_temp(
+                        egui::Id::new("markdown-external-link"),
+                        reference.target().to_owned(),
+                    );
+                });
+            }
+            ResourceReferenceClass::LocalRelative => {
+                if safe_local_target
+                    && (reference.target().ends_with(".md")
+                        || reference.target().ends_with(".markdown"))
+                {
+                    if let Some(local) = local_document_source(document.source()) {
+                        if let Some(parent) = local.path().parent() {
+                            let next = parent.join(reference.target());
+                            ui.ctx().memory_mut(|memory| {
+                                memory
+                                    .data
+                                    .insert_temp(egui::Id::new("markdown-local-link"), next);
+                            });
+                        }
+                    }
+                }
+            }
+            ResourceReferenceClass::IntrinsicSvg
+            | ResourceReferenceClass::RemoteRelativeViaSftpOrigin
+            | ResourceReferenceClass::DangerousScheme => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_image(
+    ui: &mut egui::Ui,
+    image: &ImageInline,
+    document: &MarkdownDocument,
+    approvals: &ResourceApprovalState,
+    loaded_images: &BTreeMap<usize, LoadedImage>,
+    pending_image_loads: &BTreeMap<usize, PendingImageLoad>,
+    image_errors: &BTreeMap<usize, String>,
+    pending_scroll: &mut Option<PendingScroll>,
+) {
+    let reference = &document.resource_references()[image.reference_index()];
+    // An image owns a whole paragraph row. `render_text_block` lays inline
+    // runs out in a `horizontal_wrapped` with zero item spacing, so without
+    // this the group was squeezed into whatever width was left on the
+    // current row and its stacked labels ran together ("Image: diagramLocal
+    // resource"). Claiming the paragraph's full width both wraps the group
+    // onto its own row and gives a loaded image the whole reading column.
+    let full_width = ui.max_rect().width().max(1.0);
+    let response = ui
+        .allocate_ui_with_layout(
+            vec2(full_width, 0.0),
+            egui::Layout::top_down(Align::Min),
+            |ui| {
+                ui.set_min_width(full_width);
+                ui.set_max_width(full_width);
+                // `render_text_block` zeroes item spacing so inline runs butt
+                // up against each other; restore the application's ambient
+                // spacing inside the group or its stacked rows collide.
+                ui.spacing_mut().item_spacing =
+                    ui.ctx().style_of(ui.ctx().theme()).spacing.item_spacing;
+                ui.group(|ui| {
+                    ui.set_min_width(ui.available_width());
+                    if let Some(loaded) = loaded_images.get(&image.reference_index()) {
+                        let available = ui.available_width().max(1.0);
+                        let native_width = loaded.size[0] as f32;
+                        // Scale down to the reading column when the image is
+                        // wider than it, but never scale *up* past the
+                        // image's own resolution -- stretching a small icon
+                        // across the column only makes it blurry.
+                        // `fit_to_original_size` plus `max_width` is exactly
+                        // that rule.
+                        ui.add(
+                            egui::Image::new(&loaded.texture)
+                                .fit_to_original_size(1.0)
+                                .max_width(available.min(native_width.max(1.0))),
+                        );
+                        if !image.alt_text().is_empty() {
+                            ui.label(
+                                RichText::new(image.alt_text())
+                                    .small()
+                                    .color(theme::TEXT_SECONDARY),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new(format!("Image: {}", image.alt_text()))
+                                .small()
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(resource_class_label(reference.class()))
+                                .small()
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                        if pending_image_loads.contains_key(&image.reference_index()) {
+                            ui.label(
+                                RichText::new("Loading image…")
+                                    .small()
+                                    .color(theme::TEXT_SECONDARY),
+                            );
+                        } else {
+                            let blocked_local = reference.class()
+                                == ResourceReferenceClass::LocalRelative
+                                && approvals.local_image_reads_blocked;
+                            ui.label(
+                                RichText::new(if blocked_local {
+                                    approvals.local_image_block_reason.as_deref().unwrap_or(
+                                        "Local images require a saved local Markdown document.",
+                                    )
+                                } else {
+                                    resource_placeholder_action(reference.class())
+                                })
+                                .small(),
+                            );
+                            if matches!(
+                                reference.class(),
+                                ResourceReferenceClass::LocalRelative
+                                    | ResourceReferenceClass::IntrinsicSvg
+                            ) && !blocked_local
+                                && (!approvals.is_approved(image.reference_index())
+                                    || image_errors.contains_key(&image.reference_index()))
+                                && ui
+                                    .small_button(
+                                        if reference.class() == ResourceReferenceClass::IntrinsicSvg
+                                        {
+                                            "Load image"
+                                        } else {
+                                            "Load local image"
+                                        },
+                                    )
+                                    .clicked()
+                            {
+                                ui.ctx().memory_mut(|memory| {
+                                    memory.data.insert_temp(
+                                        egui::Id::new("markdown-load-image"),
+                                        image.reference_index(),
+                                    );
+                                });
+                            }
+                            if let Some(message) = image_errors.get(&image.reference_index()) {
+                                ui.label(RichText::new(message).small().color(theme::STATUS_ERROR));
+                            }
+                        }
+                    }
+                });
+            },
+        )
+        .response;
+    if matches!(pending_scroll, Some(PendingScroll::Byte(target)) if byte_range_contains(image.span(), *target))
+    {
+        response.scroll_to_me(Some(Align::Center));
+        *pending_scroll = None;
+    }
+}
+
+/// Chooses a width for every column of a markdown table.
+///
+/// A table that fits keeps its natural, unwrapped column widths, which is what
+/// makes a two-column reference table read as two tidy columns instead of a
+/// grid stretched across the whole reading width. A table that does not fit
+/// gives every column [`TABLE_MIN_COLUMN_WIDTH`] and then shares the remaining
+/// width out in proportion to how much more each column asked for, so the
+/// prose column absorbs the wrapping and a short label column is not crushed
+/// down to one character per line alongside it.
+fn table_column_widths(natural: &[f32], available: f32) -> Vec<f32> {
+    let total: f32 = natural.iter().sum();
+    if natural.is_empty() || total <= available {
+        return natural.to_vec();
+    }
+    let budget = available - TABLE_MIN_COLUMN_WIDTH * natural.len() as f32;
+    let slack: f32 = natural
+        .iter()
+        .map(|width| (width - TABLE_MIN_COLUMN_WIDTH).max(0.0))
+        .sum();
+    if budget <= 0.0 || slack <= 0.0 {
+        // Narrower than the floor allows; the horizontal scroll area that
+        // wraps the table is what keeps the content reachable.
+        return vec![TABLE_MIN_COLUMN_WIDTH; natural.len()];
+    }
+    natural
+        .iter()
+        .map(|width| {
+            TABLE_MIN_COLUMN_WIDTH + (width - TABLE_MIN_COLUMN_WIDTH).max(0.0) / slack * budget
+        })
+        .collect()
+}
+
+fn table_cell_galley(
+    ui: &egui::Ui,
+    unwrapped: Arc<egui::Galley>,
+    width: f32,
+    on_layout: impl FnOnce(&LayoutJob),
+) -> Arc<egui::Galley> {
+    // Match epaint's integral wrap-width cache key, including at fractional DPI.
+    let width = width.round();
+    if unwrapped.size().x <= width {
+        return unwrapped;
+    }
+    let mut job = (*unwrapped.job).clone();
+    job.wrap.max_width = width;
+    on_layout(&job);
+    ui.painter().layout_job(job)
+}
+
+fn inline_layout_job(
+    inlines: &[Inline],
+    document: &MarkdownDocument,
+    find: &MarkdownFindState,
+    font: FontId,
+    style: InlineRenderStyle,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    append_inline_layout(&mut job, inlines, document, find, font, style);
+    job
+}
+
+#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
+fn append_inline_layout(
+    job: &mut LayoutJob,
+    inlines: &[Inline],
+    document: &MarkdownDocument,
+    find: &MarkdownFindState,
+    font: FontId,
+    style: InlineRenderStyle,
+) {
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => append_text_segments(
+                job,
+                text.text(),
+                text.text_span(),
+                find,
+                font.clone(),
+                style,
+            ),
+            Inline::Code(text) => append_text_segments(
+                job,
+                text.text(),
+                text.text_span(),
+                find,
+                FontId::monospace(font.size),
+                style.as_inline_code(),
+            ),
+            Inline::Emphasis(container) => append_inline_layout(
+                job,
+                container.inlines(),
+                document,
+                find,
+                font.clone(),
+                style.with_italics(),
+            ),
+            Inline::Strong(container) => append_inline_layout(
+                job,
+                container.inlines(),
+                document,
+                find,
+                font.clone(),
+                style.with_strong(),
+            ),
+            Inline::Strikethrough(container) => append_inline_layout(
+                job,
+                container.inlines(),
+                document,
+                find,
+                font.clone(),
+                style.with_strikethrough(),
+            ),
+            Inline::Link(link) => append_inline_layout(
+                job,
+                link.inlines(),
+                document,
+                find,
+                font.clone(),
+                style.as_link(),
+            ),
+            Inline::Image(image) => append_text_segments(
+                job,
+                image.alt_text(),
+                image.alt_text_span(),
+                find,
+                font.clone(),
+                style,
+            ),
+            Inline::RawHtml(html) => append_text_segments(
+                job,
+                html.literal(),
+                html.span(),
+                find,
+                FontId::monospace(font.size),
+                style.as_inline_code(),
+            ),
+            // See `render_inline_flow`: a soft break is a space, not a line
+            // break. Only an explicit hard break starts a new line.
+            Inline::SoftBreak { .. } => job.append(" ", 0.0, base_text_format(font.clone(), style)),
+            Inline::HardBreak { .. } => {
+                job.append("\n", 0.0, base_text_format(font.clone(), style))
+            }
+        }
+    }
+}
+
+fn text_job(
+    text: &str,
+    span: SourceSpan,
+    find: &MarkdownFindState,
+    font: FontId,
+    style: InlineRenderStyle,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    append_text_segments(&mut job, text, span, find, font, style);
+    job
+}
+
+/// Emits one text run inside a `horizontal_wrapped` flow.
+///
+/// A run that follows inline code or a link usually begins with the space
+/// that separated them. Left inside the wrapped `Label`, that space becomes
+/// the run's first glyph, so whenever the run is pushed onto a fresh row the
+/// paragraph gains a one-space hanging indent on that row only. Emitting the
+/// space as cursor advance instead - the same treatment `Inline::SoftBreak`
+/// gets, including dropping it when the row is already full - keeps every
+/// row flush with the reading column's left edge.
+fn render_text_run(
+    ui: &mut egui::Ui,
+    text: &str,
+    span: SourceSpan,
+    find: &MarkdownFindState,
+    font: FontId,
+    style: InlineRenderStyle,
+    document: &MarkdownDocument,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let skip = text.len() - text.trim_start_matches(' ').len();
+    if skip > 0 {
+        let width = ui.ctx().fonts_mut(|fonts| fonts.glyph_width(&font, ' '));
+        if ui.available_width() > width * 2.0 {
+            ui.add_space(width * skip as f32);
+        }
+    }
+    if skip >= text.len() {
+        return;
+    }
+    let mut job = LayoutJob::default();
+    append_text_segments_from(&mut job, text, span, find, font, style, skip);
+    let response = ui.add(egui::Label::new(job).selectable(true).wrap());
+    clipboard::text(ui, &response, document, &text[skip..], span, style);
+}
+
+/// Owned by the loaded snapshot, and cleared only when a new document replaces it.
+fn source_syntax_spans<'a>(
+    cache: &'a mut Option<Vec<festerm_syntax::Span>>,
+    source: &str,
+) -> &'a [festerm_syntax::Span] {
+    cache.get_or_insert_with(|| {
+        let mut syntax =
+            festerm_syntax::DocumentSyntax::for_language(festerm_syntax::Language::Markdown);
+        syntax.spans(source, 0, 0..source.len()).to_vec()
+    })
+}
+
+/// The spans covering one line, rebased onto that line's own bytes.
+fn roles_within(
+    spans: &[festerm_syntax::Span],
+    line: std::ops::Range<usize>,
+) -> Vec<festerm_syntax::Span> {
+    let first = spans.partition_point(|span| span.end <= line.start);
+    spans[first..]
+        .iter()
+        .take_while(|span| span.start < line.end)
+        .map(|span| festerm_syntax::Span {
+            start: span.start.max(line.start) - line.start,
+            end: span.end.min(line.end) - line.start,
+            role: span.role,
+        })
+        .collect()
+}
+
+/// Recolours a laid-out line by role, splitting any run a role starts or ends
+/// inside. The existing formats are kept otherwise, so a Find match keeps its
+/// background while the text under it keeps its syntax.
+fn recolour_by_roles(job: &mut LayoutJob, roles: &[festerm_syntax::Span]) {
+    if roles.is_empty() {
+        return;
+    }
+    fn push(
+        sections: &mut Vec<egui::text::LayoutSection>,
+        range: std::ops::Range<usize>,
+        format: TextFormat,
+    ) {
+        if range.start < range.end {
+            sections.push(egui::text::LayoutSection {
+                leading_space: 0.0,
+                byte_range: range.start.into()..range.end.into(),
+                format,
+            });
+        }
+    }
+
+    let mut sections = Vec::with_capacity(job.sections.len());
+    for section in job.sections.drain(..) {
+        let start = usize::from(section.byte_range.start);
+        let end = usize::from(section.byte_range.end);
+        let mut cursor = start;
+        for role in roles
+            .iter()
+            .filter(|role| role.start < end && role.end > start)
+        {
+            let role_start = role.start.max(start);
+            let role_end = role.end.min(end);
+            push(&mut sections, cursor..role_start, section.format.clone());
+            let mut coloured = section.format.clone();
+            coloured.color = crate::text_editor::role_colour(role.role);
+            push(&mut sections, role_start..role_end, coloured);
+            cursor = role_end;
+        }
+        let leading = section.leading_space;
+        push(&mut sections, cursor..end, section.format);
+        if let (Some(first), true) = (sections.first_mut(), leading != 0.0) {
+            first.leading_space = leading;
+        }
+    }
+    job.sections = sections;
+}
+
+fn source_line_job(
+    line: &str,
+    span: SourceSpan,
+    find: &MarkdownFindState,
+    roles: Vec<festerm_syntax::Span>,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let format = base_text_format(FontId::monospace(CODE_TEXT_SIZE), InlineRenderStyle::body());
+    append_text_segments(
+        &mut job,
+        trim_line_ending(line),
+        span,
+        find,
+        FontId::monospace(CODE_TEXT_SIZE),
+        InlineRenderStyle::body(),
+    );
+    recolour_by_roles(&mut job, &roles);
+    ensure_code_line_body(&mut job, format);
+    apply_code_line_height(&mut job);
+    job
+}
+
+/// A blank line lays out to nothing at all, which would collapse it away and
+/// misalign the document against its source. Give it one space so it keeps a
+/// full row.
+fn ensure_code_line_body(job: &mut LayoutJob, format: TextFormat) {
+    if job.sections.is_empty() {
+        job.append(" ", 0.0, format);
+    }
+}
+
+fn append_text_segments(
+    job: &mut LayoutJob,
+    text: &str,
+    span: SourceSpan,
+    find: &MarkdownFindState,
+    font: FontId,
+    style: InlineRenderStyle,
+) {
+    append_text_segments_from(job, text, span, find, font, style, 0);
+}
+
+/// As `append_text_segments`, but starts appending at `skip` bytes into
+/// `text`. Find matches are still resolved against the whole `text` so the
+/// caller's `span` stays the source of truth for byte offsets; only the
+/// emitted glyphs are clipped. Callers use this to drop a run's leading
+/// space without having to rebase its `SourceSpan`, which the markdown crate
+/// does not expose a constructor for.
+fn append_text_segments_from(
+    job: &mut LayoutJob,
+    text: &str,
+    span: SourceSpan,
+    find: &MarkdownFindState,
+    font: FontId,
+    style: InlineRenderStyle,
+    skip: usize,
+) {
+    if skip >= text.len() {
+        return;
+    }
+    let mut cursor = skip;
+    let first = find.matches().partition_point(|matched| {
+        matched.span().end().byte_offset() <= span.start().byte_offset()
+    });
+    for (index, matched) in find
+        .matches()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take_while(|(_, matched)| matched.span().start().byte_offset() < span.end().byte_offset())
+    {
+        let Some(range) = overlap_with_relative_range(span, matched.span()) else {
+            continue;
+        };
+        if range.end > text.len() || range.end <= skip {
+            continue;
+        }
+        let start = range.start.max(skip);
+        let end = range.end;
+        if cursor < start {
+            job.append(
+                &text[cursor..start],
+                0.0,
+                base_text_format(font.clone(), style),
+            );
+        }
+        let mut format = base_text_format(font.clone(), style);
+        format.background = if find.current_index == Some(index) {
+            theme::ACCENT_PRIMARY.gamma_multiply(0.35)
+        } else {
+            theme::SURFACE_SELECTION
+        };
+        job.append(&text[start..end], 0.0, format);
+        cursor = end;
+    }
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, base_text_format(font, style));
+    }
+}
+
+fn highlighted_line_job(line: &HighlightedCodeLine) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    if line.spans().is_empty() {
+        job.append(
+            trim_line_ending(line.text()),
+            0.0,
+            base_text_format(FontId::monospace(CODE_TEXT_SIZE), InlineRenderStyle::body()),
+        );
+    } else {
+        for span in line.spans() {
+            job.append(
+                trim_line_ending(span.text()),
+                0.0,
+                text_format_from_highlight(span),
+            );
+        }
+    }
+    ensure_code_line_body(
+        &mut job,
+        base_text_format(FontId::monospace(CODE_TEXT_SIZE), InlineRenderStyle::body()),
+    );
+    apply_code_line_height(&mut job);
+    job
+}
+
+/// `festerm_markdown` deliberately preserves exact source text, so each code
+/// line still carries its `\n`. Laying that out gives every line a second,
+/// empty row - the code read as double-spaced. The terminator is presentation
+/// only; the model keeps it for spans and Copy.
+fn trim_line_ending(text: &str) -> &str {
+    match text.strip_suffix('\n') {
+        Some(text) => text.strip_suffix('\r').unwrap_or(text),
+        None => text,
+    }
+}
+
+/// The bundled monospace face has generous vertical metrics, so a one-line
+/// galley is far taller than its font size. Pinning the row height keeps
+/// fenced code and Source view at the mockup's `1.55` pitch instead of
+/// rendering visibly double-spaced.
+fn apply_code_line_height(job: &mut LayoutJob) {
+    for section in &mut job.sections {
+        section.format.line_height = Some(CODE_LINE_HEIGHT);
+    }
+}
+
+fn text_format_from_highlight(span: &festerm_markdown::HighlightedSpan) -> TextFormat {
+    TextFormat {
+        font_id: FontId::monospace(CODE_TEXT_SIZE),
+        color: span
+            .role()
+            .map_or(theme::TEXT_PRIMARY, crate::text_editor::role_colour),
+        // The fenced block already paints one continuous code surface.
+        // Painting a per-span background on top of it drew a lighter pill
+        // around every token, which broke the block into ragged chips
+        // instead of the mockup's uniform `pre`.
+        background: Color32::TRANSPARENT,
+        ..Default::default()
+    }
+}
+
+fn base_text_format(font: FontId, style: InlineRenderStyle) -> TextFormat {
+    let inline_code = style.code_like;
+    let mut format = TextFormat {
+        font_id: font,
+        color: if style.link_like {
+            style.link_color
+        } else {
+            style.text_color
+        },
+        background: if inline_code && !style.link_like {
+            style.code_background
+        } else {
+            Color32::TRANSPARENT
+        },
+        line_height: style.line_height,
+        ..Default::default()
+    };
+    if inline_code {
+        // epaint draws a section's background from `baseline - font_ascent`
+        // and makes it exactly `line_height` tall, so carrying the prose line
+        // height onto a code span pins the highlight's top to the ascender and
+        // dumps every point of the paragraph's extra leading *below* the
+        // descenders. Letting the span keep its own font's row height instead
+        // makes the highlight the glyphs' own box, centered on the word.
+        //
+        // `Align::TOP` is what keeps the baseline where it was: the row is
+        // still as tall as the prose around it, and epaint offsets a glyph by
+        // `valign * (row_height - line_height)`, which is zero only at the top
+        // alignment. The default `Align::BOTTOM` would drop the code span onto
+        // the row's baseline-minus-leading and break the shared baseline.
+        format.line_height = None;
+        format.valign = Align::TOP;
+    }
+    if style.strong {
+        format.font_id.size += 0.5;
+    }
+    if style.strikethrough {
+        format.strikethrough = egui::Stroke::new(1.0, format.color);
+    }
+    if style.italics {
+        format.italics = true;
+    }
+    if style.link_like {
+        format.underline = egui::Stroke::new(1.0, format.color);
+    }
+    format
+}
+
+/// A toolbar control shaped like the mockup's `.fmd-tool`: a fixed-height
+/// pill with an optional icon, muted until it is the active choice.
+///
+/// The icon and text are measured and laid out explicitly rather than handed
+/// to `Ui::button`, because egui sizes a button from its galley alone and
+/// leaves no room to paint a leading icon into.
+/// How long typing settles before the live preview reparses. Reparsing on
+/// every keystroke makes a large document stutter under the caret; a quarter
+/// of a second is below the threshold where a reader notices the preview
+/// lagging, and it coalesces a burst of typing into one parse (ADR 0034 §11).
+pub(crate) const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// A rendered Markdown view over text somebody else owns.
+///
+/// The viewer tab loads from a source and holds the result; this pane is
+/// handed the text on every frame and reparses when it settles. It exists so
+/// the editor's Preview and Split modes render through exactly the same block
+/// renderer as the Markdown tab, rather than growing a second, quietly
+/// divergent Markdown implementation.
+pub(crate) struct MarkdownPreviewPane {
+    #[cfg(test)]
+    table_cell_probe: Option<TableCellProbe>,
+    #[cfg(test)]
+    code_copy_probe: Option<CodeCopyProbe>,
+    source: MarkdownSource,
+    source_generation: Option<Generation>,
+    source_parent_identity: Option<DirectoryIdentity>,
+    document: Option<MarkdownDocument>,
+    clipboard_owner: u64,
+    document_revision: u64,
+    error: Option<String>,
+    /// The text the current parse was made from, so an unchanged frame costs
+    /// nothing.
+    parsed: String,
+    /// Set while typing is still settling.
+    settling: Option<Instant>,
+    pending_text: Option<String>,
+    outline_selected: Option<usize>,
+    find: MarkdownFindState,
+    resource_approvals: ResourceApprovalState,
+    loaded_images: BTreeMap<usize, LoadedImage>,
+    pending_image_loads: BTreeMap<usize, PendingImageLoad>,
+    image_errors: BTreeMap<usize, String>,
+    automatic_image_loads: usize,
+    automatic_image_references: HashSet<usize>,
+    image_retries: BTreeMap<usize, ImageRetry>,
+    pending_scroll: Option<PendingScroll>,
+    line_heading_indices: Vec<Option<usize>>,
+    source_syntax: Option<Vec<festerm_syntax::Span>>,
+    code_preparation: CodeLinePreparation,
+    table_layouts: TableLayoutPreparation,
+    outline_keyboard_focus: bool,
+    heading_tops: Vec<(usize, f32)>,
+    visible_heading: Option<usize>,
+    /// A section this pane has been sent to and has not arrived at yet. While
+    /// it is in flight the pane reports where it is going rather than where it
+    /// currently is: a scroll takes several frames to animate, and a caller
+    /// syncing two panes would otherwise read the frames in between as the
+    /// reader scrolling back.
+    requested_heading: Option<usize>,
+    frames_in_flight: u32,
+}
+
+impl MarkdownPreviewPane {
+    pub(crate) fn new(source: MarkdownSource, text: &str) -> Self {
+        let mut pane = Self {
+            #[cfg(test)]
+            table_cell_probe: None,
+            #[cfg(test)]
+            code_copy_probe: None,
+            source,
+            source_generation: None,
+            source_parent_identity: None,
+            document: None,
+            clipboard_owner: clipboard::new_surface_owner(),
+            document_revision: 0,
+            error: None,
+            parsed: String::new(),
+            settling: None,
+            pending_text: None,
+            outline_selected: None,
+            find: MarkdownFindState::default(),
+            resource_approvals: ResourceApprovalState {
+                local_image_reads_blocked: true,
+                ..Default::default()
+            },
+            loaded_images: BTreeMap::new(),
+            pending_image_loads: BTreeMap::new(),
+            image_errors: BTreeMap::new(),
+            automatic_image_loads: 0,
+            automatic_image_references: HashSet::new(),
+            image_retries: BTreeMap::new(),
+            pending_scroll: None,
+            line_heading_indices: Vec::new(),
+            source_syntax: None,
+            code_preparation: CodeLinePreparation::default(),
+            table_layouts: TableLayoutPreparation::default(),
+            outline_keyboard_focus: false,
+            heading_tops: Vec::new(),
+            visible_heading: None,
+            requested_heading: None,
+            frames_in_flight: 0,
+        };
+        pane.parse(text.to_owned());
+        pane
+    }
+
+    pub(crate) fn for_saved_local_source(
+        source: LocalMarkdownSource,
+        generation: Generation,
+        parent_identity: DirectoryIdentity,
+        text: &str,
+    ) -> Self {
+        let mut pane = Self::new(MarkdownSource::from(source), text);
+        pane.source_generation = Some(generation);
+        pane.source_parent_identity = Some(parent_identity);
+        pane.resource_approvals.local_image_reads_blocked = false;
+        pane
+    }
+
+    pub(crate) fn rebind_saved_local_authority(
+        &mut self,
+        generation: Generation,
+        parent_identity: DirectoryIdentity,
+    ) {
+        if self.source_generation != Some(generation)
+            || self.source_parent_identity != Some(parent_identity)
+        {
+            self.pending_image_loads.clear();
+            self.resource_approvals.clear();
+            self.loaded_images.clear();
+            self.image_errors.clear();
+            self.image_retries.clear();
+            self.automatic_image_loads = 0;
+            self.automatic_image_references.clear();
+        }
+        self.source_generation = Some(generation);
+        self.source_parent_identity = Some(parent_identity);
+    }
+
+    pub(crate) fn with_unavailable_local_images(
+        source: MarkdownSource,
+        text: &str,
+        reason: &str,
+    ) -> Self {
+        let mut pane = Self::new(source, text);
+        pane.resource_approvals.local_image_block_reason = Some(reason.to_owned());
+        pane
+    }
+
+    pub(crate) fn load_local_image(&mut self, index: usize, context: &egui::Context) {
+        if self.error.is_none() {
+            self.image_state()
+                .try_load_local_image(index, context, false);
+        }
+    }
+
+    fn image_state(&mut self) -> MarkdownImageState<'_> {
+        MarkdownImageState {
+            source: &self.source,
+            source_generation: self.source_generation,
+            source_parent_identity: self.source_parent_identity,
+            document: self.document.as_ref(),
+            texture_label: "editor-preview",
+            resource_approvals: &mut self.resource_approvals,
+            loaded_images: &mut self.loaded_images,
+            pending_image_loads: &mut self.pending_image_loads,
+            image_errors: &mut self.image_errors,
+            automatic_image_loads: &mut self.automatic_image_loads,
+            automatic_image_references: &mut self.automatic_image_references,
+            image_retries: &mut self.image_retries,
+        }
+    }
+
+    /// Takes this frame's text. Parsing is deferred until typing settles, and
+    /// a repaint is asked for so the deferred parse actually happens even if
+    /// nothing else moves.
+    pub(crate) fn sync(&mut self, ctx: &egui::Context, text: &str) {
+        if self.pending_text.as_deref().unwrap_or(&self.parsed) != text {
+            self.pending_text = Some(text.to_owned());
+            self.settling = Some(Instant::now());
+        }
+        let Some(started) = self.settling else {
+            return;
+        };
+        let waited = started.elapsed();
+        if waited >= PREVIEW_DEBOUNCE {
+            if let Some(text) = self.pending_text.take() {
+                self.parse(text);
+            }
+            self.settling = None;
+        } else {
+            ctx.request_repaint_after(PREVIEW_DEBOUNCE - waited);
+        }
+    }
+
+    /// The text the rendering on screen was made from, which is a parse
+    /// behind the buffer while typing settles.
+    #[cfg(test)]
+    pub(crate) fn rendered_text(&self) -> &str {
+        &self.parsed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn image_loaded_for_test(&self, index: usize) -> bool {
+        self.loaded_images.contains_key(&index)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn image_error_for_test(&self, index: usize) -> Option<&str> {
+        self.image_errors.get(&index).map(String::as_str)
+    }
+
+    fn parse(&mut self, text: String) {
+        self.pending_image_loads.clear();
+        let bytes = text.as_bytes();
+        match MarkdownLoader::default().load(
+            self.source.clone(),
+            bytes.len(),
+            bytes,
+            &Default::default(),
+        ) {
+            Ok(document) => {
+                self.code_preparation.clear();
+                self.table_layouts.clear();
+                let retained: HashSet<usize> = self
+                    .document
+                    .as_ref()
+                    .map(|previous| {
+                        previous
+                            .resource_references()
+                            .iter()
+                            .zip(document.resource_references())
+                            .enumerate()
+                            .filter_map(|(index, (old, new))| {
+                                (old.kind() == new.kind()
+                                    && old.class() == new.class()
+                                    && old.target() == new.target()
+                                    && old.inline_svg() == new.inline_svg())
+                                .then_some(index)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.resource_approvals
+                    .approved
+                    .retain(|index| retained.contains(index));
+                self.loaded_images
+                    .retain(|index, _| retained.contains(index));
+                self.image_errors
+                    .retain(|index, _| retained.contains(index));
+                self.automatic_image_references
+                    .retain(|index| retained.contains(index));
+                self.image_retries
+                    .retain(|index, _| retained.contains(index));
+                self.automatic_image_loads = self.automatic_image_references.len();
+                self.line_heading_indices = build_line_heading_index_lookup(&document);
+                self.source_syntax = None;
+                self.outline_selected = document.headings().first().map(|_| 0);
+                self.document = Some(document);
+                self.document_revision = self.document_revision.wrapping_add(1);
+                self.error = None;
+            }
+            Err(error) => {
+                self.resource_approvals.clear();
+                self.loaded_images.clear();
+                self.image_errors.clear();
+                self.automatic_image_loads = 0;
+                self.automatic_image_references.clear();
+                self.image_retries.clear();
+                // The text stays editable whatever the preview makes of it,
+                // so a failed parse leaves the last good rendering in place
+                // and says why it stopped moving.
+                self.error = Some(error.to_string());
+            }
+        }
+        self.parsed = text;
+    }
+
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
+        #[cfg(test)]
+        if let Some(probe) = &mut self.table_cell_probe {
+            let ordinary = probe.ordinary;
+            *probe = TableCellProbe {
+                ordinary,
+                ..Default::default()
+            };
+        }
+        #[cfg(test)]
+        if let Some(probe) = &mut self.code_copy_probe {
+            probe.preparations = 0;
+            probe.buttons.clear();
+        }
+        if let Some(error) = &self.error {
+            ui.vertical(|ui| {
+                ui.add_space(READING_COLUMN_TOP_PADDING);
+                ui.label(
+                    egui::RichText::new("This text cannot be rendered as Markdown")
+                        .size(TOOLBAR_TEXT_SIZE + 1.0)
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.label(
+                    egui::RichText::new(error)
+                        .size(TOOLBAR_TEXT_SIZE)
+                        .color(theme::TEXT_SECONDARY),
+                );
+            });
+            return;
+        }
+        self.image_state().poll_background_work(ui.ctx());
+        self.image_state().start_automatic_image_loads(ui.ctx());
+        let Some(document) = self.document.take() else {
+            return;
+        };
+        let mut heading_tops = std::mem::take(&mut self.heading_tops);
+        heading_tops.clear();
+        let mut state = MarkdownRenderState {
+            table_cells: TableCellPreparation::default(),
+            code_copy_caption: CodeCopyCaptionPreparation::default(),
+            mode: MarkdownViewerMode::Preview,
+            outline_open: false,
+            outline_selected: &mut self.outline_selected,
+            find: &self.find,
+            resource_approvals: &self.resource_approvals,
+            loaded_images: &self.loaded_images,
+            pending_image_loads: &self.pending_image_loads,
+            image_errors: &self.image_errors,
+            pending_scroll: &mut self.pending_scroll,
+            line_heading_indices: &self.line_heading_indices,
+            source_syntax: &mut self.source_syntax,
+            source_preparation: &mut SourcePreparation::default(),
+            code_preparation: &mut self.code_preparation,
+            table_layouts: &mut self.table_layouts,
+            outline_preparation: &mut OutlinePreparation::default(),
+            outline_keyboard_focus: &mut self.outline_keyboard_focus,
+            heading_tops: Some(&mut heading_tops),
+        };
+        state.table_layouts.begin(ui, state.find);
+        state.code_preparation.begin(ui);
+        #[cfg(test)]
+        {
+            state.table_cells.probe = self.table_cell_probe.take();
+            state.code_copy_caption.probe = self.code_copy_probe.take();
+        }
+        let viewport_height = ui.available_height().max(120.0);
+        let viewport_top = ui.cursor().top();
+        clipboard::begin(ui);
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt("markdown-preview-pane")
+            .max_height(viewport_height)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let column_width = READING_WIDTH
+                    .min(ui.available_width() - READING_COLUMN_SIDE_GUTTER * 2.0)
+                    .max(160.0);
+                let leading = ((ui.available_width() - column_width) / 2.0).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_space(leading);
+                    ui.allocate_ui_with_layout(
+                        vec2(column_width, 0.0),
+                        egui::Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_max_width(column_width);
+                            ui.add_space(READING_COLUMN_TOP_PADDING);
+                            state.render_blocks(
+                                ui,
+                                document.blocks(),
+                                &document,
+                                InlineRenderStyle::body(),
+                            );
+                            ui.add_space(READING_COLUMN_BOTTOM_PADDING);
+                        },
+                    );
+                });
+            });
+        selection_drag_autoscroll(ui, &mut scroll, label_selection_dragging(ui), false, true);
+        tracing::debug!(target: "festerm::markdown_scroll",
+            markdown_preview_offset_y = scroll.state.offset.y,
+            markdown_preview_content_height = scroll.content_size.y,
+            markdown_preview_viewport_height = scroll.inner_rect.height(),
+            markdown_preview_left = scroll.inner_rect.left(),
+            markdown_preview_top = scroll.inner_rect.top(),
+            markdown_preview_right = scroll.inner_rect.right(),
+            markdown_preview_bottom = scroll.inner_rect.bottom(),
+            markdown_preview_hovered = ui.rect_contains_pointer(scroll.inner_rect),
+            markdown_preview_pointer = ?ui.input(|input| input.pointer.hover_pos()),
+            "Markdown preview pane scroll state");
+        clipboard::finish(
+            ui,
+            &document,
+            self.clipboard_owner,
+            self.document_revision,
+            scroll.inner_rect.intersect(ui.clip_rect()),
+        );
+        #[cfg(test)]
+        {
+            self.table_cell_probe = state.table_cells.probe.take();
+            self.code_copy_probe = state.code_copy_caption.probe.take();
+        }
+        // Which section the reader is actually looking at, taken from where
+        // the headings landed rather than from a scroll offset that means
+        // nothing without the rendered heights.
+        let measured = heading_tops
+            .iter()
+            .rfind(|(_, top)| *top <= viewport_top + PREVIEW_SECTION_TOLERANCE)
+            .map(|(index, _)| *index)
+            .or_else(|| heading_tops.first().map(|(index, _)| *index));
+        if let Some(requested) = self.requested_heading {
+            self.frames_in_flight += 1;
+            // A section short enough that it cannot reach the top of the pane
+            // would never arrive, so the flight is given a budget rather than
+            // being waited on for ever.
+            if measured == Some(requested) || self.frames_in_flight > PREVIEW_SCROLL_FRAMES {
+                self.requested_heading = None;
+                self.frames_in_flight = 0;
+            }
+        }
+        self.visible_heading = self.requested_heading.or(measured);
+        self.heading_tops = heading_tops;
+        self.document = Some(document);
+    }
+
+    /// The heading whose section fills the top of the preview, if the
+    /// document has any headings at all.
+    pub(crate) fn visible_heading(&self) -> Option<usize> {
+        self.visible_heading
+    }
+
+    /// Scrolls the preview so a section is at the top of the pane.
+    pub(crate) fn scroll_to_heading(&mut self, index: usize) {
+        self.pending_scroll = Some(PendingScroll::Heading(index));
+        self.visible_heading = Some(index);
+        self.requested_heading = Some(index);
+        self.frames_in_flight = 0;
+    }
+
+    pub(crate) fn set_find_offsets(&mut self, offsets: impl Iterator<Item = usize>) {
+        self.code_preparation.diagrams.set_find_offsets(offsets);
+    }
+
+    pub(crate) fn scroll_to_byte(&mut self, offset: usize) {
+        self.pending_scroll = Some(PendingScroll::Byte(offset));
+    }
+
+    /// The headings the current parse found, for a caller drawing its own
+    /// outline beside the text.
+    pub(crate) fn headings(&self) -> &[festerm_markdown::Heading] {
+        self.document
+            .as_ref()
+            .map(|document| document.headings())
+            .unwrap_or(&[])
+    }
+
+    /// The heading whose section covers a byte offset in the source.
+    pub(crate) fn heading_at_byte(&self, offset: usize) -> Option<usize> {
+        self.document
+            .as_ref()
+            .and_then(|document| document.nearest_heading_index_at_byte(offset))
+    }
+
+    /// Where a heading starts in the source, so the other pane can put its
+    /// caret and its viewport on the same words.
+    pub(crate) fn heading_byte(&self, index: usize) -> Option<usize> {
+        self.document
+            .as_ref()
+            .and_then(|document| document.headings().get(index))
+            .map(|heading| heading.section_start_byte())
+    }
+}
+
+/// One row of a Markdown outline, painted the way the mockup's
+/// `.fmd-outline-item` is. Shared rather than copied so the editor's optional
+/// outline and the viewer's cannot drift into two different sidebars.
+fn outline_item(
+    ui: &mut egui::Ui,
+    heading: &festerm_markdown::Heading,
+    selected: bool,
+) -> egui::Response {
+    outline_item_with_geometry(ui, heading, selected, None).0
+}
+
+fn outline_item_with_geometry(
+    ui: &mut egui::Ui,
+    heading: &festerm_markdown::Heading,
+    selected: bool,
+    cached_offscreen_geometry: Option<OutlineRowGeometry>,
+) -> (egui::Response, OutlineRowGeometry) {
+    // `.fmd-outline-item` gives H1 and H2 the same inset and only steps in
+    // from `.fmd-depth2` onward: in a document whose H1 is the title, the H2
+    // sections read as its peers in the outline, and indenting every level
+    // spent sidebar width the 216px pane does not have.
+    let indent = (heading.level().saturating_sub(2) as f32) * OUTLINE_ITEM_INDENT;
+    let font = FontId::proportional(TOOLBAR_TEXT_SIZE);
+    let text_color = if selected {
+        theme::TEXT_PRIMARY
+    } else if heading.level() > 2 {
+        theme::TEXT_SECONDARY
+    } else {
+        theme::TEXT_PRIMARY.gamma_multiply(0.86)
+    };
+    let width = ui.available_width();
+    let text_left =
+        OUTLINE_ITEM_PADDING_X + OUTLINE_ITEM_ACCENT_WIDTH + OUTLINE_ITEM_PADDING_X + indent;
+    // Retain only bounded, snapshot-owned geometry, never atlas-backed galleys.
+    // All rows still allocate live responses and accessibility nodes.
+    let galley = cached_offscreen_geometry.is_none().then(|| {
+        ui.painter().layout(
+            heading.text().to_owned(),
+            font,
+            text_color,
+            (width - text_left - OUTLINE_ITEM_PADDING_X).max(24.0),
+        )
+    });
+    let geometry = cached_offscreen_geometry.unwrap_or_else(|| {
+        let galley = galley.as_ref().expect("uncached row");
+        OutlineRowGeometry {
+            height: galley.size().y + OUTLINE_ITEM_PADDING_Y * 2.0,
+            text_bounds: egui::epaint::TextShape::new(
+                egui::pos2(text_left, OUTLINE_ITEM_PADDING_Y),
+                galley.clone(),
+                text_color,
+            )
+            .visual_bounding_rect(),
+        }
+    });
+    let (rect, response) = ui.allocate_exact_size(vec2(width, geometry.height), Sense::click());
+    response.widget_info(|| {
+        WidgetInfo::selected(
+            WidgetType::Button,
+            true,
+            selected,
+            format!("Heading level {}: {}", heading.level(), heading.text()),
+        )
+    });
+
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            OUTLINE_ITEM_RADIUS,
+            if selected {
+                // The mockup's current outline item is a muted slate wash
+                // (#1a303f), not the full-strength text-selection blue, which
+                // read as a stray text selection in the sidebar rather than a
+                // navigation state.
+                theme::SURFACE_SELECTION.gamma_multiply(0.6)
+            } else {
+                theme::SURFACE_TAB_ACTIVE.gamma_multiply(0.5)
+            },
+        );
+    }
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.top()),
+                egui::pos2(rect.left() + OUTLINE_ITEM_ACCENT_WIDTH, rect.bottom()),
+            ),
+            0.0,
+            theme::ACCENT_PRIMARY,
+        );
+    }
+    if let Some(galley) = galley {
+        ui.painter().galley(
+            egui::pos2(rect.left() + text_left, rect.top() + OUTLINE_ITEM_PADDING_Y),
+            galley,
+            text_color,
+        );
+    }
+    (
+        response.on_hover_cursor(egui::CursorIcon::PointingHand),
+        geometry,
+    )
+}
+
+/// The outline panel's chrome and its titled content area.
+fn outline_panel(ui: &mut egui::Ui, viewport_height: f32) -> (egui::Rect, egui::Ui) {
+    // A full-height panel divided from the document by a single hairline, not
+    // a floating card: the mockup's `.fmd-outline` uses only `border-right`,
+    // and a bordered card left an obvious gap above the status bar where the
+    // card stopped short.
+    let (panel_rect, _) =
+        ui.allocate_exact_size(vec2(OUTLINE_WIDTH, viewport_height), Sense::hover());
+    // `.fmd-outline { background: #0f151c }` is only a couple of levels above
+    // the body; the tab surface was a far bigger jump and made the outline
+    // read as a floating card.
+    ui.painter()
+        .rect_filled(panel_rect, 0.0, theme::SURFACE_TERMINAL);
+    ui.painter().line_segment(
+        [panel_rect.right_top(), panel_rect.right_bottom()],
+        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+    );
+
+    let content_rect = panel_rect
+        .shrink2(vec2(OUTLINE_PADDING_X, OUTLINE_PADDING_Y))
+        // Keep the hairline clear of the content.
+        .translate(vec2(-0.5, 0.0));
+    let mut content = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(egui::Layout::top_down(Align::Min)),
+    );
+    content.spacing_mut().item_spacing.y = 0.0;
+    content.horizontal(|ui| {
+        ui.add_space(OUTLINE_TITLE_INSET_X);
+        icon_label(
+            ui,
+            Icon::Outline,
+            RichText::new("OUTLINE")
+                .size(10.0)
+                .color(theme::TEXT_SECONDARY),
+            theme::TEXT_SECONDARY,
+        );
+    });
+    content.add_space(OUTLINE_TITLE_GAP_BELOW);
+    (panel_rect, content)
+}
+
+/// The outline a view other than the Markdown tab can hang beside its body.
+///
+/// Returns the heading the reader clicked, if any; the caller decides what
+/// "go there" means in its own pane.
+pub(crate) fn show_markdown_outline(
+    ui: &mut egui::Ui,
+    headings: &[festerm_markdown::Heading],
+    selected: Option<usize>,
+    viewport_height: f32,
+    id_salt: &str,
+) -> Option<usize> {
+    let (_, mut content) = outline_panel(ui, viewport_height);
+    let mut clicked = None;
+    egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .max_height(content.available_height())
+        .show(&mut content, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (index, heading) in headings.iter().enumerate() {
+                if outline_item(ui, heading, selected == Some(index)).clicked() {
+                    clicked = Some(index);
+                }
+            }
+        });
+    clicked
+}
+
+pub(crate) fn copy_path_menu(ui: &mut egui::Ui, path: &str) {
+    if ui.button("Copy path").clicked() {
+        ui.ctx().copy_text(path.to_owned());
+        ui.close();
+    }
+}
+
+pub(crate) fn toolbar_button(
+    ui: &mut egui::Ui,
+    icon_name: Option<Icon>,
+    label: &str,
+    accessible_label: &str,
+    active: bool,
+) -> bool {
+    toolbar_button_response(ui, icon_name, label, accessible_label, active).clicked()
+}
+
+/// As `toolbar_button`, but hands back the `Response` so a caller can anchor
+/// a popup to it, or attach a reason to a button it had to disable.
+pub(crate) fn toolbar_button_response(
+    ui: &mut egui::Ui,
+    icon_name: Option<Icon>,
+    label: &str,
+    accessible_label: &str,
+    active: bool,
+) -> egui::Response {
+    toolbar_button_with_trailing(ui, icon_name, None, label, accessible_label, active)
+}
+
+/// As `toolbar_button_response`, but with a second icon after the text.
+///
+/// The trailing slot is for a disclosure chevron: a button that opens a menu
+/// has to look different from one that acts immediately, and the mark for
+/// that sits after the words, not before them.
+/// The width `toolbar_button_response` would take for this label, so a bar
+/// can work out whether its controls fit before it lays any of them out.
+pub(crate) fn toolbar_button_width(ui: &egui::Ui, icon_name: Option<Icon>, label: &str) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(TOOLBAR_TEXT_SIZE),
+        theme::TEXT_SECONDARY,
+    );
+    let icon_width = icon_name
+        .map(|_| TOOLBAR_ICON_SIZE + TOOLBAR_ICON_TEXT_GAP)
+        .unwrap_or(0.0);
+    (TOOLBAR_BUTTON_PADDING_X * 2.0 + icon_width + galley.size().x).max(TOOLBAR_BUTTON_HEIGHT)
+}
+
+pub(crate) fn toolbar_button_with_trailing(
+    ui: &mut egui::Ui,
+    icon_name: Option<Icon>,
+    trailing_icon: Option<Icon>,
+    label: &str,
+    accessible_label: &str,
+    active: bool,
+) -> egui::Response {
+    let font = FontId::proportional(TOOLBAR_TEXT_SIZE);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        font,
+        if active {
+            theme::TEXT_PRIMARY
+        } else {
+            theme::TEXT_SECONDARY
+        },
+    );
+    toolbar_button_with_galley(
+        ui,
+        icon_name,
+        trailing_icon,
+        accessible_label,
+        active,
+        galley,
+    )
+}
+
+fn toolbar_button_with_galley(
+    ui: &mut egui::Ui,
+    icon_name: Option<Icon>,
+    trailing_icon: Option<Icon>,
+    accessible_label: &str,
+    active: bool,
+    galley: Arc<egui::Galley>,
+) -> egui::Response {
+    let icon_width = icon_name
+        .map(|_| TOOLBAR_ICON_SIZE + TOOLBAR_ICON_TEXT_GAP)
+        .unwrap_or(0.0);
+    let trailing_width = trailing_icon
+        .map(|_| TOOLBAR_ICON_SIZE + TOOLBAR_ICON_TEXT_GAP)
+        .unwrap_or(0.0);
+    let width = (TOOLBAR_BUTTON_PADDING_X * 2.0 + icon_width + galley.size().x + trailing_width)
+        .max(TOOLBAR_BUTTON_HEIGHT);
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(width, TOOLBAR_BUTTON_HEIGHT), Sense::click());
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::Button, true, active, accessible_label));
+
+    if active || response.hovered() {
+        let fill = if active {
+            theme::SURFACE_TAB_ACTIVE
+        } else {
+            theme::SURFACE_TAB_INACTIVE
+        };
+        ui.painter().rect_filled(rect, TOOLBAR_BUTTON_RADIUS, fill);
+    }
+    if active {
+        ui.painter().rect_stroke(
+            rect,
+            TOOLBAR_BUTTON_RADIUS,
+            egui::Stroke::new(1.0, theme::BORDER_ACTIVE),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let mut cursor = rect.left() + TOOLBAR_BUTTON_PADDING_X;
+    if let Some(icon_name) = icon_name {
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(cursor + TOOLBAR_ICON_SIZE / 2.0, rect.center().y),
+            egui::Vec2::splat(TOOLBAR_ICON_SIZE),
+        );
+        icon::paint(
+            ui.painter(),
+            icon_name,
+            icon_rect,
+            if active {
+                theme::TEXT_PRIMARY
+            } else {
+                theme::TEXT_SECONDARY
+            },
+        );
+        cursor += TOOLBAR_ICON_SIZE + TOOLBAR_ICON_TEXT_GAP;
+    }
+    let text_width = galley.size().x;
+    ui.painter().galley(
+        egui::pos2(cursor, rect.center().y - galley.size().y / 2.0),
+        galley,
+        theme::TEXT_SECONDARY,
+    );
+    if let Some(trailing_icon) = trailing_icon {
+        let left = cursor + text_width + TOOLBAR_ICON_TEXT_GAP;
+        icon::paint(
+            ui.painter(),
+            trailing_icon,
+            egui::Rect::from_center_size(
+                egui::pos2(left + TOOLBAR_ICON_SIZE / 2.0, rect.center().y),
+                egui::Vec2::splat(TOOLBAR_ICON_SIZE),
+            ),
+            theme::TEXT_SECONDARY,
+        );
+    }
+
+    response.on_hover_text(accessible_label)
+}
+
+/// An icon and its text on one baseline. The icon is allocated inside an
+/// explicit horizontal run so the pair stays on a single row even when the
+/// caller's layout is vertical, which is how the outline title is used.
+fn icon_label(ui: &mut egui::Ui, icon_name: Icon, text: RichText, color: Color32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = TOOLBAR_ICON_TEXT_GAP;
+        let (rect, response) =
+            ui.allocate_exact_size(egui::Vec2::splat(TOOLBAR_ICON_SIZE), Sense::hover());
+        icon::paint(ui.painter(), icon_name, rect, color);
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text.text()));
+        ui.label(text);
+    });
+}
+
+pub(crate) fn elide_middle(value: &str, max_chars: usize) -> String {
+    let total = value.chars().count();
+    if total <= max_chars {
+        return value.to_owned();
+    }
+    let prefix = max_chars / 2;
+    let suffix = max_chars.saturating_sub(prefix + 1);
+    format!(
+        "{}…{}",
+        value.chars().take(prefix).collect::<String>(),
+        value
+            .chars()
+            .skip(total.saturating_sub(suffix))
+            .collect::<String>()
+    )
+}
+
+fn overlaps(left: SourceSpan, right: SourceSpan) -> bool {
+    left.byte_range().start < right.byte_range().end
+        && right.byte_range().start < left.byte_range().end
+}
+
+fn byte_range_contains(span: SourceSpan, byte: usize) -> bool {
+    span.byte_range().start <= byte && byte < span.byte_range().end
+}
+
+fn overlap_with_relative_range(
+    container: SourceSpan,
+    matched: SourceSpan,
+) -> Option<std::ops::Range<usize>> {
+    let start = container.byte_range().start.max(matched.byte_range().start);
+    let end = container.byte_range().end.min(matched.byte_range().end);
+    (start < end)
+        .then(|| (start - container.byte_range().start)..(end - container.byte_range().start))
+}
+
+fn build_line_heading_index_lookup(document: &MarkdownDocument) -> Vec<Option<usize>> {
+    let headings = document.headings();
+    let mut lookup = Vec::with_capacity(document.line_count());
+    let mut heading_index = 0usize;
+    let mut active_heading = None;
+    let mut line_start = 0usize;
+    for line in document.source_text().split_inclusive('\n') {
+        while heading_index < headings.len()
+            && line_start >= headings[heading_index].section_end_byte()
+        {
+            heading_index += 1;
+        }
+        if heading_index < headings.len()
+            && line_start >= headings[heading_index].section_start_byte()
+            && line_start < headings[heading_index].section_end_byte()
+        {
+            active_heading = Some(heading_index);
+        }
+        lookup.push(active_heading);
+        line_start += line.len();
+    }
+    if document.source_text().is_empty() {
+        lookup.push(None);
+    }
+    lookup
+}
+
+fn resource_class_label(class: ResourceReferenceClass) -> &'static str {
+    match class {
+        ResourceReferenceClass::IntrinsicSvg => "Inline SVG",
+        ResourceReferenceClass::DocumentFragment => "Document fragment",
+        ResourceReferenceClass::LocalRelative => "Local resource",
+        ResourceReferenceClass::RemoteRelativeViaSftpOrigin => "Remote resource",
+        ResourceReferenceClass::HttpsAbsolute => "External link",
+        ResourceReferenceClass::DangerousScheme => "Blocked resource",
+    }
+}
+
+fn resource_placeholder_action(class: ResourceReferenceClass) -> &'static str {
+    match class {
+        ResourceReferenceClass::IntrinsicSvg => {
+            "Load this bounded native SVG, without external resources."
+        }
+        ResourceReferenceClass::DocumentFragment => "Document fragments do not load as images.",
+        ResourceReferenceClass::LocalRelative => {
+            "Use Load local image to view this bounded local image."
+        }
+        ResourceReferenceClass::RemoteRelativeViaSftpOrigin => {
+            "Remote image loading is deferred until the GUI SFTP browser lands."
+        }
+        ResourceReferenceClass::HttpsAbsolute => {
+            "Network images remain blocked in the Markdown viewer."
+        }
+        ResourceReferenceClass::DangerousScheme => {
+            "This resource scheme is blocked in the Markdown viewer."
+        }
+    }
+}
+
+pub fn take_viewer_commands(context: &egui::Context) -> Vec<AppCommand> {
+    let mut commands = Vec::new();
+    if let Some(target) = context.memory(|memory| {
+        memory
+            .data
+            .get_temp::<String>(egui::Id::new("markdown-external-link"))
+    }) {
+        commands.push(AppCommand::OpenExternalLink {
+            target: ExternalLinkTarget::new(target),
+        });
+        context.memory_mut(|memory| {
+            memory
+                .data
+                .remove::<String>(egui::Id::new("markdown-external-link"));
+        });
+    }
+    if let Some(path) = context.memory(|memory| {
+        memory
+            .data
+            .get_temp::<PathBuf>(egui::Id::new("markdown-local-link"))
+    }) {
+        commands.push(AppCommand::OpenLocalMarkdownFile {
+            path,
+            replacing: None,
+        });
+        context.memory_mut(|memory| {
+            memory
+                .data
+                .remove::<PathBuf>(egui::Id::new("markdown-local-link"));
+        });
+    }
+    if let Some(reference_index) = context.memory(|memory| {
+        memory
+            .data
+            .get_temp::<usize>(egui::Id::new("markdown-load-image"))
+    }) {
+        commands.push(AppCommand::LoadMarkdownLocalImage { reference_index });
+        context.memory_mut(|memory| {
+            memory
+                .data
+                .remove::<usize>(egui::Id::new("markdown-load-image"));
+        });
+    }
+    commands
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::{kittest::Queryable, Harness};
+    use festerm_markdown::RemoteSourceOwner;
+    use std::ops::Range;
+    use std::time::Duration;
+
+    /// The reference table that exposed the collapsing-column defect: two
+    /// columns, one of them short labels and the other prose long enough that
+    /// the pair has to be balanced rather than simply fitted.
+    const REFERENCE_TABLE: &str = concat!(
+        "| Task | Primary reference |\n",
+        "| --- | --- |\n",
+        "| Product scope and priorities | `DESIGN.md`, `ROADMAP.md` |\n",
+        "| Dependency and ownership boundaries | `ARCHITECTURE.md` |\n",
+    );
+
+    #[test]
+    fn selection_drag_autoscrolls_each_scrollable_axis_and_stops_at_bounds() {
+        let context = egui::Context::default();
+        let mut frame = 0;
+        let mut run = |events: Vec<egui::Event>| {
+            frame += 1;
+            let mut metrics = None;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        vec2(200.0, 200.0),
+                    )),
+                    time: Some(frame as f64 / 20.0),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let mut area = egui::ScrollArea::both()
+                        .id_salt("selection-autoscroll-test")
+                        .max_width(100.0)
+                        .max_height(100.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.allocate_exact_size(vec2(500.0, 500.0), Sense::hover());
+                        });
+                    metrics = Some((area.id, area.inner_rect, area.content_size));
+                    selection_drag_autoscroll(ui, &mut area, true, true, true);
+                },
+            );
+            output.textures_delta.clear();
+            let (id, rect, content_size) = metrics.unwrap();
+            (output, id, rect, content_size)
+        };
+
+        let (_, id, inner_rect, _) = run(Vec::new());
+        let start = inner_rect.center();
+        run(vec![
+            egui::Event::PointerMoved(start),
+            egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let outside = inner_rect.right_bottom() + vec2(24.0, 24.0);
+        for _ in 0..12 {
+            run(vec![egui::Event::PointerMoved(outside)]);
+        }
+        let state = egui::scroll_area::State::load(&context, id).unwrap();
+        assert!(state.offset.x > 0.0 && state.offset.y > 0.0);
+
+        let (_, _, inner_rect, content_size) = run(Vec::new());
+        let max_offset = content_size - inner_rect.size();
+        for _ in 0..12 {
+            run(vec![egui::Event::PointerMoved(egui::pos2(1000.0, 1000.0))]);
+        }
+        let state = egui::scroll_area::State::load(&context, id).unwrap();
+        assert!((state.offset.x - max_offset.x).abs() < 1.0);
+        assert!((state.offset.y - max_offset.y).abs() < 1.0);
+
+        for _ in 0..4 {
+            run(vec![egui::Event::PointerMoved(inner_rect.center())]);
+        }
+        let state = egui::scroll_area::State::load(&context, id).unwrap();
+        assert!((state.offset.x - max_offset.x).abs() < 1.0);
+        assert!((state.offset.y - max_offset.y).abs() < 1.0);
+
+        for _ in 0..12 {
+            run(vec![egui::Event::PointerMoved(egui::pos2(-100.0, -100.0))]);
+        }
+        let state = egui::scroll_area::State::load(&context, id).unwrap();
+        assert!(state.offset.x < 1.0 && state.offset.y < 1.0);
+
+        run(vec![
+            egui::Event::PointerButton {
+                pos: egui::pos2(-100.0, -100.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerMoved(egui::pos2(1000.0, 1000.0)),
+        ]);
+        let state = egui::scroll_area::State::load(&context, id).unwrap();
+        assert!(state.offset.x < 1.0 && state.offset.y < 1.0);
+    }
+
+    #[test]
+    fn selection_autoscroll_only_moves_the_drag_origin_viewport() {
+        let context = egui::Context::default();
+        let mut frame = 0;
+        let mut run = |events: Vec<egui::Event>| {
+            frame += 1;
+            let mut areas = Vec::new();
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        vec2(300.0, 200.0),
+                    )),
+                    time: Some(frame as f64 / 20.0),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.horizontal(|ui| {
+                        for index in 0..2 {
+                            let mut area = egui::ScrollArea::vertical()
+                                .id_salt(("selection-owner-test", index))
+                                .max_width(100.0)
+                                .max_height(100.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.allocate_exact_size(vec2(100.0, 500.0), Sense::hover());
+                                });
+                            areas.push((area.id, area.inner_rect));
+                            selection_drag_autoscroll(ui, &mut area, true, false, true);
+                        }
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            areas
+        };
+        let areas = run(Vec::new());
+        let start = areas[0].1.center();
+        run(vec![
+            egui::Event::PointerMoved(start),
+            egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let outside = egui::pos2(start.x, areas[0].1.bottom() + 40.0);
+        for _ in 0..8 {
+            run(vec![egui::Event::PointerMoved(outside)]);
+        }
+        let first = egui::scroll_area::State::load(&context, areas[0].0).unwrap();
+        let second = egui::scroll_area::State::load(&context, areas[1].0).unwrap();
+        assert!(first.offset.y > 0.0);
+        assert_eq!(second.offset.y, 0.0);
+    }
+
+    #[test]
+    fn markdown_path_context_menu_copies_the_full_path_in_preview_and_source() {
+        let path = format!(
+            "/controlled/{}notes caf\u{e9} \u{6f22}.md",
+            "long-directory/".repeat(12)
+        );
+        assert_ne!(elide_middle(&path, 72), path);
+        for remote in [false, true] {
+            for mode in [MarkdownViewerMode::Preview, MarkdownViewerMode::Source] {
+                for width in [900.0, 480.0] {
+                    for overflow in [false, true] {
+                        let mut viewer = if remote {
+                            MarkdownViewerTab::open_remote(
+                                test_remote_source(&path),
+                                path.clone(),
+                                b"# Controlled document\n".to_vec(),
+                            )
+                        } else {
+                            MarkdownViewerTab::open_local(PathBuf::from(&path))
+                        };
+                        viewer.mode = mode;
+                        let expected = viewer.display_path().to_owned();
+                        let tab = crate::tabs::AppState::for_test().active();
+                        let mut harness = Harness::builder()
+                            .with_size(vec2(width, 200.0))
+                            .build_ui_state(
+                                move |ui, viewer: &mut MarkdownViewerTab| {
+                                    assert!(viewer.show_toolbar(ui, tab).is_none());
+                                },
+                                viewer,
+                            );
+                        harness.run();
+                        assert!(harness.output().platform_output.commands.is_empty());
+                        if overflow {
+                            harness.get_by_label("Viewer menu").click();
+                        } else {
+                            let position = harness.get_by_label(&expected).rect().center();
+                            harness.event(egui::Event::PointerMoved(position));
+                            for pressed in [true, false] {
+                                harness.event(egui::Event::PointerButton {
+                                    pos: position,
+                                    button: egui::PointerButton::Secondary,
+                                    pressed,
+                                    modifiers: Default::default(),
+                                });
+                            }
+                        }
+                        harness.run();
+                        assert!(harness.output().platform_output.commands.is_empty());
+                        harness.get_by_label("Copy path").click();
+                        harness.step();
+                        assert_eq!(
+                            harness.output().platform_output.commands,
+                            vec![egui::OutputCommand::CopyText(expected.clone())]
+                        );
+                        harness.run();
+                        assert!(harness.query_by_label("Copy path").is_none());
+                        assert_eq!(harness.state().display_path(), expected);
+                        assert_eq!(harness.state().mode, mode);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_path_context_menu_can_be_dismissed_without_copying() {
+        let path = "/srv/controlled/notes.md";
+        let viewer = MarkdownViewerTab::open_remote(
+            test_remote_source(path),
+            path.to_owned(),
+            b"# Controlled document\n".to_vec(),
+        );
+        let tab = crate::tabs::AppState::for_test().active();
+        let mut harness = Harness::builder()
+            .with_size(vec2(700.0, 200.0))
+            .build_ui_state(
+                move |ui, viewer: &mut MarkdownViewerTab| {
+                    assert!(viewer.show_toolbar(ui, tab).is_none());
+                },
+                viewer,
+            );
+        harness.run();
+        let position = harness.get_by_label(path).rect().center();
+        harness.event(egui::Event::PointerMoved(position));
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Default::default(),
+            });
+        }
+        harness.run();
+        harness.get_by_label("Copy path");
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        });
+        harness.run();
+        assert!(harness.query_by_label("Copy path").is_none());
+        assert!(harness.output().platform_output.commands.is_empty());
+    }
+
+    #[test]
+    fn markdown_path_menus_do_not_retarget_when_switching_documents() {
+        for overflow in [false, true] {
+            let viewers = ["/srv/first.md", "/srv/second.md"].map(|path| {
+                MarkdownViewerTab::open_remote(
+                    test_remote_source(path),
+                    path.to_owned(),
+                    b"# Controlled document\n".to_vec(),
+                )
+            });
+            let tabs = [TabId::next_for_test(), TabId::next_for_test()];
+            let mut harness = Harness::builder()
+                .with_size(vec2(900.0, 200.0))
+                .build_ui_state(
+                    move |ui, state: &mut (usize, [MarkdownViewerTab; 2])| {
+                        assert!(state.1[state.0].show_toolbar(ui, tabs[state.0]).is_none());
+                    },
+                    (0, viewers),
+                );
+            harness.run();
+            if overflow {
+                harness.get_by_label("Viewer menu").click();
+            } else {
+                let position = harness.get_by_label("/srv/first.md").rect().center();
+                harness.event(egui::Event::PointerMoved(position));
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: Default::default(),
+                    });
+                }
+            }
+            harness.run();
+            harness.get_by_label("Copy path");
+            harness.state_mut().0 = 1;
+            harness.run();
+            assert!(harness.query_by_label("Copy path").is_none());
+            assert!(harness.output().platform_output.commands.is_empty());
+            harness.state_mut().0 = 0;
+            harness.run();
+            assert!(harness.query_by_label("Copy path").is_none());
+        }
+    }
+
+    /// Renders a document through the real block renderer inside a headless
+    /// harness, so layout assertions measure the geometry the viewer actually
+    /// draws rather than a reimplementation of it.
+    #[test]
+    fn keyboard_markdown_toolbar_uses_custom_and_unbound_effective_hints() {
+        use festerm_config::KeyboardAction as A;
+        for unbound in [false, true] {
+            let mut bindings = festerm_config::KeyboardBindings::default();
+            for (action, chord) in [
+                (A::MarkdownOutline, "Ctrl+Shift+F1"),
+                (A::MarkdownFind, "Ctrl+Shift+F2"),
+                (A::MarkdownPreviewSource, "Ctrl+Shift+F3"),
+                (A::MarkdownReload, "Ctrl+Shift+F4"),
+            ] {
+                bindings.set(action, Some(if unbound { "" } else { chord }.into()));
+            }
+            let mut viewer =
+                MarkdownViewerTab::open_local(PathBuf::from("controlled-toolbar-only.md"));
+            let tab = crate::tabs::AppState::for_test().active();
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(900.0, 100.0))
+                .build_ui(move |ui| {
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("effective-keyboard-bindings"),
+                            bindings.clone(),
+                        )
+                    });
+                    viewer.show_toolbar(ui, tab);
+                });
+            harness.run();
+            for (title, chord) in [
+                ("Hide outline", "Ctrl+Shift+F1"),
+                ("Find", "Ctrl+Shift+F2"),
+                ("Show the Markdown source", "Ctrl+Shift+F3"),
+                ("Show the rendered document", "Ctrl+Shift+F3"),
+                ("Reload", "Ctrl+Shift+F4"),
+            ] {
+                let label = if unbound {
+                    title.into()
+                } else {
+                    format!("{title} ({chord})")
+                };
+                harness.get_by_label(&label);
+            }
+            harness.get_by_label("Viewer menu");
+        }
+    }
+
+    fn render_markdown(markdown: &str) -> Harness<'static, ()> {
+        let parsed = document(markdown);
+        let find = MarkdownFindState::default();
+        let approvals = ResourceApprovalState::default();
+        let loaded_images = BTreeMap::new();
+        let pending_image_loads = BTreeMap::new();
+        let image_errors = BTreeMap::new();
+        let mut outline_selected = None;
+        let mut pending_scroll = None;
+        let mut outline_keyboard_focus = false;
+        let mut heading_tops = Vec::new();
+        Harness::builder().build_ui_state(
+            move |ui, _state: &mut ()| {
+                let mut state = MarkdownRenderState {
+                    table_cells: TableCellPreparation::default(),
+                    code_copy_caption: CodeCopyCaptionPreparation::default(),
+                    mode: MarkdownViewerMode::Preview,
+                    outline_open: false,
+                    outline_selected: &mut outline_selected,
+                    find: &find,
+                    resource_approvals: &approvals,
+                    loaded_images: &loaded_images,
+                    pending_image_loads: &pending_image_loads,
+                    image_errors: &image_errors,
+                    pending_scroll: &mut pending_scroll,
+                    line_heading_indices: &[],
+                    source_syntax: &mut None,
+                    source_preparation: &mut SourcePreparation::default(),
+                    code_preparation: &mut CodeLinePreparation::default(),
+                    table_layouts: &mut TableLayoutPreparation::default(),
+                    outline_preparation: &mut OutlinePreparation::default(),
+                    outline_keyboard_focus: &mut outline_keyboard_focus,
+                    heading_tops: Some(&mut heading_tops),
+                };
+                state.render_blocks(ui, parsed.blocks(), &parsed, InlineRenderStyle::body());
+            },
+            (),
+        )
+    }
+
+    #[test]
+    fn mermaid_fences_render_in_shared_preview_keep_copy_and_reveal_find_matches() {
+        let source = "flowchart LR\n A[Start] --> B[Finish]\n";
+        let text = format!("```mermaid\n{source}```\n\n```rust\nlet plain = 1;\n```\n");
+        let mut harness = Harness::builder()
+            .with_size(vec2(900.0, 700.0))
+            .build_ui_state(
+                |ui, pane: &mut MarkdownPreviewPane| pane.show(ui),
+                MarkdownPreviewPane::new(
+                    MarkdownSource::from(
+                        LocalMarkdownSource::new(PathBuf::from("controlled-mermaid.md")).unwrap(),
+                    ),
+                    &text,
+                ),
+            );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while harness.query_by_label("Show Mermaid source").is_none() {
+            assert!(Instant::now() < deadline, "Mermaid worker did not finish");
+            thread::sleep(Duration::from_millis(5));
+            harness.run();
+        }
+        assert!(harness.query_by_label("flowchart LR").is_none());
+        assert!(harness.query_by_label("let plain = 1;").is_some());
+        harness
+            .get_all_by_label("Copy the code block")
+            .next()
+            .unwrap()
+            .click();
+        harness.step();
+        assert_eq!(
+            harness.output().platform_output.commands,
+            vec![egui::OutputCommand::CopyText(source.to_owned())]
+        );
+        harness.get_by_label("Show Mermaid source").click();
+        harness.run();
+        harness.get_by_label("flowchart LR");
+        harness.get_by_label("Show Mermaid source").click();
+        harness.run();
+        assert!(harness.query_by_label("flowchart LR").is_none());
+        let pane = harness.state_mut();
+        pane.find
+            .set_query(pane.document.as_ref().unwrap(), "Start".into());
+        harness.run();
+        harness.get_by_label("flowchart LR");
+        assert_eq!(harness.state().rendered_text(), text);
+    }
+
+    /// epaint anchors a text section's background at `baseline -
+    /// font_ascent` and makes it exactly `line_height` tall. A code span that
+    /// inherited the paragraph's prose line height therefore grew its
+    /// highlight downwards only: the top sat exactly on the ascender while the
+    /// bottom fell five points past the descenders.
+    #[test]
+    fn an_inline_code_highlight_is_centred_on_its_own_glyphs() {
+        let mut harness = Harness::builder().build_ui(|ui| {
+            let job = paragraph_job(ui, "Use `gp` here.");
+            let galley = ui.painter().layout_job(job);
+            let row = &galley.rows[0].row;
+
+            // `g` and `p` appear only inside the code span; `e` only outside
+            // it, so neither needs to know how sections are numbered.
+            let code = row
+                .glyphs
+                .iter()
+                .find(|glyph| glyph.chr == 'g')
+                .expect("the code span should have been laid out");
+            let prose = row
+                .glyphs
+                .iter()
+                .find(|glyph| glyph.chr == 'e')
+                .expect("the prose should have been laid out");
+
+            assert_eq!(
+                code.pos.y, prose.pos.y,
+                "the code span sits on a different baseline ({}) from the prose around it ({})",
+                code.pos.y, prose.pos.y
+            );
+
+            let highlight = code.logical_rect();
+            let ink_top = code.pos.y - code.font_face_ascent;
+            let ink_bottom = code.pos.y + (code.font_face_height - code.font_face_ascent);
+            let above = ink_top - highlight.top();
+            let below = highlight.bottom() - ink_bottom;
+            assert!(
+                (above - below).abs() < 0.5,
+                "the highlight clears the ascenders by {above} but the descenders by {below}"
+            );
+        });
+        harness.run();
+    }
+
+    /// The highlight is the code span's own box, which is shorter than the
+    /// prose line height it used to carry. That must not tighten the
+    /// paragraph: rows are sized from the tallest line height on them, so the
+    /// prose on the row has to keep setting the pitch.
+    #[test]
+    fn an_inline_code_span_does_not_tighten_the_row_it_sits_on() {
+        let mut harness = Harness::builder().build_ui(|ui| {
+            let with_code = ui.painter().layout_job(paragraph_job(ui, "Use `gp` here."));
+            let without = ui.painter().layout_job(paragraph_job(ui, "Use gp here."));
+            assert_eq!(
+                with_code.rows[0].row.size.y, without.rows[0].row.size.y,
+                "a code span changed the row pitch from {} to {}",
+                without.rows[0].row.size.y, with_code.rows[0].row.size.y
+            );
+        });
+        harness.run();
+    }
+
+    /// Lays a one-paragraph document out exactly as the body renderer does.
+    fn paragraph_job(ui: &egui::Ui, markdown: &str) -> LayoutJob {
+        let parsed = document(markdown);
+        let Block::Paragraph(paragraph) = &parsed.blocks()[0] else {
+            panic!("the fixture should be a single paragraph");
+        };
+        let mut job = inline_layout_job(
+            paragraph.inlines(),
+            &parsed,
+            &MarkdownFindState::default(),
+            FontId::proportional(BODY_TEXT_SIZE),
+            InlineRenderStyle::body(),
+        );
+        job.wrap.max_width = ui.available_width();
+        job
+    }
+
+    /// `egui::Grid` sized a column from what its cells reported last frame,
+    /// and a wrapping `Label` reports its own wrapped width, so every frame
+    /// the column shrank a little further until the text wrapped one
+    /// character per line. Measuring the cells up front breaks that loop.
+    #[test]
+    fn a_table_column_that_fits_is_not_wrapped_one_character_per_line() {
+        let mut harness = render_markdown(REFERENCE_TABLE);
+        harness.run();
+        harness.run();
+        harness.run();
+
+        let header = harness.get_by_label("Primary reference").rect();
+        assert!(
+            header.height() <= BODY_TEXT_SIZE * 2.0,
+            "the header cell is {} px tall, so it wrapped; a column with room \
+             for its text must render it on one line",
+            header.height()
+        );
+        assert!(
+            header.width() >= 90.0,
+            "the header cell is only {} px wide, so its column collapsed",
+            header.width()
+        );
+    }
+
+    /// A table too wide for the reading column has to be squeezed, but it
+    /// must still be squeezed on word boundaries rather than collapsed: this
+    /// is the path the old renderer degenerated into for *every* table.
+    #[test]
+    fn a_table_too_wide_for_the_reading_column_still_wraps_on_words() {
+        let mut harness = render_markdown(concat!(
+            "| Capability | Evidence |\n",
+            "| --- | --- |\n",
+            "| Session restore across an application restart with every tab ",
+            "reattached | Covered by the workspace persistence suite and the ",
+            "native session daemon smoke test |\n",
+        ));
+        harness.run();
+        harness.run();
+
+        let header = harness.get_by_label("Evidence").rect();
+        assert!(
+            header.width() >= TABLE_MIN_COLUMN_WIDTH - f32::from(TABLE_CELL_PADDING_X) * 2.0,
+            "a squeezed column fell below the floor at {} px",
+            header.width()
+        );
+        let cell = harness
+            .get_by_label(
+                "Covered by the workspace persistence suite and the native \
+                 session daemon smoke test",
+            )
+            .rect();
+        assert!(
+            cell.height() <= BODY_TEXT_SIZE * 8.0,
+            "the squeezed cell is {} px tall, so it is wrapping far too narrow",
+            cell.height()
+        );
+    }
+
+    #[test]
+    fn a_table_that_fits_keeps_its_natural_column_widths() {
+        let widths = table_column_widths(&[120.0, 260.0], 600.0);
+        assert_eq!(widths, vec![120.0, 260.0]);
+    }
+
+    #[test]
+    fn table_cells_reuse_fitting_galleys_without_changing_layout() {
+        let parsed = document(concat!(
+            "| Left | Right | Empty |\n",
+            "| :--- | ---: | :---: |\n",
+            "| short words | **bold** and *italic* with `e\u{301}\u{754c}` | |\n",
+            "| longer words that must wrap in a narrow cell | ",
+            "~~struck~~ [link](#heading) and \u{1f680} | trailing |\n",
+        ));
+        let Block::Table(table) = &parsed.blocks()[0] else {
+            panic!("expected the table fixture");
+        };
+        for scale in [0.75, 1.0, 1.25, 1.5, 2.0, 3.0] {
+            let context = egui::Context::default();
+            context.set_pixels_per_point(scale);
+            let mut output = context.run_ui(Default::default(), |ui| {
+                for query in ["", "e"] {
+                    let mut find = MarkdownFindState::default();
+                    find.set_query(&parsed, query.into());
+                    for style in [InlineRenderStyle::body(), InlineRenderStyle::blockquote()] {
+                        for row in table.rows() {
+                            for cell in row.cells() {
+                                let job = inline_layout_job(
+                                    cell.inlines(),
+                                    &parsed,
+                                    &find,
+                                    FontId::proportional(BODY_TEXT_SIZE - 1.0),
+                                    if row.is_header() {
+                                        style.with_strong()
+                                    } else {
+                                        style
+                                    },
+                                );
+                                let unwrapped = ui.painter().layout_job(job);
+                                for width in [
+                                    1.0,
+                                    40.25,
+                                    40.49,
+                                    40.51,
+                                    (unwrapped.size().x - 0.125).max(1.0),
+                                    unwrapped.size().x.max(1.0),
+                                    unwrapped.size().x + 100.0,
+                                ] {
+                                    let actual =
+                                        table_cell_galley(ui, unwrapped.clone(), width, |_| {});
+                                    let mut reference_job = (*unwrapped.job).clone();
+                                    reference_job.wrap.max_width = width;
+                                    let reference = ui.painter().layout_job(reference_job);
+                                    assert_eq!(
+                                        Arc::ptr_eq(&actual, &unwrapped),
+                                        unwrapped.size().x <= reference.job.wrap.max_width,
+                                        "scale={scale}, width={width}"
+                                    );
+                                    let mut normalized = (*actual).clone();
+                                    let mut normalized_job = (*actual.job).clone();
+                                    normalized_job.wrap.max_width = reference.job.wrap.max_width;
+                                    normalized.job = Arc::new(normalized_job);
+                                    assert_eq!(
+                                        &normalized,
+                                        reference.as_ref(),
+                                        "scale={scale}, width={width}, text={:?}",
+                                        unwrapped.job.text
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn a_table_that_does_not_fit_is_shared_out_across_the_reading_width() {
+        let widths = table_column_widths(&[120.0, 600.0], 400.0);
+        let total: f32 = widths.iter().sum();
+
+        assert!(
+            (total - 400.0).abs() <= 0.5,
+            "a squeezed table should use exactly the width it has, not {total}"
+        );
+        assert!(
+            widths.iter().all(|width| *width >= TABLE_MIN_COLUMN_WIDTH),
+            "no column may be squeezed below the floor: {widths:?}"
+        );
+        assert!(
+            widths[1] > widths[0],
+            "the column that asked for more should still be the wider one: {widths:?}"
+        );
+        // The prose column gives up far more than the label column does.
+        assert!(
+            widths[0] > 90.0,
+            "the short column lost too much of its {widths:?} share"
+        );
+    }
+
+    #[test]
+    fn a_table_narrower_than_its_floor_falls_back_to_the_floor() {
+        let widths = table_column_widths(&[300.0, 300.0, 300.0], 100.0);
+        assert_eq!(widths, vec![TABLE_MIN_COLUMN_WIDTH; 3]);
+    }
+
+    fn document(text: &str) -> MarkdownDocument {
+        MarkdownLoader::default()
+            .load(
+                LocalMarkdownSource::new("/docs/readme.md").unwrap().into(),
+                text.len(),
+                text.as_bytes(),
+                &Default::default(),
+            )
+            .unwrap()
+    }
+
+    fn code_navigation_fixture() -> String {
+        (0..400)
+            .map(|index| format!("## Entry {index}\n\n```text\nnav_target_{index}\n```\n\n"))
+            .collect()
+    }
+
+    fn code_navigation_context() -> egui::Context {
+        let context = egui::Context::default();
+        context.set_theme(egui::ThemePreference::Dark);
+        context.set_visuals(theme::default_visuals());
+        context.global_style_mut(|style| {
+            style.scroll_animation = egui::style::ScrollAnimation::none();
+        });
+        context
+    }
+
+    fn code_navigation_frame(
+        context: &egui::Context,
+        frame: usize,
+        events: Vec<egui::Event>,
+        show: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(1180.0, 760.0),
+                )),
+                time: Some(frame as f64 / 60.0),
+                events,
+                ..Default::default()
+            },
+            show,
+        );
+        // These tests inspect CPU shapes and interactions, not uploaded textures.
+        output.textures_delta.clear();
+        output
+    }
+
+    fn visible_code_geometry(
+        output: &egui::FullOutput,
+        text: &str,
+    ) -> Option<(egui::Rect, egui::Rect)> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(label) if label.galley.job.text == text => {
+                let rect = label.galley.rect.translate(label.pos.to_vec2());
+                shape
+                    .clip_rect
+                    .intersects(rect)
+                    .then_some((rect, shape.clip_rect))
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn code_byte_navigation_reaches_the_offscreen_shared_preview_tail_and_keeps_copy_selection() {
+        let text = code_navigation_fixture();
+        let context = code_navigation_context();
+        let mut pane = MarkdownPreviewPane::new(
+            LocalMarkdownSource::new("/docs/navigation.md")
+                .unwrap()
+                .into(),
+            &text,
+        );
+        let source = pane
+            .document
+            .as_ref()
+            .unwrap()
+            .blocks()
+            .iter()
+            .rev()
+            .find_map(|block| match block {
+                Block::CodeBlock(block) => Some(block.span().start().byte_offset()),
+                _ => None,
+            })
+            .unwrap();
+        let output = code_navigation_frame(&context, 0, Vec::new(), |ui| pane.show(ui));
+        assert!(visible_code_geometry(&output, "nav_target_399").is_none());
+        pane.pending_scroll = Some(PendingScroll::Byte(source));
+        code_navigation_frame(&context, 1, Vec::new(), |ui| pane.show(ui));
+        code_navigation_frame(&context, 2, Vec::new(), |ui| pane.show(ui));
+        let output = code_navigation_frame(&context, 3, Vec::new(), |ui| pane.show(ui));
+        let geometry = visible_code_geometry(&output, "nav_target_399");
+        assert!(
+            geometry.is_some(),
+            "pending={:?}, heading={:?}, last Copy={:?}",
+            pane.pending_scroll,
+            pane.visible_heading,
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(label) if label.galley.job.text == "Copy" => Some(label.pos),
+                    _ => None,
+                })
+                .next_back()
+        );
+        let (rect, clip) = geometry.unwrap();
+        assert!(clip.contains(rect.center()));
+        assert!(pane.pending_scroll.is_none());
+        assert_eq!(output.shapes.iter().filter(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(label) if label.galley.job.text == "Copy")
+        }).count(), 400, "all fence headers still run");
+
+        let label = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.job.text == "nav_target_399" => {
+                    Some(label)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let start = label.pos
+            + label
+                .galley
+                .pos_from_cursor(label.galley.begin())
+                .center()
+                .to_vec2();
+        let end = label.pos
+            + label
+                .galley
+                .pos_from_cursor(label.galley.end())
+                .center()
+                .to_vec2();
+        let pointer = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        code_navigation_frame(
+            &context,
+            4,
+            vec![egui::Event::PointerMoved(start), pointer(start, true)],
+            |ui| pane.show(ui),
+        );
+        code_navigation_frame(&context, 5, vec![egui::Event::PointerMoved(end)], |ui| {
+            pane.show(ui)
+        });
+        code_navigation_frame(&context, 6, vec![pointer(end, false)], |ui| pane.show(ui));
+        let output =
+            code_navigation_frame(&context, 7, vec![egui::Event::Copy], |ui| pane.show(ui));
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "nav_target_399")
+        }));
+        let position = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.job.text == "Copy" => {
+                    let rect = label.galley.rect.translate(label.pos.to_vec2());
+                    (shape.clip_rect.contains(rect.center()) && rect.bottom() < start.y)
+                        .then_some(rect)
+                }
+                _ => None,
+            })
+            .max_by(|left, right| left.center().y.total_cmp(&right.center().y))
+            .unwrap()
+            .center();
+        code_navigation_frame(
+            &context,
+            8,
+            vec![egui::Event::PointerMoved(position), pointer(position, true)],
+            |ui| pane.show(ui),
+        );
+        let output = code_navigation_frame(&context, 9, vec![pointer(position, false)], |ui| {
+            pane.show(ui)
+        });
+        assert!(
+            output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == "nav_target_399\n")
+            }),
+            "the tail header copies its exact raw fence, not selected display text"
+        );
+        code_navigation_frame(
+            &context,
+            10,
+            vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            }],
+            |ui| pane.show(ui),
+        );
+        assert!(context.memory(|memory| memory.focused()).is_some());
+        let output = code_navigation_frame(
+            &context,
+            11,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            |ui| pane.show(ui),
+        );
+        assert!(
+            output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == "nav_target_399\n")
+            }),
+            "the existing focused Copy action remains live"
+        );
+    }
+
+    #[test]
+    fn code_byte_navigation_preserves_horizontal_wrap_geometry_and_offset() {
+        let line = format!("{} tail_token", "wide_".repeat(100));
+        let text = format!("```text\n{line}\n```\n");
+        let context = code_navigation_context();
+        let mut pane = MarkdownPreviewPane::new(
+            LocalMarkdownSource::new("/docs/wide.md").unwrap().into(),
+            &text,
+        );
+        let source = pane.document.as_ref().unwrap().blocks()[0]
+            .span()
+            .start()
+            .byte_offset();
+        let output = code_navigation_frame(&context, 0, Vec::new(), |ui| pane.show(ui));
+        let (original_rect, original_clip) = visible_code_geometry(&output, &line).unwrap();
+        let original_galley = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.job.text == line => {
+                    Some(label.galley.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            original_galley.rows.len() > 1,
+            "the actual code path wraps long rows within its horizontal child"
+        );
+        assert!(original_rect.width() <= original_clip.width());
+        pane.pending_scroll = Some(PendingScroll::Byte(source));
+        code_navigation_frame(&context, 1, Vec::new(), |ui| pane.show(ui));
+        let output = code_navigation_frame(&context, 2, Vec::new(), |ui| pane.show(ui));
+        let (rect, clip) = visible_code_geometry(&output, &line).unwrap();
+        assert_eq!(rect, original_rect);
+        assert_eq!(clip, original_clip);
+        let galley = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.job.text == line => Some(&label.galley),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(galley.as_ref(), original_galley.as_ref());
+        let output = code_navigation_frame(&context, 3, Vec::new(), |ui| pane.show(ui));
+        let (retained, _) = visible_code_geometry(&output, &line).unwrap();
+        assert_eq!(
+            retained.min.x, rect.min.x,
+            "vertical forwarding must not reset the horizontal offset"
+        );
+    }
+
+    #[test]
+    fn code_byte_navigation_find_reaches_the_viewer_preview_tail() {
+        let text = code_navigation_fixture();
+        let context = code_navigation_context();
+        let mut tab = MarkdownViewerTab::open_remote(
+            test_remote_source("/docs/navigation.md"),
+            "/docs/navigation.md".into(),
+            text.into_bytes(),
+        );
+        tab.outline_open = false;
+        let tab_id = crate::tabs::AppState::for_test().active();
+        let output = code_navigation_frame(&context, 0, Vec::new(), |ui| {
+            assert!(tab.show(ui, tab_id).is_none());
+        });
+        assert!(visible_code_geometry(&output, "nav_target_399").is_none());
+        assert_eq!(tab.set_find_query_for_test("nav_target_399"), 1);
+        tab.advance_find(false);
+        let span = tab.find.current_match().unwrap().span();
+        code_navigation_frame(&context, 1, Vec::new(), |ui| {
+            assert!(tab.show(ui, tab_id).is_none());
+        });
+        let output = code_navigation_frame(&context, 2, Vec::new(), |ui| {
+            assert!(tab.show(ui, tab_id).is_none());
+        });
+        let (rect, clip) = visible_code_geometry(&output, "nav_target_399").unwrap();
+        assert!(clip.contains(rect.center()));
+        assert!(tab.pending_scroll.is_none());
+        assert_eq!(tab.find.current_match().unwrap().span(), span);
+        assert_eq!(tab.outline_selected, Some(399));
+    }
+
+    fn mixed_caption_fixture() -> String {
+        // Keep the actual outline-disabled profile's 400 mixed sections, not
+        // a caption-only surrogate. The profiling module has a separate owner.
+        mixed_fixture_sections(400)
+    }
+
+    fn mixed_fixture_sections(sections: usize) -> String {
+        (0..sections)
+            .map(|index| {
+                format!(
+                    "## Section {index}\n\nA **synthetic** paragraph with `inline code` and ordinary text.\n\n\
+                     ```rust\nfn example() {{ let value = {index}; }}\n```\n\n\
+                     | Name | Value |\n| --- | --- |\n| Item | {index} |\n\n"
+                )
+            })
+            .collect()
+    }
+
+    fn source_preparation_pair(text: &str) -> [(egui::Context, MarkdownViewerTab); 2] {
+        let source = test_remote_source("/owned/source.md");
+        let (_, document) = load_remote_document(
+            source.clone(),
+            "/owned/source.md".into(),
+            text.as_bytes().to_vec(),
+        )
+        .unwrap();
+        let syntax = source_syntax_spans(&mut None, text).to_vec();
+        std::array::from_fn(|index| {
+            let context = code_navigation_context();
+            context.enable_accesskit();
+            let mut viewer = MarkdownViewerTab::open_remote(
+                source.clone(),
+                "/owned/source.md".into(),
+                text.as_bytes().to_vec(),
+            );
+            // Both oracles use the same syntax-budget outcome, not two timed parses.
+            viewer.document = Some(document.clone());
+            viewer.source_syntax = Some(syntax.clone());
+            viewer.mode = MarkdownViewerMode::Source;
+            viewer.outline_open = false;
+            viewer.pending_scroll = None;
+            viewer.source_preparation.probe = Some(SourcePreparationProbe {
+                ordinary: index == 0,
+                ..Default::default()
+            });
+            (context, viewer)
+        })
+    }
+
+    fn source_preparation_frame(
+        pair: &mut [(egui::Context, MarkdownViewerTab); 2],
+        frame: usize,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> [egui::FullOutput; 2] {
+        source_preparation_frame_with_opacity(pair, frame, size, events, 1.0)
+    }
+
+    fn source_preparation_frame_with_opacity(
+        pair: &mut [(egui::Context, MarkdownViewerTab); 2],
+        frame: usize,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+        opacity: f32,
+    ) -> [egui::FullOutput; 2] {
+        let tab_id = pair[0].0.data_mut(|data| {
+            *data.get_temp_mut_or_insert_with(egui::Id::new("source-oracle-tab"), || {
+                crate::tabs::AppState::for_test().active()
+            })
+        });
+        let output = std::array::from_fn(|index| {
+            let (context, viewer) = &mut pair[index];
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(frame as f64 / 60.0),
+                    events: events.clone(),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.set_opacity(opacity);
+                    assert!(viewer.show(ui, tab_id).is_none());
+                },
+            );
+            output.textures_delta.clear();
+            output
+        });
+        assert_eq!(
+            output[0].shapes, output[1].shapes,
+            "all Source clipped shapes, frame {frame}"
+        );
+        assert_eq!(
+            format!("{:?}", output[0].platform_output.accesskit_update),
+            format!("{:?}", output[1].platform_output.accesskit_update),
+            "all Source accessibility nodes, bounds and order, frame {frame}"
+        );
+        assert_eq!(
+            format!("{:?}", output[0].platform_output.commands),
+            format!("{:?}", output[1].platform_output.commands),
+            "selection and Copy commands, frame {frame}"
+        );
+        let ordinary = pair[0].1.source_preparation.probe.as_ref().unwrap();
+        let candidate = pair[1].1.source_preparation.probe.as_ref().unwrap();
+        assert_eq!(ordinary.observations, candidate.observations);
+        assert_eq!(ordinary.visited_lines, candidate.visited_lines);
+        if ordinary.ordinary {
+            assert_eq!(ordinary.preparations, ordinary.visited_lines);
+        }
+        if ordinary.geometry_ordinary {
+            assert_eq!(ordinary.layouts, ordinary.visited_lines);
+        }
+        for prepared in pair[1].1.source_preparation.jobs.values() {
+            if let Some(geometry) = prepared.geometry {
+                assert!(geometry.size.is_finite());
+                assert!(geometry.intrinsic_size.is_finite());
+                assert!(geometry.wrap_width.is_finite());
+            }
+        }
+        assert_eq!(pair[0].1.pending_scroll, pair[1].1.pending_scroll);
+        assert_eq!(pair[0].1.find, pair[1].1.find);
+        assert!(pair[1].1.source_preparation.jobs.len() <= MAX_PREPARED_SOURCE_JOBS);
+        assert!(
+            pair[1].1.source_preparation.payload_bytes <= MAX_PREPARED_SOURCE_JOB_PAYLOAD_BYTES
+        );
+        output
+    }
+
+    fn source_geometry_pair(text: &str) -> [(egui::Context, MarkdownViewerTab); 2] {
+        let mut pair = source_preparation_pair(text);
+        for (index, (_, viewer)) in pair.iter_mut().enumerate() {
+            let probe = viewer.source_preparation.probe.as_mut().unwrap();
+            probe.ordinary = false;
+            probe.geometry_ordinary = index == 0;
+        }
+        pair
+    }
+
+    #[test]
+    fn source_drag_autoscroll_keeps_offscreen_selection_copyable() {
+        let text = (0..140)
+            .map(|index| format!("line {index:03}\n"))
+            .collect::<String>();
+        let mut pair = source_geometry_pair(&text);
+        let size = vec2(900.0, 600.0);
+        source_preparation_frame(&mut pair, 0, size, Vec::new());
+        let output = source_preparation_frame(&mut pair, 1, size, Vec::new());
+        let (start, bottom) = output[1]
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.job.text == "line 000" => Some((
+                    label.pos
+                        + label
+                            .galley
+                            .pos_from_cursor(label.galley.begin())
+                            .center()
+                            .to_vec2(),
+                    shape.clip_rect.bottom(),
+                )),
+                _ => None,
+            })
+            .expect("first source line is visible");
+        source_preparation_frame(
+            &mut pair,
+            2,
+            size,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let outside = egui::pos2(start.x + 20.0, bottom + 40.0);
+        source_preparation_frame(&mut pair, 3, size, vec![egui::Event::PointerMoved(outside)]);
+        for frame in 4..84 {
+            source_preparation_frame(&mut pair, frame, size, Vec::new());
+        }
+        source_preparation_frame(
+            &mut pair,
+            84,
+            size,
+            vec![egui::Event::PointerButton {
+                pos: outside,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let output = source_preparation_frame(&mut pair, 85, size, vec![egui::Event::Copy]);
+        for frame in output {
+            let [egui::OutputCommand::CopyText(copied)] = frame.platform_output.commands.as_slice()
+            else {
+                panic!("source selection must emit exactly one plain Copy");
+            };
+            assert!(copied.contains("line 000"), "{copied}");
+            assert!(copied.contains("line 025"), "{copied}");
+        }
+    }
+
+    fn assert_source_geometry_warm(pair: &[(egui::Context, MarkdownViewerTab); 2], control: &str) {
+        let ordinary = pair[0].1.source_preparation.probe.as_ref().unwrap();
+        let candidate = pair[1].1.source_preparation.probe.as_ref().unwrap();
+        assert_eq!(ordinary.preparations, 0, "{control}");
+        assert_eq!(candidate.preparations, 0, "{control}");
+        assert_eq!(ordinary.layouts, ordinary.visited_lines, "{control}");
+        assert_eq!(ordinary.shared_label_inputs, ordinary.layouts, "{control}");
+        assert_eq!(
+            candidate.explicit_job_clones, candidate.layouts,
+            "{control}"
+        );
+        assert_eq!(candidate.geometry_key_clones, 0, "{control}");
+        assert_eq!(candidate.geometry_metadata_rejections, 0, "{control}");
+        assert!(
+            (1..=96).contains(&candidate.layouts),
+            "{control}: {}",
+            candidate.layouts
+        );
+        assert!(candidate.layouts * 4 < ordinary.layouts, "{control}");
+        assert!(
+            candidate.explicit_clone_capacity_bytes * 4 < ordinary.label_clone_payload_bytes,
+            "{control}"
+        );
+        println!(
+            "source geometry {control}: rows old={} candidate={}, actual layouts old={} candidate={}, layout UTF-8 bytes old={} candidate={}, retained jobs={} payload bytes={}",
+            ordinary.visited_lines, candidate.visited_lines,
+            ordinary.layouts, candidate.layouts,
+            ordinary.layout_text_bytes, candidate.layout_text_bytes,
+            pair[1].1.source_preparation.jobs.len(), pair[1].1.source_preparation.payload_bytes,
+        );
+        println!(
+            "source geometry cloning {control}: ordinary shared Label inputs={} clone payload bytes={}, candidate explicit clones={} cloned String/Vec capacity bytes={}; payload capacities are not allocator usable-size, total allocations or retained font-atlas memory",
+            ordinary.shared_label_inputs, ordinary.label_clone_payload_bytes,
+            candidate.explicit_job_clones, candidate.explicit_clone_capacity_bytes,
+        );
+        let preparation = &pair[1].1.source_preparation;
+        let definitions = &preparation.geometry_key.as_ref().unwrap().definitions;
+        let definition_strings: usize = definitions.font_data.keys().map(String::capacity).sum();
+        let family_strings: usize = definitions
+            .families
+            .values()
+            .flatten()
+            .map(String::capacity)
+            .sum();
+        let family_vectors: usize = definitions
+            .families
+            .values()
+            .map(|names| names.capacity() * std::mem::size_of::<String>())
+            .sum();
+        println!(
+            "source geometry metadata {control}: slots={} slot bytes={} inline key bytes={} font map entries={} family map entries={} owned key/name string capacities={} owned family vector capacities={}; map-node allocator overhead and shared font bytes are not counted as instruction payload",
+            preparation.jobs.len(),
+            preparation.jobs.len() * std::mem::size_of::<Option<SourceRowGeometry>>(),
+            std::mem::size_of::<Option<OutlineGeometryKey>>(),
+            definitions.font_data.len(),
+            definitions.families.len(),
+            definition_strings + family_strings,
+            family_vectors,
+        );
+        println!(
+            "source dependency metadata {control}: key resets={} clones={} rejected={} cloned String capacities={} family Vec capacities={} shared custom-family name bytes={}; separate from layout work, not allocator/RSS totals",
+            candidate.geometry_key_resets,
+            candidate.geometry_key_clones,
+            candidate.geometry_metadata_rejections,
+            candidate.geometry_clone_string_capacity_bytes,
+            candidate.geometry_clone_family_vector_capacity_bytes,
+            candidate.geometry_clone_custom_family_name_bytes,
+        );
+    }
+
+    fn assert_source_font_metadata_rejected(
+        pair: &[(egui::Context, MarkdownViewerTab); 2],
+        rows: usize,
+        control: usize,
+    ) {
+        let preparation = &pair[1].1.source_preparation;
+        let probe = preparation.probe.as_ref().unwrap();
+        assert!(preparation.geometry_key.is_none(), "control {control}");
+        assert!(preparation.jobs.values().all(|job| job.geometry.is_none()));
+        assert_eq!(probe.layouts, rows, "control {control}");
+        assert_eq!(probe.shared_label_inputs, rows, "control {control}");
+        assert_eq!(probe.explicit_job_clones, 0, "ordinary Label fallback");
+        assert_eq!(probe.geometry_key_clones, 0, "reject before cloning");
+        assert_eq!(probe.geometry_metadata_rejections, 1);
+        assert_eq!(probe.geometry_clone_string_capacity_bytes, 0);
+        assert_eq!(probe.geometry_clone_family_vector_capacity_bytes, 0);
+        assert_eq!(probe.geometry_clone_custom_family_name_bytes, 0);
+        println!(
+            "source dependency rejection control={control}: rows={} layouts={} definition clones={} metadata payload=0",
+            probe.visited_lines, probe.layouts, probe.geometry_key_clones,
+        );
+    }
+
+    #[test]
+    fn source_geometry_font_metadata_overflow_uses_live_labels_and_recovers() {
+        let line = "metadata café 漢字   ";
+        let text = format!("{line}\n{}", mixed_caption_fixture());
+        let rows = text.split_inclusive('\n').count();
+        let size = vec2(1180.0, 760.0);
+        for control in 0..5 {
+            let mut pair = source_geometry_pair(&text);
+            source_preparation_frame(&mut pair, 0, size, Vec::new());
+            source_preparation_frame(&mut pair, 1, size, Vec::new());
+            assert_source_geometry_warm(&pair, &format!("metadata control={control} valid"));
+            let mut definitions = egui::FontDefinitions::default();
+            match control {
+                0 => {
+                    let data = definitions.font_data.values().next().unwrap().clone();
+                    while definitions.font_data.len() <= MAX_GEOMETRY_FONT_MAP_ENTRIES {
+                        definitions.font_data.insert(
+                            format!("alias-{}", definitions.font_data.len()),
+                            data.clone(),
+                        );
+                    }
+                }
+                1 => {
+                    while definitions.families.len() <= MAX_GEOMETRY_FONT_MAP_ENTRIES {
+                        definitions.families.insert(
+                            egui::FontFamily::Name(
+                                format!("family-{}", definitions.families.len()).into(),
+                            ),
+                            Vec::new(),
+                        );
+                    }
+                }
+                2 => {
+                    let data = definitions.font_data.values().next().unwrap().clone();
+                    definitions
+                        .font_data
+                        .insert("x".repeat(MAX_GEOMETRY_FONT_NAME_BYTES + 1), data);
+                }
+                3 => {
+                    definitions.families.insert(
+                        egui::FontFamily::Name("x".repeat(MAX_GEOMETRY_FONT_NAME_BYTES + 1).into()),
+                        Vec::new(),
+                    );
+                }
+                _ => {
+                    let names = definitions
+                        .families
+                        .get_mut(&egui::FontFamily::Monospace)
+                        .unwrap();
+                    let name = names[0].clone();
+                    names.resize(MAX_GEOMETRY_FONT_FAMILY_REFERENCES + 1, name);
+                }
+            }
+            assert!(geometry_font_metadata(&definitions).is_none());
+            for (context, _) in &pair {
+                context.set_fonts(definitions.clone());
+            }
+            source_preparation_frame(&mut pair, 2, size, Vec::new());
+            assert_source_font_metadata_rejected(&pair, rows, control);
+            let output = source_preparation_frame(&mut pair, 3, size, Vec::new());
+            assert_source_font_metadata_rejected(&pair, rows, control);
+            let (rect, clip) = visible_code_geometry(&output[0], line).unwrap();
+            let start = rect.min + vec2(1.0, CODE_LINE_HEIGHT / 2.0);
+            let end = egui::pos2(rect.right() + 8.0, rect.center().y);
+            assert!(clip.contains(start) && clip.contains(end));
+            source_preparation_frame(
+                &mut pair,
+                4,
+                size,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            source_preparation_frame(&mut pair, 5, size, vec![egui::Event::PointerMoved(end)]);
+            source_preparation_frame(
+                &mut pair,
+                6,
+                size,
+                vec![egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            let output = source_preparation_frame(&mut pair, 7, size, vec![egui::Event::Copy]);
+            assert!(output[1].platform_output.commands.iter().any(
+                |command| matches!(command, egui::OutputCommand::CopyText(text) if text == line)
+            ));
+            assert_source_font_metadata_rejected(&pair, rows, control);
+            for (context, _) in &pair {
+                context.set_fonts(egui::FontDefinitions::default());
+            }
+            source_preparation_frame(&mut pair, 8, size, Vec::new());
+            let probe = pair[1].1.source_preparation.probe.as_ref().unwrap();
+            assert_eq!(probe.layouts, rows, "admitted recovery is cold");
+            assert_eq!(probe.geometry_key_clones, 1);
+            assert_eq!(probe.geometry_metadata_rejections, 0);
+            assert!(
+                probe.geometry_clone_string_capacity_bytes
+                    + probe.geometry_clone_custom_family_name_bytes
+                    <= MAX_GEOMETRY_FONT_NAME_BYTES
+            );
+            assert!(
+                probe.geometry_clone_family_vector_capacity_bytes
+                    <= MAX_GEOMETRY_FONT_FAMILY_REFERENCES * std::mem::size_of::<String>()
+            );
+            println!(
+                "source dependency recovery control={control}: layouts={} clones={} String capacities={} family Vec capacities={} custom-family name bytes={}",
+                probe.layouts,
+                probe.geometry_key_clones,
+                probe.geometry_clone_string_capacity_bytes,
+                probe.geometry_clone_family_vector_capacity_bytes,
+                probe.geometry_clone_custom_family_name_bytes,
+            );
+            source_preparation_frame(&mut pair, 9, size, Vec::new());
+            assert_source_geometry_warm(&pair, &format!("metadata control={control} recovered"));
+        }
+    }
+
+    #[test]
+    fn source_geometry_font_metadata_admits_exact_caps_without_warm_key_clones() {
+        let mut definitions = egui::FontDefinitions::default();
+        let data = definitions.font_data.values().next().unwrap().clone();
+        while definitions.font_data.len() < MAX_GEOMETRY_FONT_MAP_ENTRIES {
+            definitions
+                .font_data
+                .insert(format!("a{}", definitions.font_data.len()), data.clone());
+        }
+        while definitions.families.len() < MAX_GEOMETRY_FONT_MAP_ENTRIES - 1 {
+            definitions.families.insert(
+                egui::FontFamily::Name(format!("f{}", definitions.families.len()).into()),
+                Vec::new(),
+            );
+        }
+        let other_capacity: usize = definitions
+            .families
+            .iter()
+            .filter(|(family, _)| **family != egui::FontFamily::Monospace)
+            .map(|(_, names)| names.capacity())
+            .sum();
+        let names = definitions
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .unwrap();
+        let capacity = MAX_GEOMETRY_FONT_FAMILY_REFERENCES - other_capacity;
+        names.reserve_exact(capacity - names.len());
+        names.resize(capacity, names[0].clone());
+        // Match egui's cloned input, not spare capacity in the fixture builder.
+        definitions = definitions.clone();
+        let metadata = geometry_font_metadata(&definitions).unwrap();
+        definitions.families.insert(
+            egui::FontFamily::Name(
+                "x".repeat(
+                    MAX_GEOMETRY_FONT_NAME_BYTES
+                        - metadata.string_capacity_bytes
+                        - metadata.custom_family_name_bytes,
+                )
+                .into(),
+            ),
+            Vec::new(),
+        );
+        let mut pair = source_geometry_pair(&mixed_caption_fixture());
+        for (context, _) in &pair {
+            context.set_fonts(definitions.clone());
+        }
+        let size = vec2(1180.0, 760.0);
+        source_preparation_frame(&mut pair, 0, size, Vec::new());
+        let preparation = &pair[1].1.source_preparation;
+        let key = preparation.geometry_key.as_ref().unwrap();
+        let metadata = geometry_font_metadata(&key.definitions).unwrap();
+        assert_eq!(
+            key.definitions.font_data.len(),
+            MAX_GEOMETRY_FONT_MAP_ENTRIES
+        );
+        assert_eq!(
+            key.definitions.families.len(),
+            MAX_GEOMETRY_FONT_MAP_ENTRIES
+        );
+        assert_eq!(
+            metadata.string_capacity_bytes + metadata.custom_family_name_bytes,
+            MAX_GEOMETRY_FONT_NAME_BYTES
+        );
+        assert_eq!(
+            metadata.family_reference_capacity,
+            MAX_GEOMETRY_FONT_FAMILY_REFERENCES
+        );
+        let probe = preparation.probe.as_ref().unwrap();
+        assert_eq!(probe.geometry_key_clones, 1);
+        assert_eq!(
+            probe.geometry_clone_string_capacity_bytes
+                + probe.geometry_clone_custom_family_name_bytes,
+            MAX_GEOMETRY_FONT_NAME_BYTES
+        );
+        assert_eq!(
+            probe.geometry_clone_family_vector_capacity_bytes,
+            MAX_GEOMETRY_FONT_FAMILY_REFERENCES * std::mem::size_of::<String>()
+        );
+        println!(
+            "source dependency exact caps: maps={}/{} cloned String capacities={} shared custom-family name bytes={} family Vec capacities={} clones={}",
+            key.definitions.font_data.len(),
+            key.definitions.families.len(),
+            probe.geometry_clone_string_capacity_bytes,
+            probe.geometry_clone_custom_family_name_bytes,
+            probe.geometry_clone_family_vector_capacity_bytes,
+            probe.geometry_key_clones,
+        );
+        source_preparation_frame(&mut pair, 1, size, Vec::new());
+        assert_source_geometry_warm(&pair, "exact metadata ceilings");
+        source_preparation_frame(&mut pair, 2, size, Vec::new());
+        assert_source_geometry_warm(&pair, "exact metadata ceilings unchanged again");
+    }
+
+    #[test]
+    fn source_geometry_bounds_actual_warm_layouts_without_removing_live_rows() {
+        for sections in [64, 400] {
+            let text = mixed_fixture_sections(sections);
+            let rows = text.split_inclusive('\n').count();
+            for width in [430.0, 1180.0] {
+                let mut pair = source_geometry_pair(&text);
+                let size = vec2(width, 760.0);
+                source_preparation_frame(&mut pair, 0, size, Vec::new());
+                assert_eq!(
+                    pair[1].1.source_preparation.probe.as_ref().unwrap().layouts,
+                    rows,
+                    "cold Source performs ordinary layout for every row"
+                );
+                for frame in 1..=12 {
+                    source_preparation_frame(&mut pair, frame, size, Vec::new());
+                    assert_source_geometry_warm(
+                        &pair,
+                        &format!("sections={sections}, width={width}, unchanged={frame}"),
+                    );
+                    let old = pair[0].1.source_preparation.probe.as_ref().unwrap();
+                    let candidate = pair[1].1.source_preparation.probe.as_ref().unwrap();
+                    assert!(candidate.layout_text_bytes * 4 < old.layout_text_bytes);
+                }
+                source_preparation_frame(
+                    &mut pair,
+                    13,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(egui::pos2(width / 2.0, 400.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: vec2(0.0, -1100.0),
+                            phase: egui::TouchPhase::Move,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                for frame in 14..=16 {
+                    source_preparation_frame(&mut pair, frame, size, Vec::new());
+                    assert_source_geometry_warm(
+                        &pair,
+                        &format!("sections={sections}, width={width}, scroll={frame}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_geometry_invalidates_real_width_fonts_scale_options_and_revision() {
+        let text = mixed_caption_fixture();
+        let rows = text.split_inclusive('\n').count();
+        let mut pair = source_geometry_pair(&text);
+        let mut size = vec2(1180.0, 760.0);
+        source_preparation_frame(&mut pair, 0, size, Vec::new());
+        source_preparation_frame(&mut pair, 1, size, Vec::new());
+        assert_source_geometry_warm(&pair, "initial warm");
+        for dependency in 0..4 {
+            for (context, _) in &pair {
+                match dependency {
+                    0 => {}
+                    1 => context.set_pixels_per_point(1.25),
+                    2 => {
+                        let mut fonts = egui::FontDefinitions::default();
+                        fonts
+                            .families
+                            .get_mut(&egui::FontFamily::Monospace)
+                            .unwrap()
+                            .reverse();
+                        context.set_fonts(fonts);
+                    }
+                    _ => context.global_style_mut(|style| {
+                        style.visuals.text_options.font_hinting =
+                            !style.visuals.text_options.font_hinting;
+                    }),
+                }
+            }
+            if dependency == 0 {
+                size.x = 430.0;
+            }
+            let frame = 2 + dependency * 3;
+            source_preparation_frame(&mut pair, frame, size, Vec::new());
+            assert_eq!(
+                pair[1].1.source_preparation.probe.as_ref().unwrap().layouts,
+                rows,
+                "dependency {dependency} invalidates every row before replay"
+            );
+            for warm in frame + 1..=frame + 2 {
+                let previous = pair[1].1.source_preparation.geometry_key.clone().unwrap();
+                source_preparation_frame(&mut pair, warm, size, Vec::new());
+                let current = pair[1].1.source_preparation.geometry_key.as_ref().unwrap();
+                if *current != previous {
+                    assert_eq!(
+                        pair[1].1.source_preparation.probe.as_ref().unwrap().layouts,
+                        rows,
+                        "actual geometry dependency changed again before frame {warm}"
+                    );
+                    println!(
+                        "source geometry dependency={dependency}, frame={warm}: actual width {} -> {}, scale {} -> {}; all {rows} rows relaid out",
+                        previous.width, current.width, previous.pixels_per_point, current.pixels_per_point
+                    );
+                } else {
+                    assert_source_geometry_warm(
+                        &pair,
+                        &format!("dependency={dependency}, frame={warm}"),
+                    );
+                }
+            }
+            assert_source_geometry_warm(&pair, &format!("dependency={dependency} stabilized"));
+        }
+        for (context, _) in &pair {
+            context.set_theme(egui::ThemePreference::Light);
+            context.memory_mut(|memory| memory.options.screen_reader = true);
+        }
+        for frame in 14..17 {
+            source_preparation_frame_with_opacity(&mut pair, frame, size, Vec::new(), 0.5);
+        }
+        assert_source_geometry_warm(&pair, "live theme, opacity and screen-reader sense");
+        let replacement = text.replace(
+            "ordinary text.",
+            &"Unicode café 漢字 🦀 e\u{301} ".repeat(40),
+        );
+        let (_, document) = load_remote_document(
+            test_remote_source("/owned/source.md"),
+            "/owned/source.md".into(),
+            replacement.as_bytes().to_vec(),
+        )
+        .unwrap();
+        let syntax = source_syntax_spans(&mut None, &replacement).to_vec();
+        for (_, viewer) in &mut pair {
+            viewer.apply_load_result(Ok(("/owned/source.md".into(), document.clone())));
+            assert!(viewer.source_preparation.jobs.is_empty());
+            assert!(viewer.source_preparation.geometry_key.is_none());
+            viewer.source_syntax = Some(syntax.clone());
+        }
+        source_preparation_frame(&mut pair, 17, size, Vec::new());
+        assert_eq!(
+            pair[1].1.source_preparation.probe.as_ref().unwrap().layouts,
+            rows
+        );
+        source_preparation_frame(&mut pair, 18, size, Vec::new());
+        assert_source_geometry_warm(&pair, "replaced long wrapped Unicode snapshot");
+    }
+
+    #[test]
+    fn source_geometry_keeps_ordinary_uncached_overflow_and_unsupported_layouts() {
+        let text = "bounded\n".repeat(MAX_PREPARED_SOURCE_JOBS + 1);
+        let mut pair = source_geometry_pair(&text);
+        for (_, viewer) in &mut pair {
+            // One role keeps each formatting job small enough to reach the
+            // entry cap independently of the separate payload cap.
+            viewer.source_syntax = Some(vec![festerm_syntax::Span {
+                start: 0,
+                end: text.len(),
+                role: festerm_syntax::Role::StringLiteral,
+            }]);
+        }
+        let size = vec2(1180.0, 760.0);
+        source_preparation_frame(&mut pair, 0, size, Vec::new());
+        source_preparation_frame(&mut pair, 1, size, Vec::new());
+        let candidate = pair[1].1.source_preparation.probe.as_ref().unwrap();
+        assert_eq!(candidate.visited_lines, MAX_PREPARED_SOURCE_JOBS + 1);
+        assert_eq!(
+            pair[1].1.source_preparation.jobs.len(),
+            MAX_PREPARED_SOURCE_JOBS
+        );
+        assert_eq!(
+            candidate.preparations, 1,
+            "only the overflow row is rebuilt"
+        );
+        assert!((2..=97).contains(&candidate.layouts));
+        assert!(!pair[1]
+            .1
+            .source_preparation
+            .jobs
+            .contains_key(&(text.len() - "bounded\n".len())));
+        let raw = "# heading\nline café 漢字\n";
+        for layout in [
+            egui::Layout::top_down(Align::Center),
+            egui::Layout::top_down(Align::Min).with_cross_justify(true),
+            egui::Layout::left_to_right(Align::Center).with_main_wrap(true),
+        ] {
+            let document = document(raw);
+            let pair = source_geometry_pair(raw);
+            let mut preparations: [SourcePreparation; 2] =
+                std::array::from_fn(|index| SourcePreparation {
+                    probe: Some(SourcePreparationProbe {
+                        geometry_ordinary: index == 0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            for frame in 0..2 {
+                let output: [egui::FullOutput; 2] = std::array::from_fn(|index| {
+                    let find = &pair[index].1.find;
+                    let preparation = &mut preparations[index];
+                    let mut output = pair[index].0.run_ui(egui::RawInput::default(), |ui| {
+                        ui.with_layout(layout, |ui| {
+                            preparation.begin(find);
+                            preparation.begin_geometry(ui);
+                            let mut start = 0;
+                            for line in raw.split_inclusive('\n') {
+                                let (span, job) =
+                                    preparation.line(start, line, &document, find, &[]);
+                                let response = preparation.label(ui, start, job, false);
+                                preparation.record(span, &response);
+                                start += line.len();
+                            }
+                        });
+                    });
+                    output.textures_delta.clear();
+                    output
+                });
+                assert_eq!(
+                    output[0].shapes, output[1].shapes,
+                    "unsupported layout, frame {frame}"
+                );
+                assert_eq!(
+                    format!("{:?}", output[0].platform_output.accesskit_update),
+                    format!("{:?}", output[1].platform_output.accesskit_update),
+                );
+                assert_eq!(
+                    preparations[0].probe.as_ref().unwrap().observations,
+                    preparations[1].probe.as_ref().unwrap().observations,
+                );
+                assert_eq!(preparations[1].probe.as_ref().unwrap().layouts, 2);
+                assert!(preparations[1]
+                    .jobs
+                    .values()
+                    .all(|prepared| prepared.geometry.is_none()));
+            }
+        }
+    }
+
+    #[test]
+    fn source_geometry_preserves_long_wrapped_crlf_find_and_offscreen_navigation() {
+        let line = format!(
+            "needle {} trailing   ",
+            "café 漢字 🦀 e\u{301}\t".repeat(40)
+        );
+        let raw = format!(
+            "# Unicode\r\n\r\n{line}\r\n{}\r\n## Tail\r\nlast needle café without newline",
+            "\r\n".repeat(400)
+        );
+        let mut pair = source_geometry_pair(&raw);
+        let size = vec2(430.0, 760.0);
+        let output = source_preparation_frame(&mut pair, 0, size, Vec::new());
+        let wrapped_rows = output[1]
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == line => {
+                    Some(text.galley.rows.len())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            wrapped_rows > 8,
+            "the actual selectable label wraps the Unicode row"
+        );
+        let output = source_preparation_frame(&mut pair, 1, size, Vec::new());
+        assert_source_geometry_warm(&pair, "long Unicode CRLF and empty rows");
+        let (rect, clip) = visible_code_geometry(&output[0], &line).unwrap();
+        let start = rect.min + vec2(1.0, CODE_LINE_HEIGHT / 2.0);
+        let end = egui::pos2(rect.right() + 8.0, rect.bottom() - CODE_LINE_HEIGHT / 2.0);
+        assert!(
+            clip.contains(start) && clip.contains(end),
+            "owned wrapped selection fits the viewport"
+        );
+        source_preparation_frame(
+            &mut pair,
+            2,
+            size,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        source_preparation_frame(&mut pair, 3, size, vec![egui::Event::PointerMoved(end)]);
+        source_preparation_frame(
+            &mut pair,
+            4,
+            size,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let output = source_preparation_frame(&mut pair, 5, size, vec![egui::Event::Copy]);
+        assert!(
+            output[1].platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == &line)
+            }),
+            "wrapped Unicode Copy preserves raw tab/combining/trailing text"
+        );
+        for (_, viewer) in &mut pair {
+            viewer
+                .find
+                .set_query(viewer.document.as_ref().unwrap(), "needle".into());
+            assert_eq!(viewer.find.matches().len(), 2);
+        }
+        source_preparation_frame(&mut pair, 6, size, Vec::new());
+        source_preparation_frame(&mut pair, 7, size, Vec::new());
+        assert_source_geometry_warm(&pair, "long wrapped Unicode Find");
+        for (_, viewer) in &mut pair {
+            viewer.find.previous();
+            viewer.pending_scroll = Some(PendingScroll::Byte(
+                viewer
+                    .find
+                    .current_match()
+                    .unwrap()
+                    .span()
+                    .start()
+                    .byte_offset(),
+            ));
+        }
+        let mut output = source_preparation_frame(&mut pair, 8, size, Vec::new());
+        for frame in 9..12 {
+            output = source_preparation_frame(&mut pair, frame, size, Vec::new());
+        }
+        assert!(visible_code_geometry(&output[1], "last needle café without newline").is_some());
+        assert!(pair[1].1.pending_scroll.is_none());
+        assert_source_geometry_warm(&pair, "offscreen byte Find target");
+        for (_, viewer) in &mut pair {
+            viewer.find.clear();
+            viewer.pending_scroll = Some(PendingScroll::Heading(0));
+        }
+        let mut output = source_preparation_frame(&mut pair, 12, size, Vec::new());
+        for frame in 13..16 {
+            output = source_preparation_frame(&mut pair, frame, size, Vec::new());
+        }
+        assert!(visible_code_geometry(&output[1], "# Unicode").is_some());
+        assert!(pair[1].1.pending_scroll.is_none());
+        assert_source_geometry_warm(&pair, "offscreen heading target");
+    }
+
+    fn assert_source_preparation_warm(
+        pair: &[(egui::Context, MarkdownViewerTab); 2],
+        control: &str,
+    ) {
+        let ordinary = pair[0].1.source_preparation.probe.as_ref().unwrap();
+        let candidate = pair[1].1.source_preparation.probe.as_ref().unwrap();
+        assert_eq!(candidate.preparations, 0, "{control}");
+        assert_eq!(candidate.prepared_text_bytes, 0, "{control}");
+        assert_eq!(candidate.rebased_roles, 0, "{control}");
+        println!(
+            "source {control}: visited old={} candidate={}, prepared jobs old={} candidate={}, prepared text bytes old={} candidate={}, rebased roles old={} candidate={}, retained jobs={} payload bytes={}",
+            ordinary.visited_lines, candidate.visited_lines,
+            ordinary.preparations, candidate.preparations,
+            ordinary.prepared_text_bytes, candidate.prepared_text_bytes,
+            ordinary.rebased_roles, candidate.rebased_roles,
+            pair[1].1.source_preparation.jobs.len(), pair[1].1.source_preparation.payload_bytes,
+        );
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn markdown_outer_frame_preserves_real_preview_source_pixels_dpi_and_opacity() {
+        use eframe::{egui_wgpu, wgpu};
+        use egui_kittest::{
+            wgpu::{create_render_state, default_wgpu_setup, WgpuTestRenderer},
+            TestRenderer,
+        };
+
+        let mut setup = default_wgpu_setup();
+        let egui_wgpu::WgpuSetup::CreateNew(options) = &mut setup else {
+            unreachable!()
+        };
+        options.instance_descriptor.backends = wgpu::Backends::DX12;
+        let state = create_render_state(setup, Default::default());
+        let adapter = state.adapter.get_info();
+        assert_eq!(adapter.backend, wgpu::Backend::Dx12);
+        assert_eq!(adapter.device_type, wgpu::DeviceType::Cpu);
+        assert_eq!(state.target_format, wgpu::TextureFormat::Rgba8Unorm);
+        let mut renderer = WgpuTestRenderer::from_render_state(state.clone());
+        let tab_id = crate::tabs::AppState::for_test().active();
+        for mode in [MarkdownViewerMode::Preview, MarkdownViewerMode::Source] {
+            for (width, scale, opacity) in [
+                (430.0, 1.0, 1.0),
+                (430.0, 1.25, 1.0),
+                (1180.0, 1.0, 1.0),
+                (1180.0, 1.25, 1.0),
+                (430.0, 1.25, 0.5),
+            ] {
+                let mut pair = source_preparation_pair(&mixed_fixture_sections(4));
+                for (_, viewer) in &mut pair {
+                    viewer.mode = mode;
+                    viewer.outline_open = true;
+                    viewer
+                        .find
+                        .set_query(viewer.document.as_ref().unwrap(), "value".into());
+                    viewer.open_find();
+                }
+                let probe = crate::software_background::PanelTestProbe::install(&pair[1].0, &state);
+                let mut output = Vec::new();
+                let mut images = Vec::new();
+                for (context, viewer) in &mut pair {
+                    let mut input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(width, 760.0),
+                        )),
+                        ..Default::default()
+                    };
+                    input
+                        .viewports
+                        .get_mut(&egui::ViewportId::ROOT)
+                        .unwrap()
+                        .native_pixels_per_point = Some(scale);
+                    let mut last = None;
+                    for frame in 0..4 {
+                        input.time = Some(frame as f64 / 60.0);
+                        let mut current = context.run_ui(input.clone(), |ui| {
+                            ui.painter().rect_filled(
+                                ui.max_rect(),
+                                0.0,
+                                egui::Color32::from_rgb(70, 25, 80),
+                            );
+                            ui.set_opacity(opacity);
+                            ui.set_clip_rect(egui::Rect::from_min_max(
+                                egui::pos2(11.25, 13.5),
+                                egui::pos2(width - 14.5, 744.75),
+                            ));
+                            assert!(viewer.show(ui, tab_id).is_none());
+                        });
+                        renderer.handle_delta(&mut current.textures_delta);
+                        last = Some(current);
+                    }
+                    let last = last.unwrap();
+                    images.push(
+                        renderer
+                            .render(context, &last)
+                            .expect("Markdown framebuffer"),
+                    );
+                    output.push(last);
+                }
+                assert_eq!(images[0].dimensions(), images[1].dimensions());
+                let mismatches = images[0]
+                    .pixels()
+                    .zip(images[1].pixels())
+                    .filter(|(ordinary, candidate)| ordinary != candidate)
+                    .count();
+                assert_eq!(
+                    mismatches, 0,
+                    "{mode:?}, width={width}, scale={scale}, opacity={opacity}"
+                );
+                assert_eq!(
+                    probe.paints(),
+                    usize::from(opacity == 1.0),
+                    "exactly the eligible outer frame must use the callback"
+                );
+                assert_eq!(
+                    format!("{:?}", output[0].platform_output.accesskit_update),
+                    format!("{:?}", output[1].platform_output.accesskit_update),
+                    "actual caller keeps complete live accessibility"
+                );
+                assert_eq!(
+                    pair[0]
+                        .1
+                        .source_preparation
+                        .probe
+                        .as_ref()
+                        .unwrap()
+                        .observations,
+                    pair[1]
+                        .1
+                        .source_preparation
+                        .probe
+                        .as_ref()
+                        .unwrap()
+                        .observations,
+                    "actual Source response geometry and identities"
+                );
+                assert_eq!(pair[0].1.pending_scroll, pair[1].1.pending_scroll);
+                assert_eq!(pair[0].1.outline_selected, pair[1].1.outline_selected);
+                println!(
+                    "Markdown outer frame {mode:?}: width={width}, scale={scale}, opacity={opacity}, format={:?}, callbacks={}, differing pixels={mismatches}",
+                    state.target_format, probe.paints()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_preparation_reuses_jobs_with_live_wrap_font_theme_and_revision_layout() {
+        for sections in [64, 400] {
+            let text = mixed_fixture_sections(sections);
+            let mut pair = source_preparation_pair(&text);
+            let size = vec2(1180.0, 760.0);
+            source_preparation_frame(&mut pair, 0, size, Vec::new());
+            assert_eq!(
+                pair[1]
+                    .1
+                    .source_preparation
+                    .probe
+                    .as_ref()
+                    .unwrap()
+                    .preparations,
+                text.split_inclusive('\n').count()
+            );
+            source_preparation_frame(&mut pair, 1, size, Vec::new());
+            assert_source_preparation_warm(&pair, &format!("sections={sections} unchanged"));
+            source_preparation_frame(
+                &mut pair,
+                2,
+                size,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(700.0, 400.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(0.0, -1100.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            source_preparation_frame(&mut pair, 3, size, Vec::new());
+            assert_source_preparation_warm(&pair, &format!("sections={sections} scroll"));
+        }
+        let mut pair = source_preparation_pair(&mixed_caption_fixture());
+        let mut size = vec2(1180.0, 760.0);
+        source_preparation_frame(&mut pair, 0, size, Vec::new());
+        let pointers: Vec<_> = pair[1]
+            .1
+            .source_preparation
+            .jobs
+            .values()
+            .map(|prepared| Arc::as_ptr(&prepared.job))
+            .collect();
+        for control in 0..4 {
+            for (context, _) in &pair {
+                match control {
+                    0 => {}
+                    1 => context.set_pixels_per_point(1.5),
+                    2 => {
+                        let mut fonts = egui::FontDefinitions::default();
+                        fonts
+                            .families
+                            .get_mut(&egui::FontFamily::Monospace)
+                            .unwrap()
+                            .reverse();
+                        context.set_fonts(fonts);
+                    }
+                    _ => {
+                        context.set_theme(egui::ThemePreference::Light);
+                        context.global_style_mut(|style| {
+                            style.visuals.text_options.font_hinting =
+                                !style.visuals.text_options.font_hinting;
+                        });
+                    }
+                }
+            }
+            if control == 0 {
+                size.x = 430.0;
+            }
+            source_preparation_frame(&mut pair, 1 + control, size, Vec::new());
+            assert_source_preparation_warm(&pair, &format!("400 sections dependency={control}"));
+            assert_eq!(
+                pointers,
+                pair[1]
+                    .1
+                    .source_preparation
+                    .jobs
+                    .values()
+                    .map(|prepared| Arc::as_ptr(&prepared.job))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let replacement =
+            mixed_caption_fixture().replace("ordinary text.", "revised Unicode café 漢字 text.");
+        let (_, document) = load_remote_document(
+            test_remote_source("/owned/source.md"),
+            "/owned/source.md".into(),
+            replacement.as_bytes().to_vec(),
+        )
+        .unwrap();
+        let syntax = source_syntax_spans(&mut None, &replacement).to_vec();
+        for (_, viewer) in &mut pair {
+            viewer.apply_load_result(Ok(("/owned/source.md".into(), document.clone())));
+            assert!(viewer.source_preparation.jobs.is_empty());
+            viewer.source_syntax = Some(syntax.clone());
+        }
+        source_preparation_frame(&mut pair, 5, size, Vec::new());
+        assert_eq!(
+            pair[1]
+                .1
+                .source_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .preparations,
+            replacement.split_inclusive('\n').count()
+        );
+        source_preparation_frame(&mut pair, 6, size, Vec::new());
+        assert_source_preparation_warm(&pair, "400 sections replaced snapshot");
+        for (context, _) in &pair {
+            context.memory_mut(|memory| memory.options.screen_reader = true);
+        }
+        source_preparation_frame(&mut pair, 7, size, Vec::new());
+        assert_source_preparation_warm(&pair, "400 sections live screen-reader labels");
+    }
+
+    #[test]
+    fn source_preparation_preserves_find_offscreen_bytes_unicode_selection_and_copy() {
+        let mut pair = source_preparation_pair(&mixed_caption_fixture());
+        let size = vec2(1180.0, 760.0);
+        source_preparation_frame(&mut pair, 0, size, Vec::new());
+        for (_, viewer) in &mut pair {
+            let document = viewer.document.as_ref().unwrap();
+            viewer.find.set_query(document, "value".into());
+        }
+        source_preparation_frame(&mut pair, 1, size, Vec::new());
+        source_preparation_frame(&mut pair, 2, size, Vec::new());
+        assert_source_preparation_warm(&pair, "400 sections Find unchanged");
+        for (_, viewer) in &mut pair {
+            viewer.find.previous();
+            viewer.pending_scroll = Some(PendingScroll::Byte(
+                viewer
+                    .find
+                    .current_match()
+                    .unwrap()
+                    .span()
+                    .start()
+                    .byte_offset(),
+            ));
+        }
+        let output = source_preparation_frame(&mut pair, 3, size, Vec::new());
+        assert!(
+            pair[1]
+                .1
+                .source_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .preparations
+                <= 2
+        );
+        let mut output = output;
+        for frame in 4..7 {
+            output = source_preparation_frame(&mut pair, frame, size, Vec::new());
+        }
+        assert!(visible_code_geometry(&output[1], "fn example() { let value = 399; }").is_some());
+        assert!(pair[1].1.pending_scroll.is_none());
+        assert_source_preparation_warm(&pair, "400 sections Find tail");
+
+        let raw = "# Unicode\r\n\r\nneedle café 漢字   \r\nneedle\tβ \r\n\r\n```text\r\nraw\tbytes  \r\n```\r\nlast needle café without newline";
+        let mut pair = source_preparation_pair(raw);
+        source_preparation_frame(&mut pair, 0, size, Vec::new());
+        for (_, viewer) in &mut pair {
+            let document = viewer.document.as_ref().unwrap();
+            viewer.find.set_query(document, "needle".into());
+        }
+        let output = source_preparation_frame(&mut pair, 1, size, Vec::new());
+        let (rect, _) = visible_code_geometry(&output[0], "needle café 漢字   ").unwrap();
+        let start = egui::pos2(rect.left() + 1.0, rect.center().y);
+        let end = egui::pos2(rect.right() + 8.0, rect.center().y);
+        source_preparation_frame(
+            &mut pair,
+            2,
+            size,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        source_preparation_frame(&mut pair, 3, size, vec![egui::Event::PointerMoved(end)]);
+        source_preparation_frame(
+            &mut pair,
+            4,
+            size,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let output = source_preparation_frame(&mut pair, 5, size, vec![egui::Event::Copy]);
+        assert!(output[1].platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "needle café 漢字   ")
+        }));
+        for (_, viewer) in &mut pair {
+            viewer.find.clear();
+            let target = viewer
+                .document
+                .as_ref()
+                .unwrap()
+                .source_text()
+                .find("last needle")
+                .unwrap();
+            viewer.pending_scroll = Some(PendingScroll::Byte(target));
+        }
+        for frame in 6..9 {
+            source_preparation_frame(&mut pair, frame, vec2(430.0, 180.0), Vec::new());
+        }
+        assert!(pair[1].1.pending_scroll.is_none());
+        assert_source_preparation_warm(&pair, "Unicode CRLF/trailing/no-newline byte navigation");
+
+        let mut pair = source_preparation_pair("first\r\nsecond\r\n\r\nfirst\r\nsecond");
+        for (_, viewer) in &mut pair {
+            viewer
+                .find
+                .set_query(viewer.document.as_ref().unwrap(), "first\r\nsecond".into());
+            assert_eq!(viewer.find.matches().len(), 2);
+        }
+        source_preparation_frame(&mut pair, 0, size, Vec::new());
+        source_preparation_frame(&mut pair, 1, size, Vec::new());
+        assert_source_preparation_warm(&pair, "multiline Find unchanged");
+        for (_, viewer) in &mut pair {
+            viewer.find.next();
+        }
+        source_preparation_frame(&mut pair, 2, size, Vec::new());
+        assert_eq!(
+            pair[1]
+                .1
+                .source_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .preparations,
+            4,
+            "all old/new multiline match rows refresh"
+        );
+        source_preparation_frame(&mut pair, 3, size, Vec::new());
+        assert_source_preparation_warm(&pair, "multiline Find moved");
+    }
+
+    #[test]
+    fn source_preparation_caps_payload_queries_entries_and_releases_snapshot_owners() {
+        let find = MarkdownFindState::default();
+        let text = "bounded\n".repeat(MAX_PREPARED_SOURCE_JOBS + 1);
+        let document = document(&text);
+        let roles = [festerm_syntax::Span {
+            start: 0,
+            end: text.len(),
+            role: festerm_syntax::Role::StringLiteral,
+        }];
+        let mut preparation = SourcePreparation::default();
+        preparation.begin(&find);
+        for repeat in 0..2 {
+            let mut start = 0;
+            for line in text.split_inclusive('\n') {
+                let (span, job) = preparation.line(start, line, &document, &find, &roles);
+                assert_eq!(
+                    job.as_ref(),
+                    &source_line_job(
+                        line,
+                        span,
+                        &find,
+                        roles_within(&roles, start..start + line.len())
+                    )
+                );
+                start += line.len();
+            }
+            assert_eq!(preparation.jobs.len(), MAX_PREPARED_SOURCE_JOBS);
+            assert!(!preparation
+                .jobs
+                .contains_key(&(text.len() - "bounded\n".len())));
+            assert!(preparation.payload_bytes <= MAX_PREPARED_SOURCE_JOB_PAYLOAD_BYTES);
+            println!(
+                "source cap repeat={repeat}: retained={} payload={}",
+                preparation.jobs.len(),
+                preparation.payload_bytes
+            );
+        }
+        let large = "x".repeat(festerm_markdown::MAX_SOURCE_BYTES);
+        let large_document = self::document(&large);
+        preparation.clear();
+        preparation.begin(&find);
+        let (_, job) = preparation.line(0, &large, &large_document, &find, &[]);
+        assert_eq!(job.text, large);
+        assert!(
+            preparation.jobs.is_empty(),
+            "one over-budget job must use the ordinary path"
+        );
+        assert_eq!(preparation.payload_bytes, 0);
+
+        let mut pair = source_preparation_pair(&"x".repeat(MAX_SOURCE_PREPARATION_QUERY_BYTES + 1));
+        source_preparation_frame(&mut pair, 0, vec2(1180.0, 760.0), Vec::new());
+        let weak = Arc::downgrade(&pair[1].1.source_preparation.jobs[&0].job);
+        for (_, viewer) in &mut pair {
+            viewer.find.set_query(
+                viewer.document.as_ref().unwrap(),
+                "x".repeat(MAX_SOURCE_PREPARATION_QUERY_BYTES + 1),
+            );
+        }
+        source_preparation_frame(&mut pair, 1, vec2(1180.0, 760.0), Vec::new());
+        assert!(weak.upgrade().is_none());
+        assert!(pair[1].1.source_preparation.jobs.is_empty());
+        let probe = pair[1].1.source_preparation.probe.as_ref().unwrap();
+        assert_eq!(
+            probe.layouts, probe.visited_lines,
+            "uncached Find retains ordinary row layout"
+        );
+        assert_eq!(
+            pair[1].1.find.matches().len(),
+            1,
+            "long Find is not truncated"
+        );
+        for (_, viewer) in &mut pair {
+            viewer.find.clear();
+        }
+        source_preparation_frame(&mut pair, 2, vec2(1180.0, 760.0), Vec::new());
+        let weak = Arc::downgrade(&pair[1].1.source_preparation.jobs[&0].job);
+        pair[1].1.reload();
+        assert!(
+            weak.upgrade().is_some(),
+            "failed reload retains its prior snapshot"
+        );
+        let replacement = load_remote_document(
+            test_remote_source("/owned/source.md"),
+            "/owned/source.md".into(),
+            b"# New\n".to_vec(),
+        )
+        .unwrap();
+        pair[1].1.apply_load_result(Ok(replacement));
+        assert!(weak.upgrade().is_none());
+        assert!(pair[1].1.source_preparation.jobs.is_empty());
+        let mut owner = source_preparation_pair("# Close\n");
+        source_preparation_frame(&mut owner, 0, vec2(1180.0, 760.0), Vec::new());
+        let weak = Arc::downgrade(&owner[1].1.source_preparation.jobs[&0].job);
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+    }
+
+    fn caption_oracle_pair(text: &str) -> [(egui::Context, MarkdownPreviewPane); 2] {
+        let document = document(text);
+        std::array::from_fn(|index| {
+            let context = egui::Context::default();
+            context.enable_accesskit();
+            context.set_theme(egui::ThemePreference::Dark);
+            context.set_visuals(theme::default_visuals());
+            context.global_style_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none();
+                style.interaction.tooltip_delay = 0.0;
+                style.interaction.show_tooltips_only_when_still = false;
+            });
+            let mut pane = MarkdownPreviewPane::new(
+                LocalMarkdownSource::new("/docs/readme.md").unwrap().into(),
+                "",
+            );
+            // Compare preparation against exactly the same parsed snapshot,
+            // including any honest syntax-budget fallback, not two timed parses.
+            pane.line_heading_indices = build_line_heading_index_lookup(&document);
+            pane.outline_selected = document.headings().first().map(|_| 0);
+            pane.document = Some(document.clone());
+            pane.parsed = text.into();
+            pane.code_copy_probe = Some(CodeCopyProbe {
+                ordinary: index == 0,
+                ..Default::default()
+            });
+            // Older caption/cell oracles isolate their own frame-local seam.
+            pane.table_layouts.ordinary = true;
+            pane.table_cell_probe = Some(TableCellProbe {
+                ordinary: index == 0,
+                ..Default::default()
+            });
+            pane.code_preparation.probe = Some(CodeLinePreparationProbe {
+                ordinary: index == 0,
+                ..Default::default()
+            });
+            (context, pane)
+        })
+    }
+
+    fn rebind_caption_oracle(pair: &mut [(egui::Context, MarkdownPreviewPane); 2], text: &str) {
+        let document = document(text);
+        for (_, pane) in pair {
+            pane.parse(String::new());
+            pane.find.recompute(&document, None);
+            pane.line_heading_indices = build_line_heading_index_lookup(&document);
+            pane.outline_selected = document.headings().first().map(|_| 0);
+            pane.document = Some(document.clone());
+            pane.parsed = text.into();
+        }
+    }
+
+    fn caption_oracle_frame(
+        pair: &mut [(egui::Context, MarkdownPreviewPane); 2],
+        frame: usize,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> [egui::FullOutput; 2] {
+        let mut output = std::array::from_fn(|index| {
+            let (context, pane) = &mut pair[index];
+            context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(frame as f64 / 60.0),
+                    events: events.clone(),
+                    ..Default::default()
+                },
+                |ui| pane.show(ui),
+            )
+        });
+        assert_eq!(
+            output[0].shapes, output[1].shapes,
+            "frame {frame}: all clipped shapes"
+        );
+        assert_eq!(output[0].pixels_per_point, output[1].pixels_per_point);
+        assert!(output[0].platform_output.accesskit_update.is_some());
+        assert_eq!(
+            format!("{:?}", output[0].platform_output.accesskit_update),
+            format!("{:?}", output[1].platform_output.accesskit_update),
+            "frame {frame}: complete accessibility nodes, IDs, bounds and order"
+        );
+        assert_eq!(
+            format!("{:?}", output[0].platform_output.commands),
+            format!("{:?}", output[1].platform_output.commands),
+            "frame {frame}: live commands"
+        );
+        let ordinary = pair[0].1.code_copy_probe.as_ref().unwrap();
+        let prepared = pair[1].1.code_copy_probe.as_ref().unwrap();
+        assert_eq!(
+            ordinary.buttons, prepared.buttons,
+            "frame {frame}: live button responses"
+        );
+        let fences = pair[0]
+            .1
+            .document
+            .as_ref()
+            .filter(|_| pair[0].1.error.is_none())
+            .map_or(0, |document| {
+                document
+                    .blocks()
+                    .iter()
+                    .filter(|block| matches!(block, Block::CodeBlock(_)))
+                    .count()
+            });
+        assert_eq!(ordinary.buttons.len(), fences);
+        assert_eq!(
+            ordinary.preparations,
+            if ordinary.ordinary {
+                fences
+            } else {
+                usize::from(fences != 0)
+            }
+        );
+        assert_eq!(prepared.preparations, usize::from(fences != 0));
+        assert_eq!(pair[0].1.pending_scroll, pair[1].1.pending_scroll);
+        assert_eq!(pair[0].1.visible_heading, pair[1].1.visible_heading);
+        assert_eq!(pair[0].1.heading_tops, pair[1].1.heading_tops);
+        assert_eq!(
+            pair[0]
+                .1
+                .code_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .observations,
+            pair[1]
+                .1
+                .code_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .observations,
+            "frame {frame}: code label identities, bounds, intrinsic sizes and sense"
+        );
+        let old_cells = pair[0].1.table_cell_probe.as_ref().unwrap();
+        let new_cells = pair[1].1.table_cell_probe.as_ref().unwrap();
+        assert_eq!(old_cells.observations, new_cells.observations);
+        assert!(new_cells.retained_entries <= MAX_PREPARED_TABLE_CELLS);
+        assert!(new_cells.retained_payload_bytes <= MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES);
+        // These headless assertions inspect shapes without applying textures.
+        for frame_output in &mut output {
+            frame_output.textures_delta.clear();
+        }
+        output
+    }
+
+    fn assert_table_preparation_work(
+        pair: &[(egui::Context, MarkdownPreviewPane); 2],
+        expected_preparations: usize,
+        control: &str,
+    ) {
+        let old = pair[0].1.table_cell_probe.as_ref().unwrap();
+        let new = pair[1].1.table_cell_probe.as_ref().unwrap();
+        assert_eq!(old.observations.len(), 1600, "{control}");
+        assert_eq!(new.observations.len(), 1600, "{control}");
+        assert_eq!(old.preparations, 1600, "{control}");
+        assert_eq!(old.unwrapped_layouts, 1600, "{control}");
+        assert_eq!(new.preparations, expected_preparations, "{control}");
+        assert_eq!(new.unwrapped_layouts, expected_preparations, "{control}");
+        assert_eq!(old.wrap_layouts, new.wrap_layouts, "{control}");
+        assert_eq!(
+            old.wrap_clone_capacity_bytes, new.wrap_clone_capacity_bytes,
+            "{control}"
+        );
+        assert!(new.job_capacity_bytes < old.job_capacity_bytes, "{control}");
+        eprintln!(
+            "table preparation {control}: live cells={}; ordinary/candidate preparations={}/{} unwrapped layouts={}/{} text bytes={}/{} actual job String/section Vec capacity bytes={}/{}; wrap layouts={}/{} actual wrap-clone capacities={}/{}; candidate retained entries={} accounted frame-local galley payload={}",
+            new.observations.len(), old.preparations, new.preparations,
+            old.unwrapped_layouts, new.unwrapped_layouts, old.prepared_text_bytes,
+            new.prepared_text_bytes, old.job_capacity_bytes, new.job_capacity_bytes,
+            old.wrap_layouts, new.wrap_layouts, old.wrap_clone_capacity_bytes,
+            new.wrap_clone_capacity_bytes, new.retained_entries, new.retained_payload_bytes,
+        );
+    }
+
+    fn table_preparation_pair(text: &str) -> [(egui::Context, MarkdownPreviewPane); 2] {
+        let mut pair = caption_oracle_pair(text);
+        // Isolate the new seam against current production caption preparation,
+        // not the caption's older independent control.
+        pair[0].1.code_copy_probe.as_mut().unwrap().ordinary = false;
+        pair
+    }
+
+    fn document_layout_pair(text: &str) -> [(egui::Context, MarkdownPreviewPane); 2] {
+        let mut pair = table_preparation_pair(text);
+        for (_, pane) in &mut pair {
+            pane.table_cell_probe.as_mut().unwrap().ordinary = false;
+            pane.code_preparation.probe.as_mut().unwrap().ordinary = false;
+        }
+        pair[1].1.table_layouts.ordinary = false;
+        pair
+    }
+
+    fn assert_table_divider_geometry(
+        output: &egui::FullOutput,
+        table: &PreparedTable,
+    ) -> (egui::Rect, egui::Rect) {
+        let stroke = egui::Stroke::new(1.0, theme::BORDER_SUBTLE);
+        let (border_index, border, clip) = output
+            .shapes
+            .iter()
+            .enumerate()
+            .find_map(|(index, shape)| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.corner_radius == egui::CornerRadius::ZERO
+                        && rect.stroke == stroke
+                        && rect.stroke_kind == egui::StrokeKind::Inside =>
+                {
+                    Some((index, rect.rect, shape.clip_rect))
+                }
+                _ => None,
+            })
+            .expect("the real table outline must be painted");
+        assert!((border.width() - table.widths.iter().sum::<f32>()).abs() < 0.01);
+        assert!(
+            (border.height() - table.rows.iter().map(|row| row.height).sum::<f32>()).abs() < 0.01
+        );
+        let mut verticals = Vec::new();
+        let mut horizontals = Vec::new();
+        for (index, shape) in output.shapes.iter().enumerate() {
+            if let egui::Shape::LineSegment {
+                points,
+                stroke: actual,
+            } = &shape.shape
+            {
+                if *actual != stroke {
+                    continue;
+                }
+                assert!(index > border_index, "dividers follow cells and outline");
+                assert_eq!(shape.clip_rect, clip, "all borders share the table clip");
+                if points[0].x == points[1].x {
+                    assert_eq!(points[0].y, border.top());
+                    assert_eq!(points[1].y, border.bottom());
+                    verticals.push(points[0].x);
+                } else {
+                    assert_eq!(points[0].x, border.left());
+                    assert_eq!(points[1].x, border.right());
+                    assert_eq!(points[0].y, points[1].y);
+                    horizontals.push(points[0].y);
+                }
+            }
+        }
+        assert_eq!(
+            verticals.len(),
+            table.widths.len() - 1,
+            "one actual full-height stroke per internal column, regardless of row count"
+        );
+        let mut right = border.left();
+        for (actual, width) in verticals.iter().zip(&table.widths) {
+            right += width;
+            assert_eq!(*actual, right);
+        }
+        assert_eq!(horizontals.len(), table.rows.len() - 1);
+        let mut bottom = border.top();
+        for (actual, row) in horizontals.iter().zip(&table.rows) {
+            bottom += row.height;
+            assert!((*actual - bottom).abs() < 0.01);
+        }
+        if table
+            .rows
+            .iter()
+            .flat_map(|row| &row.galleys)
+            .any(|galley| !galley.job.text.is_empty())
+        {
+            assert!(
+                output.shapes[..border_index]
+                    .iter()
+                    .any(|shape| matches!(shape.shape, egui::Shape::Text(_))),
+                "visible cell text is painted before the border overlay"
+            );
+        }
+        (border, clip)
+    }
+
+    #[test]
+    fn table_dividers_emit_once_per_column_for_tall_ragged_empty_and_header_only_tables() {
+        let header = "| Left | Middle | Right |\n| :--- | :---: | ---: |\n";
+        for text in [
+            header.to_owned(),
+            format!("{header}| a | b | c |\n"),
+            format!("{header}{}", "| a | b | c |\n".repeat(64)),
+            format!("{header}| short |\n| | | |\n| a | b |\n"),
+            "| Only |\n| --- |\n| body |\n".to_owned(),
+            "| | | |\n| --- | --- | --- |\n| | | |\n".to_owned(),
+        ] {
+            let parsed = document(&text);
+            let Block::Table(block) = &parsed.blocks()[0] else {
+                panic!("expected a table fixture");
+            };
+            let expected_cells: usize = block.rows().iter().map(|row| row.cells().len()).sum();
+            for width in [360.0, 1180.0] {
+                for scale in [1.0, 1.25] {
+                    let mut pair = document_layout_pair(&text);
+                    for (context, _) in &pair {
+                        context.set_pixels_per_point(scale);
+                    }
+                    for frame in 0..3 {
+                        let output =
+                            caption_oracle_frame(&mut pair, frame, vec2(width, 760.0), Vec::new());
+                        let pane = &pair[1].1;
+                        let table = pane.table_layouts.tables.values().next().unwrap();
+                        assert_table_divider_geometry(&output[1], table);
+                        let cells = &pane.table_cell_probe.as_ref().unwrap().observations;
+                        assert_eq!(cells.len(), expected_cells, "every cell remains live");
+                        assert!(cells
+                            .iter()
+                            .all(|cell| cell.enabled && cell.sense.senses_click()));
+                        if frame == 2 {
+                            assert_eq!(pane.table_layouts.preparations, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_dividers_scroll_with_cells_inside_the_existing_clip() {
+        let text = concat!(
+            "| First | Second | Third | Fourth | Fifth | Sixth | Seventh | Eighth |\n",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |\n",
+            "| a | b | c | d | e | f | g | h |\n",
+        );
+        let mut pair = document_layout_pair(text);
+        let size = vec2(360.0, 400.0);
+        caption_oracle_frame(&mut pair, 0, size, Vec::new());
+        let output = caption_oracle_frame(&mut pair, 1, size, Vec::new());
+        let table = pair[1].1.table_layouts.tables.values().next().unwrap();
+        let (before, clip) = assert_table_divider_geometry(&output[1], table);
+        assert!(before.width() > clip.width(), "the fixture must overflow");
+        let cell_before = pair[1].1.table_cell_probe.as_ref().unwrap().observations[0].rect;
+        let pointer = before.intersect(clip).center();
+        let output = caption_oracle_frame(
+            &mut pair,
+            2,
+            size,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(-80.0, 0.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let table = pair[1].1.table_layouts.tables.values().next().unwrap();
+        assert_table_divider_geometry(&output[1], table);
+        // Scroll input is applied after this frame's content has been laid out.
+        let output = caption_oracle_frame(&mut pair, 3, size, Vec::new());
+        let table = pair[1].1.table_layouts.tables.values().next().unwrap();
+        let (after, after_clip) = assert_table_divider_geometry(&output[1], table);
+        let cell_after = pair[1].1.table_cell_probe.as_ref().unwrap().observations[0].rect;
+        assert!(
+            after.left() < before.left(),
+            "horizontal scroll must move ink"
+        );
+        assert!((after.size() - before.size()).abs().max_elem() < 0.01);
+        assert_eq!(after_clip, clip);
+        assert!(
+            (cell_after.left() - cell_before.left() - (after.left() - before.left())).abs() < 0.01
+        );
+        assert_eq!(pair[1].1.table_layouts.preparations, 0);
+    }
+
+    #[test]
+    fn document_layout_reuses_complete_live_tables_and_invalidates_exact_dependencies() {
+        let fixture = mixed_caption_fixture();
+        let mut pair = document_layout_pair(&fixture);
+        let wide = vec2(1180.0, 760.0);
+        for frame in 0..3 {
+            caption_oracle_frame(&mut pair, frame, wide, Vec::new());
+            assert_eq!(pair[0].1.table_layouts.preparations, 400);
+            assert_eq!(
+                pair[1].1.table_layouts.preparations,
+                if frame == 0 { 400 } else { 0 }
+            );
+            assert_eq!(
+                pair[1]
+                    .1
+                    .table_cell_probe
+                    .as_ref()
+                    .unwrap()
+                    .observations
+                    .len(),
+                1600
+            );
+            if frame != 0 {
+                let probe = pair[1].1.table_cell_probe.as_ref().unwrap();
+                assert_eq!(
+                    (
+                        probe.preparations,
+                        probe.prepared_text_bytes,
+                        probe.wrap_layouts
+                    ),
+                    (0, 0, 0)
+                );
+            }
+        }
+        for (index, control) in [
+            "width", "fonts", "options", "scale", "theme", "find", "current", "ranges", "revision",
+            "atlas",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let size = if control == "width" {
+                vec2(360.0, 760.0)
+            } else {
+                wide
+            };
+            for (context, pane) in &mut pair {
+                match control {
+                    "fonts" => {
+                        let mut fonts = egui::FontDefinitions::default();
+                        fonts.families.insert(
+                            egui::FontFamily::Proportional,
+                            fonts.families[&egui::FontFamily::Monospace].clone(),
+                        );
+                        context.set_fonts(fonts);
+                    }
+                    "options" => context.global_style_mut(|style| {
+                        style.visuals.text_options.font_hinting =
+                            !style.visuals.text_options.font_hinting;
+                    }),
+                    "scale" => context.set_pixels_per_point(1.25),
+                    "theme" => context.set_visuals(egui::Visuals::light()),
+                    "find" => pane
+                        .find
+                        .set_query(pane.document.as_ref().unwrap(), "Item".into()),
+                    "current" => {
+                        pane.find.next();
+                    }
+                    // Keep query, length and current index the same, changing
+                    // only an internal range: a query/count-only key is unsafe.
+                    "ranges" => {
+                        let ranges = pane.document.as_ref().unwrap().find_matches("synthetic");
+                        assert_eq!(ranges.len(), pane.find.matches.len());
+                        pane.find.matches = ranges;
+                    }
+                    "revision" => {
+                        pane.parse(fixture.replace("Item", "café 漢字"));
+                        pane.find
+                            .set_query(pane.document.as_ref().unwrap(), pane.find.query.clone());
+                    }
+                    "atlas" => crate::document_layout::exhaust_font_atlas(context),
+                    _ => {}
+                }
+            }
+            caption_oracle_frame(&mut pair, 3 + index * 2, size, Vec::new());
+            assert_eq!(pair[1].1.table_layouts.preparations, 400, "{control}");
+            caption_oracle_frame(&mut pair, 4 + index * 2, size, Vec::new());
+            assert_eq!(pair[1].1.table_layouts.preparations, 0, "{control}: warm");
+        }
+        // Retained geometry never removes offscreen heading or byte targets.
+        for (_, pane) in &mut pair {
+            pane.find.clear();
+            pane.scroll_to_heading(399);
+        }
+        for frame in 24..28 {
+            caption_oracle_frame(&mut pair, frame, wide, Vec::new());
+        }
+        assert_eq!(pair[1].1.visible_heading(), Some(399));
+        for (_, pane) in &mut pair {
+            let tail = pane
+                .document
+                .as_ref()
+                .unwrap()
+                .source_text()
+                .rfind("fn example")
+                .unwrap();
+            pane.pending_scroll = Some(PendingScroll::Byte(tail));
+        }
+        let output = caption_oracle_frame(&mut pair, 28, wide, Vec::new());
+        let text = output[1]
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text.galley.job.text == "café 漢字"
+                        && shape.clip_rect.intersects(egui::Rect::from_min_size(
+                            text.pos,
+                            text.galley.size(),
+                        )) =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("offscreen table navigation must expose its live selectable cell");
+        let start = text.pos
+            + text
+                .galley
+                .pos_from_cursor(text.galley.begin())
+                .center()
+                .to_vec2();
+        let end = text.pos
+            + text
+                .galley
+                .pos_from_cursor(text.galley.end())
+                .center()
+                .to_vec2();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        caption_oracle_frame(
+            &mut pair,
+            29,
+            wide,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        caption_oracle_frame(&mut pair, 30, wide, vec![egui::Event::PointerMoved(end)]);
+        caption_oracle_frame(&mut pair, 31, wide, vec![button(end, false)]);
+        let output = caption_oracle_frame(&mut pair, 32, wide, vec![egui::Event::Copy]);
+        assert!(output[1].platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyHtml {text, html} if text.trim() == "café 漢字" && html.contains("<table>"))));
+    }
+
+    #[test]
+    fn document_layout_tables_bound_retention_and_release_replaced_snapshots() {
+        let fixture: String = (0..MAX_PREPARED_TABLE_LAYOUTS + 2)
+            .map(|index| format!("## Section {index}\n\n| A | B |\n| - | - |\n| **café** | long wrapped value {index} |\n\n"))
+            .collect();
+        let mut pair = document_layout_pair(&fixture);
+        let size = vec2(360.0, 760.0);
+        caption_oracle_frame(&mut pair, 0, size, Vec::new());
+        assert_eq!(
+            pair[1].1.table_layouts.tables.len(),
+            MAX_PREPARED_TABLE_LAYOUTS
+        );
+        assert!(pair[1].1.table_layouts.cells <= MAX_PREPARED_TABLE_LAYOUT_CELLS);
+        assert!(pair[1].1.table_layouts.payload_bytes <= MAX_PREPARED_TABLE_LAYOUT_BYTES);
+        caption_oracle_frame(&mut pair, 1, size, Vec::new());
+        assert_eq!(pair[1].1.table_layouts.preparations, 2);
+        let weak = Arc::downgrade(pair[1].1.table_layouts.tables.values().next().unwrap());
+        for (_, pane) in &mut pair {
+            pane.parse("| New | Table |\n| - | - |\n| new bytes | value |\n".into());
+        }
+        assert!(weak.upgrade().is_none());
+        assert!(pair[1].1.table_layouts.tables.is_empty());
+        caption_oracle_frame(&mut pair, 2, size, Vec::new());
+        caption_oracle_frame(&mut pair, 3, size, Vec::new());
+        assert_eq!(pair[1].1.table_layouts.preparations, 0);
+
+        // Charge actual spare capacities, including final wrapped glyph/mesh
+        // storage, rather than accepting a short input on its text length.
+        let table = pair[1].1.table_layouts.tables.values().next().unwrap();
+        let mut galley = (*table.rows[0].galleys[0]).clone();
+        let before = galley_payload_bytes(&galley).unwrap();
+        galley.rows.reserve_exact(
+            MAX_PREPARED_TABLE_LAYOUT_BYTES / std::mem::size_of::<egui::epaint::text::PlacedRow>()
+                + 1,
+        );
+        assert!(galley_payload_bytes(&galley).unwrap() > before + MAX_PREPARED_TABLE_LAYOUT_BYTES);
+        let mut excessive = PreparedTable {
+            available_width: table.available_width,
+            style: table.style,
+            widths: table.widths.clone(),
+            rows: vec![PreparedTableRow {
+                galleys: vec![Arc::new(galley)],
+                height: table.rows[0].height,
+            }],
+            cells: 1,
+            payload_bytes: 0,
+        };
+        excessive.payload_bytes = excessive.accounted_payload().unwrap();
+        let cache = &mut pair[1].1.table_layouts;
+        cache.clear();
+        cache.find = Some((Vec::new(), None));
+        cache.retain(0, &Arc::new(excessive));
+        assert!(cache.tables.is_empty());
+
+        let mut viewers = source_preparation_pair(&fixture);
+        for (index, (_, viewer)) in viewers.iter_mut().enumerate() {
+            viewer.mode = MarkdownViewerMode::Preview;
+            viewer.table_layouts.ordinary = index == 0;
+            viewer.table_cell_probe = Some(TableCellProbe::default());
+        }
+        for frame in 0..3 {
+            source_preparation_frame(&mut viewers, frame, size, Vec::new());
+            assert_eq!(viewers[0].1.table_layouts.preparations, 514);
+            assert_eq!(
+                viewers[1].1.table_layouts.preparations,
+                if frame == 0 { 514 } else { 2 },
+                "standalone live Preview"
+            );
+            assert_eq!(
+                viewers[0].1.table_cell_probe.as_ref().unwrap().observations,
+                viewers[1].1.table_cell_probe.as_ref().unwrap().observations
+            );
+        }
+        for (_, viewer) in &mut viewers {
+            viewer.set_find_query_for_test("café");
+        }
+        source_preparation_frame(&mut viewers, 3, size, Vec::new());
+        assert_eq!(viewers[1].1.table_layouts.preparations, 514);
+    }
+
+    #[test]
+    fn table_preparation_removes_repeated_work_across_the_live_400_section_preview() {
+        for width in [1180.0, 360.0] {
+            let mut pair = table_preparation_pair(&mixed_caption_fixture());
+            let size = vec2(width, 760.0);
+            for frame in 0..3 {
+                caption_oracle_frame(&mut pair, frame, size, Vec::new());
+                assert_table_preparation_work(&pair, 403, &format!("width={width} frame={frame}"));
+            }
+            caption_oracle_frame(
+                &mut pair,
+                3,
+                size,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(width / 2.0, 400.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(0.0, -1100.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_table_preparation_work(&pair, 403, "scroll");
+            for (frame, query, expected) in [(4, "synthetic", 403), (5, "Item", 802)] {
+                for (_, pane) in &mut pair {
+                    pane.find
+                        .set_query(pane.document.as_ref().unwrap(), query.into());
+                }
+                caption_oracle_frame(&mut pair, frame, size, Vec::new());
+                assert_table_preparation_work(&pair, expected, query);
+            }
+            for (_, pane) in &mut pair {
+                pane.find.next();
+            }
+            caption_oracle_frame(&mut pair, 6, size, Vec::new());
+            assert_table_preparation_work(&pair, 802, "current Find match");
+            for (_, pane) in &mut pair {
+                pane.find.clear();
+            }
+            caption_oracle_frame(&mut pair, 7, size, Vec::new());
+            assert_table_preparation_work(&pair, 403, "Find cleared");
+
+            let mut viewers = source_preparation_pair(&mixed_caption_fixture());
+            for (index, (_, viewer)) in viewers.iter_mut().enumerate() {
+                viewer.mode = MarkdownViewerMode::Preview;
+                viewer.table_layouts.ordinary = true;
+                viewer.table_cell_probe = Some(TableCellProbe {
+                    ordinary: index == 0,
+                    ..Default::default()
+                });
+            }
+            for frame in 0..2 {
+                source_preparation_frame(&mut viewers, frame, size, Vec::new());
+                let old = viewers[0].1.table_cell_probe.as_ref().unwrap();
+                let new = viewers[1].1.table_cell_probe.as_ref().unwrap();
+                assert_eq!(old.observations, new.observations, "standalone viewer");
+                assert_eq!(old.observations.len(), 1600);
+                assert_eq!(old.unwrapped_layouts, 1600);
+                assert_eq!(new.unwrapped_layouts, 403);
+            }
+        }
+    }
+
+    #[test]
+    fn table_preparation_keeps_live_dependencies_navigation_and_unicode_copy() {
+        let mut pair = table_preparation_pair(&mixed_caption_fixture());
+        let wide = vec2(1180.0, 760.0);
+        caption_oracle_frame(&mut pair, 0, wide, Vec::new());
+        for (frame, control) in ["width", "fonts", "options", "scale", "theme", "revision"]
+            .into_iter()
+            .enumerate()
+        {
+            let size = if control == "width" {
+                vec2(360.0, 760.0)
+            } else {
+                wide
+            };
+            for (context, _) in &pair {
+                match control {
+                    "fonts" => {
+                        let mut fonts = egui::FontDefinitions::default();
+                        fonts.families.insert(
+                            egui::FontFamily::Proportional,
+                            fonts.families[&egui::FontFamily::Monospace].clone(),
+                        );
+                        context.set_fonts(fonts);
+                    }
+                    "options" => context.global_style_mut(|style| {
+                        style.visuals.text_options.font_hinting =
+                            !style.visuals.text_options.font_hinting;
+                    }),
+                    "scale" => context.set_pixels_per_point(1.25),
+                    "theme" => context.set_visuals(egui::Visuals::light()),
+                    _ => {}
+                }
+            }
+            if control == "revision" {
+                rebind_caption_oracle(
+                    &mut pair,
+                    &mixed_caption_fixture().replace("Item", "café 漢字"),
+                );
+            }
+            caption_oracle_frame(&mut pair, frame + 1, size, Vec::new());
+            assert_table_preparation_work(&pair, 403, control);
+        }
+        for (_, pane) in &mut pair {
+            pane.scroll_to_heading(0);
+        }
+        for frame in 7..10 {
+            caption_oracle_frame(&mut pair, frame, wide, Vec::new());
+        }
+        let output = caption_oracle_frame(&mut pair, 10, wide, Vec::new());
+        let text = output[0]
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "café 漢字" => Some(text),
+                _ => None,
+            })
+            .expect("the live Unicode table cell");
+        let start = text.pos
+            + text
+                .galley
+                .pos_from_cursor(text.galley.begin())
+                .center()
+                .to_vec2();
+        let end = text.pos
+            + text
+                .galley
+                .pos_from_cursor(text.galley.end())
+                .center()
+                .to_vec2();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        caption_oracle_frame(
+            &mut pair,
+            11,
+            wide,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        caption_oracle_frame(&mut pair, 12, wide, vec![egui::Event::PointerMoved(end)]);
+        caption_oracle_frame(&mut pair, 13, wide, vec![button(end, false)]);
+        let output = caption_oracle_frame(&mut pair, 14, wide, vec![egui::Event::Copy]);
+        assert!(output[1].platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyHtml {text, html} if text.trim() == "café 漢字" && html.contains("<table>"))
+        }));
+        for (_, pane) in &mut pair {
+            pane.scroll_to_heading(399);
+        }
+        for frame in 15..18 {
+            caption_oracle_frame(&mut pair, frame, wide, Vec::new());
+        }
+        let cells = &pair[1].1.table_cell_probe.as_ref().unwrap().observations;
+        assert!(cells
+            .last()
+            .unwrap()
+            .rect
+            .intersects(egui::Rect::from_min_size(egui::Pos2::ZERO, wide)));
+        assert_table_preparation_work(&pair, 403, "offscreen heading navigation");
+    }
+
+    #[test]
+    fn table_preparation_refuses_complex_highlighted_and_capacity_overflow_then_recovers() {
+        let context = egui::Context::default();
+        let mut output = context.run_ui(Default::default(), |ui| {
+            let base = ui.painter().layout_no_wrap(
+                "capacity".into(),
+                FontId::proportional(BODY_TEXT_SIZE - 1.0),
+                theme::TEXT_PRIMARY,
+            );
+            let mut exact = (*base).clone();
+            let mut job = (*exact.job).clone();
+            job.text = String::with_capacity(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES);
+            job.text.push_str("capacity");
+            exact.job = Arc::new(job);
+            let non_text = table_cell_payload_bytes(&exact).unwrap() - exact.job.text.capacity();
+            let mut job = (*exact.job).clone();
+            job.text = String::with_capacity(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES - non_text);
+            job.text.push_str("capacity");
+            exact.job = Arc::new(job);
+            assert_eq!(table_cell_payload_bytes(&exact), Some(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES));
+            let mut preparation = TableCellPreparation::default();
+            assert!(preparation.retain(&Arc::new(exact.clone())));
+            assert!(!preparation.retain(&base), "an admitted entry cannot exceed the exact aggregate cap");
+
+            let mut extra = exact.clone();
+            let mut job = (*extra.job).clone();
+            job.text = String::with_capacity(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES - non_text + 1);
+            job.text.push_str("capacity");
+            extra.job = Arc::new(job);
+            assert_eq!(table_cell_payload_bytes(&extra), Some(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES + 1));
+            assert!(!TableCellPreparation::default().retain(&Arc::new(extra)));
+
+            for field in ["sections", "rows", "glyphs", "vertices", "indices"] {
+                let mut extra = (*base).clone();
+                extra.job = Arc::new((*extra.job).clone());
+                for row in &mut extra.rows {
+                    Arc::make_mut(&mut row.row);
+                }
+                let before = table_cell_payload_bytes(&extra).unwrap();
+                let delta = match field {
+                    "sections" => {
+                        let job = Arc::make_mut(&mut extra.job);
+                        let before = job.sections.capacity();
+                        job.sections.reserve_exact(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES);
+                        (job.sections.capacity() - before) * std::mem::size_of::<egui::text::LayoutSection>()
+                    }
+                    "rows" => {
+                        let before = extra.rows.capacity();
+                        extra.rows.reserve_exact(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES);
+                        (extra.rows.capacity() - before) * std::mem::size_of::<egui::epaint::text::PlacedRow>()
+                    }
+                    _ => {
+                        let row = Arc::make_mut(&mut extra.rows[0].row);
+                        match field {
+                            "glyphs" => {
+                                let before = row.glyphs.capacity();
+                                row.glyphs.reserve_exact(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES);
+                                (row.glyphs.capacity() - before) * std::mem::size_of::<egui::epaint::text::Glyph>()
+                            }
+                            "vertices" => {
+                                let before = row.visuals.mesh.vertices.capacity();
+                                row.visuals.mesh.vertices.reserve_exact(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES);
+                                (row.visuals.mesh.vertices.capacity() - before) * std::mem::size_of::<egui::epaint::Vertex>()
+                            }
+                            _ => {
+                                let before = row.visuals.mesh.indices.capacity();
+                                row.visuals.mesh.indices.reserve_exact(MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES);
+                                (row.visuals.mesh.indices.capacity() - before) * std::mem::size_of::<u32>()
+                            }
+                        }
+                    }
+                };
+                assert!(delta > 0, "{field}");
+                assert_eq!(table_cell_payload_bytes(&extra), Some(before + delta), "{field}");
+                assert!(!TableCellPreparation::default().retain(&Arc::new(extra)), "{field} spare capacity must be charged");
+            }
+            eprintln!(
+                "table metadata: fixed entry array={} bytes; painter-key Option={} bytes; two counters={} bytes; Galley/LayoutJob/Row bodies include their Vec metadata; Arc control blocks and allocator overhead are not included in the 64 KiB payload",
+                std::mem::size_of::<[Option<Arc<egui::Galley>>; MAX_PREPARED_TABLE_CELLS]>(),
+                std::mem::size_of::<Option<TableCellPainterKey>>(),
+                2 * std::mem::size_of::<usize>(),
+            );
+        });
+        output.textures_delta.clear();
+        let mut pair = table_preparation_pair(&mixed_caption_fixture());
+        let size = vec2(1180.0, 760.0);
+        let bounded_rows: String = (0..48)
+            .map(|index| format!("| cell{index} | value{index} |\n"))
+            .collect();
+        rebind_caption_oracle(
+            &mut pair,
+            &format!("| A | B |\n| - | - |\n{bounded_rows}{bounded_rows}"),
+        );
+        caption_oracle_frame(&mut pair, 0, size, Vec::new());
+        let old = pair[0].1.table_cell_probe.as_ref().unwrap();
+        let new = pair[1].1.table_cell_probe.as_ref().unwrap();
+        assert_eq!(new.retained_entries, MAX_PREPARED_TABLE_CELLS);
+        assert_eq!(old.observations.len(), 194);
+        assert_eq!(new.preparations, old.preparations - 30);
+
+        let input = format!("{}é", "x".repeat(MAX_PREPARED_TABLE_CELL_INPUT_BYTES - 2));
+        let rows = (0..4)
+            .map(|index| format!("| {input}{index} | **complex** |\n"))
+            .collect::<String>();
+        rebind_caption_oracle(&mut pair, &format!("| A | B |\n| - | - |\n{rows}{rows}"));
+        caption_oracle_frame(&mut pair, 1, size, Vec::new());
+        let old = pair[0].1.table_cell_probe.as_ref().unwrap();
+        let new = pair[1].1.table_cell_probe.as_ref().unwrap();
+        assert_eq!(
+            new.retained_entries, 2,
+            "257 UTF-8 bytes and complex inlines are ordinary"
+        );
+        assert_eq!(old.preparations, new.preparations);
+
+        let rows = (0..8)
+            .map(|index| {
+                format!(
+                    "| {}{index} | short |\n",
+                    "x".repeat(MAX_PREPARED_TABLE_CELL_INPUT_BYTES - 1)
+                )
+            })
+            .collect::<String>();
+        rebind_caption_oracle(&mut pair, &format!("| A | B |\n| - | - |\n{rows}{rows}"));
+        caption_oracle_frame(&mut pair, 2, size, Vec::new());
+        let old = pair[0].1.table_cell_probe.as_ref().unwrap();
+        let new = pair[1].1.table_cell_probe.as_ref().unwrap();
+        assert!(
+            new.retained_entries < 11,
+            "actual glyph/row/mesh capacities exhaust the payload allowance"
+        );
+        assert!(
+            new.preparations > 11,
+            "refused payloads are prepared normally again"
+        );
+        assert!(
+            new.preparations < old.preparations,
+            "admitted cells still reuse"
+        );
+        assert!(new.retained_payload_bytes <= MAX_PREPARED_TABLE_CELL_PAYLOAD_BYTES);
+        eprintln!(
+            "table capacity refusal: entries={} accounted payload={} preparations={}/{}",
+            new.retained_entries, new.retained_payload_bytes, old.preparations, new.preparations
+        );
+
+        rebind_caption_oracle(&mut pair, &mixed_caption_fixture());
+        caption_oracle_frame(&mut pair, 3, size, Vec::new());
+        assert_table_preparation_work(&pair, 403, "refusal recovery");
+    }
+
+    #[test]
+    fn code_copy_caption_matches_the_same_context_factory_and_refreshes_dependencies() {
+        let mut preparation = CodeCopyCaptionPreparation {
+            probe: Some(CodeCopyProbe::default()),
+            ..Default::default()
+        };
+        let contexts = [egui::Context::default(), egui::Context::default()];
+        for (index, context) in contexts.iter().enumerate() {
+            // The second context must not inherit the first context's atlas.
+            for scale in [1.0, 1.5] {
+                context.set_pixels_per_point(scale);
+                let before = preparation.probe.as_ref().unwrap().preparations;
+                let mut output = context.run_ui(Default::default(), |ui| {
+                    for (font, color) in [
+                        (
+                            FontId::proportional(TOOLBAR_TEXT_SIZE),
+                            theme::TEXT_SECONDARY,
+                        ),
+                        (
+                            FontId::monospace(TOOLBAR_TEXT_SIZE + 2.0),
+                            theme::TEXT_SECONDARY,
+                        ),
+                        (
+                            FontId::monospace(TOOLBAR_TEXT_SIZE + 2.0),
+                            theme::TEXT_PRIMARY,
+                        ),
+                    ] {
+                        for width in [40.0, 700.0] {
+                            ui.set_max_width(width);
+                            ui.style_mut().override_font_id = Some(FontId::monospace(29.0));
+                            ui.style_mut().visuals.override_text_color = Some(Color32::RED);
+                            ui.set_opacity(0.5);
+                            let next_id = ui.next_auto_id();
+                            let actual = preparation.galley(ui, font.clone(), color);
+                            let reference =
+                                ui.painter()
+                                    .layout_no_wrap("Copy".to_owned(), font.clone(), color);
+                            assert_eq!(actual.as_ref(), reference.as_ref());
+                            assert!(
+                                Arc::ptr_eq(&actual, &reference),
+                                "context={index}, scale={scale}"
+                            );
+                            assert_eq!(
+                                next_id,
+                                ui.next_auto_id(),
+                                "preparation allocates no widget IDs"
+                            );
+                        }
+                    }
+                });
+                assert_eq!(preparation.probe.as_ref().unwrap().preparations - before, 3);
+                output.textures_delta.clear();
+            }
+        }
+        let context = &contexts[1];
+        let mut input = egui::RawInput {
+            viewport_id: egui::ViewportId::from_hash_of("caption-other-viewport"),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .insert(input.viewport_id, Default::default());
+        let mut output = context.run_ui(input, |ui| {
+            let actual = preparation.galley(
+                ui,
+                FontId::proportional(TOOLBAR_TEXT_SIZE),
+                theme::TEXT_SECONDARY,
+            );
+            let reference = ui.painter().layout_no_wrap(
+                "Copy".to_owned(),
+                FontId::proportional(TOOLBAR_TEXT_SIZE),
+                theme::TEXT_SECONDARY,
+            );
+            assert!(Arc::ptr_eq(&actual, &reference));
+            assert_eq!(
+                preparation.prepared.as_ref().unwrap().key.viewport,
+                ui.ctx().viewport_id()
+            );
+        });
+        output.textures_delta.clear();
+
+        let mut preparation = CodeCopyCaptionPreparation {
+            probe: Some(CodeCopyProbe::default()),
+            ..Default::default()
+        };
+        let font = FontId::proportional(TOOLBAR_TEXT_SIZE);
+        let mut prior = None;
+        let mut output = context.run_ui(Default::default(), |ui| {
+            let before = preparation.galley(ui, font.clone(), theme::TEXT_SECONDARY);
+            let mut definitions = egui::FontDefinitions::default();
+            definitions.families.insert(
+                egui::FontFamily::Proportional,
+                definitions.families[&egui::FontFamily::Monospace].clone(),
+            );
+            context.set_fonts(definitions);
+            let after = preparation.galley(ui, font.clone(), theme::TEXT_SECONDARY);
+            let reference =
+                ui.painter()
+                    .layout_no_wrap("Copy".to_owned(), font.clone(), theme::TEXT_SECONDARY);
+            assert!(
+                Arc::ptr_eq(&before, &after),
+                "font updates are deferred within a pass"
+            );
+            assert!(Arc::ptr_eq(&after, &reference));
+            prior = Some(after);
+        });
+        output.textures_delta.clear();
+        let mut output = context.run_ui(Default::default(), |ui| {
+            let actual = preparation.galley(ui, font.clone(), theme::TEXT_SECONDARY);
+            let reference =
+                ui.painter()
+                    .layout_no_wrap("Copy".to_owned(), font.clone(), theme::TEXT_SECONDARY);
+            assert!(Arc::ptr_eq(&actual, &reference));
+            assert!(
+                !Arc::ptr_eq(&actual, prior.as_ref().unwrap()),
+                "the new pass cannot reuse the previous atlas's galley"
+            );
+        });
+        assert_eq!(preparation.probe.as_ref().unwrap().preparations, 2);
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn code_line_galleys_skip_warm_job_clones_and_layouts_even_when_revealed() {
+        let mut pair = caption_oracle_pair(&code_navigation_fixture());
+        let size = vec2(1180.0, 760.0);
+        let tail = "nav_target_399";
+        for frame in 0..3 {
+            let output = caption_oracle_frame(&mut pair, frame, size, Vec::new());
+            assert!(visible_code_geometry(&output[1], tail).is_none());
+        }
+        let retained: Vec<_> = pair[1]
+            .1
+            .code_preparation
+            .galleys
+            .iter()
+            .map(|(key, prepared)| (*key, prepared.galley.clone()))
+            .collect();
+        assert_eq!(retained.len(), 400);
+        for frame in 3..8 {
+            if frame == 3 {
+                for (_, pane) in &mut pair {
+                    pane.find
+                        .set_query(pane.document.as_ref().unwrap(), "Entry".into());
+                    pane.pending_scroll = Some(PendingScroll::Byte(
+                        pane.code_copy_probe.as_ref().unwrap().buttons[399]
+                            .source
+                            .start,
+                    ));
+                }
+            }
+            let output = caption_oracle_frame(&mut pair, frame, size, Vec::new());
+            let preparation = &pair[1].1.code_preparation;
+            let probe = preparation.probe.as_ref().unwrap();
+            assert_eq!(probe.galley_hits, 400);
+            assert_eq!(probe.layouts, 0);
+            assert_eq!(probe.clone_payload_bytes, 0);
+            assert_eq!(probe.preparations, 400);
+            for (key, galley) in &retained {
+                assert!(Arc::ptr_eq(galley, &preparation.galleys[key].galley));
+            }
+            if frame == 7 {
+                // Byte navigation targets the code row, not its separate header.
+                let (rect, clip) = visible_code_geometry(&output[1], tail)
+                    .expect("the previously offscreen code row must be revealed");
+                assert!(clip.contains(rect.center()));
+            }
+        }
+        assert!(pair[1].1.pending_scroll.is_none());
+        let weak = Arc::downgrade(&retained[0].1);
+        drop(retained);
+        let owners = weak.strong_count();
+        rebind_caption_oracle(&mut pair, "```text\nreplacement\n```\n");
+        assert_eq!(weak.strong_count(), owners - 1);
+        assert_eq!(pair[1].1.code_preparation.galley_payload_bytes, 0);
+        caption_oracle_frame(&mut pair, 8, size, Vec::new());
+        let weak = Arc::downgrade(
+            &pair[1]
+                .1
+                .code_preparation
+                .galleys
+                .values()
+                .next()
+                .unwrap()
+                .galley,
+        );
+        // Egui may still own the same galley in its ordinary font cache.
+        // Dropping the owner must remove our retention, not evict egui's cache.
+        drop(pair);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn code_line_galleys_invalidate_exact_dependencies_and_preserve_unicode_selection() {
+        let source = "```text\ncafé 漢字\n\n\tindented\n```\n";
+        let mut pair = caption_oracle_pair(source);
+        let size = vec2(1180.0, 760.0);
+        caption_oracle_frame(&mut pair, 0, size, Vec::new());
+        for (frame, control) in [
+            "width", "fonts", "options", "scale", "theme", "override", "atlas", "revision",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let size = if control == "width" {
+                vec2(360.0, 760.0)
+            } else {
+                size
+            };
+            for (context, _) in &pair {
+                match control {
+                    "fonts" => {
+                        let mut fonts = egui::FontDefinitions::default();
+                        fonts.families.insert(
+                            egui::FontFamily::Monospace,
+                            fonts.families[&egui::FontFamily::Proportional].clone(),
+                        );
+                        context.set_fonts(fonts);
+                    }
+                    "options" => context.global_style_mut(|style| {
+                        style.visuals.text_options.font_hinting =
+                            !style.visuals.text_options.font_hinting;
+                    }),
+                    "scale" => {
+                        context.set_pixels_per_point(1.25);
+                        // Context::begin_pass overrides screen_rect while
+                        // activating zoom. Activate it before measuring at our
+                        // fixed input rectangle, rather than calling that
+                        // transient rectangle the first stable-width frame.
+                        let mut output = context.run_ui(Default::default(), |_| {});
+                        output.textures_delta.clear();
+                        assert_eq!(context.pixels_per_point(), 1.25);
+                    }
+                    "theme" => context.set_visuals(egui::Visuals::light()),
+                    "override" => context.global_style_mut(|style| {
+                        style.visuals.override_text_color = Some(egui::Color32::RED);
+                    }),
+                    "atlas" => crate::document_layout::exhaust_font_atlas(context),
+                    _ => {}
+                }
+            }
+            if control == "revision" {
+                rebind_caption_oracle(&mut pair, source);
+            }
+            caption_oracle_frame(&mut pair, frame * 2 + 1, size, Vec::new());
+            let preparation = &pair[1].1.code_preparation;
+            assert_eq!(preparation.probe.as_ref().unwrap().layouts, 3, "{control}");
+            assert!(preparation.galley_payload_bytes <= MAX_PREPARED_CODE_GALLEY_BYTES);
+            caption_oracle_frame(&mut pair, frame * 2 + 2, size, Vec::new());
+            assert_eq!(
+                pair[1].1.code_preparation.probe.as_ref().unwrap().layouts,
+                0,
+                "{control}: warm"
+            );
+        }
+        let output = caption_oracle_frame(&mut pair, 17, size, Vec::new());
+        let text = output[0]
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "café 漢字" => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        let start = text.pos
+            + text
+                .galley
+                .pos_from_cursor(text.galley.begin())
+                .center()
+                .to_vec2();
+        let end = text.pos
+            + text
+                .galley
+                .pos_from_cursor(text.galley.end())
+                .center()
+                .to_vec2();
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        caption_oracle_frame(
+            &mut pair,
+            18,
+            size,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        caption_oracle_frame(&mut pair, 19, size, vec![egui::Event::PointerMoved(end)]);
+        caption_oracle_frame(&mut pair, 20, size, vec![button(end, false)]);
+        let output = caption_oracle_frame(&mut pair, 21, size, vec![egui::Event::Copy]);
+        assert!(output[1].platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text.trim() == "café 漢字")
+        }));
+    }
+
+    #[test]
+    fn code_line_galleys_bound_capacity_and_keep_uncached_and_unsupported_labels_live() {
+        let mut pair = caption_oracle_pair("```text\nbounded\n```\n");
+        let size = vec2(1180.0, 760.0);
+        caption_oracle_frame(&mut pair, 0, size, Vec::new());
+        let galley = pair[1]
+            .1
+            .code_preparation
+            .galleys
+            .values()
+            .next()
+            .unwrap()
+            .galley
+            .clone();
+        let cache = &mut pair[1].1.code_preparation;
+        cache.clear_galleys();
+        for index in 0..=MAX_PREPARED_CODE_JOBS {
+            cache.retain((usize::MAX, index), 100.0, Align::Min, false, &galley);
+        }
+        assert_eq!(cache.galleys.len(), MAX_PREPARED_CODE_JOBS);
+        assert!(!cache
+            .galleys
+            .contains_key(&(usize::MAX, MAX_PREPARED_CODE_JOBS)));
+        // A full cache must still render the entire ordinary selectable label.
+        caption_oracle_frame(&mut pair, 1, size, Vec::new());
+        assert_eq!(
+            pair[1].1.code_preparation.probe.as_ref().unwrap().layouts,
+            1
+        );
+        caption_oracle_frame(&mut pair, 2, size, Vec::new());
+        assert_eq!(
+            pair[1].1.code_preparation.probe.as_ref().unwrap().layouts,
+            1
+        );
+        let mut excessive = (*galley).clone();
+        excessive.rows.reserve_exact(
+            MAX_PREPARED_CODE_GALLEY_BYTES / std::mem::size_of::<egui::epaint::text::PlacedRow>()
+                + 1,
+        );
+        assert!(galley_payload_bytes(&excessive).unwrap() > MAX_PREPARED_CODE_GALLEY_BYTES);
+        let cache = &mut pair[1].1.code_preparation;
+        cache.clear_galleys();
+        cache.retain((0, 0), 100.0, Align::Min, false, &Arc::new(excessive));
+        assert!(cache.galleys.is_empty());
+        assert_eq!(cache.galley_payload_bytes, 0);
+        let mut large = (*galley).clone();
+        large.rows.reserve_exact(
+            MAX_PREPARED_CODE_GALLEY_BYTES
+                / 4
+                / std::mem::size_of::<egui::epaint::text::PlacedRow>(),
+        );
+        let large = Arc::new(large);
+        for index in 0..8 {
+            cache.retain((usize::MAX, index), 100.0, Align::Min, false, &large);
+        }
+        assert!(!cache.galleys.is_empty());
+        assert!(cache.galleys.len() < 8);
+        assert!(cache.galley_payload_bytes <= MAX_PREPARED_CODE_GALLEY_BYTES);
+        let weak = Arc::downgrade(&large);
+        drop(large);
+        cache.clear();
+        assert!(weak.upgrade().is_none());
+        caption_oracle_frame(&mut pair, 3, size, Vec::new());
+        caption_oracle_frame(&mut pair, 4, size, Vec::new());
+        assert_eq!(
+            pair[1].1.code_preparation.probe.as_ref().unwrap().layouts,
+            0
+        );
+
+        let parsed = document("```text\nbounded\n```\n");
+        let Block::CodeBlock(block) = &parsed.blocks()[0] else {
+            panic!("code block")
+        };
+        let output: [egui::FullOutput; 2] = std::array::from_fn(|index| {
+            let (context, pane) = &mut pair[index];
+            let mut output = context.run_ui(Default::default(), |ui| {
+                pane.code_preparation.begin(ui);
+                ui.horizontal_wrapped(|ui| {
+                    let response =
+                        pane.code_preparation
+                            .label(ui, 0, 0, &block.highlighted_lines()[0]);
+                    assert!(response.rect.height() > 0.0);
+                });
+            });
+            output.textures_delta.clear();
+            output
+        });
+        assert_eq!(output[0].shapes, output[1].shapes);
+        assert_eq!(
+            format!("{:?}", output[0].platform_output.accesskit_update),
+            format!("{:?}", output[1].platform_output.accesskit_update)
+        );
+        assert_eq!(
+            pair[1]
+                .1
+                .code_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .galley_hits,
+            0
+        );
+    }
+
+    #[test]
+    fn code_line_preparation_reuses_bounded_jobs_with_live_layout_and_snapshot_invalidation() {
+        let mut pair = caption_oracle_pair(&mixed_caption_fixture());
+        let size = vec2(1180.0, 760.0);
+        caption_oracle_frame(&mut pair, 0, size, Vec::new());
+        let count = pair[1].1.code_preparation.jobs.len();
+        assert_eq!(count, 400);
+        let weak = Arc::downgrade(pair[1].1.code_preparation.jobs.values().next().unwrap());
+        for frame in 1..5 {
+            for (context, pane) in &mut pair {
+                pane.find
+                    .set_query(pane.document.as_ref().unwrap(), "synthetic".into());
+                if frame == 2 {
+                    let mut fonts = egui::FontDefinitions::default();
+                    fonts.families.insert(
+                        egui::FontFamily::Monospace,
+                        fonts.families[&egui::FontFamily::Proportional].clone(),
+                    );
+                    context.set_fonts(fonts);
+                }
+                if frame == 3 {
+                    context.set_pixels_per_point(2.0);
+                    context.set_visuals(egui::Visuals::light());
+                }
+                if frame == 4 {
+                    pane.pending_scroll = Some(PendingScroll::Byte(
+                        pane.code_copy_probe.as_ref().unwrap().buttons[399]
+                            .source
+                            .start,
+                    ));
+                }
+            }
+            let width = if frame == 1 { 360.0 } else { size.x };
+            caption_oracle_frame(&mut pair, frame, vec2(width, size.y), Vec::new());
+            assert_eq!(
+                pair[0]
+                    .1
+                    .code_preparation
+                    .probe
+                    .as_ref()
+                    .unwrap()
+                    .preparations,
+                count * (frame + 1)
+            );
+            assert_eq!(
+                pair[1]
+                    .1
+                    .code_preparation
+                    .probe
+                    .as_ref()
+                    .unwrap()
+                    .preparations,
+                count
+            );
+        }
+        assert!(weak.upgrade().is_some());
+        rebind_caption_oracle(&mut pair, "```text\nreplacement\n```\n");
+        assert!(weak.upgrade().is_none());
+        caption_oracle_frame(&mut pair, 5, size, Vec::new());
+        let job = pair[1].1.code_preparation.jobs.values().next().unwrap();
+        assert_eq!(job.text, "replacement");
+        let weak = Arc::downgrade(job);
+        drop(pair);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn code_line_preparation_falls_back_at_both_bounds_and_releases_reloaded_snapshots() {
+        let text = format!(
+            "```text\n{}```\n",
+            "bounded\n".repeat(MAX_PREPARED_CODE_JOBS + 1)
+        );
+        let parsed = document(&text);
+        let Block::CodeBlock(block) = &parsed.blocks()[0] else {
+            panic!("expected code block");
+        };
+        let mut preparation = CodeLinePreparation::default();
+        for (index, line) in block.highlighted_lines().iter().enumerate() {
+            let job = preparation.line(0, index, line);
+            assert_eq!(job.as_ref(), &highlighted_line_job(line));
+        }
+        assert_eq!(preparation.jobs.len(), MAX_PREPARED_CODE_JOBS);
+        assert!(preparation.payload_bytes <= MAX_PREPARED_CODE_JOB_PAYLOAD_BYTES);
+        assert!(!preparation.jobs.contains_key(&(0, MAX_PREPARED_CODE_JOBS)));
+        preparation.clear();
+        let text = format!("```text\n{}\n```\n", "x".repeat(128 * 1024));
+        let parsed = document(&text);
+        let Block::CodeBlock(block) = &parsed.blocks()[0] else {
+            panic!("expected code block");
+        };
+        for index in 0..32 {
+            let job = preparation.line(index, 0, &block.highlighted_lines()[0]);
+            assert_eq!(job.text.len(), 128 * 1024);
+        }
+        assert_eq!(preparation.jobs.len(), 31);
+        assert!(preparation.payload_bytes <= MAX_PREPARED_CODE_JOB_PAYLOAD_BYTES);
+        assert!(!preparation.jobs.contains_key(&(31, 0)));
+
+        let mut viewer = MarkdownViewerTab::open_remote(
+            test_remote_source("/owned/code.md"),
+            "/owned/code.md".into(),
+            b"```text\nold\n```\n".to_vec(),
+        );
+        let context = egui::Context::default();
+        let tab_id = TabId::next_for_test();
+        let mut output = context.run_ui(Default::default(), |ui| {
+            viewer.show(ui, tab_id);
+        });
+        output.textures_delta.clear();
+        let weak = Arc::downgrade(viewer.code_preparation.jobs.values().next().unwrap());
+        let galley = Arc::downgrade(
+            &viewer
+                .code_preparation
+                .galleys
+                .values()
+                .next()
+                .unwrap()
+                .galley,
+        );
+        let owners = galley.strong_count();
+        viewer.reload();
+        assert!(
+            weak.upgrade().is_some(),
+            "failed reload preserves the old snapshot"
+        );
+        assert_eq!(galley.strong_count(), owners);
+        viewer.apply_load_result(Ok(load_remote_document(
+            test_remote_source("/owned/code.md"),
+            "/owned/code.md".into(),
+            b"```text\nnew\n```\n".to_vec(),
+        )
+        .unwrap()));
+        assert!(weak.upgrade().is_none());
+        assert_eq!(galley.strong_count(), owners - 1);
+        assert!(viewer.code_preparation.jobs.is_empty());
+        assert_eq!(viewer.code_preparation.payload_bytes, 0);
+        assert!(viewer.code_preparation.galleys.is_empty());
+        assert_eq!(viewer.code_preparation.galley_payload_bytes, 0);
+    }
+
+    #[test]
+    fn code_copy_caption_preserves_the_mixed_preview_on_cold_warm_and_invalidated_passes() {
+        let markdown = mixed_caption_fixture();
+        let mut pair = caption_oracle_pair(&markdown);
+        let wide = vec2(1180.0, 760.0);
+        for frame in 0..2 {
+            caption_oracle_frame(&mut pair, frame, wide, Vec::new());
+            let buttons = &pair[1].1.code_copy_probe.as_ref().unwrap().buttons;
+            assert_eq!(buttons.len(), 400);
+            assert!(
+                buttons.last().unwrap().rect.top() > wide.y,
+                "offscreen fences remain live"
+            );
+        }
+        caption_oracle_frame(&mut pair, 2, vec2(360.0, 760.0), Vec::new());
+        for (context, pane) in &mut pair {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.families.insert(
+                egui::FontFamily::Proportional,
+                fonts.families[&egui::FontFamily::Monospace].clone(),
+            );
+            context.set_fonts(fonts);
+            pane.find
+                .set_query(pane.document.as_ref().unwrap(), "synthetic".into());
+        }
+        caption_oracle_frame(&mut pair, 3, wide, Vec::new());
+        for (context, _) in &pair {
+            context.set_theme(egui::ThemePreference::Light);
+            context.set_visuals(egui::Visuals::light());
+        }
+        caption_oracle_frame(&mut pair, 4, wide, Vec::new());
+        for (context, _) in &pair {
+            context.set_pixels_per_point(1.5);
+        }
+        caption_oracle_frame(&mut pair, 5, wide, Vec::new());
+        rebind_caption_oracle(
+            &mut pair,
+            &markdown.replace("fn example()", "fn changed_example()"),
+        );
+        caption_oracle_frame(&mut pair, 6, wide, Vec::new());
+        for (_, pane) in &mut pair {
+            pane.error = Some("Synthetic projection failure".into());
+        }
+        caption_oracle_frame(&mut pair, 7, wide, Vec::new());
+        assert_eq!(pair[1].1.code_copy_probe.as_ref().unwrap().preparations, 0);
+        rebind_caption_oracle(&mut pair, "# No fences\n\nOnly a paragraph.\n");
+        caption_oracle_frame(&mut pair, 8, wide, Vec::new());
+        assert_eq!(pair[1].1.code_copy_probe.as_ref().unwrap().preparations, 0);
+        for (_, pane) in &mut pair {
+            pane.document = None;
+        }
+        caption_oracle_frame(&mut pair, 9, wide, Vec::new());
+    }
+
+    #[test]
+    fn preview_selection_copies_rich_text_and_shift_menu_markdown_source() {
+        for (source, start_text, start_index, end_text, end_index, plain, markdown, tags) in [
+            (
+                "Before **café & bold** and `code` after.\n",
+                "Before ",
+                0,
+                "after.",
+                usize::MAX,
+                "Before café & bold and code after.",
+                "Before **café & bold** and `code` after.",
+                vec!["<strong>café &amp; bold</strong>", "<code>code</code>"],
+            ),
+            (
+                "Before *italic* ~~strike~~ [Web](https://example.test/?a=1&b=2) after.\n",
+                "Before ",
+                0,
+                "after.",
+                usize::MAX,
+                "Before italic strike Web after.",
+                "Before *italic* ~~strike~~ [Web](https://example.test/?a=1&b=2) after.",
+                vec![
+                    "<em>italic</em>",
+                    "<s>strike</s>",
+                    "<a href=\"https://example.test/?a=1&amp;b=2\">Web</a>",
+                ],
+            ),
+            (
+                "Before **café 漢字 e\u{301}** after.\n",
+                "café 漢字 e\u{301}",
+                2,
+                "café 漢字 e\u{301}",
+                6,
+                "fé 漢",
+                "fé 漢",
+                vec!["<strong>fé 漢</strong>"],
+            ),
+            (
+                "Before same **same** and same after.\n",
+                "Before same ",
+                0,
+                "and same after.",
+                usize::MAX,
+                "Before same same and same after.",
+                "Before same **same** and same after.",
+                vec!["<strong>same</strong>"],
+            ),
+            (
+                "Before **bold**\n\n```text\ncafé\n```\n\nAfter end.\n",
+                "Before ",
+                0,
+                "After end.",
+                usize::MAX,
+                "Before bold\n\ncafé\n\nAfter end.",
+                "Before **bold**\n\n```text\ncafé\n```\n\nAfter end.",
+                vec!["<strong>bold</strong>", "<pre>", "<code>café</code>"],
+            ),
+            (
+                "Before **bold**\n\n```text\nfirst\n\nsecond\n\n\nthird\n```\n\nAfter end.\n",
+                "Before ",
+                0,
+                "After end.",
+                usize::MAX,
+                "Before bold\n\nfirst\n\nsecond\n\nthird\n\nAfter end.",
+                "Before **bold**\n\n```text\nfirst\n\nsecond\n\n\nthird\n```\n\nAfter end.",
+                vec!["<code>first</code>\n\n<code>second</code>\n\n\n<code>third</code>"],
+            ),
+            (
+                "Before **bold**\n\n```text\nif (x) {\n  foo();\n}\n```\n\nAfter end.\n",
+                "Before ",
+                0,
+                "After end.",
+                usize::MAX,
+                "Before bold\n\nif (x) {\n  foo();\n}\n\nAfter end.",
+                "Before **bold**\n\n```text\nif (x) {\n  foo();\n}\n```\n\nAfter end.",
+                vec!["<code>if (x) {</code>\n<code>  foo();</code>\n<code>}</code>"],
+            ),
+        ] {
+            for standalone in [false, true] {
+                let [(context, mut viewer), _] = source_preparation_pair(source);
+                viewer.mode = MarkdownViewerMode::Preview;
+                viewer.outline_open = false;
+                let mut pane = MarkdownPreviewPane::new(
+                    LocalMarkdownSource::new("/docs/copy.md").unwrap().into(),
+                    source,
+                );
+                let tab = crate::tabs::AppState::for_test().active();
+                let mut frame = 0;
+                let mut render = |mut events: Vec<egui::Event>, modifiers| {
+                    frame += 1;
+                    events.insert(0, egui::Event::ModifiersChanged(modifiers));
+                    let mut output = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                vec2(1180.0, 760.0),
+                            )),
+                            time: Some(frame as f64 / 60.0),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            if standalone {
+                                viewer.show(ui, tab);
+                            } else {
+                                pane.show(ui);
+                            }
+                        },
+                    );
+                    output.textures_delta.clear();
+                    output
+                };
+                render(Vec::new(), egui::Modifiers::NONE);
+                let output = render(Vec::new(), egui::Modifiers::NONE);
+                let cursor = |text: &str, index: usize| {
+                    output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(label) if label.galley.job.text == text => {
+                                let cursor =
+                                    egui::text::CCursor::new(index.min(text.chars().count()));
+                                Some(
+                                    label.pos
+                                        + label.galley.pos_from_cursor(cursor).center().to_vec2(),
+                                )
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("missing selectable {text:?}"))
+                };
+                let start = cursor(start_text, start_index);
+                let end = cursor(end_text, end_index);
+                let button = |pos, pressed, button, modifiers| egui::Event::PointerButton {
+                    pos,
+                    pressed,
+                    button,
+                    modifiers,
+                };
+                render(
+                    vec![
+                        egui::Event::PointerMoved(start),
+                        button(
+                            start,
+                            true,
+                            egui::PointerButton::Primary,
+                            egui::Modifiers::NONE,
+                        ),
+                    ],
+                    egui::Modifiers::NONE,
+                );
+                render(vec![egui::Event::PointerMoved(end)], egui::Modifiers::NONE);
+                render(
+                    vec![button(
+                        end,
+                        false,
+                        egui::PointerButton::Primary,
+                        egui::Modifiers::NONE,
+                    )],
+                    egui::Modifiers::NONE,
+                );
+                let output = render(vec![egui::Event::Copy], egui::Modifiers::NONE);
+                let (html, text) = output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .find_map(|command| match command {
+                        egui::OutputCommand::CopyHtml { html, text } => Some((html, text)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "no rich clipboard command: {:?}",
+                            output.platform_output.commands
+                        )
+                    });
+                assert_eq!(text, plain);
+                for tag in &tags {
+                    assert!(html.contains(tag), "{html} missing {tag}");
+                }
+                assert!(!html.contains("**"));
+                render(
+                    vec![button(
+                        end,
+                        true,
+                        egui::PointerButton::Secondary,
+                        egui::Modifiers::SHIFT,
+                    )],
+                    egui::Modifiers::SHIFT,
+                );
+                render(
+                    vec![button(
+                        end,
+                        false,
+                        egui::PointerButton::Secondary,
+                        egui::Modifiers::SHIFT,
+                    )],
+                    egui::Modifiers::SHIFT,
+                );
+                let output = render(Vec::new(), egui::Modifiers::NONE);
+                let copy = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(label)
+                            if label.galley.job.text == "Copy Markdown source" =>
+                        {
+                            Some(label.galley.rect.translate(label.pos.to_vec2()).center())
+                        }
+                        _ => None,
+                    })
+                    .expect("Shift-right-click exposes source copying");
+                render(
+                    vec![
+                        egui::Event::PointerMoved(copy),
+                        button(
+                            copy,
+                            true,
+                            egui::PointerButton::Primary,
+                            egui::Modifiers::NONE,
+                        ),
+                    ],
+                    egui::Modifiers::NONE,
+                );
+                let output = render(
+                    vec![button(
+                        copy,
+                        false,
+                        egui::PointerButton::Primary,
+                        egui::Modifiers::NONE,
+                    )],
+                    egui::Modifiers::NONE,
+                );
+                assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == markdown)), "{:?}", output.platform_output.commands);
+            }
+        }
+    }
+
+    #[test]
+    fn code_copy_caption_preserves_selection_scroll_hover_and_exact_fence_payloads() {
+        let mut pair = caption_oracle_pair(&mixed_caption_fixture());
+        let size = vec2(1180.0, 760.0);
+        caption_oracle_frame(&mut pair, 0, size, Vec::new());
+        let output = caption_oracle_frame(&mut pair, 1, size, Vec::new());
+        let leading = output[0]
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "A " => Some(text),
+                _ => None,
+            })
+            .expect("the mixed paragraph's leading selectable run");
+        let trailing = output[0]
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "and ordinary text." => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("the mixed paragraph's trailing selectable run");
+        let expected_selection = "A synthetic paragraph with inline code and ordinary text.";
+        let start = leading.pos
+            + leading
+                .galley
+                .pos_from_cursor(leading.galley.begin())
+                .center()
+                .to_vec2();
+        let end = trailing.pos
+            + trailing
+                .galley
+                .pos_from_cursor(trailing.galley.end())
+                .center()
+                .to_vec2();
+        let pointer_button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        caption_oracle_frame(
+            &mut pair,
+            2,
+            size,
+            vec![
+                egui::Event::PointerMoved(start),
+                pointer_button(start, true),
+            ],
+        );
+        caption_oracle_frame(&mut pair, 3, size, vec![egui::Event::PointerMoved(end)]);
+        caption_oracle_frame(&mut pair, 4, size, vec![pointer_button(end, false)]);
+        let output = caption_oracle_frame(&mut pair, 5, size, vec![egui::Event::Copy]);
+        assert!(output[1].platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyHtml {text, ..} if text.trim() == expected_selection.trim())
+        }), "the actual mixed paragraph remains selectable and copyable");
+
+        let mut frame = 6;
+        for fence in [0, 399] {
+            for (_, pane) in &mut pair {
+                let source = pane.code_copy_probe.as_ref().unwrap().buttons[fence]
+                    .source
+                    .start;
+                pane.pending_scroll = Some(PendingScroll::Byte(source));
+            }
+            caption_oracle_frame(&mut pair, frame, size, Vec::new());
+            frame += 1;
+            caption_oracle_frame(&mut pair, frame, size, Vec::new());
+            frame += 1;
+            // egui applies the target after constructing the next content UI.
+            caption_oracle_frame(&mut pair, frame, size, Vec::new());
+            frame += 1;
+            let buttons = &pair[1].1.code_copy_probe.as_ref().unwrap().buttons;
+            let position = buttons[fence].rect.center();
+            assert!(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains(position),
+                "fence={fence}, position={position:?}, rect={:?}, pending={:?}, visible_heading={:?}",
+                buttons[fence].rect,
+                pair[1].1.pending_scroll,
+                pair[1].1.visible_heading,
+            );
+            let hovered_output = caption_oracle_frame(
+                &mut pair,
+                frame,
+                size,
+                vec![egui::Event::PointerMoved(position)],
+            );
+            assert!(pair[1].1.code_copy_probe.as_ref().unwrap().buttons[fence].hovered);
+            frame += 1;
+            let tooltip_output = caption_oracle_frame(&mut pair, frame, size, Vec::new());
+            assert!(hovered_output[1].shapes.iter().chain(&tooltip_output[1].shapes).any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Copy the code block")
+            }), "the live tooltip remains available");
+            frame += 1;
+            caption_oracle_frame(&mut pair, frame, size, vec![pointer_button(position, true)]);
+            frame += 1;
+            let output = caption_oracle_frame(
+                &mut pair,
+                frame,
+                size,
+                vec![pointer_button(position, false)],
+            );
+            assert!(output[1].platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == &format!("fn example() {{ let value = {fence}; }}\n"))
+            }), "pointer click copies this fence, including the offscreen-tail fence");
+            frame += 1;
+            for (context, pane) in &pair {
+                context.memory_mut(|memory| {
+                    memory.request_focus(pane.code_copy_probe.as_ref().unwrap().buttons[fence].id)
+                });
+            }
+            let output = caption_oracle_frame(
+                &mut pair,
+                frame,
+                size,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+            );
+            assert!(pair[1].1.code_copy_probe.as_ref().unwrap().buttons[fence].focused);
+            assert!(output[1].platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == &format!("fn example() {{ let value = {fence}; }}\n"))
+            }));
+            frame += 1;
+            caption_oracle_frame(
+                &mut pair,
+                frame,
+                size,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+            );
+            frame += 1;
+        }
+        // Display lines omit terminators; Copy must still use each raw fence.
+        let raw = "```text\nfirst\r\nsecond\n\n```\n\n```text\nlast without terminator";
+        rebind_caption_oracle(&mut pair, raw);
+        let payloads: Vec<String> = pair[0]
+            .1
+            .document
+            .as_ref()
+            .unwrap()
+            .blocks()
+            .iter()
+            .filter_map(|block| match block {
+                Block::CodeBlock(block) => Some(block.code_text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads[0].ends_with("\n\n"));
+        assert_eq!(payloads[1], "last without terminator");
+        caption_oracle_frame(&mut pair, frame, size, Vec::new());
+        frame += 1;
+        for (fence, expected) in payloads.iter().enumerate() {
+            for (context, pane) in &pair {
+                context.memory_mut(|memory| {
+                    memory.request_focus(pane.code_copy_probe.as_ref().unwrap().buttons[fence].id)
+                });
+            }
+            let output = caption_oracle_frame(
+                &mut pair,
+                frame,
+                size,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+            );
+            assert!(output[1].platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == expected)
+            }));
+            frame += 1;
+            caption_oracle_frame(
+                &mut pair,
+                frame,
+                size,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+            );
+            frame += 1;
+        }
+    }
+
+    #[test]
+    fn source_syntax_handles_multibyte_text_at_the_former_cache_key_boundary() {
+        let source = format!(
+            "{}\u{1f680}\n\n# Heading\n\n{}",
+            "x".repeat(511),
+            "y".repeat(600)
+        );
+        let mut cache = None;
+        let spans = source_syntax_spans(&mut cache, &source);
+        assert!(!spans.is_empty());
+        assert!(spans
+            .iter()
+            .all(|span| source.is_char_boundary(span.start) && source.is_char_boundary(span.end)));
+        let first = spans.as_ptr();
+        assert_eq!(source_syntax_spans(&mut cache, &source).as_ptr(), first);
+    }
+
+    #[test]
+    fn source_syntax_cache_follows_successful_reload_not_matching_text_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.md");
+        let prefix = format!("{}\n", "prefix\n".repeat(100));
+        let suffix = format!("\n{}", "suffix\n".repeat(100));
+        let before = format!("{prefix}# title\n{suffix}");
+        let after = format!("{prefix}  title\n{suffix}");
+        assert_eq!(before.len(), after.len());
+        assert_eq!(&before[..512], &after[..512]);
+        assert_eq!(&before[before.len() - 512..], &after[after.len() - 512..]);
+        fs::write(&path, &before).unwrap();
+        let mut tab = MarkdownViewerTab::open_local(path.clone());
+        let old = source_syntax_spans(&mut tab.source_syntax, &before).to_vec();
+        fs::write(&path, &after).unwrap();
+        tab.reload();
+        assert!(tab.source_syntax.is_none());
+        assert_eq!(tab.document.as_ref().unwrap().source_text(), after);
+        let fresh = source_syntax_spans(&mut tab.source_syntax, &after).to_vec();
+        assert_ne!(old, fresh);
+        let pointer = tab.source_syntax.as_ref().unwrap().as_ptr();
+        fs::remove_file(path).unwrap();
+        tab.reload();
+        assert!(tab.stale_snapshot);
+        assert_eq!(tab.source_syntax.as_ref().unwrap().as_ptr(), pointer);
+        assert_eq!(tab.document.as_ref().unwrap().source_text(), after);
+    }
+
+    #[test]
+    fn indexed_source_roles_match_full_scan_for_clipped_and_empty_ranges() {
+        let spans: Vec<_> = (0..1000)
+            .map(|index| festerm_syntax::Span {
+                start: index * 3 + 1,
+                end: index * 3 + 3,
+                role: festerm_syntax::Role::Keyword,
+            })
+            .collect();
+        for start in (0..3200).step_by(7) {
+            let end = start + start % 31;
+            let expected: Vec<_> = spans
+                .iter()
+                .filter(|span| span.start < end && span.end > start)
+                .map(|span| festerm_syntax::Span {
+                    start: span.start.max(start) - start,
+                    end: span.end.min(end) - start,
+                    role: span.role,
+                })
+                .collect();
+            assert_eq!(roles_within(&spans, start..end), expected);
+        }
+        assert!(roles_within(&[], 0..100).is_empty());
+    }
+
+    fn highlighted_sections(job: &LayoutJob) -> Vec<(Range<usize>, String)> {
+        job.sections
+            .iter()
+            .filter(|section| section.format.background != Color32::TRANSPARENT)
+            .map(|section| {
+                let range = section.byte_range.start.0..section.byte_range.end.0;
+                (range.clone(), job.text[range].to_owned())
+            })
+            .collect()
+    }
+
+    fn section_format_for_text<'a>(job: &'a LayoutJob, needle: &str) -> &'a TextFormat {
+        let start = job.text.find(needle).expect("text should be present");
+        let end = start + needle.len();
+        &job.sections
+            .iter()
+            .find(|section| {
+                let range = section.byte_range.start.0..section.byte_range.end.0;
+                range.start <= start && range.end >= end
+            })
+            .expect("section should cover the requested text")
+            .format
+    }
+
+    /// A scratch directory for image-loading tests. The viewer resolves
+    /// relative image targets against the *canonicalised* Markdown path, so
+    /// the temp root is canonicalised here too — on Windows `TEMP` is
+    /// routinely an `8.3` short path that would otherwise not match.
+    fn image_test_directory(label: &str) -> PathBuf {
+        let root = fs::canonicalize(std::env::temp_dir()).expect("temp dir should canonicalise");
+        let directory = root.join(format!(
+            "festerm-markdown-image-{label}-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("scratch directory should be creatable");
+        directory
+    }
+
+    fn write_test_png(path: &Path, width: u32, height: u32) {
+        image::RgbaImage::from_pixel(width, height, image::Rgba([10, 20, 30, 255]))
+            .save(path)
+            .expect("test PNG should be writable");
+    }
+
+    #[cfg(windows)]
+    fn image_test_junction(link: &Path, target: &Path) {
+        let command = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' -ErrorAction Stop | Out-Null",
+            link.display().to_string().replace('\'', "''"),
+            target.display().to_string().replace('\'', "''"),
+        );
+        let created = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+    }
+
+    fn saved_local_preview(source: LocalMarkdownSource, text: &str) -> MarkdownPreviewPane {
+        let loaded =
+            crate::document_store::load(source.path(), festerm_document::DocumentBounds::default())
+                .unwrap();
+        let source =
+            LocalMarkdownSource::new(loaded.source_authority.canonical_path().to_path_buf())
+                .unwrap();
+        MarkdownPreviewPane::for_saved_local_source(
+            source,
+            loaded.generation,
+            loaded.source_authority.parent_identity(),
+            text,
+        )
+    }
+
+    fn pump_preview_images(
+        pane: &mut MarkdownPreviewPane,
+        context: &egui::Context,
+        predicate: impl Fn(&MarkdownPreviewPane) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            pane.image_state().poll_background_work(context);
+            pane.image_state().start_automatic_image_loads(context);
+            if predicate(pane) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    #[test]
+    fn image_budget_saved_local_preview_shares_viewer_bytes_and_recovers_after_a_limit_increase() {
+        let directory = image_test_directory("preview-shared-bytes");
+        write_test_png(&directory.join("image.png"), 1536, 1536);
+        let markdown = directory.join("readme.md");
+        let body = "![Image](image.png)\n";
+        fs::write(&markdown, body).unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(
+            &context,
+            festerm_config::ImageMemoryBudgetPreference::MiB64,
+        );
+        let mut viewer = MarkdownViewerTab::open_local(markdown.clone());
+        assert!(pump_image_loads(&mut viewer, &context, |viewer| viewer
+            .loaded_images
+            .len()
+            == 1));
+        let retained = RETAINED_IMAGE_OVERHEAD + 2 * 1536 * 1536 * 4;
+        let mut preview = saved_local_preview(LocalMarkdownSource::new(markdown).unwrap(), body);
+        assert!(pump_preview_images(&mut preview, &context, |pane| !pane
+            .image_errors
+            .is_empty()));
+        assert!(preview.image_errors[&0].contains("Image memory budget exhausted"));
+        assert_eq!(budget.usage_for_test(), (retained, 0));
+        let generation = budget.generation();
+        for _ in 0..32 {
+            preview.image_state().start_automatic_image_loads(&context);
+        }
+        assert_eq!(budget.generation(), generation);
+        budget.set_preference(festerm_config::ImageMemoryBudgetPreference::MiB128);
+        assert!(pump_preview_images(&mut preview, &context, |pane| pane
+            .loaded_images
+            .len()
+            == 1));
+        assert_eq!(preview.automatic_image_loads, 1);
+        assert_eq!(budget.usage_for_test(), (2 * retained, 0));
+        preview.parse("# Replaced\n".to_owned());
+        assert!(preview.loaded_images.is_empty());
+        assert!(preview.pending_image_loads.is_empty());
+        assert!(!preview.resource_approvals.is_approved(0));
+        assert!(preview.image_retries.is_empty());
+        assert_eq!(preview.automatic_image_loads, 0);
+        context.tex_manager().write().take_delta().clear();
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (retained, 0));
+        drop(viewer);
+        context.tex_manager().write().take_delta().clear();
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn image_budget_preview_and_viewer_share_worker_slots() {
+        let directory = image_test_directory("preview-shared-workers");
+        write_test_png(&directory.join("image.png"), 2, 2);
+        let markdown = directory.join("readme.md");
+        let body = "![Image](image.png)\n";
+        fs::write(&markdown, body).unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(&context, Default::default());
+        let workers: Vec<_> = (0..MAX_CONCURRENT_IMAGE_LOADS)
+            .map(|_| budget.start_worker(&context).unwrap())
+            .collect();
+        let mut viewer = MarkdownViewerTab::open_local(markdown.clone());
+        let mut preview = saved_local_preview(LocalMarkdownSource::new(markdown).unwrap(), body);
+        viewer.load_local_image(0, &context);
+        preview.load_local_image(0, &context);
+        assert!(viewer.pending_image_loads.is_empty());
+        assert!(preview.pending_image_loads.is_empty());
+        assert!(viewer.image_errors[&0].contains("Four image loads"));
+        assert!(preview.image_errors[&0].contains("Four image loads"));
+        drop(workers);
+        assert!(pump_preview_images(&mut preview, &context, |pane| pane
+            .loaded_images
+            .len()
+            == 1));
+        drop(preview);
+        context.tex_manager().write().take_delta().clear();
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn image_budget_preview_failed_image_can_be_explicitly_retried_without_automatic_retry() {
+        use egui_kittest::kittest::Queryable;
+        let directory = image_test_directory("preview-manual-retry");
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "![Image](image.png)\n").unwrap();
+        let source = LocalMarkdownSource::new(markdown).unwrap();
+        let mut harness = Harness::builder().build_ui_state(
+            |ui, pane: &mut MarkdownPreviewPane| {
+                pane.show(ui);
+                for command in take_viewer_commands(ui.ctx()) {
+                    if let AppCommand::LoadMarkdownLocalImage { reference_index } = command {
+                        pane.load_local_image(reference_index, ui.ctx());
+                    }
+                }
+            },
+            saved_local_preview(source, "![Image](image.png)\n"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while harness.state().image_errors.is_empty() {
+            harness.step();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        write_test_png(&directory.join("image.png"), 2, 2);
+        for _ in 0..8 {
+            harness.step();
+        }
+        assert!(harness.state().loaded_images.is_empty());
+        assert!(harness.state().pending_image_loads.is_empty());
+        harness.get_by_label("Load local image").click();
+        while harness.state().loaded_images.is_empty() {
+            harness.step();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(harness.state().automatic_image_loads, 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn image_budget_failed_preview_parse_releases_images_without_reloading_the_hidden_snapshot() {
+        let directory = image_test_directory("preview-parse-failure");
+        write_test_png(&directory.join("image.png"), 2, 2);
+        fs::write(directory.join("readme.md"), "![Image](image.png)\n").unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(&context, Default::default());
+        let mut preview = saved_local_preview(
+            LocalMarkdownSource::new(directory.join("readme.md")).unwrap(),
+            "![Image](image.png)\n",
+        );
+        assert!(pump_preview_images(&mut preview, &context, |pane| pane
+            .loaded_images
+            .len()
+            == 1));
+        preview.parse("x".repeat(festerm_markdown::MAX_SOURCE_BYTES + 1));
+        assert!(preview.error.is_some());
+        assert!(preview.loaded_images.is_empty());
+        preview.load_local_image(0, &context);
+        let mut output = context.run_ui(Default::default(), |ui| preview.show(ui));
+        output.textures_delta.clear();
+        assert!(preview.pending_image_loads.is_empty());
+        assert_eq!(preview.automatic_image_loads, 0);
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn image_budget_preview_reparse_preserves_unchanged_completed_images() {
+        let directory = image_test_directory("preview-stable-image");
+        write_test_png(&directory.join("image.png"), 2, 2);
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "![Image](image.png)\n").unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(&context, Default::default());
+        let mut preview = saved_local_preview(
+            LocalMarkdownSource::new(markdown).unwrap(),
+            "![Image](image.png)\n",
+        );
+        assert!(pump_preview_images(&mut preview, &context, |pane| pane
+            .loaded_images
+            .len()
+            == 1));
+        let usage = budget.usage_for_test();
+
+        preview.parse("# Edited prose\n\n![Image](image.png)\n".to_owned());
+
+        assert_eq!(preview.loaded_images.len(), 1);
+        assert!(preview.pending_image_loads.is_empty());
+        assert!(preview.resource_approvals.is_approved(0));
+        assert_eq!(preview.automatic_image_loads, 1);
+        assert_eq!(budget.usage_for_test(), usage);
+        drop(preview);
+        context.tex_manager().write().take_delta().clear();
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn image_budget_local_paths_cannot_escape_the_opened_markdown_directory() {
+        let directory = image_test_directory("image-directory-grant");
+        write_test_png(&directory.join("image.png"), 2, 2);
+        fs::create_dir(directory.join("docs")).unwrap();
+        let source = directory.join("docs").join("readme.md");
+        let target = Path::new("..").join("image.png");
+        assert!(read_local_image(&source, target.to_str().unwrap())
+            .unwrap_err()
+            .contains("inside the Markdown file's directory"));
+        assert!(
+            read_local_image(&source, directory.join("image.png").to_str().unwrap())
+                .unwrap_err()
+                .contains("Only relative")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn image_budget_authority_rejects_source_replacement_after_document_load() {
+        let directory = image_test_directory("image-source-generation");
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "![Original](image.png)\n").unwrap();
+        let loaded =
+            crate::document_store::load(&markdown, festerm_document::DocumentBounds::default())
+                .unwrap();
+        let replacement = directory.join("replacement.md");
+        fs::write(&replacement, "![Replacement](image.png)\n").unwrap();
+        fs::rename(&replacement, &markdown).unwrap();
+
+        let capability = crate::document_store::open_canonical_directory(
+            loaded.source_authority.canonical_path().parent().unwrap(),
+        )
+        .unwrap();
+        assert!(validate_markdown_generation(
+            &capability,
+            loaded.source_authority.canonical_path(),
+            loaded.generation,
+            loaded.source_authority.parent_identity(),
+        )
+        .is_err());
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn image_budget_authority_rejects_a_hard_link_in_a_replacement_parent() {
+        let directory = image_test_directory("image-parent-generation");
+        let retained = image_test_directory("image-parent-retained");
+        fs::remove_dir(&retained).unwrap();
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "![Original](image.png)\n").unwrap();
+        let loaded =
+            crate::document_store::load(&markdown, festerm_document::DocumentBounds::default())
+                .unwrap();
+
+        #[cfg(windows)]
+        {
+            let error = fs::rename(&directory, &retained).unwrap_err();
+            assert!(matches!(error.raw_os_error(), Some(5) | Some(32)));
+        }
+        let canonical_path = loaded.source_authority.canonical_path().to_path_buf();
+        let generation = loaded.generation;
+        let parent_identity = loaded.source_authority.parent_identity();
+        drop(loaded);
+
+        fs::rename(&directory, &retained).unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::hard_link(retained.join("readme.md"), &markdown).unwrap();
+        write_test_png(&directory.join("image.png"), 4, 4);
+
+        let capability = crate::document_store::open_canonical_directory(&directory).unwrap();
+        assert!(
+            validate_markdown_generation(
+                &capability,
+                &canonical_path,
+                generation,
+                parent_identity,
+            )
+            .is_err(),
+            "the same Markdown file in a different directory must not transfer image authority"
+        );
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(retained).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_budget_authority_rejects_a_final_source_symlink_to_the_same_file() {
+        let directory = image_test_directory("image-source-symlink");
+        let markdown = directory.join("readme.md");
+        let retained = directory.join("retained.md");
+        fs::write(&markdown, "![Original](image.png)\n").unwrap();
+        let loaded =
+            crate::document_store::load(&markdown, festerm_document::DocumentBounds::default())
+                .unwrap();
+
+        fs::rename(&markdown, &retained).unwrap();
+        std::os::unix::fs::symlink(&retained, &markdown).unwrap();
+
+        let capability = crate::document_store::open_canonical_directory(&directory).unwrap();
+        assert!(
+            validate_markdown_generation(
+                &capability,
+                loaded.source_authority.canonical_path(),
+                loaded.generation,
+                loaded.source_authority.parent_identity(),
+            )
+            .is_err(),
+            "a name-surrogate replacement must not preserve image authority"
+        );
+        drop(capability);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_budget_final_symlink_rebinding_cannot_read_outside_the_root() {
+        let directory = image_test_directory("final-image-rebinding");
+        let outside = image_test_directory("final-image-outside");
+        write_test_png(&directory.join("image.png"), 2, 2);
+        write_test_png(&outside.join("image.png"), 4, 4);
+        let replaced = directory.join("image.png");
+        let escaped = outside.join("image.png");
+        BEFORE_LOCAL_IMAGE_OPEN.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(&replaced).unwrap();
+                std::os::unix::fs::symlink(escaped, replaced).unwrap();
+            }));
+        });
+        let result = read_local_image(&directory.join("readme.md"), "image.png");
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        assert!(
+            result.is_err(),
+            "an opened image must remain beneath its authorized directory after final-name rebinding"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_budget_intermediate_symlink_rebinding_cannot_read_outside_the_root() {
+        let directory = image_test_directory("intermediate-image-rebinding");
+        let outside = image_test_directory("intermediate-image-outside");
+        fs::create_dir(directory.join("images")).unwrap();
+        write_test_png(&directory.join("images").join("image.png"), 2, 2);
+        write_test_png(&outside.join("image.png"), 4, 4);
+        let replaced = directory.join("images");
+        let retained = directory.join("retained-images");
+        let escaped = outside.clone();
+        BEFORE_LOCAL_IMAGE_OPEN.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&replaced, retained).unwrap();
+                std::os::unix::fs::symlink(escaped, replaced).unwrap();
+            }));
+        });
+        let result = read_local_image(&directory.join("readme.md"), "images/image.png");
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        assert!(
+            result.is_err(),
+            "an opened image must remain beneath its authorized directory after component rebinding"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn image_budget_intermediate_junction_rebinding_cannot_read_outside_the_root() {
+        let directory = image_test_directory("junction-image-rebinding");
+        let outside = image_test_directory("junction-image-outside");
+        fs::create_dir(directory.join("images")).unwrap();
+        write_test_png(&directory.join("images").join("image.png"), 2, 2);
+        write_test_png(&outside.join("image.png"), 4, 4);
+        let replaced = directory.join("images");
+        let retained = directory.join("retained-images");
+        let escaped = outside.clone();
+        BEFORE_LOCAL_IMAGE_OPEN.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&replaced, retained).unwrap();
+                image_test_junction(&replaced, &escaped);
+            }));
+        });
+        let result = read_local_image(&directory.join("readme.md"), "images\\image.png");
+        fs::remove_dir(directory.join("images")).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        assert!(
+            result.is_err(),
+            "a Windows reparse point must not redirect an admitted image outside its captured root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_budget_captured_root_survives_directory_name_rebinding() {
+        let directory = image_test_directory("captured-image-root");
+        let outside = image_test_directory("captured-image-outside");
+        let retained = image_test_directory("captured-image-retained");
+        fs::remove_dir(&retained).unwrap();
+        write_test_png(&directory.join("image.png"), 2, 2);
+        write_test_png(&outside.join("image.png"), 4, 4);
+        let replaced = directory.clone();
+        let moved = retained.clone();
+        let escaped = outside.clone();
+        BEFORE_LOCAL_IMAGE_OPEN.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&replaced, moved).unwrap();
+                std::os::unix::fs::symlink(escaped, replaced).unwrap();
+            }));
+        });
+        let image = read_local_image(&directory.join("readme.md"), "image.png").unwrap();
+        fs::remove_file(directory).unwrap();
+        fs::remove_dir_all(retained).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        assert_eq!(
+            image.size,
+            [2, 2],
+            "only the captured authorized root may supply bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_budget_in_root_relative_and_absolute_symlink_aliases_remain_readable() {
+        let directory = image_test_directory("allowed-image-symlinks");
+        write_test_png(&directory.join("image.png"), 2, 2);
+        std::os::unix::fs::symlink("image.png", directory.join("relative.png")).unwrap();
+        std::os::unix::fs::symlink(directory.join("image.png"), directory.join("absolute.png"))
+            .unwrap();
+        for alias in ["relative.png", "absolute.png"] {
+            let image = read_local_image(&directory.join("readme.md"), alias).unwrap();
+            assert_eq!(image.size, [2, 2]);
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn image_budget_image_reads_release_directory_handles_on_success_and_refusal() {
+        let directory = image_test_directory("image-directory-handle-lifetime");
+        let moved = image_test_directory("image-directory-handle-moved");
+        fs::remove_dir(&moved).unwrap();
+        write_test_png(&directory.join("image.png"), 2, 2);
+        fs::write(
+            directory.join("image.svg"),
+            "<svg width=\"2\" height=\"2\"><image href=\"file:///outside.png\"/></svg>",
+        )
+        .unwrap();
+        assert!(read_local_image(&directory.join("readme.md"), "image.png").is_ok());
+        for target in ["missing.png", "image.svg", "../outside.png"] {
+            assert!(read_local_image(&directory.join("readme.md"), target).is_err());
+        }
+        fs::rename(&directory, &moved).expect("no finished image read may retain a directory lock");
+        fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[test]
+    fn image_budget_root_acquisition_refuses_a_rebound_canonical_source_parent() {
+        let directory = image_test_directory("image-root-acquisition");
+        let outside = image_test_directory("image-root-acquisition-outside");
+        let retained = image_test_directory("image-root-acquisition-retained");
+        fs::remove_dir(&retained).unwrap();
+        write_test_png(&directory.join("image.png"), 2, 2);
+        write_test_png(&outside.join("image.png"), 4, 4);
+        let replaced = directory.clone();
+        let moved = retained.clone();
+        let escaped = outside.clone();
+        BEFORE_LOCAL_IMAGE_DIRECTORY_OPEN.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&replaced, moved).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&escaped, &replaced).unwrap();
+                #[cfg(windows)]
+                image_test_junction(&replaced, &escaped);
+            }));
+        });
+        let result = read_local_image(&directory.join("readme.md"), "image.png");
+        #[cfg(unix)]
+        fs::remove_file(directory).unwrap();
+        #[cfg(windows)]
+        fs::remove_dir(directory).unwrap();
+        fs::remove_dir_all(retained).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        assert!(
+            result.is_err(),
+            "root acquisition must not reinterpret the granted canonical parent through a new alias"
+        );
+    }
+
+    #[test]
+    fn image_budget_preview_reparse_cannot_adopt_an_old_workers_result() {
+        let directory = image_test_directory("preview-stale-worker");
+        write_test_png(&directory.join("old.png"), 2, 2);
+        write_test_png(&directory.join("new.png"), 4, 4);
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "![Old](old.png)\n").unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(&context, Default::default());
+        let mut preview = saved_local_preview(
+            LocalMarkdownSource::new(markdown.clone()).unwrap(),
+            "![Old](old.png)\n",
+        );
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
+        let worker = budget.start_worker(&context).unwrap();
+        let scratch = budget
+            .reserve(IMAGE_READ_RESERVATION, Some(&context))
+            .unwrap();
+        let receiver = spawn_image_worker(
+            budget.clone(),
+            worker,
+            scratch,
+            context.clone(),
+            move |scratch, _, budget| {
+                release_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                let result = read_local_image_with_budget(
+                    &markdown, None, None, "old.png", budget, scratch, 4096,
+                );
+                finished_sender.send(()).unwrap();
+                result
+            },
+            |work| thread::Builder::new().spawn(work),
+        )
+        .unwrap();
+        preview
+            .pending_image_loads
+            .insert(0, PendingImageLoad { receiver });
+        preview.parse("![New](new.png)\n".to_owned());
+        assert!(preview.pending_image_loads.is_empty());
+        assert!(pump_preview_images(&mut preview, &context, |pane| pane
+            .loaded_images
+            .len()
+            == 1));
+        assert_eq!(preview.loaded_images[&0].size, [4, 4]);
+        release_sender.send(()).unwrap();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let retained = RETAINED_IMAGE_OVERHEAD + 2 * 4 * 4 * 4;
+        while budget.usage_for_test() != (retained, 0) {
+            assert!(
+                Instant::now() < deadline,
+                "the discarded old result must release its real owners"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        preview.image_state().poll_background_work(&context);
+        assert_eq!(preview.loaded_images[&0].size, [4, 4]);
+        drop(preview);
+        context.tex_manager().write().take_delta().clear();
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_budget_local_fifo_is_rejected_without_waiting_for_a_writer() {
+        let directory = image_test_directory("image-fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(directory.join("image.png"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "the owned FIFO fixture must be created");
+        let markdown = directory.join("readme.md");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            sender
+                .send(read_local_image(&markdown, "image.png"))
+                .unwrap()
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a special file must not pin an image worker waiting for a writer");
+        assert!(result.unwrap_err().contains("not a regular file"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn image_budget_manual_admission_obeys_the_same_pending_limit_as_automatic_loads() {
+        let directory = image_test_directory("manual-admission");
+        let mut body = String::new();
+        for index in 0..8 {
+            write_test_png(&directory.join(format!("image-{index}.png")), 2, 2);
+            body.push_str(&format!("![Image {index}](image-{index}.png)\n\n"));
+        }
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, body).unwrap();
+        let context = egui::Context::default();
+        let mut viewer = MarkdownViewerTab::open_local(markdown);
+        for index in 0..8 {
+            viewer.load_local_image(index, &context);
+        }
+        assert!(
+            viewer.pending_image_loads.len() <= MAX_CONCURRENT_AUTOMATIC_IMAGE_LOADS,
+            "manual admission retained {} pending loads, above the shared limit",
+            viewer.pending_image_loads.len()
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn image_budget_rejects_oversized_raster_header_before_trying_to_expand_its_pixels() {
+        let directory = image_test_directory("predecode-area");
+        let path = directory.join("oversized.png");
+        write_test_png(&path, 1, 1);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[16..20].copy_from_slice(&4097u32.to_be_bytes());
+        bytes[20..24].copy_from_slice(&4097u32.to_be_bytes());
+        let mut crc = u32::MAX;
+        for byte in &bytes[12..29] {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        fs::write(&path, bytes).unwrap();
+        let refusal = read_local_image(&directory.join("readme.md"), "oversized.png")
+            .expect_err("oversized header must be refused before pixel decoding");
+        assert_eq!(
+            refusal,
+            "The requested local image exceeds the raster-area limit."
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn image_budget_actual_read_is_bounded_even_without_relying_on_metadata() {
+        struct GrowingReader {
+            read: usize,
+            interrupted: bool,
+        }
+        impl Read for GrowingReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                output.fill(0);
+                self.read += output.len();
+                Ok(output.len())
+            }
+        }
+        let mut reader = GrowingReader {
+            read: 0,
+            interrupted: false,
+        };
+        let error = read_bounded_image_bytes(&mut reader).unwrap_err();
+        assert!(error.message().contains("must not exceed"));
+        assert_eq!(reader.read, MAX_IMAGE_BYTES as usize + 1);
+        let exact = vec![0u8; MAX_IMAGE_BYTES as usize];
+        let admitted = read_bounded_image_bytes(Cursor::new(&exact)).unwrap();
+        assert_eq!(admitted, exact);
+        assert_eq!(admitted.capacity(), MAX_IMAGE_BYTES as usize);
+    }
+
+    #[test]
+    fn image_budget_two_viewers_share_storage_and_retry_only_after_external_capacity_changes() {
+        let directory = image_test_directory("shared-budget");
+        write_test_png(&directory.join("image.png"), 1536, 1536);
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "![Image](image.png)\n").unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(
+            &context,
+            festerm_config::ImageMemoryBudgetPreference::MiB64,
+        );
+        let mut first = MarkdownViewerTab::open_local(markdown.clone());
+        let mut second = MarkdownViewerTab::open_local(markdown);
+        assert!(pump_image_loads(&mut first, &context, |viewer| viewer
+            .loaded_images
+            .len()
+            == 1));
+        let retained = RETAINED_IMAGE_OVERHEAD + 2 * 1536 * 1536 * 4;
+        assert_eq!(budget.usage_for_test(), (retained, 0));
+        assert!(pump_image_loads(&mut second, &context, |viewer| !viewer
+            .image_errors
+            .is_empty()));
+        assert!(second.image_errors[&0].contains("Image memory budget exhausted"));
+        assert_eq!(second.automatic_image_loads, 1);
+        let generation = budget.generation();
+        for _ in 0..32 {
+            second.poll_background_work(&context);
+            second.start_automatic_image_loads(&context);
+        }
+        assert_eq!(
+            budget.generation(),
+            generation,
+            "a refused reference must not retry its own released scratch storage"
+        );
+        assert!(second.pending_image_loads.is_empty());
+        assert_eq!(budget.usage_for_test(), (retained, 0));
+        assert_eq!(first.loaded_images.len(), 1);
+        budget.set_preference(festerm_config::ImageMemoryBudgetPreference::MiB128);
+        assert!(pump_image_loads(&mut second, &context, |viewer| viewer
+            .loaded_images
+            .len()
+            == 1));
+        assert_eq!(
+            second.automatic_image_loads, 1,
+            "retrying the same reference must not spend another automatic admission"
+        );
+        assert_eq!(budget.usage_for_test(), (2 * retained, 0));
+        drop(first);
+        budget.generation();
+        assert_eq!(
+            budget.usage_for_test(),
+            (2 * retained, 0),
+            "the real egui upload delta still owns these pixels"
+        );
+        let mut delta = context.tex_manager().write().take_delta();
+        assert!(!delta.set.is_empty());
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (2 * retained, 0));
+        delta.clear();
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (retained, 0));
+        drop(second);
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn image_budget_decoded_result_outlives_its_viewer_without_releasing_its_storage_early() {
+        let directory = image_test_directory("queued-result");
+        write_test_png(&directory.join("image.png"), 16, 16);
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "![Image](image.png)\n").unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(&context, Default::default());
+        let mut viewer = MarkdownViewerTab::open_local(markdown);
+        viewer.load_local_image(0, &context);
+        let decoded = viewer.pending_image_loads[&0]
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let retained = RETAINED_IMAGE_OVERHEAD + 2 * 16 * 16 * 4;
+        assert_eq!(budget.usage_for_test(), (retained, 0));
+        assert!(
+            viewer.loaded_images.is_empty(),
+            "a hidden viewer has not uploaded its queued result"
+        );
+        drop(viewer);
+        assert_eq!(budget.usage_for_test(), (retained, 0));
+        drop(decoded);
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn image_budget_closed_viewer_keeps_a_running_worker_charged_until_that_worker_finishes() {
+        let directory = image_test_directory("active-drop");
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "# Closed viewer\n").unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(&context, Default::default());
+        let worker = budget.start_worker(&context).unwrap();
+        let scratch = budget.reserve(100, Some(&context)).unwrap();
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let receiver = spawn_image_worker(
+            budget.clone(),
+            worker,
+            scratch,
+            context.clone(),
+            move |_, _, _| {
+                entered_sender.send(()).unwrap();
+                release_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Err(ImageLoadFailure::Permanent(
+                    "Controlled worker failure.".to_owned(),
+                ))
+            },
+            |work| thread::Builder::new().spawn(work),
+        )
+        .unwrap();
+        let mut viewer = MarkdownViewerTab::open_local(markdown);
+        viewer
+            .pending_image_loads
+            .insert(0, PendingImageLoad { receiver });
+        entered_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        drop(viewer);
+        assert_eq!(budget.usage_for_test(), (100, 1));
+        release_sender.send(()).unwrap();
+        for _ in 0..500 {
+            if budget.usage_for_test() == (0, 0) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn image_budget_failed_spawn_releases_both_the_worker_and_its_reservation() {
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(&context, Default::default());
+        let worker = budget.start_worker(&context).unwrap();
+        let scratch = budget.reserve(100, Some(&context)).unwrap();
+        let failure = spawn_image_worker(
+            budget.clone(),
+            worker,
+            scratch,
+            context,
+            |_, _, _| panic!("the failed spawner must never execute the loader"),
+            |work| {
+                drop(work);
+                Err(std::io::Error::other("Controlled thread-spawn failure."))
+            },
+        );
+        assert!(failure.is_err());
+        assert_eq!(budget.usage_for_test(), (0, 0));
+    }
+
+    #[test]
+    fn image_budget_manual_and_automatic_admission_share_one_running_worker_limit() {
+        let directory = image_test_directory("shared-workers");
+        write_test_png(&directory.join("image.png"), 2, 2);
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "![Image](image.png)\n").unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(&context, Default::default());
+        let mut releases = Vec::new();
+        let mut results = Vec::new();
+        for _ in 0..MAX_CONCURRENT_IMAGE_LOADS {
+            let (release_sender, release_receiver) = mpsc::sync_channel(1);
+            releases.push(release_sender);
+            let worker = budget.start_worker(&context).unwrap();
+            let scratch = budget.reserve(100, Some(&context)).unwrap();
+            results.push(
+                spawn_image_worker(
+                    budget.clone(),
+                    worker,
+                    scratch,
+                    context.clone(),
+                    move |_, _, _| {
+                        release_receiver
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        Err(ImageLoadFailure::Permanent(
+                            "Controlled completed load.".to_owned(),
+                        ))
+                    },
+                    |work| thread::Builder::new().spawn(work),
+                )
+                .unwrap(),
+            );
+        }
+        let mut manual = MarkdownViewerTab::open_local(markdown.clone());
+        let mut automatic = MarkdownViewerTab::open_local(markdown);
+        manual.load_local_image(0, &context);
+        automatic.start_automatic_image_loads(&context);
+        assert!(manual.pending_image_loads.is_empty());
+        assert!(automatic.pending_image_loads.is_empty());
+        assert_eq!(automatic.automatic_image_loads, 0);
+        assert!(manual.image_errors[&0].contains("Four image loads"));
+        assert!(automatic.image_errors[&0].contains("Four image loads"));
+        assert_eq!(budget.usage_for_test(), (400, MAX_CONCURRENT_IMAGE_LOADS));
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for result in results {
+            assert!(result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err());
+        }
+        assert!(pump_image_loads(&mut automatic, &context, |viewer| viewer
+            .loaded_images
+            .len()
+            == 1));
+        assert_eq!(automatic.automatic_image_loads, 1);
+        drop(manual);
+        drop(automatic);
+        let mut delta = context.tex_manager().write().take_delta();
+        delta.clear();
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn image_budget_refused_images_do_not_retry_each_others_released_scratch_storage() {
+        let directory = image_test_directory("refusal-progress");
+        write_test_png(&directory.join("image.png"), 2048, 2048);
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, "![One](image.png)\n\n![Two](image.png)\n").unwrap();
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(
+            &context,
+            festerm_config::ImageMemoryBudgetPreference::MiB64,
+        );
+        let mut viewer = MarkdownViewerTab::open_local(markdown);
+        assert!(pump_image_loads(&mut viewer, &context, |viewer| viewer
+            .image_errors
+            .len()
+            == 2));
+        for _ in 0..64 {
+            viewer.poll_background_work(&context);
+            viewer.start_automatic_image_loads(&context);
+        }
+        assert!(viewer.pending_image_loads.is_empty());
+        assert_eq!(viewer.automatic_image_loads, 2);
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        budget.set_preference(festerm_config::ImageMemoryBudgetPreference::MiB128);
+        assert!(pump_image_loads(&mut viewer, &context, |viewer| viewer
+            .loaded_images
+            .len()
+            == 2));
+        assert_eq!(viewer.automatic_image_loads, 2);
+        drop(viewer);
+        let mut delta = context.tex_manager().write().take_delta();
+        delta.clear();
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (0, 0));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Drives the viewer's per-frame background work until `condition` holds,
+    /// mirroring what `show` does every frame without needing a real frame.
+    fn pump_image_loads(
+        viewer: &mut MarkdownViewerTab,
+        context: &egui::Context,
+        mut condition: impl FnMut(&MarkdownViewerTab) -> bool,
+    ) -> bool {
+        for _ in 0..200 {
+            viewer.poll_background_work(context);
+            viewer.start_automatic_image_loads(context);
+            if condition(viewer) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn native_svg_local_images_load_in_viewer_and_saved_preview() {
+        let directory = image_test_directory("native-svg-local");
+        fs::write(
+            directory.join("diagram.svg"),
+            "<svg width='4' height='3'><rect width='4' height='3' fill='red'/></svg>",
+        )
+        .unwrap();
+        let text = "![Diagram](diagram.svg)\n";
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, text).unwrap();
+        let context = egui::Context::default();
+        let mut viewer = MarkdownViewerTab::open_local(markdown.clone());
+        let mut preview = saved_local_preview(LocalMarkdownSource::new(markdown).unwrap(), text);
+        assert!(pump_image_loads(&mut viewer, &context, |viewer| viewer
+            .loaded_images
+            .len()
+            == 1));
+        assert!(pump_preview_images(&mut preview, &context, |pane| pane
+            .loaded_images
+            .len()
+            == 1));
+        assert_eq!(viewer.loaded_images[&0].size, [4, 3]);
+        assert_eq!(preview.loaded_images[&0].size, [4, 3]);
+        drop(viewer);
+        drop(preview);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_svg_inline_images_load_without_local_file_authority() {
+        let text = "<svg width='3' height='2'><rect width='3' height='2'/></svg>\n\n![Local](missing.svg)\n\n![Network](https://example.test/missing.svg)\n";
+        let context = egui::Context::default();
+        let mut viewer = MarkdownViewerTab::open_remote(
+            test_remote_source("/owned/svg.md"),
+            "SVG".into(),
+            text.as_bytes().to_vec(),
+        );
+        let mut preview =
+            MarkdownPreviewPane::new(LocalMarkdownSource::new("UNTITLED").unwrap().into(), text);
+        assert!(pump_image_loads(&mut viewer, &context, |viewer| viewer
+            .loaded_images
+            .len()
+            == 1));
+        assert!(pump_preview_images(&mut preview, &context, |pane| pane
+            .loaded_images
+            .len()
+            == 1));
+        for _ in 0..4 {
+            viewer.start_automatic_image_loads(&context);
+            preview.image_state().start_automatic_image_loads(&context);
+        }
+        assert_eq!(viewer.loaded_images[&0].size, [3, 2]);
+        assert_eq!(preview.loaded_images[&0].size, [3, 2]);
+        assert_eq!(viewer.automatic_image_loads, 1);
+        assert_eq!(preview.automatic_image_loads, 1);
+        assert!(viewer.pending_image_loads.is_empty());
+        assert!(preview.pending_image_loads.is_empty());
+        preview.load_local_image(1, &context);
+        assert!(preview.image_errors[&1].contains("saved local"));
+        assert!(!preview.loaded_images.contains_key(&1));
+    }
+
+    #[test]
+    fn native_svg_reparse_compares_payload_and_releases_actual_image_owners() {
+        let text = "<svg width='2' height='2'><rect width='2' height='2' fill='red'/></svg>";
+        let context = egui::Context::default();
+        let budget = ImageMemoryBudget::for_context(&context, Default::default());
+        let mut preview =
+            MarkdownPreviewPane::new(LocalMarkdownSource::new("UNTITLED").unwrap().into(), text);
+        assert!(pump_preview_images(&mut preview, &context, |pane| pane
+            .loaded_images
+            .len()
+            == 1));
+        let texture = preview.loaded_images[&0].texture.id();
+        preview.parse(format!("{text}\n\nEdited prose"));
+        assert_eq!(preview.loaded_images[&0].texture.id(), texture);
+        assert_eq!(preview.automatic_image_loads, 1);
+        preview.parse(text.replace("red", "tan"));
+        assert!(preview.loaded_images.is_empty());
+        assert!(!preview.resource_approvals.is_approved(0));
+        assert_eq!(preview.automatic_image_loads, 0);
+        assert!(pump_preview_images(&mut preview, &context, |pane| pane
+            .loaded_images
+            .len()
+            == 1));
+        assert_ne!(preview.loaded_images[&0].texture.id(), texture);
+        drop(preview);
+        context.tex_manager().write().take_delta().clear();
+        budget.generation();
+        assert_eq!(budget.usage_for_test(), (0, 0));
+    }
+
+    #[test]
+    fn native_html_named_anchors_scroll_offscreen_targets_and_consume_requests() {
+        for anchor in [
+            "<a id='spot' name='alias'></a>\n\nArrival café 漢字".to_owned(),
+            "<a id='spot' name='alias'>Arrival café 漢字</a>".to_owned(),
+            format!(
+                "{}<a id='spot' name='alias'>Arrival café 漢字</a> {}",
+                "Wrapped café 漢字 ".repeat(1000),
+                "Following words ".repeat(1000),
+            ),
+        ] {
+            let text = format!(
+                "{}\n\n{anchor}\n\n{}\n\n<a id='spot'>Duplicate target</a>",
+                "Before café 漢字\n\n".repeat(100),
+                "After\n\n".repeat(100),
+            );
+            for standalone in [false, true] {
+                let context = code_navigation_context();
+                let mut viewer = MarkdownViewerTab::open_remote(
+                    test_remote_source("/docs/anchors.md"),
+                    "/docs/anchors.md".into(),
+                    text.as_bytes().to_vec(),
+                );
+                viewer.outline_open = false;
+                let mut pane = MarkdownPreviewPane::new(
+                    LocalMarkdownSource::new("UNTITLED").unwrap().into(),
+                    &text,
+                );
+                let tab = crate::tabs::AppState::for_test().active();
+                let mut show = |ui: &mut egui::Ui| {
+                    if standalone {
+                        viewer.show(ui, tab);
+                    } else {
+                        pane.show(ui);
+                    }
+                };
+                let before = code_navigation_frame(&context, 0, Vec::new(), &mut show);
+                assert!(visible_code_geometry(&before, "Arrival café 漢字").is_none());
+                let document = viewer.document.as_ref().unwrap();
+                assert!(document.headings().is_empty());
+                let target = document.named_anchor("spot").unwrap().start().byte_offset();
+                assert_eq!(target, text.find("<a id='spot'").unwrap());
+                assert!(text.is_char_boundary(target));
+                let request = fragment_scroll(document, "alias");
+                assert_eq!(request, Some(PendingScroll::Byte(target)));
+                if standalone {
+                    viewer.pending_scroll = request;
+                } else {
+                    pane.pending_scroll = request;
+                }
+                let mut output = before;
+                for frame in 1..5 {
+                    output = code_navigation_frame(&context, frame, Vec::new(), |ui| {
+                        if standalone {
+                            viewer.show(ui, tab);
+                        } else {
+                            pane.show(ui);
+                        }
+                    });
+                }
+                let (rect, clip) = visible_code_geometry(&output, "Arrival café 漢字")
+                    .expect("navigation must move the actual viewport to the first named target");
+                assert!(clip.contains(rect.center()));
+                assert!(visible_code_geometry(&output, "Duplicate target").is_none());
+                assert!(if standalone {
+                    viewer.pending_scroll.is_none()
+                } else {
+                    pane.pending_scroll.is_none()
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn native_html_anchor_activation_uses_source_targets_and_existing_link_policy() {
+        use egui_kittest::kittest::Queryable;
+        let text = "<a id='spot' name='alias'></a>\n\n<a href='#spot'>Jump</a>\n\n<a href='javascript:alert(1)'>Unsafe</a>\n\n<a href='&#92;&#92;attacker.example&#92;share&#92;readme.md'>UNC</a>\n\n<a href='https://example.test'>Web</a>";
+        let document = MarkdownLoader::default()
+            .load(
+                LocalMarkdownSource::new("anchors.md").unwrap().into(),
+                text.len(),
+                text.as_bytes(),
+                &Default::default(),
+            )
+            .unwrap();
+        let target = document.named_anchor("spot").unwrap().start().byte_offset();
+        assert_eq!(
+            fragment_scroll(&document, "alias"),
+            Some(PendingScroll::Byte(target))
+        );
+        assert!(document.headings().is_empty());
+        let mut harness = Harness::builder().build_ui_state(
+            |ui,
+             state: &mut (
+                MarkdownDocument,
+                Option<PendingScroll>,
+                Option<usize>,
+                Vec<AppCommand>,
+            )| {
+                for block in state.0.blocks() {
+                    if let Block::Paragraph(block) = block {
+                        for inline in block.inlines() {
+                            if let Inline::Link(link) = inline {
+                                render_link(
+                                    ui,
+                                    link,
+                                    &state.0,
+                                    &Default::default(),
+                                    FontId::proportional(16.0),
+                                    InlineRenderStyle::body(),
+                                    &mut state.1,
+                                    &mut state.2,
+                                );
+                            }
+                        }
+                    }
+                }
+                state.3.extend(take_viewer_commands(ui.ctx()));
+            },
+            (document, None, Some(0), Vec::new()),
+        );
+        harness.get_by_label("Link: Jump").click();
+        harness.step();
+        assert_eq!(harness.state().1, Some(PendingScroll::Byte(target)));
+        assert_eq!(harness.state().2, None);
+        harness.get_by_label("Link: Unsafe").click();
+        harness.step();
+        assert!(harness.state().3.is_empty());
+        harness.get_by_label("Link: UNC").click();
+        harness.step();
+        assert!(harness.state().3.is_empty());
+        harness.get_by_label("Link: Web").click();
+        harness.step();
+        assert_eq!(harness.state().3.len(), 1);
+    }
+
+    /// Images a local document references relatively are loaded on open. A
+    /// document whose pictures are all "Load local image" buttons is not a
+    /// readable document; see `start_automatic_image_loads` for why this
+    /// narrow case is exempt from ADR 0030's explicit-activation rule.
+    #[test]
+    fn local_relative_images_load_without_the_reader_asking() {
+        let directory = image_test_directory("auto");
+        write_test_png(&directory.join("diagram.png"), 4, 3);
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, b"# Doc\n\n![A diagram](diagram.png)\n").unwrap();
+
+        let context = egui::Context::default();
+        let mut viewer = MarkdownViewerTab::open_local(markdown);
+        let loaded = pump_image_loads(&mut viewer, &context, |viewer| {
+            !viewer.loaded_images.is_empty()
+        });
+
+        assert!(
+            loaded,
+            "the local image should have loaded on its own; errors: {:?}",
+            viewer.image_errors
+        );
+        assert!(viewer.image_errors.is_empty());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The exemption stops at the document's own directory: anything that
+    /// would reach the network keeps its explicit placeholder.
+    #[test]
+    fn absolute_url_images_are_never_loaded_automatically() {
+        let directory = image_test_directory("absolute");
+        let markdown = directory.join("readme.md");
+        fs::write(
+            &markdown,
+            b"# Doc\n\n![Remote](https://example.test/diagram.png)\n",
+        )
+        .unwrap();
+
+        let context = egui::Context::default();
+        let mut viewer = MarkdownViewerTab::open_local(markdown);
+        viewer.start_automatic_image_loads(&context);
+
+        assert!(viewer.pending_image_loads.is_empty());
+        assert!(viewer.loaded_images.is_empty());
+        assert_eq!(viewer.automatic_image_loads, 0);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A reference that cannot be read must be attempted once, not re-read
+    /// from disk on every frame for as long as the document stays open.
+    #[test]
+    fn a_local_image_that_cannot_be_read_is_only_attempted_once() {
+        let directory = image_test_directory("missing");
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, b"# Doc\n\n![Gone](missing.png)\n").unwrap();
+
+        let context = egui::Context::default();
+        let mut viewer = MarkdownViewerTab::open_local(markdown);
+        let failed = pump_image_loads(&mut viewer, &context, |viewer| {
+            !viewer.image_errors.is_empty()
+        });
+
+        assert!(failed, "the missing image should have recorded an error");
+        for _ in 0..5 {
+            viewer.start_automatic_image_loads(&context);
+        }
+        assert_eq!(viewer.automatic_image_loads, 1);
+        assert!(viewer.pending_image_loads.is_empty());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Automatic loading is bounded: a document with more image references
+    /// than the concurrency cap never starts more than the cap at once.
+    #[test]
+    fn automatic_image_loading_is_bounded_by_the_concurrency_cap() {
+        let directory = image_test_directory("bounded");
+        let mut body = String::from("# Doc\n\n");
+        for index in 0..(MAX_CONCURRENT_AUTOMATIC_IMAGE_LOADS * 3) {
+            write_test_png(&directory.join(format!("image-{index}.png")), 2, 2);
+            body.push_str(&format!("![Image {index}](image-{index}.png)\n\n"));
+        }
+        let markdown = directory.join("readme.md");
+        fs::write(&markdown, body.as_bytes()).unwrap();
+
+        let context = egui::Context::default();
+        let mut viewer = MarkdownViewerTab::open_local(markdown);
+        viewer.start_automatic_image_loads(&context);
+
+        assert_eq!(
+            viewer.pending_image_loads.len(),
+            MAX_CONCURRENT_AUTOMATIC_IMAGE_LOADS
+        );
+
+        // The rest follow as the first batch drains, so the whole document
+        // still ends up readable.
+        let all_loaded = pump_image_loads(&mut viewer, &context, |viewer| {
+            viewer.loaded_images.len() == MAX_CONCURRENT_AUTOMATIC_IMAGE_LOADS * 3
+        });
+        assert!(
+            all_loaded,
+            "expected every image to load eventually; loaded {} errors {:?}",
+            viewer.loaded_images.len(),
+            viewer.image_errors
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    fn outline_preparation_fixture(rows: usize) -> String {
+        (0..rows)
+            .map(|index| {
+                let depth = "#".repeat(index % 6 + 1);
+                let title = if index % 7 == 0 {
+                    "Unicode café 漢字 and a deliberately long heading that wraps onto several rows"
+                } else {
+                    "Short heading"
+                };
+                format!("{depth} {title} {index}\n\n")
+            })
+            .collect()
+    }
+
+    fn outline_preparation_pair(text: &str) -> [(egui::Context, MarkdownViewerTab); 2] {
+        std::array::from_fn(|index| {
+            let context = code_navigation_context();
+            context.enable_accesskit();
+            let mut viewer = MarkdownViewerTab::open_remote(
+                test_remote_source("/owned/outline.md"),
+                "/owned/outline.md".into(),
+                text.as_bytes().to_vec(),
+            );
+            viewer.outline_preparation.probe = Some(OutlinePreparationProbe {
+                ordinary: index == 0,
+                ..Default::default()
+            });
+            (context, viewer)
+        })
+    }
+
+    fn outline_preparation_frame(
+        pair: &mut [(egui::Context, MarkdownViewerTab); 2],
+        frame: usize,
+        size: egui::Vec2,
+        scroll: f32,
+        events: Vec<egui::Event>,
+    ) -> [egui::FullOutput; 2] {
+        let output = std::array::from_fn(|index| {
+            let (context, viewer) = &mut pair[index];
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(frame as f64 / 60.0),
+                    events: events.clone(),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("owned-outline-preparation")
+                        .vertical_scroll_offset(scroll)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let headings = viewer.document.as_ref().unwrap().headings();
+                            viewer.outline_preparation.begin(ui, headings.len());
+                            for (index, heading) in headings.iter().enumerate() {
+                                let response = viewer.outline_preparation.item(
+                                    ui,
+                                    index,
+                                    heading,
+                                    viewer.outline_selected == Some(index),
+                                );
+                                if response.clicked() {
+                                    viewer.outline_selected = Some(index);
+                                    viewer.pending_scroll = Some(PendingScroll::Heading(index));
+                                    viewer.outline_keyboard_focus = true;
+                                }
+                            }
+                        });
+                },
+            );
+            output.textures_delta.clear();
+            output
+        });
+        assert_eq!(
+            visible_outline_shapes(&output[0]),
+            visible_outline_shapes(&output[1])
+        );
+        assert_eq!(
+            format!("{:?}", output[0].platform_output.accesskit_update),
+            format!("{:?}", output[1].platform_output.accesskit_update),
+            "all headings retain their accessibility nodes, IDs, bounds and order"
+        );
+        let ordinary = pair[0].1.outline_preparation.probe.as_ref().unwrap();
+        let prepared = pair[1].1.outline_preparation.probe.as_ref().unwrap();
+        assert_eq!(ordinary.observations, prepared.observations);
+        assert_eq!(ordinary.rows, prepared.rows);
+        assert_eq!(ordinary.rows, ordinary.layouts);
+        assert_eq!(pair[0].1.outline_selected, pair[1].1.outline_selected);
+        assert_eq!(pair[0].1.pending_scroll, pair[1].1.pending_scroll);
+        output
+    }
+
+    fn visible_outline_shapes(output: &egui::FullOutput) -> Vec<egui::epaint::ClippedShape> {
+        output
+            .shapes
+            .iter()
+            .filter(|shape| {
+                shape
+                    .shape
+                    .visual_bounding_rect()
+                    .intersects(shape.clip_rect)
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn outline_preparation_bounds_warm_layout_work_without_losing_wrapped_rows() {
+        for rows in [64, 400, 2000] {
+            let text = outline_preparation_fixture(rows);
+            let mut pair = outline_preparation_pair(&text);
+            let size = vec2(216.0, 480.0);
+            outline_preparation_frame(&mut pair, 0, size, 0.0, Vec::new());
+            assert_eq!(
+                pair[1]
+                    .1
+                    .outline_preparation
+                    .probe
+                    .as_ref()
+                    .unwrap()
+                    .layouts,
+                rows
+            );
+            // Scrollbar admission can change the actual wrap width on pass two.
+            for frame in 1..4 {
+                outline_preparation_frame(&mut pair, frame, size, 0.0, Vec::new());
+            }
+            let maximum_scroll = pair[0]
+                .1
+                .outline_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .observations
+                .iter()
+                .map(|(_, rect, ..)| rect.height())
+                .sum::<f32>()
+                - size.y;
+            for (frame, requested_scroll) in [(4, 0.0_f32), (5, 1100.0_f32), (6, 8000.0_f32)] {
+                let scroll = requested_scroll.min(maximum_scroll.max(0.0));
+                outline_preparation_frame(&mut pair, frame, size, scroll, Vec::new());
+                let ordinary = pair[0].1.outline_preparation.probe.as_ref().unwrap();
+                let prepared = pair[1].1.outline_preparation.probe.as_ref().unwrap();
+                assert!(
+                    (1..=32).contains(&prepared.layouts),
+                    "{rows} rows: {}",
+                    prepared.layouts
+                );
+                assert!(prepared.prepared_text_bytes * 2 < ordinary.prepared_text_bytes);
+                println!(
+                    "outline rows={rows} scroll={scroll}: layouts old={} candidate={}, layout text bytes old={} candidate={}",
+                    ordinary.layouts, prepared.layouts,
+                    ordinary.prepared_text_bytes, prepared.prepared_text_bytes,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn outline_preparation_invalidates_width_scale_fonts_options_and_snapshot() {
+        let mut pair = outline_preparation_pair(&outline_preparation_fixture(400));
+        let mut size = vec2(216.0, 480.0);
+        for frame in 0..3 {
+            outline_preparation_frame(&mut pair, frame, size, 0.0, Vec::new());
+        }
+        for control in 0..5 {
+            for (context, viewer) in &mut pair {
+                match control {
+                    0 => {}
+                    1 => context.set_pixels_per_point(1.5),
+                    2 => {
+                        let mut definitions = egui::FontDefinitions::default();
+                        definitions
+                            .families
+                            .get_mut(&egui::FontFamily::Proportional)
+                            .unwrap()
+                            .reverse();
+                        context.set_fonts(definitions);
+                    }
+                    3 => context.global_style_mut(|style| {
+                        style.visuals.text_options.font_hinting =
+                            !style.visuals.text_options.font_hinting;
+                    }),
+                    _ => {
+                        let replacement = outline_preparation_fixture(400).replace(
+                            "Short heading",
+                            "A replacement heading with different wrapping",
+                        );
+                        viewer.apply_load_result(Ok((
+                            "owned replacement".into(),
+                            document(&replacement),
+                        )));
+                        assert!(viewer.outline_preparation.rows.is_empty());
+                    }
+                }
+            }
+            if control == 0 {
+                size.x = 140.0;
+            }
+            outline_preparation_frame(&mut pair, 3 + control * 3, size, 0.0, Vec::new());
+            assert_eq!(
+                pair[1]
+                    .1
+                    .outline_preparation
+                    .probe
+                    .as_ref()
+                    .unwrap()
+                    .layouts,
+                400
+            );
+            for frame in 1..3 {
+                outline_preparation_frame(
+                    &mut pair,
+                    3 + control * 3 + frame,
+                    size,
+                    0.0,
+                    Vec::new(),
+                );
+            }
+            let prepared = pair[1].1.outline_preparation.probe.as_ref().unwrap();
+            assert!(prepared.layouts <= 32);
+            println!(
+                "outline invalidation control={control}: cold layouts=400 warm layouts={}",
+                prepared.layouts,
+            );
+        }
+        for (context, _) in &pair {
+            context.set_theme(egui::ThemePreference::Light);
+        }
+        outline_preparation_frame(&mut pair, 20, size, 8000.0, Vec::new());
+    }
+
+    #[test]
+    fn outline_preparation_font_metadata_overflow_discards_geometry_and_recovers() {
+        let mut pair = outline_preparation_pair(&outline_preparation_fixture(400));
+        let size = vec2(216.0, 480.0);
+        for frame in 0..3 {
+            outline_preparation_frame(&mut pair, frame, size, 0.0, Vec::new());
+        }
+        assert!(
+            pair[1]
+                .1
+                .outline_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .layouts
+                <= 32
+        );
+        let mut definitions = egui::FontDefinitions::default();
+        definitions.families.insert(
+            egui::FontFamily::Name("x".repeat(MAX_GEOMETRY_FONT_NAME_BYTES + 1).into()),
+            Vec::new(),
+        );
+        for (context, _) in &pair {
+            context.set_fonts(definitions.clone());
+        }
+        for frame in 3..5 {
+            outline_preparation_frame(&mut pair, frame, size, 0.0, Vec::new());
+            let preparation = &pair[1].1.outline_preparation;
+            assert!(preparation.key.is_none());
+            assert!(preparation.rows.is_empty());
+            assert_eq!(preparation.probe.as_ref().unwrap().layouts, 400);
+        }
+        for (context, _) in &pair {
+            context.set_fonts(egui::FontDefinitions::default());
+        }
+        outline_preparation_frame(&mut pair, 5, size, 0.0, Vec::new());
+        assert_eq!(
+            pair[1]
+                .1
+                .outline_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .layouts,
+            400
+        );
+        for frame in 6..8 {
+            outline_preparation_frame(&mut pair, frame, size, 0.0, Vec::new());
+        }
+        assert!(
+            pair[1]
+                .1
+                .outline_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .layouts
+                <= 32
+        );
+    }
+
+    #[test]
+    fn outline_preparation_cap_falls_back_and_keeps_live_offscreen_navigation() {
+        let rows = MAX_PREPARED_OUTLINE_ROWS + 16;
+        let text = outline_preparation_fixture(rows);
+        let mut pair = outline_preparation_pair(&outline_preparation_fixture(3000));
+        let size = vec2(216.0, 480.0);
+        outline_preparation_frame(&mut pair, 0, size, 0.0, Vec::new());
+        for (_, viewer) in &mut pair {
+            viewer.apply_load_result(Ok(("owned larger revision".into(), document(&text))));
+        }
+        for frame in 0..4 {
+            outline_preparation_frame(&mut pair, frame, size, 0.0, Vec::new());
+        }
+        let prepared = pair[1].1.outline_preparation.probe.as_ref().unwrap();
+        assert_eq!(
+            pair[1].1.outline_preparation.rows.len(),
+            MAX_PREPARED_OUTLINE_ROWS
+        );
+        assert!(pair[1].1.outline_preparation.rows.capacity() <= MAX_PREPARED_OUTLINE_ROWS);
+        assert!((16..=48).contains(&prepared.layouts));
+        println!(
+            "outline cap: rows={rows}, retained={}, capacity={}, geometry bytes={}, layouts old={rows} candidate={}",
+            pair[1].1.outline_preparation.rows.len(),
+            pair[1].1.outline_preparation.rows.capacity(),
+            pair[1].1.outline_preparation.rows.capacity() * std::mem::size_of::<Option<OutlineRowGeometry>>(),
+            prepared.layouts,
+        );
+        // All widgets, including uncached and offscreen rows, keep stable focus IDs.
+        for (context, viewer) in &mut pair {
+            let id = viewer
+                .outline_preparation
+                .probe
+                .as_ref()
+                .unwrap()
+                .observations[rows - 1]
+                .0;
+            context.memory_mut(|memory| memory.request_focus(id));
+        }
+        outline_preparation_frame(&mut pair, 4, size, 0.0, Vec::new());
+        for (_, viewer) in &pair {
+            assert!(
+                viewer
+                    .outline_preparation
+                    .probe
+                    .as_ref()
+                    .unwrap()
+                    .observations[rows - 1]
+                    .3
+            );
+        }
+
+        let total_height: f32 = pair[0]
+            .1
+            .outline_preparation
+            .probe
+            .as_ref()
+            .unwrap()
+            .observations
+            .iter()
+            .map(|(_, rect, ..)| rect.height())
+            .sum();
+        let scroll = total_height - size.y;
+        for frame in 5..7 {
+            outline_preparation_frame(&mut pair, frame, size, scroll, Vec::new());
+        }
+        let tail = pair[0]
+            .1
+            .outline_preparation
+            .probe
+            .as_ref()
+            .unwrap()
+            .observations[rows - 1]
+            .1;
+        assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains(tail.center()));
+        for (frame, pressed) in [(7, true), (8, false)] {
+            outline_preparation_frame(
+                &mut pair,
+                frame,
+                size,
+                scroll,
+                vec![
+                    egui::Event::PointerMoved(tail.center()),
+                    egui::Event::PointerButton {
+                        pos: tail.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(
+            pair[1].1.pending_scroll,
+            Some(PendingScroll::Heading(rows - 1))
+        );
+
+        let mut navigation = outline_preparation_pair(&outline_preparation_fixture(400));
+        let tab_id = crate::tabs::AppState::for_test().active();
+        let mut arrivals = [None; 2];
+        for frame in 0..7 {
+            let events = match frame {
+                1 | 2 => vec![egui::Event::Key {
+                    key: if frame == 1 {
+                        egui::Key::ArrowDown
+                    } else {
+                        egui::Key::Enter
+                    },
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                _ => Vec::new(),
+            };
+            let output: [egui::FullOutput; 2] = std::array::from_fn(|index| {
+                let (context, viewer) = &mut navigation[index];
+                if frame == 1 {
+                    viewer.outline_selected = Some(398);
+                    viewer.outline_keyboard_focus = true;
+                }
+                let output = code_navigation_frame(context, frame, events.clone(), |ui| {
+                    viewer.show(ui, tab_id);
+                });
+                let title = viewer.document.as_ref().unwrap().headings()[399].text();
+                if arrivals[index].is_none() && visible_code_geometry(&output, title).is_some() {
+                    arrivals[index] = Some(frame);
+                }
+                output
+            });
+            assert_eq!(
+                visible_outline_shapes(&output[0]),
+                visible_outline_shapes(&output[1])
+            );
+            assert_eq!(
+                format!("{:?}", output[0].platform_output.accesskit_update),
+                format!("{:?}", output[1].platform_output.accesskit_update),
+            );
+        }
+        // Both paths must reach the same heading on the same settling frame.
+        assert!(arrivals[0].is_some());
+        assert_eq!(arrivals[0], arrivals[1]);
+        println!(
+            "outline keyboard tail arrival: old={:?} candidate={:?}",
+            arrivals[0], arrivals[1],
+        );
+        for (_, viewer) in &navigation {
+            assert_eq!(viewer.outline_selected, Some(399));
+            assert!(viewer.pending_scroll.is_none());
+        }
+    }
+
+    #[test]
+    fn preview_heading_positions_reuse_storage_and_replace_old_revision_positions() {
+        let context = code_navigation_context();
+        let mut pane = MarkdownPreviewPane::new(
+            LocalMarkdownSource::new(PathBuf::from(r"Q:\owned\positions.md"))
+                .unwrap()
+                .into(),
+            &outline_preparation_fixture(400),
+        );
+        code_navigation_frame(&context, 0, Vec::new(), |ui| pane.show(ui));
+        let pointer = pane.heading_tops.as_ptr();
+        let capacity = pane.heading_tops.capacity();
+        for frame in 1..4 {
+            pane.scroll_to_heading(399);
+            code_navigation_frame(&context, frame, Vec::new(), |ui| pane.show(ui));
+            assert_eq!(pane.heading_tops.as_ptr(), pointer);
+            assert_eq!(pane.heading_tops.capacity(), capacity);
+            assert_eq!(pane.visible_heading(), Some(399));
+        }
+        pane.parse("# Replacement\n\nOnly one section.\n".into());
+        code_navigation_frame(&context, 4, Vec::new(), |ui| pane.show(ui));
+        assert_eq!(pane.heading_tops.len(), 1);
+        assert_eq!(pane.heading_tops[0].0, 0);
+    }
+
+    #[test]
+    fn outline_and_preview_keep_separate_vertical_viewports() {
+        let document = document(
+            "# fesTerm Architecture\n\nIntro.\n\n## Architectural Goals\n\nGoals.\n\n## Dependency Direction\n\nDependencies.",
+        );
+        let context = egui::Context::default();
+        let mut outline_selected = None;
+        let find = MarkdownFindState::default();
+        let approvals = ResourceApprovalState::default();
+        let loaded_images = BTreeMap::new();
+        let pending_image_loads = BTreeMap::new();
+        let image_errors = BTreeMap::new();
+        let mut pending_scroll = None;
+        let mut outline_keyboard_focus = false;
+        let mut heading_tops = Vec::new();
+        let mut layout = None;
+
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(1_000.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let mut render_state = MarkdownRenderState {
+                        table_cells: TableCellPreparation::default(),
+                        code_copy_caption: CodeCopyCaptionPreparation::default(),
+                        mode: MarkdownViewerMode::Preview,
+                        outline_open: true,
+                        outline_selected: &mut outline_selected,
+                        find: &find,
+                        resource_approvals: &approvals,
+                        loaded_images: &loaded_images,
+                        pending_image_loads: &pending_image_loads,
+                        image_errors: &image_errors,
+                        pending_scroll: &mut pending_scroll,
+                        line_heading_indices: &[],
+                        source_syntax: &mut None,
+                        source_preparation: &mut SourcePreparation::default(),
+                        code_preparation: &mut CodeLinePreparation::default(),
+                        table_layouts: &mut TableLayoutPreparation::default(),
+                        outline_preparation: &mut OutlinePreparation::default(),
+                        outline_keyboard_focus: &mut outline_keyboard_focus,
+                        heading_tops: Some(&mut heading_tops),
+                    };
+                    layout = Some(render_state.show_document(ui, &document, 1, 0));
+                });
+            },
+        );
+        output.textures_delta.clear();
+
+        let layout = layout.expect("the Markdown document should be laid out");
+        let outline = layout.outline_rect.expect("the outline should be visible");
+        assert!(outline.width() <= OUTLINE_WIDTH + 18.0);
+        // The document well starts exactly where the outline panel ends -
+        // they abut across a single hairline, so any overlap at all would
+        // put document content under the sidebar.
+        assert!(layout.document_rect.left() >= outline.right());
+        assert!(
+            layout.document_rect.width() > 500.0,
+            "unexpected Markdown layout: {layout:?}"
+        );
+        assert!(
+            layout.document_rect.height() > 500.0,
+            "unexpected Markdown layout: {layout:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_window_hides_the_outline_so_the_reading_column_survives() {
+        // At 400 logical points the 216pt outline left a 184pt well, which
+        // wrapped prose to two or three words a row. The outline is a
+        // navigation aid; the document is the point, so the outline yields.
+        let document = document("# fesTerm\n\nIntro.\n\n## Goals\n\nGoals.");
+        let context = egui::Context::default();
+        let mut outline_selected = None;
+        let find = MarkdownFindState::default();
+        let approvals = ResourceApprovalState::default();
+        let loaded_images = BTreeMap::new();
+        let pending_image_loads = BTreeMap::new();
+        let image_errors = BTreeMap::new();
+        let mut pending_scroll = None;
+        let mut outline_keyboard_focus = false;
+        let mut heading_tops = Vec::new();
+        let mut layout = None;
+
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(OUTLINE_WIDTH + OUTLINE_MIN_DOCUMENT_WIDTH - 40.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let mut render_state = MarkdownRenderState {
+                        table_cells: TableCellPreparation::default(),
+                        code_copy_caption: CodeCopyCaptionPreparation::default(),
+                        mode: MarkdownViewerMode::Preview,
+                        // The user's own toggle stays on; only this frame
+                        // declines to draw the panel.
+                        outline_open: true,
+                        outline_selected: &mut outline_selected,
+                        find: &find,
+                        resource_approvals: &approvals,
+                        loaded_images: &loaded_images,
+                        pending_image_loads: &pending_image_loads,
+                        image_errors: &image_errors,
+                        pending_scroll: &mut pending_scroll,
+                        line_heading_indices: &[],
+                        source_syntax: &mut None,
+                        source_preparation: &mut SourcePreparation::default(),
+                        code_preparation: &mut CodeLinePreparation::default(),
+                        table_layouts: &mut TableLayoutPreparation::default(),
+                        outline_preparation: &mut OutlinePreparation::default(),
+                        outline_keyboard_focus: &mut outline_keyboard_focus,
+                        heading_tops: Some(&mut heading_tops),
+                    };
+                    layout = Some(render_state.show_document(ui, &document, 1, 0));
+                });
+            },
+        );
+        output.textures_delta.clear();
+
+        let layout = layout.expect("the Markdown document should be laid out");
+        assert!(
+            layout.outline_rect.is_none(),
+            "the outline should collapse on a narrow window: {layout:?}"
+        );
+        assert!(
+            layout.document_rect.width() > OUTLINE_MIN_DOCUMENT_WIDTH,
+            "the document should claim the whole well: {layout:?}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn local_markdown_display_paths_hide_windows_verbatim_prefixes() {
+        assert_eq!(
+            display_local_path(Path::new(r"\\?\C:\work\README.md")),
+            r"C:\work\README.md"
+        );
+        assert_eq!(
+            display_local_path(Path::new(r"\\?\UNC\server\share\README.md")),
+            r"\\server\share\README.md"
+        );
+    }
+
+    #[test]
+    fn find_navigation_wraps_in_both_directions() {
+        let document = document("alpha beta alpha beta");
+        let mut state = MarkdownFindState::default();
+        state.set_query(&document, "beta".to_owned());
+        assert_eq!(state.current_label(), "1 of 2");
+        state.next();
+        assert_eq!(state.current_label(), "2 of 2");
+        state.next();
+        assert_eq!(state.current_label(), "1 of 2");
+        state.previous();
+        assert_eq!(state.current_label(), "2 of 2");
+    }
+
+    #[test]
+    fn opening_find_requests_query_focus() {
+        let mut state = MarkdownFindState::default();
+        state.open();
+        assert!(state.take_focus_request());
+        assert!(!state.take_focus_request());
+    }
+
+    #[test]
+    fn find_highlighting_tracks_inline_code_text_offsets() {
+        let document = document("before `code` after");
+        let mut find = MarkdownFindState::default();
+        find.set_query(&document, "code".to_owned());
+        let Block::Paragraph(paragraph) = &document.blocks()[0] else {
+            panic!("the first block should be a paragraph");
+        };
+
+        let job = inline_layout_job(
+            paragraph.inlines(),
+            &document,
+            &find,
+            FontId::proportional(14.0),
+            InlineRenderStyle::body(),
+        );
+
+        assert_eq!(job.text, "before code after");
+        assert_eq!(highlighted_sections(&job), vec![(7..11, "code".to_owned())]);
+    }
+
+    #[test]
+    fn find_highlighting_tracks_link_label_offsets() {
+        let document = document("see [needle link](https://example.com) now");
+        let mut find = MarkdownFindState::default();
+        find.set_query(&document, "needle".to_owned());
+        let Block::Paragraph(paragraph) = &document.blocks()[0] else {
+            panic!("the first block should be a paragraph");
+        };
+
+        let job = inline_layout_job(
+            paragraph.inlines(),
+            &document,
+            &find,
+            FontId::proportional(14.0),
+            InlineRenderStyle::body(),
+        );
+
+        assert_eq!(job.text, "see needle link now");
+        assert_eq!(
+            highlighted_sections(&job),
+            vec![(4..10, "needle".to_owned())]
+        );
+    }
+
+    #[test]
+    fn indexed_find_highlighting_matches_full_scan_with_unicode_and_clipping() {
+        fn full_scan(
+            text: &str,
+            span: SourceSpan,
+            find: &MarkdownFindState,
+            style: InlineRenderStyle,
+            skip: usize,
+        ) -> LayoutJob {
+            let mut job = LayoutJob::default();
+            if skip >= text.len() {
+                return job;
+            }
+            let font = FontId::proportional(14.0);
+            let mut cursor = skip;
+            for (index, matched) in find.matches().iter().enumerate() {
+                let Some(range) = overlap_with_relative_range(span, matched.span()) else {
+                    continue;
+                };
+                if range.end > text.len() || range.end <= skip {
+                    continue;
+                }
+                let start = range.start.max(skip);
+                if cursor < start {
+                    job.append(
+                        &text[cursor..start],
+                        0.0,
+                        base_text_format(font.clone(), style),
+                    );
+                }
+                let mut format = base_text_format(font.clone(), style);
+                format.background = if find.current_index == Some(index) {
+                    theme::ACCENT_PRIMARY.gamma_multiply(0.35)
+                } else {
+                    theme::SURFACE_SELECTION
+                };
+                job.append(&text[start..range.end], 0.0, format);
+                cursor = range.end;
+            }
+            if cursor < text.len() {
+                job.append(&text[cursor..], 0.0, base_text_format(font, style));
+            }
+            job
+        }
+
+        let prefix = "needle ".repeat(17);
+        let target = "  \u{754c} needle e\u{301} needle \u{1f916}\r\nneedle ";
+        let source = format!("{prefix}{target}{}", "needle ".repeat(13));
+        let document = document(&source);
+        let start = prefix.len();
+        let end = start + target.len();
+        let ranges = [
+            start..end,
+            start + 2..end,
+            start + target.find("needle").unwrap() + 2..end,
+            start..end - 3,
+            end..end,
+        ];
+        for query in [
+            "",
+            "absent",
+            "needle",
+            "e\u{301}",
+            "\u{754c}",
+            " ",
+            "\r\nneedle",
+        ] {
+            let mut find = MarkdownFindState::default();
+            find.set_query(&document, query.to_owned());
+            for current in [
+                None,
+                Some(0),
+                Some(17),
+                Some(19),
+                find.matches().len().checked_sub(1),
+            ] {
+                find.current_index = current;
+                for range in &ranges {
+                    let span = document.source_span(range.clone()).unwrap();
+                    let text = &source[range.clone()];
+                    for length in [
+                        text.len(),
+                        text.char_indices()
+                            .next_back()
+                            .map_or(0, |(index, _)| index),
+                    ] {
+                        let text = &text[..length];
+                        for skip in [
+                            0,
+                            text.chars().next().map_or(0, char::len_utf8),
+                            text.len() - text.trim_start_matches(' ').len(),
+                            text.len(),
+                        ] {
+                            for style in [
+                                InlineRenderStyle::body(),
+                                InlineRenderStyle::body().as_inline_code(),
+                                InlineRenderStyle::body().as_link().with_italics(),
+                            ] {
+                                let mut actual = LayoutJob::default();
+                                append_text_segments_from(
+                                    &mut actual,
+                                    text,
+                                    span,
+                                    &find,
+                                    FontId::proportional(14.0),
+                                    style,
+                                    skip,
+                                );
+                                assert_eq!(
+                                    actual,
+                                    full_scan(text, span, &find, style, skip),
+                                    "query={query:?}, current={current:?}, range={range:?}, skip={skip}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_source_reload_preserves_current_match_when_possible() {
+        let document = document("alpha beta alpha beta");
+        let mut state = MarkdownFindState::default();
+        state.set_query(&document, "beta".to_owned());
+        state.next();
+        let before = state.current_match().unwrap().span();
+        state.restore_for_reload(&document);
+        assert_eq!(state.current_match().unwrap().span(), before);
+    }
+
+    #[test]
+    fn only_h2_carries_a_rule_under_the_heading() {
+        // The mockup gives `h2` a `border-bottom` and leaves `h1` bare, so
+        // the document title is not doubly separated from the first
+        // paragraph by both its own rule and the following section's.
+        assert_eq!(
+            heading_style(1),
+            HeadingStyle {
+                size: 30.0,
+                text_color: theme::TEXT_PRIMARY,
+                underline: false,
+            }
+        );
+        assert_eq!(
+            heading_style(2),
+            HeadingStyle {
+                size: 22.5,
+                text_color: theme::TEXT_PRIMARY,
+                underline: true,
+            }
+        );
+        assert_eq!(
+            heading_style(6),
+            HeadingStyle {
+                size: 12.75,
+                text_color: theme::TEXT_SECONDARY,
+                underline: false,
+            }
+        );
+    }
+
+    #[test]
+    fn inline_layout_styles_emphasis_links_inline_code_and_blockquotes() {
+        let document = document("> *quoted* [link](https://example.com) `code`");
+        let Block::BlockQuote(blockquote) = &document.blocks()[0] else {
+            panic!("the first block should be a blockquote");
+        };
+        let Block::Paragraph(paragraph) = &blockquote.blocks()[0] else {
+            panic!("the quoted content should be a paragraph");
+        };
+
+        let job = inline_layout_job(
+            paragraph.inlines(),
+            &document,
+            &MarkdownFindState::default(),
+            FontId::proportional(BODY_TEXT_SIZE),
+            InlineRenderStyle::blockquote(),
+        );
+
+        let quoted = section_format_for_text(&job, "quoted");
+        let link = section_format_for_text(&job, "link");
+        let code = section_format_for_text(&job, "code");
+        assert!(quoted.italics);
+        assert_eq!(quoted.color, theme::TEXT_SECONDARY);
+        assert_eq!(link.color, theme::ACCENT_PRIMARY);
+        assert_eq!(link.underline.color, theme::ACCENT_PRIMARY);
+        assert_eq!(
+            code.background,
+            theme::SURFACE_TAB_ACTIVE.gamma_multiply(0.85)
+        );
+        assert_eq!(code.font_id.family, egui::FontFamily::Monospace);
+    }
+
+    #[test]
+    fn a_soft_break_lays_out_as_a_space_not_a_row_break() {
+        // CommonMark: a single newline inside a paragraph is a soft break
+        // and renders as a space. Emitting a row break instead made every
+        // paragraph inherit the source file's hard wrapping, so prose
+        // stopped reflowing to the reading column.
+        let document = document("alpha beta\ngamma delta\n");
+        let Block::Paragraph(paragraph) = &document.blocks()[0] else {
+            panic!("the first block should be a paragraph");
+        };
+        let job = inline_layout_job(
+            paragraph.inlines(),
+            &document,
+            &MarkdownFindState::default(),
+            FontId::proportional(BODY_TEXT_SIZE),
+            InlineRenderStyle::body(),
+        );
+        assert_eq!(job.text, "alpha beta gamma delta");
+    }
+
+    #[test]
+    fn a_hard_break_still_lays_out_as_a_row_break() {
+        let document = document("alpha beta\\\ngamma delta\n");
+        let Block::Paragraph(paragraph) = &document.blocks()[0] else {
+            panic!("the first block should be a paragraph");
+        };
+        let job = inline_layout_job(
+            paragraph.inlines(),
+            &document,
+            &MarkdownFindState::default(),
+            FontId::proportional(BODY_TEXT_SIZE),
+            InlineRenderStyle::body(),
+        );
+        assert_eq!(job.text, "alpha beta\ngamma delta");
+    }
+
+    #[test]
+    fn code_lines_drop_their_terminator_and_carry_the_fenced_line_height() {
+        // `festerm_markdown` keeps each code line's trailing newline so
+        // spans and Copy stay faithful to the source. Laying that newline
+        // out gives a one-line galley two rows, which is exactly the
+        // double-spacing fenced blocks and Source view used to show.
+        let document = document("```rust\nlet x = 1;\nlet y = 2;\n```\n");
+        let Block::CodeBlock(block) = &document.blocks()[0] else {
+            panic!("the first block should be a code block");
+        };
+        for line in block.highlighted_lines() {
+            let job = highlighted_line_job(line);
+            assert!(
+                !job.text.contains('\n'),
+                "code line laid out with its terminator: {:?}",
+                job.text
+            );
+            for section in &job.sections {
+                assert_eq!(section.format.line_height, Some(CODE_LINE_HEIGHT));
+            }
+        }
+    }
+
+    #[test]
+    fn body_prose_carries_the_mockup_line_height() {
+        // Wrapped rows inside `horizontal_wrapped` take their pitch from
+        // `TextFormat::line_height`; `item_spacing.y` measurably does not
+        // move them.
+        let document = document("alpha beta gamma\n");
+        let Block::Paragraph(paragraph) = &document.blocks()[0] else {
+            panic!("the first block should be a paragraph");
+        };
+        let job = inline_layout_job(
+            paragraph.inlines(),
+            &document,
+            &MarkdownFindState::default(),
+            FontId::proportional(BODY_TEXT_SIZE),
+            InlineRenderStyle::body(),
+        );
+        assert_eq!(job.sections[0].format.line_height, Some(BODY_LINE_HEIGHT));
+    }
+
+    #[test]
+    fn a_text_run_can_skip_its_leading_space_without_losing_find_offsets() {
+        // A run following inline code usually starts with the separating
+        // space. It is emitted as cursor advance so a wrapped row never
+        // gains a hanging indent, but the find highlight still has to line
+        // up with the untrimmed source offsets.
+        let document = document("`code` needle here\n");
+        let mut find = MarkdownFindState::default();
+        find.set_query(&document, "needle".to_owned());
+        let Block::Paragraph(paragraph) = &document.blocks()[0] else {
+            panic!("the first block should be a paragraph");
+        };
+        let Inline::Text(text) = &paragraph.inlines()[1] else {
+            panic!("the run after the code span should be text");
+        };
+        assert!(text.text().starts_with(' '));
+
+        let mut job = LayoutJob::default();
+        append_text_segments_from(
+            &mut job,
+            text.text(),
+            text.text_span(),
+            &find,
+            FontId::proportional(BODY_TEXT_SIZE),
+            InlineRenderStyle::body(),
+            1,
+        );
+        assert_eq!(job.text, "needle here");
+        assert_eq!(
+            highlighted_sections(&job),
+            vec![(0..6, "needle".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_status_bar_reports_the_viewer_as_read_only_without_a_state_dot() {
+        // `.fmd-status` in the mockup is the application status bar showing
+        // `Local Markdown - UTF-8` and `Read only`, with no state dot: the
+        // viewer has no live transport to report. A failed load is the only
+        // thing that lights the dot.
+        let dir =
+            std::env::temp_dir().join(format!("festerm-markdown-status-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp directory should be creatable");
+        let path = dir.join("readme.md");
+        fs::write(&path, b"# Title\n").expect("temp file should be writable");
+
+        let mut tab = MarkdownViewerTab::open_local(path.clone());
+        assert_eq!(tab.status_bar_context(), "Local Markdown");
+        assert_eq!(tab.status_bar_encoding(), "UTF-8");
+        assert_eq!(tab.status_bar_label(), "Read only");
+        assert_eq!(
+            tab.status_bar_status(),
+            festerm_ui_egui::chrome::ChipStatus::Neutral
+        );
+
+        fs::remove_file(&path).ok();
+        tab.reload();
+        assert_eq!(
+            tab.status_bar_status(),
+            festerm_ui_egui::chrome::ChipStatus::Failed
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mode_switch_anchor_round_trips_within_heading_section() {
+        let document = document("# One\n\nalpha\n\n# Two\n\nbeta\n");
+        let offset = document.source_text().find("beta").unwrap();
+        let anchor = scroll_anchor_for_offset(&document, offset);
+        assert_eq!(anchor.heading_index, Some(1));
+        assert_eq!(byte_offset_for_anchor(&document, anchor), offset);
+    }
+
+    #[test]
+    fn source_mode_uses_precomputed_heading_lookup_per_line() {
+        let document = document("# One\nalpha\n# Two\nbeta\n");
+        assert_eq!(
+            build_line_heading_index_lookup(&document),
+            vec![Some(0), Some(0), Some(1), Some(1)]
+        );
+    }
+
+    #[test]
+    fn resource_approval_is_per_reference_and_clears() {
+        let mut approvals = ResourceApprovalState::default();
+        assert!(!approvals.is_approved(2));
+        approvals.approve(2);
+        assert!(approvals.is_approved(2));
+        assert!(!approvals.is_approved(3));
+        approvals.clear();
+        assert!(!approvals.is_approved(2));
+    }
+
+    #[test]
+    fn markdown_source_errors_build_content_free_error_states() {
+        for error in [
+            MarkdownSourceError::EmptyPath,
+            MarkdownSourceError::EmptyRemoteHost,
+            MarkdownSourceError::WhitespaceRemoteHost,
+            MarkdownSourceError::ZeroRemotePort,
+            MarkdownSourceError::EmptyRemoteUsername,
+            MarkdownSourceError::EmptyRemoteProfileIdentifier,
+            MarkdownSourceError::EmptyVerifiedFingerprint,
+        ] {
+            let state = MarkdownViewerErrorState::from_source_error(error, true);
+            assert!(!state.title.is_empty());
+            assert!(!state.detail.is_empty());
+            assert!(state.stale_snapshot);
+        }
+    }
+
+    fn test_remote_source(remote_path: &str) -> RemoteMarkdownSource {
+        RemoteMarkdownSource::new(
+            "sftp.example.test",
+            22,
+            RemoteSourceOwner::username("deploy").unwrap(),
+            "SHA256:abc123",
+            remote_path,
+            1,
+        )
+        .expect("valid remote source fields")
+    }
+
+    #[test]
+    fn open_remote_parses_in_memory_bytes_without_touching_disk() {
+        let source = test_remote_source("/srv/docs/guide.md");
+        let tab = MarkdownViewerTab::open_remote(
+            source,
+            "/srv/docs/guide.md".to_owned(),
+            b"# Remote Guide\n".to_vec(),
+        );
+        assert_eq!(tab.title(), "guide.md");
+        assert_eq!(tab.display_path(), "/srv/docs/guide.md");
+        assert_eq!(tab.chip_secondary(), "Markdown · Remote");
+        assert_eq!(
+            tab.status_bar_status(),
+            festerm_ui_egui::chrome::ChipStatus::Neutral
+        );
+    }
+
+    #[test]
+    fn matches_remote_source_requires_full_remote_identity() {
+        let tab = MarkdownViewerTab::open_remote(
+            test_remote_source("/etc/motd"),
+            "/etc/motd".to_owned(),
+            b"hello\n".to_vec(),
+        );
+        assert!(tab.matches_remote_source(&test_remote_source("/etc/motd")));
+        assert!(!tab.matches_remote_source(
+            &RemoteMarkdownSource::new(
+                "sftp.example.test",
+                22,
+                RemoteSourceOwner::profile_identifier("staging").unwrap(),
+                "SHA256:abc123",
+                "/etc/motd",
+                1,
+            )
+            .unwrap()
+        ));
+        assert!(!tab.matches_remote_source(
+            &RemoteMarkdownSource::new(
+                "sftp.example.test",
+                22,
+                RemoteSourceOwner::username("deploy").unwrap(),
+                "SHA256:different",
+                "/etc/motd",
+                1,
+            )
+            .unwrap()
+        ));
+        assert!(!tab.matches_remote_source(
+            &RemoteMarkdownSource::new(
+                "sftp.example.test",
+                22,
+                RemoteSourceOwner::username("deploy").unwrap(),
+                "SHA256:abc123",
+                "/etc/motd",
+                2,
+            )
+            .unwrap()
+        ));
+    }
+
+    #[test]
+    fn reload_on_a_remote_tab_reports_reload_unsupported_instead_of_reloading() {
+        let mut tab = MarkdownViewerTab::open_remote(
+            test_remote_source("/etc/motd"),
+            "/etc/motd".to_owned(),
+            b"hello\n".to_vec(),
+        );
+        assert_eq!(
+            tab.status_bar_status(),
+            festerm_ui_egui::chrome::ChipStatus::Neutral
+        );
+        tab.reload();
+        assert_eq!(
+            tab.status_bar_status(),
+            festerm_ui_egui::chrome::ChipStatus::Failed
+        );
+        let error = tab.error.as_ref().expect("reload should set an error");
+        assert!(!error.title.is_empty());
+        assert!(error.detail.contains("SFTP file manager"));
+        // The original snapshot is preserved (not cleared) on this failure,
+        // matching how a failed local reload keeps showing the last good
+        // content rather than blanking the viewer.
+        assert!(tab.document.is_some());
+    }
+
+    #[test]
+    fn markdown_load_errors_build_content_free_error_states() {
+        let errors = [
+            MarkdownLoadError::Cancelled,
+            MarkdownLoadError::InvalidUtf8,
+            MarkdownLoadError::BinaryContent,
+            MarkdownLoadError::OversizeInput {
+                limit_bytes: 1,
+                actual_bytes: 2,
+            },
+            MarkdownLoadError::TooManyLines {
+                limit: 1,
+                actual: 2,
+            },
+            MarkdownLoadError::ExcessiveNesting {
+                limit: 1,
+                actual: 2,
+            },
+            MarkdownLoadError::TooManyTableCells {
+                limit: 1,
+                actual: 2,
+            },
+            MarkdownLoadError::CodeBlockTooLarge {
+                limit_bytes: 1,
+                actual_bytes: 2,
+            },
+            MarkdownLoadError::TooManyResourceReferences {
+                limit: 1,
+                actual: 2,
+            },
+            MarkdownLoadError::ParseModelInvariant,
+        ];
+        for error in errors {
+            let state = MarkdownViewerErrorState::from_load_error(error, false);
+            assert!(!state.title.is_empty());
+            assert!(!state.detail.is_empty());
+            assert!(!state.source_unavailable);
+        }
+    }
+
+    #[test]
+    fn local_load_errors_build_actionable_error_states() {
+        for error in [
+            LocalLoadError::NotFound,
+            LocalLoadError::PermissionDenied,
+            LocalLoadError::NotAFile,
+            LocalLoadError::Io,
+        ] {
+            let state = MarkdownViewerErrorState::from_local_error(error, true);
+            assert!(!state.title.is_empty());
+            assert!(!state.detail.is_empty());
+            assert!(state.stale_snapshot);
+        }
+    }
+}

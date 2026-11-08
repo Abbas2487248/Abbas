@@ -1,0 +1,102 @@
+# fesTerm experimental composition host
+
+Source: crates.io `egui-wgpu` **0.36.1**, registry checksum
+`2fc362cc6bc8c1d7169c9cb0e7741ff1e03063681373d6e55cc3b25fd21213f3`.
+The accompanying MIT/Apache-2.0 licenses are the upstream egui licenses, also
+shipped with the existing pinned egui-winit vendor copy. Registry sources are
+not modified. The workspace patch selects this source for eframe, the app and
+egui_kittest together.
+
+Local changes are deliberately limited to:
+
+- `renderer.rs`: a default-disabled final-callback copy flag, optional immutable
+  copy descriptor, and validation against the actual target, viewport and clip.
+  Ordinary callback preparation/paint remain intact. Only the final primitive
+  can be copied directly; overlays cause same-frame shader fallback. A separate
+  default-disabled retained-prefix flag adds explicit immutable callback keys
+  and managed-texture generation/ownership tracking. Returning an actual managed
+  texture or rebinding one to external resources disables retention for that
+  renderer; a missing-texture lookup does not export a resource.
+  A separate default-disabled complete-frame flag shares these invariants and
+  additionally checks actual target format, size, copy usage, MSAA and depth.
+  The ordinary `update_buffers` contract is preserved. Native hosts may instead
+  prepare uniforms/callbacks before acquisition and defer vertex/index staging
+  until retention needs geometry. `mesh_upload_bytes` counts actual staged
+  vertex/index bytes, not logical geometry or submitted GPU work.
+- `retained.rs` / `lib.rs`: one private immutable prefix or complete-frame image, capped at
+  16,777,216 pixels, plus at most 1 MiB of exact paint signatures. A miss renders
+  a fresh image; a hit copies existing pixels. Eligible complete-frame misses
+  may retain only the exact common leading paint-job prefix, copy that clear-
+  initialized image to the target, and render the current suffix in its original
+  order with load-preserving composition. The cache records the full current
+  signature separately from the number of jobs represented by retained pixels;
+  stationary frames upgrade partial images to exact complete-frame retention.
+  Partial composition requires a render-attachment target, stages current mesh
+  geometry, and has separate diagnostics from complete exact hits. Complete ordered geometry,
+  clipping, screen/clear/format state, callback keys and managed-texture
+  generations are compared without hashes. Unknown callbacks and user textures
+  decline the optimization. Callback preparation still runs every frame.
+  Prefix and complete-frame signatures are distinct; complete frames also
+  decline image-copy callbacks. Both modes share the same cache and budgets.
+  Hits compare current borrowed meshes and callback keys against the existing
+  exact signature before allocating an owned candidate. Only misses capture
+  mesh payloads; the cumulative `signature_captures` counter counts actual
+  capture attempts, including refusals. Texture ownership and epochs remain
+  checked, and ordinary preparation still runs.
+  Shared admission/planning and encoding serve both the existing already-uploaded
+  APIs and the deferred-mesh API. Exact hits do not stage meshes. Rebuilds and
+  refusals upload current geometry before rebuild or same-frame ordinary paint;
+  no speculative preflight duplicates signature capture. Ranged suffix drawing
+  preserves mesh buffer-slice indexing from the complete paint-job list.
+- `winit.rs`: when requested, negotiate COPY_DST only for capable opaque root
+  surfaces without MSAA/depth. End the normal clear/UI pass, encode the validated
+  copy, then use the same submission and presentation. Reconfiguration and
+  surface recreation retain upstream ownership and recovery. Content-free
+  debug counters prove that native frames actually take the path. The separately
+  enabled retained-prefix path substitutes its exact cached prefix for the
+  ordinary clear/UI pass before the same terminal copy. It is root-only and
+  discards retained state on ineligibility, reconfiguration, recreation,
+  acquisition failure, resize, viewport retirement and destruction.
+  Eligible complete frames without a final terminal copy can reuse that same
+  image; the terminal-prefix path retains precedence.
+  Texture updates and every callback's prepare/finish_prepare still run before
+  acquisition, including unavailable surfaces. Mesh uploads occur only after
+  acquisition and the real retention decision. Captures, final terminal copies,
+  unsupported targets, MSAA/depth fallback and queue/present order are preserved.
+  Opt-in frame timing names this pre-acquisition phase `prepare_ms`; post-acquire
+  `encode_ms` includes any required mesh staging. It no longer mislabels
+  callback/texture-only preparation as all mesh-upload time.
+  The opt-in `egui_wgpu::frame_timing` debug target records content-free root
+  paint begin/end frame numbers, surface policy, unavailable surface results,
+  phase durations and primitive counts. Configuration is timed separately
+  from acquisition. These are host call durations, not GPU timestamp
+  measurements, and queue/present calls can include waiting. No additional device polling,
+  synchronization, rendering or frame scheduling is introduced.
+- `capture.rs`: inherit the surface's optional COPY_DST usage in the screenshot
+  target, including changes after creation, so screenshots exercise the same
+  composition rather than silently substituting shader painting. Recreate the
+  capture pipeline too if the target format changes.
+
+Application selection is automatic only on the supported Windows x64 DX12
+WARP/BGRA gamma Direct2D path. Terminal-prefix policy has no production switches;
+the complete-frame extension defaults on after native installation and has
+the explicit `FESTERM_WARP_RETAIN_DOCUMENT_FRAMES=0` opt-out. Unsupported
+targets retain ordinary rendering. The vendor renderer itself still defaults retention
+off; the eligible app policy selects it. Only the application's immutable
+textureless panel and solid-background painters provide callback keys.
+No new backend, partial presentation, frame dropping,
+mutable published textures, terminal ownership or input routing is introduced.
+
+CI runs `cargo test -p egui-wgpu --lib retained::tests` on each desktop OS.
+This separately covers exact identity and resource-budget invariants because
+the vendored crate is deliberately excluded from workspace test membership.
+
+See accepted ADRs 0040, 0041, 0046 and 0051. Keep the local diff against this exact upstream version
+reviewable; revalidate or remove it on dependency upgrades. A successful
+prototype does not by itself approve maintaining a fork or enabling it by default.
+The owner approved bounded automatic rollout on 2026-10-03. Source reviews and
+exact-head CI gate merge; #282 retains native/resource/latency follow-ups and
+historical noisy/failed evidence without treating them as completed qualification.
+CP-18 records source/test-binary-bound all-miss evidence; final integration
+review accepts the bounded complete-frame and exact-prefix policies with hosted
+timing limits preserved. This is not approval of broader complete-frame gates.

@@ -1,0 +1,625 @@
+use std::{
+    ffi::OsString,
+    fs,
+    io::{self, Read},
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+
+use festerm_tunnel_bridge::relay::{host_fingerprint, Destination};
+use serde::Deserialize;
+use tokio::{io::AsyncReadExt, io::AsyncWriteExt, process::Command, time::timeout};
+use zeroize::{Zeroize, Zeroizing};
+
+const PORT: &str = "47461";
+const MAX_RESPONSE: u64 = 64 * 1024;
+const CLI_TIMEOUT: Duration = Duration::from_secs(60);
+
+mod managed_setup;
+mod service_install;
+
+#[cfg(test)]
+use festerm_tunnel_bridge::setup_storage;
+#[cfg(test)]
+mod test_support;
+
+fn refused(stage: &'static str) -> io::Error {
+    io::Error::other(stage)
+}
+
+fn background_command(path: &Path) -> Command {
+    let command = Command::new(path);
+    #[cfg(windows)]
+    let command = {
+        let mut command = command;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        command
+    };
+    command
+}
+
+#[derive(Deserialize)]
+struct Account {
+    status: String,
+    provider: String,
+}
+
+#[derive(Deserialize)]
+struct Created {
+    tunnel: CreatedTunnel,
+}
+
+#[derive(Deserialize)]
+struct CreatedTunnel {
+    #[serde(rename = "tunnelId")]
+    tunnel_id: String,
+}
+
+#[derive(Deserialize)]
+struct ScopedToken {
+    token: String,
+}
+
+impl Drop for ScopedToken {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
+}
+
+fn decode_token(bytes: &[u8]) -> io::Result<Zeroizing<String>> {
+    let mut response: ScopedToken =
+        serde_json::from_slice(bytes).map_err(|_| refused("setup.token_response"))?;
+    if response.token.is_empty()
+        || response.token.len() > 16 * 1024
+        || !response
+            .token
+            .bytes()
+            .all(|byte| (33..=126).contains(&byte))
+    {
+        return Err(refused("setup.token_response"));
+    }
+    Ok(Zeroizing::new(std::mem::take(&mut response.token)))
+}
+
+fn split_created_id(value: &str, expected: &str) -> io::Result<(String, String)> {
+    let (id, cluster) = value
+        .rsplit_once('.')
+        .ok_or_else(|| refused("setup.created_tunnel_identity"))?;
+    if id != expected
+        || cluster.is_empty()
+        || cluster.len() > 32
+        || !cluster.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(refused("setup.created_tunnel_identity"));
+    }
+    Ok((id.into(), cluster.into()))
+}
+
+async fn cli(path: &Path, args: &[&str], stage: &'static str) -> io::Result<Zeroizing<Vec<u8>>> {
+    let response = cli_captured(path, args, stage).await?;
+    drop(response.stderr);
+    if response.code != Some(0) {
+        return Err(refused(stage));
+    }
+    Ok(response.stdout)
+}
+
+struct CliCaptured {
+    code: Option<i32>,
+    stdout: Zeroizing<Vec<u8>>,
+    stderr: Zeroizing<Vec<u8>>,
+}
+
+async fn bounded_cli_output(
+    stream: impl tokio::io::AsyncRead + Unpin,
+    stage: &'static str,
+) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    stream
+        .take(MAX_RESPONSE + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| refused(stage))?;
+    if bytes.len() as u64 > MAX_RESPONSE {
+        return Err(refused(stage));
+    }
+    Ok(bytes)
+}
+
+async fn cli_captured(path: &Path, args: &[&str], stage: &'static str) -> io::Result<CliCaptured> {
+    let mut child = background_command(path)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| refused(stage))?;
+    let stdout = child.stdout.take().ok_or_else(|| refused(stage))?;
+    let stderr = child.stderr.take().ok_or_else(|| refused(stage))?;
+    let result = timeout(CLI_TIMEOUT, async {
+        let (stdout, stderr, status) = tokio::try_join!(
+            bounded_cli_output(stdout, stage),
+            bounded_cli_output(stderr, stage),
+            async { child.wait().await.map_err(|_| refused(stage)) },
+        )?;
+        Ok::<_, io::Error>(CliCaptured {
+            code: status.code(),
+            stdout,
+            stderr,
+        })
+    })
+    .await
+    .map_err(|_| refused(stage))??;
+    Ok(result)
+}
+
+async fn sign_in(path: &Path) -> io::Result<()> {
+    // Login is deliberately interactive; never capture a device code or tokens in a log.
+    let status = Command::new(path)
+        .args(["user", "login", "--github", "--use-device-code-auth"])
+        .kill_on_drop(true)
+        .status()
+        .await
+        .map_err(|_| refused("setup.github_login"))?;
+    if !status.success() {
+        return Err(refused("setup.github_login"));
+    }
+    let response = cli(path, &["user", "show", "--json"], "setup.verify_account").await?;
+    let account: Account =
+        serde_json::from_slice(&response).map_err(|_| refused("setup.verify_account"))?;
+    if account.provider != "github" || account.status != "Logged in" {
+        return Err(refused("setup.verify_account"));
+    }
+    Ok(())
+}
+
+fn private_directory(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)?;
+        let directory = fs::File::open(path)?;
+        festerm_unix_security::secure_staging_parent(&directory)?;
+        Ok(directory)
+    }
+    #[cfg(windows)]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| refused("setup.state_directory"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| refused("setup.state_directory"))?;
+        let directory =
+            festerm_windows_security::lock_directory_path_without_delete_sharing(parent)?;
+        festerm_windows_security::create_current_user_only_directory(&directory, Path::new(name))
+    }
+}
+
+/// The user's home directory, where the tunnel shell starts; `None` leaves the
+/// daemon's own working directory in place.
+pub(crate) fn shell_home() -> Option<PathBuf> {
+    home_from(std::env::var_os(if cfg!(windows) {
+        "USERPROFILE"
+    } else {
+        "HOME"
+    }))
+}
+
+/// The user's own shell (from `$SHELL`, as set by the terminal running setup),
+/// started as a login shell so history, line editing and profile settings
+/// work. Falls back to `/bin/sh`, which may lack line editing (e.g. dash).
+#[cfg(unix)]
+pub(crate) fn shell_command(start: &mut Command) {
+    let shell = shell_from(std::env::var_os("SHELL"));
+    start.arg("--shell").arg(&shell);
+    if shell != Path::new("/bin/sh") {
+        start.args(["--arg", "-l"]);
+    }
+}
+
+#[cfg(unix)]
+fn shell_from(value: Option<OsString>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    value
+        .map(PathBuf::from)
+        .filter(|path| {
+            path.is_absolute()
+                && std::fs::metadata(path)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+}
+
+fn home_from(value: Option<OsString>) -> Option<PathBuf> {
+    value
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_dir())
+}
+
+fn arguments() -> io::Result<(PathBuf, PathBuf)> {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if args.len() != 4 || args[0] != "--devtunnel" || args[2] != "--state-dir" {
+        return Err(refused(
+            "usage: festerm-tunnel-setup --devtunnel PATH --state-dir NEW_DIRECTORY",
+        ));
+    }
+    let cli = PathBuf::from(&args[1]);
+    let state = PathBuf::from(&args[3]);
+    if !cli.is_absolute() || !state.is_absolute() {
+        return Err(refused("setup.absolute_paths_required"));
+    }
+    Ok((cli, state))
+}
+
+async fn run() -> io::Result<()> {
+    let (devtunnel, state) = arguments()?;
+    let executable = std::env::current_exe()?;
+    let helpers = executable
+        .parent()
+        .ok_or_else(|| refused("setup.helpers"))?;
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let daemon = helpers.join(format!("festerm-sessiond{suffix}"));
+    let bridge = helpers.join(format!("festerm-tunnel-bridge{suffix}"));
+    if !daemon.is_file() || !bridge.is_file() || !devtunnel.is_file() {
+        return Err(refused("setup.helpers_missing"));
+    }
+    let _directory = private_directory(&state)?;
+    println!("Explicit experimental setup: a NEW private tunnel and shell; no service, firewall or existing tunnel changes.");
+    println!("Sign in to GitHub using the official Dev Tunnels CLI. Its own credential storage policy applies.");
+    sign_in(&devtunnel).await?;
+    let name = format!("festerm-{}", uuid::Uuid::new_v4().simple());
+    let response = cli(
+        &devtunnel,
+        &[
+            "create",
+            &name,
+            "--expiration",
+            "30d",
+            "--description",
+            "fesTerm experimental private shell",
+            "--json",
+        ],
+        "setup.create_tunnel",
+    )
+    .await?;
+    let created: Created =
+        serde_json::from_slice(&response).map_err(|_| refused("setup.create_response"))?;
+    let (id, cluster) = split_created_id(&created.tunnel.tunnel_id, &name)?;
+    let qualified = format!("{id}.{cluster}");
+    println!("Created private tunnel: {qualified} (30-day expiry). Remove only this tunnel with: devtunnel delete {qualified}");
+    cli(
+        &devtunnel,
+        &[
+            "port",
+            "create",
+            &qualified,
+            "--port-number",
+            PORT,
+            "--description",
+            "festerm-bridge-v1",
+            "--json",
+        ],
+        "setup.create_port",
+    )
+    .await?;
+    let mut start = Command::new(&daemon);
+    start.args(["start", "--name", &name]);
+    #[cfg(unix)]
+    shell_command(&mut start);
+    if let Some(home) = shell_home() {
+        start.arg("--cwd").arg(home);
+    }
+    let status = start
+        .current_dir(&state)
+        .args([
+            "--cols",
+            "80",
+            "--rows",
+            "24",
+            "--scrollback-limit-bytes",
+            "1048576",
+        ])
+        .status()
+        .await
+        .map_err(|_| refused("setup.start_daemon"))?;
+    if !status.success() {
+        return Err(refused("setup.start_daemon"));
+    }
+    println!(
+        "Retained shell session: {name}. Stopping setup/bridge does not terminate this shell."
+    );
+    let token_bytes = cli(
+        &devtunnel,
+        &["token", &qualified, "--scopes", "host", "--json"],
+        "setup.host_token",
+    )
+    .await?;
+    let token = decode_token(&token_bytes)?;
+    drop(token_bytes);
+    let destination = state.join("destination.json");
+    let mut child = Command::new(&bridge)
+        .args([
+            "--experimental",
+            "--tunnel-id",
+            &id,
+            "--cluster",
+            &cluster,
+            "--port",
+            PORT,
+            "--session",
+            &name,
+        ])
+        .arg("--destination")
+        .arg(&destination)
+        .arg("--token-stdin")
+        .stdin(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| refused("setup.start_bridge"))?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| refused("setup.bridge_input"))?;
+    input.write_all(token.as_bytes()).await?;
+    input.write_all(b"\n").await?;
+    drop(input);
+    drop(token);
+    let metadata = timeout(Duration::from_secs(40), async {
+        loop {
+            if child.try_wait()?.is_some() {
+                return Err(refused("setup.bridge_exited_before_ready"));
+            }
+            match fs::File::open(&destination) {
+                Ok(file) => {
+                    let mut bytes = Vec::new();
+                    file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+                    if bytes.len() > 64 * 1024 {
+                        return Err(refused("setup.destination_size"));
+                    }
+                    // The bridge creates the file before writing; wait for its complete JSON.
+                    if let Ok(metadata) = serde_json::from_slice::<Destination>(&bytes) {
+                        break Ok(metadata);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => return Err(refused("setup.destination_read")),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| refused("setup.bridge_ready_timeout"))??;
+    if metadata.version != 1
+        || metadata.tunnel_id != id
+        || metadata.cluster != cluster
+        || metadata.port != 47461
+        || metadata.target.name != name
+        || metadata.file_read
+    {
+        return Err(refused("setup.destination_identity"));
+    }
+    let key = metadata
+        .endpoint
+        .host_public_keys
+        .first()
+        .ok_or_else(|| refused("setup.host_key"))?;
+    println!("READY - experimental bridge (foreground; no reboot or automatic-refresh guarantee)");
+    println!("fesTerm Tunnel: {qualified}");
+    println!("Verify host fingerprint: {}", host_fingerprint(key)?);
+    println!(
+        "Trusted destination file (public metadata, NO credentials): {}",
+        destination.display()
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&metadata).map_err(|_| refused("setup.destination_encode"))?
+    );
+    println!("Native GitHub discovery remains unqualified (management HTTP 401 in the live fixture); use Advanced destination-file mode with a scoped connect token supplied privately on stdin. Never paste tokens into chat, command arguments or ordinary files.");
+    println!("Keep this command running to host. Ctrl+C detaches; the shell remains.");
+    tokio::select! {
+        status = child.wait() => {
+            let status = status.map_err(|_| refused("setup.bridge_wait"))?;
+            if !status.success() { return Err(refused("setup.bridge_stopped")); }
+        }
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            if child.try_wait()?.is_none() {
+                child.start_kill()?;
+                child.wait().await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args == ["--version"] {
+        println!(
+            "festerm-tunnel-setup {} experimental",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
+    if args == ["--help"] {
+        println!(concat!(
+            "festerm-tunnel-setup [--managed] --devtunnel ABSOLUTE_CLI_PATH --state-dir ABSOLUTE_PRIVATE_DIRECTORY ",
+            "[--no-takeover] [--upgrade] [--repair-session] [--friendly-name NAME] [--restart-unexpected|--no-restart-unexpected] ",
+            "[--file-root ABSOLUTE_DIRECTORY [--allow-file-write] | --disable-files]\n",
+            "Default: new foreground-only setup in a new directory.\n",
+            "--manage {{list | delete INSTALLATION_ID --yes [--confirm-legacy-cloud-id QUALIFIED_ID] | delete-all --yes | archive INSTALLATION_ID --yes}} [--json]: ",
+            "manage only verified local script installations, without setup, login or downloads. ",
+            "Desktop hosts must be removed through fesTerm's consent-aware GUI. ",
+            "Deletion preserves the persistent shell and retains pending cloud-cleanup evidence.\n",
+            "Legacy confirmation applies only to exact-ID deletion of a verified script installation, never delete-all. ",
+            "Archive retains only completed, locally stopped and cloud-gone state; normal explicit setup can then create a fresh installation.\n",
+            "--managed: explicit per-user service setup; healthy reruns reuse the original private tunnel, ",
+            "host identity and exact shell generation, printing public profile JSON without credentials. ",
+            "By default stale/partial/foreign state refuses, never creates a replacement. ",
+            "Add --upgrade to switch an existing installation's service to this release's helpers, ",
+            "keeping its tunnel, host key and running daemon session. ",
+            "--repair-session explicitly replaces a DEAD session with a NEW default shell, even without legacy lifecycle evidence. ",
+            "It preserves the tunnel, host key and grants; programs/state are lost. Uses the daemon beside --devtunnel. ",
+            "Combine with --upgrade to switch helpers; interrupted repair adopts only its journaled generation and never blindly creates again. ",
+            "Repair cannot change policy; apply grant/restart options separately.\n",
+            "Add --friendly-name NAME on first setup to name the tunnel's user-visible description.\n",
+            "--restart-unexpected: explicitly allow a NEW default shell after instrumented unexpected daemon loss, ",
+            "at most three starts per ten minutes; never after observed shell exit or operator stop. ",
+            "Missing evidence and uncertain creation refuse. --no-restart-unexpected disables this policy. ",
+            "Policy changes restart the owned worker; older helpers require --upgrade. ",
+            "Automatic client recovery never switches generations; reconnect explicitly. Programs/state are not restored.\n",
+            "Managed filesystem policy: --file-root ABSOLUTE_DIRECTORY enables rooted enumeration/downloads; ",
+            "add --allow-file-write for uploads/mkdir. Rerun --file-root without writes to make it read-only, ",
+            "or --disable-files to revoke. Omitted policy preserves existing consent. ",
+            "Changes restart only owned hosting workers, never the shell or cloud tunnel. ",
+            "Different helper releases require --upgrade.\n",
+            "Independent read-only observation: repeat --observe-root ABSOLUTE_DIRECTORY for at most four approved roots; ",
+            "--disable-observation revokes only observation. Omission preserves consent. ",
+            "Observation never grants filesystem writes, MCP enrollment or JavaScript. ",
+            "Revocation leaves hosting stopped if account/target verification is unavailable.\n",
+            "--serve --state-dir ABSOLUTE_PRIVATE_DIRECTORY: existing installation worker, no cloud provisioning or key regeneration.\n",
+            "First setup uses interactive official GitHub login and creates one private 30-day tunnel, ",
+            "marked virtual port and retained platform-default shell session. Managed startup requires an unelevated user; ",
+            "sign-in auto-start does not preserve a shell through reboot. Linux services and Windows workers retry 15s ",
+            "after transient bridge/relay failure; opted-in daemon supervision also retries on macOS. ",
+            "Identity, unauthorized stale-generation and unsafe-cleanup refusals exit 78. ",
+            "Existing hosts need an explicit helper upgrade. The worker records start/ready/retry/exit, ",
+            "daemon loss/replacement and client open/close events in bounded worker.log. ",
+            "Daemons retain bounded private lifecycle journals under the runtime root. ",
+            "No credentials or terminal data are logged. No remote file access by default; no ACL widening or automatic client takeover/reconnect."
+        ));
+        return;
+    }
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                match args.first().and_then(|arg| arg.to_str()) {
+                    Some("--profile-host") => managed_setup::profile_request_file(&args[1..]).await,
+                    Some("--manage") => managed_setup::manage(&args[1..]).await,
+                    Some("--managed") => managed_setup::install(&args[1..]).await,
+                    Some("--serve") => managed_setup::serve(&args[1..]).await,
+                    _ => run().await,
+                }
+            })
+        });
+    if let Err(error) = result {
+        if args.first().is_some_and(|arg| arg == "--manage") {
+            eprintln!("Tunnel management refused or incomplete: {error}. Follow per-host results; private cleanup evidence is retained. The persistent shell was not targeted.");
+        } else {
+            eprintln!("Experimental tunnel setup refused/stopped: {error}. Any explicitly reported new tunnel/session remains; existing resources were not removed.");
+        }
+        let serving = args.first().is_some_and(|arg| arg == "--serve");
+        std::process::exit(if serving && managed_setup::is_permanent_refusal(&error) {
+            service_install::PERMANENT_REFUSAL_EXIT
+        } else {
+            1
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn background_commands_do_not_allocate_a_console() {
+        let powershell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let output = timeout(
+            Duration::from_secs(15),
+            background_command(&powershell)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class ConsoleProbe { [DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow(); }'; [ConsoleProbe]::GetConsoleWindow().ToInt64(); exit 37",
+                ])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("console probe exceeded its deadline")
+        .expect("console probe must launch");
+        assert_eq!(output.status.code(), Some(37), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_prefers_an_executable_absolute_shell_and_falls_back_to_sh() {
+        assert_eq!(shell_from(Some("/bin/sh".into())), PathBuf::from("/bin/sh"));
+        assert_eq!(shell_from(None), PathBuf::from("/bin/sh"));
+        assert_eq!(shell_from(Some("bash".into())), PathBuf::from("/bin/sh"));
+        assert_eq!(
+            shell_from(Some("/no/such/shell".into())),
+            PathBuf::from("/bin/sh")
+        );
+        assert_eq!(
+            shell_from(Some("/etc/hosts".into())),
+            PathBuf::from("/bin/sh")
+        );
+    }
+
+    #[test]
+    fn shell_home_requires_an_existing_absolute_directory() {
+        let existing = std::env::temp_dir();
+        assert_eq!(home_from(Some(existing.clone().into())), Some(existing));
+        assert_eq!(home_from(None), None);
+        assert_eq!(home_from(Some("relative/home".into())), None);
+        assert_eq!(
+            home_from(Some(
+                std::env::temp_dir().join("festerm-no-such-home").into()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn scoped_host_token_decoding_rejects_empty_multiline_nonascii_and_oversized() {
+        for token in ["", "a\nb", "abc def", "é", &"a".repeat(16 * 1024 + 1)] {
+            let json = serde_json::json!({"token": token}).to_string();
+            assert!(decode_token(json.as_bytes()).is_err());
+        }
+        assert_eq!(
+            &**decode_token(br#"{"token":"abc._-123","scope":"host"}"#).unwrap(),
+            "abc._-123"
+        );
+    }
+
+    #[test]
+    fn created_tunnel_must_match_only_the_new_owned_id() {
+        assert_eq!(
+            split_created_id("festerm-owned.usw2", "festerm-owned").unwrap(),
+            ("festerm-owned".into(), "usw2".into())
+        );
+        for value in [
+            "other.usw2",
+            "festerm-owned",
+            "festerm-owned.",
+            "festerm-owned.us/w2",
+            "festerm-owned.usw2.extra",
+        ] {
+            assert!(split_created_id(value, "festerm-owned").is_err());
+        }
+    }
+
+    #[test]
+    fn setup_cli_schema_is_typed_without_capturing_unneeded_token_fields() {
+        let created: Created = serde_json::from_str(
+            r#"{"tunnel":{"tunnelId":"festerm-owned.usw2","accessControl":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(created.tunnel.tunnel_id, "festerm-owned.usw2");
+        assert!(serde_json::from_str::<Created>(r#"{"tunnelId":"wrong-shape"}"#).is_err());
+    }
+}

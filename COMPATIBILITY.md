@@ -1,0 +1,311 @@
+# fesTerm Compatibility Plan
+
+The experimental Android port shares the iOS mobile UI/protocol stack and
+adds native input, secure storage, device lock, document import and on-device
+speech adapters (ADR 0073). Development APK/emulator evidence is not
+physical-device or live-service certification. Provider documents are imported
+as private copies rather than edited in place; see the
+[Android qualification matrix](docs/manual-validation.md#android-shared-mobile-port-adr-0073).
+Both mobile hosts expose their controls to VoiceOver/TalkBack and UI automation
+(ADR 0075). Shared Maestro flows run on a Simulator and an emulator; physical
+assistive-technology use remains manual `MOB-10` evidence. Plan
+
+**Status:** Draft
+
+fesTerm measures compatibility in terms of observable application behavior. Recognizing an escape sequence is not sufficient if screen state, input reporting, cursor behavior, shaping, resize, or restoration semantics are wrong.
+
+## Compatibility Baseline
+
+Synchronized terminal recording and per-session silent MP4 export are
+implemented under proposed ADR 0077. Shared capture, pacing and publication
+tests do not establish native lifecycle, picker, encoder or physical-device
+qualification; the remaining evidence is `TR-01`–`TR-03` in
+`docs/manual-validation.md`.
+
+The [automation campaign](docs/automation-design.md) has a default-off local
+MCP **beta** on macOS, Linux and Windows: observation and per-input-reviewed
+control of exact local terminals, gated by verification-code matching and
+native lock/sleep monitors that fail closed. A default-off JavaScript
+workflow **beta** on the same desktops runs one reviewed bundle against one
+local terminal in a contained worker; every input needs separate approval.
+iOS JavaScript execution remains unavailable. Automated tests are not native lifecycle, client
+interoperability, sandbox or mobile qualification evidence.
+The controller presentation tools report unavailable on every platform. A
+queued focus request is not success.
+
+The experimental iOS terminal keyboards include an on-device-only dictation
+spike with explicit bounded review/Insert (no implicit Return or cloud fallback).
+Portable tests and Simulator launch are not physical-device speech/privacy
+qualification; that remains `MOB-07` under
+[#564](https://github.com/fes/fesTerm/issues/564).
+
+The [Dev Tunnels subset](docs/dev-tunnels-experiment.md), included in default desktop builds, implements
+peer profiles, independently bound scoped credentials, exact-generation
+daemon attach/detach and optional bounded remote file snapshots. It is
+experimental; `DT-01`–`DT-06` real-service/native qualification remains open.
+An explicit default-off rooted host filesystem service adds enumeration,
+metadata, streamed read/write and mkdir under ADR 0067; its desktop/iOS clients
+and native transfer qualification remain separate, not accepted capabilities.
+Independent read-only observation under ADR 0070 adds approved roots,
+identity/revision-checked offset reads, bounded watch/rescan semantics and
+daemon generation correlation. Separate exact-caller/tab/root MCP consent is
+implemented in a dependent broker slice; native DT/AUTO qualification is still
+open, and unsupported SSH combinations remain unavailable.
+Installed desktop Local profiles can explicitly request native-daemon tunnel
+hosting on Save (ADR 0072), with host-local consent, non-attaching one-shot
+launch, verified helper staging and shell-preserving revocation/cleanup.
+Signed native provisioning, servicing and physical-client acceptance remain
+open under DT-08; no file/observation grant is implied. This is separate from
+remote session inventory/create/terminate, which remain unavailable. Native GitHub device
+authorization, account-bound refresh and tunnel-name discovery have deterministic
+coverage, not live qualification: the project-owned public client is registered
+and included in default builds; actual service acceptance remains pending
+[#429](https://github.com/fes/fesTerm/issues/429). An explicitly empty/invalid
+build override reports sign-in unavailable. This is not a
+production, mobile or multi-account service-qualification claim.
+
+The baseline is commonly relied-upon xterm behavior, augmented by pragmatic modern extensions. fesTerm is not attempting to reproduce every historical xterm feature or every private extension from another terminal.
+
+The sourced implementation references and cross-project lessons that guide this
+plan are collected in
+[Standards and Implementation Notes](docs/standards-and-implementation-notes.md).
+
+The initial target includes:
+
+- ANSI and VT control functions used by contemporary command-line applications.
+- Primary and alternate screen buffers.
+- Cursor movement, save and restore behavior, visibility, and style where practical.
+- Scrolling regions, insert and delete operations, erasure, wrapping, and origin modes.
+- Standard, bright, 256-color, and true-color attributes.
+- Bracketed paste.
+- Focus-in and focus-out reporting.
+- Mouse tracking and SGR mouse encoding.
+- Correct row and column resize propagation.
+- Keyboard encoding required by interactive applications.
+- Practical Unicode cell-width and combining-character behavior.
+- Ligature-capable shaping that preserves terminal cell semantics.
+
+## Validation Principles
+
+Smart selection (#397) is an additive deterministic presentation baseline
+(`GUI:TERM-14`), not a terminal-protocol compatibility claim. Wrapped prose,
+explicit paragraph breaks, indentation, bordered/gapped row segments and Unicode
+have exact-cell/text regression coverage. Unmarked columns and arbitrary TUI
+semantic blocks are unsupported; pane segments conservatively stay one visual
+row. Native clipboard/accessibility and usability qualification remain pending
+under `docs/manual-validation.md` TI-19. No model-quality claim or M6 acceptance
+status changes.
+
+- Core behavior is tested without a GUI, PTY, or SSH connection wherever possible.
+- Fixtures are stored in the repository from the beginning.
+- Every corrected compatibility defect should gain a regression fixture.
+- Real-application tests demonstrate combinations of behavior but do not replace lower-level assertions.
+- Compatibility status is capability-based rather than date-based.
+- CI should run deterministic compatibility fixtures on every change.
+
+## Priority Tiers
+
+### Tier 0 — Test and diagnostic infrastructure
+
+Before broad feature implementation:
+
+- A GUI-independent terminal-core test harness.
+- A human-reviewable golden-fixture format.
+- Helpers to inspect grid, cursor, modes, scrollback, titles, dirty regions, and emitted replies.
+- Expected-versus-actual output that makes fixture failures understandable.
+- Regression fixtures stored in the repository.
+- Structured logging and opt-in parser or protocol tracing.
+- CI discovery and execution of the complete deterministic fixture corpus.
+
+### Tier 1 — Essential full-screen TUI behavior
+
+Required for the first meaningful compatibility milestone:
+
+- Primary and alternate screen switching and restoration.
+- Cursor addressing, movement, save, and restore.
+- Erase, insert, delete, scroll, and scrolling-region behavior.
+- Autowrap, pending-wrap, reverse wraparound, origin, and margin behavior.
+- Standard SGR attributes and 256-color support.
+- True color.
+- Resize events and terminal-dimension reporting.
+- Bracketed paste.
+- Focus reporting.
+- Mouse button, release, motion, wheel, modifier, and SGR coordinate reporting.
+- Application cursor-key and keypad modes as required by tested applications.
+
+### Tier 2 — Broad everyday compatibility
+
+- Tab-stop behavior.
+- Cursor styles.
+- Window and terminal title operations.
+- Hyperlinks where they can be supported safely.
+- Clipboard-related sequences only after a security and consent design.
+- Broader device-status and terminal-identification replies.
+- Refined Unicode width, combining-character, emoji, and grapheme behavior.
+- Font fallback.
+- Ligatures with correct cell, cursor, selection, and mouse-coordinate mapping.
+
+### Tier 3 — Optional protocol extensions
+
+These require separate design decisions and are not implied by the xterm baseline:
+
+- Kitty keyboard protocol.
+- Kitty graphics.
+- Sixel or another inline graphics protocol.
+- Shell integration sequences.
+- Semantic prompt or command zones.
+- Terminal notifications.
+- Application-specific private protocols.
+
+## Behavioral Matrix
+
+Status values are `planned`, `partial`, `passing`, or `deferred`.
+`passing` denotes the listed deterministic evidence, not M6
+reference-application acceptance; P5 remains a manual release gate.
+
+| Area | Scenario | Initial status | Verification approach |
+| --- | --- | --- | --- |
+| Screen buffers | Enter alternate screen, draw, leave, and recover primary contents and cursor | passing | Core fixture; real TUI later |
+| Cursor | Save, move, modify state, and restore correctly | passing | Core fixture |
+| Scrolling | Respect margins and scroll only the active region | passing | Core fixture |
+| Wrapping | Handle right-margin wrap and pending-wrap semantics | passing | Core fixture |
+| Erasure | Erase line and display ranges without corrupting unaffected cells | passing | Core fixture |
+| Attributes | Apply and reset style and color attributes | passing | Core fixture; M4 renderer attribute mapping |
+| 256 color | Render indexed foreground and background colors | passing | Core fixture; M4 renderer palette mapping |
+| True color | Render RGB foreground and background colors | passing | Core fixture; M4 renderer RGB mapping |
+| Resize | Propagate rows and columns and preserve valid state without reflow | passing | Core fixture; M5 controlled PTY resize integration |
+| Reflow | Preserve primary-screen logical lines, viewport anchor, cursor, and selection across width changes | passing | M9 core reflow/history fixtures and UI resize integration; selection/search stability across reflow remains #43 |
+| Bracketed paste | Wrap pasted data only while the mode is enabled | passing | Exact-byte core test |
+| Focus | Emit focus events only while requested | passing | Exact-byte core test |
+| Mouse buttons | Report presses and releases according to active mode | passing | Exact-byte core test |
+| Mouse motion | Report motion only for the requested tracking mode | passing | Exact-byte core test |
+| Mouse wheel | Report wheel events with modifiers | passing | Exact-byte core test |
+| Mouse coordinates | Use SGR coordinates beyond legacy limits | passing | Exact-byte core test |
+| Selection | Select locally when mouse reporting does not claim the interaction | passing | Core input-outcome and M4 routing/selection tests; completed Shift-selection survives hover under modes 1000/1002/1003 |
+| Bounded rectangle copy | Freeze visible presentation, select by alternating clicks or drag, copy physical rows; frozen menu offers Copy and rectangle-bounded path/URL/link actions | implemented; native validation pending | Admission/Unicode/whitespace, click/drag/edge/interruption geometry, frozen cache/context captures, full-viewport fallback, shared destination policy, read-only history and input/clipboard ownership regressions; native delivery and renderer/DPI/usability evidence remain TI-17/TI-18 |
+| Keyboard modes | Encode cursor and keypad keys according to active modes | passing | Exact-byte core test |
+| Page keys | Plain Page Up/Down reach terminal programs; Shift paging retains local primary history | passing | Exact-byte core screen/mode/lock/queue tests, production view press/repeat/release/modifier/foreground/read-only/IME tests, and composition-to-transport clipboard ordering; native TUI interpretation remains TI-02 |
+| Tab stops | Set, clear, resize, and traverse explicit tab stops | passing | Core fixture |
+| Cursor styles | Apply DECSCUSR shapes without changing cell geometry | passing | Core fixture; renderer shape mapping |
+| Titles | Apply sanitized OSC 0/2 titles without affecting grid state | passing | Core fixture; application title mapping |
+| Hyperlinks | Preserve normalized HTTP/HTTPS and bounded absolute local-file OSC 8 metadata; explicit modifier/context activation opens web URLs through OS policy and local-session files only in internal document surfaces | implemented | Core parser/lifetime, decoded UI preview/copy, source-generation/origin, no-follow file/parent and web-only OS-sink tests; ADR 0052; native TI-10 pending |
+| Color queries | Report the painted foreground, background, cursor, and palette entries for OSC 4/10/11/12 queries, mirroring the request terminator; color *sets* and the OSC 104/110/111/112 resets stay ignored rather than reported as applied | passing | Exact-byte core tests; renderer/core palette-agreement test; ADR 0036 |
+| Reverse wraparound | Honor DECSET 45 by climbing to the previous row only across a soft-wrapped boundary, stopping at the start of the logical line and at the top of the scrolling region | passing | esctest2 `CUBTests`; core cursor-motion tests; ADR 0037 |
+| Terminal identity | Return conservative primary and secondary device attributes | passing | Core fixture |
+| Unicode width | Keep common wide and combining characters aligned | passing | Grid fixtures and core test |
+| Emoji and fallback | Preserve cell layout across fallback fonts | passing | All 3,773 fully-qualified Unicode 15.1 emoji are tested for streamed two-cell geometry, color classification/rasterization, and owned monochrome scalar coverage; users can select deterministic color or monochrome presentation without changing geometry; bounded positive/negative caches with per-frame work budgets and cold/warm Criterion workloads; reviewed Windows/Linux snapshots; native emoji smoke verifies geometry and color-texture submission |
+| Ligatures | Shape supported runs without moving cursor or selection boundaries | implemented; default off | Embedded JetBrains Mono plus three downloadable pinned families (ADR 0049), immutable P6 cell geometry, generation-safe caches, bounded ASCII runs, representative operator tests, and reviewed snapshots |
+| High output | Remain interactive under sustained output | passing | Core benchmark; M4 dirty-cache, input, and resize workload test |
+| Scrollback | Scroll and select smoothly near configured limits | passing | M9 bounded-memory core fixtures and GUI viewport integration; eviction fallback and disconnected read-only history remain #43 |
+| Dirty rendering | Redraw changed content without mandatory full-grid copying | passing | M4 `TerminalSnapshot` and dirty-row cache tests |
+| Local PTY | Run, resize, exit, and shut down a local application | passing | M5 Unix PTY and Windows ConPTY integration tests; CI runs the Windows test |
+| SSH PTY | Allocate, resize, disconnect, and reconnect a remote PTY | passing | Controlled OpenSSH integration test (`controlled_openssh_interoperability`, `controlled_openssh_manual_reconnect_interoperability`) |
+| OpenSSH config | Map supported host directives into an internal profile | planned | Configuration fixtures; M8 owns OpenSSH-config import UI |
+
+## Reference Applications
+
+Compatibility should be evaluated against a deliberately varied application set. The set may change as failures reveal better coverage.
+
+Initial candidates:
+
+- GitHub Copilot CLI, as the motivating advanced interactive application.
+- Neovim and Helix, for alternate screens, cursor modes, mouse input, color, and editing behavior.
+- Lazygit, for complex TUI layout and interaction.
+- `less`, for common pager behavior.
+- `tmux`, for terminal negotiation and nested terminal behavior.
+- `htop` or a platform-equivalent process monitor, for frequent screen updates and mouse use.
+- Shell line editors such as Readline and PSReadLine, for editing, paste, history, and Unicode.
+- A controlled high-output generator for flow-control and rendering measurements.
+
+Passing a reference application demonstrates that combinations of behaviors work together. It does not replace lower-level tests.
+
+## Test Fixture Model
+
+A terminal-core fixture should be able to describe:
+
+1. Initial dimensions and optional initial state.
+2. Bytes received from the session.
+3. User input or resize events where relevant.
+4. Expected grid contents and attributes.
+5. Expected cursor, modes, title, scrollback, and dirty regions.
+6. Expected replies or encoded input bytes emitted toward the session.
+7. Optional diagnostic context describing the user-visible scenario.
+
+Fixtures should be readable enough to review in code changes. Binary recordings may supplement them, but should not be the only description of expected behavior.
+
+### Fixture fields through M3
+
+The repository fixture parser keeps the format deliberately small. `size`,
+`input`, `grid`, `cursor`, and `replies` are required. `input` and `replies`
+accept `\xNN` raw-byte escapes. `resize` applies one post-input resize, and
+optional `modes` and `dirty` assertions inspect all currently implemented mode
+flags and input-caused dirty rows.
+
+Optional `cells` assertions make colors and attributes reviewable without
+repeating every blank cell. Each quoted entry has the form
+`column,row|text|foreground|background|attributes[|width]`; `text` may retain
+combining marks and `width` is optionally `single`, `double`, or
+`continuation`. Colors are
+`default`, `indexed:n`, or `rgb:r,g,b`, and attributes are `none` or a
+comma-separated list. `grid` retains one scalar per display cell, representing
+continuations as spaces. Typed input events remain focused Rust tests because
+constructing keys and pointer events in the small text fixture format would be
+less reviewable; those tests assert queue bytes and explicit input outcomes.
+The legacy fixture format does not yet expose the M9 logical-history inspection
+API, so scrollback is covered by focused Rust tests until the fixture extension
+lands.
+
+## Renderer Compatibility Tests
+
+Renderer tests should distinguish terminal state correctness from visual mapping:
+
+- The core fixture proves which cells, attributes, and cursor state exist.
+- The renderer test proves how those cells map to shaped glyph runs, font fallback, pixel positions, selection geometry, and dirty regions.
+- Ligature tests must verify that a visual glyph spanning multiple characters does not collapse or shift terminal cells.
+- Visual snapshots may supplement structural assertions but should not be the sole source of truth.
+
+M4's renderer tests use the repository Unicode fixture to construct core state,
+then assert cached leading, double-width, continuation, and combining-text
+cells. They also test point-to-cell geometry, selection normalization, and
+mode-aware routing without opening a native window. The renderer uses
+one-cell egui layouts, so this is deliberately not ligature shaping.
+
+## PTY and SSH Compatibility Tests
+
+M5's repository-owned Unix integration test starts `/bin/sh` with a controlled
+argument vector, receives output, sends input, observes `stty size` after a
+resize, observes exit, completes bounded shutdown, and verifies that a shell
+descendant is gone. The Windows-gated ConPTY integration test uses `%COMSPEC%`
+to cover spawn, output, input, resize, exit, and shutdown in Windows CI.
+Local reference applications remain an interactive M5 exercise; their
+compatibility defects belong in M6 fixtures.
+
+SSH tests should use:
+
+1. Fake or in-process transports for state-machine and reconnect scenarios.
+2. In-process server tests where the selected Rust SSH implementation supports them.
+3. A thin containerized OpenSSH `sshd` suite covering host keys, authentication, PTY allocation, resize, shell I/O, disconnect, and reconnect.
+
+The test environment must own its configuration and credentials and must not consume a developer's SSH setup.
+
+## Native document projection
+
+| Capability | Status | Evidence and remaining qualification |
+| --- | --- | --- |
+| Static local SVG and intrinsic SVG in Markdown | passing (deterministic); native validation pending | ADR 0048; `svg_projection_*`, `svg_*` decoder bounds/pixels, `native_svg_*` viewer/editor Preview/Split, authority and payload-retirement regressions. No browser, external resources or system-font reads; CP-06/CP-15 retain native renderer/DPI/font/accessibility/usability evidence |
+| Restricted HTML links and named targets | passing (deterministic); native validation pending | `html_anchors_*`, `markdown_and_html_links_reject_rooted_and_network_destinations`, `svg_and_anchor_markup_inside_opaque_html_stays_literal`, and `native_html_anchor_activation_uses_source_targets_and_existing_link_policy`. Source bytes and outline headings remain unchanged; rooted/UNC/control-character destinations are blocked. Native keyboard/screen-reader and external-handoff evidence remains CP-06/CP-15 |
+
+## Compatibility Decisions Still Needed
+
+- Exact xterm feature or version references used for ambiguous behavior.
+- `TERM=xterm-256color` is the M6 local interoperability baseline; a custom
+  `festerm` entry awaits M10 packaging so it can be installed reliably.
+- Complex-script shaping policy beyond the accepted ADR 0026 grapheme and
+  emoji scope.
+- Reflow semantics when the terminal width changes.
+- Clipboard escape-sequence policy.
+- Support level for OSC 8 hyperlinks.
+- Whether Kitty keyboard support belongs in an early post-foundation target.
+- Whether nested `tmux` compatibility requires additional extensions.
+- Ligature defaults and per-font controls.
+- Manual versus automated acceptance criteria for each reference application.

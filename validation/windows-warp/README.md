@@ -1,0 +1,2005 @@
+# Windows WARP application rasterization
+
+## Native prefix navigation: 2026-10-28
+
+A source-matched native comparison now covers all four Markdown fixtures and
+plain Edit. The owner explicitly accepted ADR 0051's renderer-wide exact-prefix
+policy on 2026-10-28, retaining the broader CP-18 gates. This is limited
+single-machine WARP performance evidence, not general native acceptance.
+The [numeric record](native-prefix-navigation-20261028.json) preserves all
+33 comparison outcomes, including the two rejected observations.
+
+The candidate is source `a44ea5c71e72e2bef40496c13be747ee58b4a843`,
+tree `c85f549ade0315537adc6589bffbd6faf7cefb79`, executable SHA-256
+`cf1361f043c0c1ef95a638c526e1f8bfbd935f13e13ddccd35d8c43abf71944f`.
+The control is source `b58dcf3cb5bdb90b9c7df7b95f517b8bdc85b836`,
+tree `d2841e06012f6682aae68d6bffc5bf6a3338604b`, executable SHA-256
+`4937a40fa4aa37a2d920d44e1832fb717fe57dc35bc3bd40e7f46284fd60e9bf`.
+That measured control commit was local and is not published. Its exact tree
+remains reproducible from durable history: start at candidate `a44ea5c7` and
+restore `app/festerm/src/direct2d/document_retention.rs` plus
+`vendor/egui-wgpu/src/{renderer,retained,winit}.rs` from main `a9273c43`.
+An automated evidence test reconstructs and requires the recorded tree hash.
+This post-measurement preservation does not relabel the historical receipt or
+executable. The control therefore differs only in the three renderer files and
+their directly dependent document-retention test module; both arms otherwise
+include the same integrated Markdown fixes, diagnostics, profiler and Ubuntu
+CI workaround. Both releases were built from the same fixed source path with
+Rust 1.98.1 and
+`cargo build --release --locked -p festerm --bin festerm --message-format=json`.
+Later documentation commits are not relabelled as measured source.
+
+The shared profiler SHA-256 is
+`76ae19e93a51005eb548a0b8c19aea46f935705c416fdd9e5d9bc2c4410843e3`.
+Each case used a fresh profiler invocation and fresh owned process in
+control/candidate/candidate/control order, with no concurrent owned builds or
+tests. All twenty final observations prove Microsoft Basic Render Driver /
+Dx12 / Cpu, 640 x 400 logical / 1280 x 800 physical / DPI 192, matching fixture
+hashes, the required Preview or Edit surface, five alternating approximately
+200-point movements, normal exit, restored cursor, and post-exit identity
+revalidation. They use the normal `--open --` route and production software
+backgrounds, not an offscreen harness. The burst/drain protocol below is
+unchanged.
+
+Values below are ranges of two per-process observations per arm, not pooled
+percentiles. CPU reduction compares the sum of the two full measured
+burst/drain process-CPU intervals. Frames and idle-hit proportions differ;
+messages and presents are not one-to-one.
+
+| Fixture | Control CPU (s) | Candidate CPU (s) | CPU reduction | Control host frame p50 (ms) | Candidate host frame p50 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 20-line Rust fence | 46.53-46.64 | 23.64-25.78 | 47.0% | 70.15-72.76 | 38.41-39.00 |
+| 300-line Rust fence | 51.89-52.20 | 23.67-24.69 | 53.5% | 67.35-69.32 | 28.05-30.42 |
+| 30-row table | 78.80-86.13 | 54.63-56.64 | 32.5% | 103.57-116.74 | 76.74-81.13 |
+| 20 prose paragraphs | 56.53-58.72 | 29.42-33.50 | 45.4% | 68.08-71.18 | 32.89-35.23 |
+| Plain 300-line Rust Edit | 42.97-46.25 | 26.34-26.50 | 40.8% | 54.07-63.47 | 35.95-36.08 |
+
+| Fixture | Control host frame p95 (ms) | Candidate host frame p95 (ms) |
+| --- | ---: | ---: |
+| 20-line Rust fence | 76.26-82.92 | 74.10-77.65 |
+| 300-line Rust fence | 73.74-75.69 | 64.10-70.76 |
+| 30-row table | 109.84-122.80 | 114.69-117.94 |
+| 20 prose paragraphs | 74.86-77.56 | 66.93-70.21 |
+| Plain 300-line Rust Edit | 65.44-68.51 | 62.06-63.82 |
+
+The table control drift and overlapping/adverse p95 values are not normalized
+away. Host-return timings are neither completed GPU work nor physical latency;
+two observations per arm do not establish statistical confidence or eliminate
+tail stalls. The table still has substantial WARP cost.
+
+Candidate measured intervals contain 58-94 partial reuses, separately from
+8-15 exact hits and 14-15 rebuilds. Manually transcribed annotations from the
+private native logs report a nine-job prefix of 11-14 jobs in Markdown and six
+of ten in Edit; these annotations and logged byte maxima are not covered by
+each `result_sha256`. Old control partial/prefix fields remain null, not zero.
+Logged maxima can include startup geometry and are not process peak memory or
+long-duration resource qualification. Result-bound counters remain in the
+numeric record.
+
+Two earlier all-case invocations were rejected at the unchanged three-second
+prose settle deadline: one control after four bursts and one candidate after
+three. Their available successful cases and failed cases are all retained,
+not pooled into the balanced result. Forced cleanup of those failed owned
+processes is not counted as normal exit. The final block isolates each case in
+a fresh profiler invocation; it does not relax the deadline. The initial
+cursor-access and private-directory ACL failures also remain recorded. The
+ACL repair persists only the intended owner/DACL via .NET, avoiding
+`Set-Acl`'s unavailable audit privilege while retaining protected,
+inheritable owner/SYSTEM-only access; a real Windows ACL regression verifies it.
+
+Other machines/adapters, selection/typing, mixed DPI, multi-window, device
+loss, sustained resource behavior, usability and physical latency remain
+separate CP-18 prerequisites. No matched VS Code runtime comparison or
+universal freeze-repair claim is made.
+
+## Native Markdown scrolling: draft qualification
+
+At initial draft publication, the ADR 0051 candidate was **not yet natively
+performance-qualified**. Its launch was refused before app/input creation because the Windows
+desktop session was disconnected (`WTSActive` required; actual state 4).
+The user selected publication as a draft pending native qualification.
+There is no candidate/native speedup, GPU-completion, physical-latency or
+freeze-repair claim.
+
+### Source-bound control pilots
+
+The control is source `8d4bb9c4bbd5bd8bb18d76f8c8c897e0605c783c`,
+tree `24c96ac6b8641d2c90afc6d9ca1c06b5ed4ef37f`,
+executable SHA-256
+`19de10d8a1a2e4b2721ccbfc7afc81b0e1ce78010f0a22a213db46aa8aba4c2b`.
+It adds numeric scroll/viewport diagnostics to main `0db5e864` without the
+adaptive-prefix change. A successful four-case native pilot used the normal
+`festerm --open -- <fixture.md>` route (the shared editor in Preview mode),
+default bundled fonts and the installed software-background plugins.
+Actual adapter proof was Microsoft Basic Render Driver / Dx12 / Cpu;
+the client was 1280 x 800 physical, 640 x 400 logical, DPI 192.
+
+Each process received five alternating down/up/down/up/down bursts of five
+targeted wheel messages at nominal 45 ms cadence. Logged offsets actually
+alternated approximately 0 and 200 points; all processes closed normally and
+restored the explicitly opted-in real cursor. CPU is aggregate process CPU,
+not elapsed latency or one-core utilization.
+
+| Fixture | Process CPU (s) | Measured wall (s) |
+| --- | ---: | ---: |
+| 20 prose paragraphs | 34.52 | 5.84 |
+| One 20-line Rust fence | 38.53 | 6.37 |
+| One 300-line Rust fence | 31.75 | 5.52 |
+| One 30-row table | 59.56 | 7.37 |
+
+These are bottleneck pilots, not balanced A/B observations. The final profiler
+subsequently gained recipe/fixture/receipt hashes, post-exit identity checks,
+independent cleanup steps, partial-reuse counters and measured-root-frame
+timing summaries. Do not assign its final recipe hash or new metadata to the
+earlier pilots. Raw logs/results and rejected zero-motion attempts remain
+local session artifacts; private paths, pointer coordinates and raw logs are
+not published. Redundant synthetic mouse moves cleared real Windows hover;
+the explicitly opted-in real-pointer route now omits those moves and still
+sends wheel messages only to the owned HWND.
+
+The frozen candidate build is source
+`54e2f62afbb01af61314a3d51d8c8efb406aa0ee`,
+tree `bb4e08a235b27911524a21b70f1f30e61672651a`,
+executable SHA-256
+`a97dd74bc765c043f1c161b49f72902ca7c1ee9579db5cdaa1e85287891d835b`.
+Both staged releases used Rust 1.98.1 and
+`cargo build --release --locked -p festerm --bin festerm --message-format=json`
+from the same fixed source path. These are historical frozen artifacts, not
+rebuilt versions of the integrated PR head. Current main subsequently merged
+independent Mermaid/table/code-galley changes and assigned ADR 0050 to Mermaid;
+the prefix proposal is now ADR 0051. Rebuild the integrated candidate and an
+instrumentation-only control from the same current main before qualification.
+Do not attribute those independent changes to prefix retention by comparing
+the old control with an integrated candidate.
+
+For the original pre-integration candidate `54e2f62a`, `cargo test --workspace`
+stopped at the application suite: 1,299 passed, 34 failed, 22 ignored. The clean
+instrumentation-only control `8d4bb9c4`, run with
+`cargo test --locked -p festerm --bin festerm`, produced 1,296 passed,
+the exact same 34 failed test names, and 22 ignored. Those failures include
+unavailable `SeSecurityPrivilege`, recovery-worker timeouts and an owned-capture
+cleanup-path assertion. They were not repaired in this rendering workstream,
+and this comparison does not make the workspace green or predict the outcome
+of a later integrated head. Record that head's own results in the PR.
+
+### Historical matched-comparison prerequisites
+
+The current recipe has five cases: the original four Markdown fixtures plus
+`editor300`, a 300-line plain `.rs` document opened in Edit mode. The latter
+requires Edit-specific offset/geometry diagnostics; a Markdown preview cannot
+silently stand in for the non-Markdown qualification required by ADR 0051.
+The historical control pilots above still cover only their original four cases.
+
+Use an active Windows desktop, no concurrent owned builds/tests, the same
+frozen final profiler recipe, fresh per-process output and matching receipts.
+Repeat all five fixtures in balanced A/B/B/A order; retain every adverse and
+rejected outcome. Require matching fixture hashes, physical geometry/DPI,
+adapter, actual signed offsets, normal exits and identity revalidation.
+Record exact, rebuilt and partial retention outcomes separately; absent old
+counter fields are null, not zero. Check prefix-job counts and native refusal
+logs before attributing any gain. Host `root_paint` p50/p95 summaries cover only
+the measured frame range and return from host API calls, not completed GPU
+work or message-to-display acknowledgments. Desktop interaction invalidates a
+sample rather than being overridden.
+
+The aggregate opt-in entry point supports focused execution without triggering
+ConPTY staging or unrelated suites:
+
+```powershell
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+$env:FESTERM_MARKDOWN_SCROLL_EXE = 'C:\stage\festerm.exe'
+$env:FESTERM_MARKDOWN_SCROLL_RECEIPT = 'C:\stage\receipt.json'
+$env:FESTERM_MARKDOWN_SCROLL_SOURCE_ROOT = 'C:\src\frozen-source'
+$env:FESTERM_MARKDOWN_SCROLL_OUT = 'C:\evidence\fresh-run'
+# Only after explicit permission to activate the owned window and move/restore the cursor:
+$env:FESTERM_MARKDOWN_SCROLL_ALLOW_POINTER = '1'
+.\scripts\run-optional-validation.ps1 -MarkdownScrollingOnly `
+    -ResultPath C:\evidence\scroll-status.txt
+```
+
+In the full optional aggregate, set `FESTERM_RUN_MARKDOWN_SCROLLING=1` as well.
+The receipt schema and direct invocation are documented in the profiler's
+comment-based help. Stage artifacts outside the clean frozen source tree.
+The recipe is read-locked during each process and its hash, fixture hash,
+receipt, executable and source identities are revalidated after exit.
+
+The earlier small offscreen Preview/navigation measurements did **not** install
+the production software-background plugins. Preserve their historical
+identities and narrower offscreen claims; they are not this native route or a
+matched VS Code comparison. Broader CP-18 native/hardware/resource/usability
+gates remain open.
+
+Follow-up to [#242](https://github.com/fes/fesTerm/issues/242), after #253
+corrected application-window selection. This investigates CPU work that
+continues after the GUI frame counter stops advancing.
+
+The #353-#369 consolidation preserves the newer shared `show_modal` repair
+already on main. It reuses that helper's backdrop/frame matchers and adds
+independent test-only controls for the two attribution probes; it does not
+restore the older picker-only implementation. The actual-modal regression
+keeps fresh renderer ownership, exact pixels/responses and ordinary fallbacks.
+All historical measurements below retain their original source/binary
+identity and limitations; none is a rerun or performance claim for the
+consolidated head.
+
+## 2026-10-11 merged-main UI baseline
+
+This is a fresh optimized Windows x64 run of clean merged main
+`ba74adfff153af981bfccfe338da61cf1cd4c1ec`, tree
+`6a2e53b3f86fa626bee3bc80977a19379246abc3`, executable SHA-256
+`0952319bc038f9061645918d6cefa2c0a411988ec7723003bcf18a3d3bc36512`.
+Local receipts, ordered samples, coverage and the derived `analysis.json`
+are retained under `target/ui-performance-ba74-20261011/`; they are local
+evidence, not checked-in artifacts.
+
+Two complete construction runs cover all 64 scenes; three additional
+original-control runs cover the twelve document/list scenes and model
+diagnostics. One intervening construction attempt failed its
+`ParseFailed` guard on the 2,000-line Rust fixture and produced no accepted
+profile. The parser has a 40 ms cancellation budget and retries on the next
+revision; the guard outcome alone does not establish why parsing failed.
+The failure remains in `construction-native-3.log` and its native receipt.
+Five initial direct executable invocations returned zero without producing
+measurement artifacts and were rejected; accepted executions use
+`scripts/windows_test_runner.py` to collect actual native outcomes.
+
+Two complete WARP runs cover all 60 scenes on DX12 CPU
+`Microsoft Basic Render Driver`. Each run includes 56 expanded scenes with
+actual fixture-state and exact same-frame profiled-render pixel guards.
+The four original controls remain separate: they do not expose those
+expanded guards or per-draw attribution buckets. Coverage generation still
+leaves broader alternatives and native rows unqualified.
+
+### Largest steady construction costs
+
+These are ranges of **per-process medians and p95s**, not pooled
+percentiles. The original controls use 1,180 x 760 points at scale 1,
+eight warmups and forty measured frames per process.
+
+| Actual fixture | UI median (ms) | UI p95 (ms) |
+| --- | ---: | ---: |
+| Markdown Preview, 400 mixed sections | 10.76-13.38 | 11.94-23.13 |
+| Same Preview with Find | 13.01-13.85 | 14.47-20.18 |
+| Markdown Source, 4,800 lines | 2.59-2.69 | 2.70-3.56 |
+| Code-only Preview, 400 blocks | 3.65-4.61 | 3.80-6.12 |
+| Table-only Preview, 400 tables | 3.44-3.70 | 3.63-3.91 |
+| Rust editor, 2,000 lines | 0.35-0.39 | 0.41-0.55 |
+| Same editor with 2,000 Find matches | 0.89-0.90 | 0.97-1.02 |
+| SFTP, 5,000 entries per pane | 0.75-0.88 | 0.80-1.44 |
+
+First UI calls remain distinct from steady state: 78-82 ms for the Rust
+editor, 64-103 ms for mixed Preview and 74-83 ms for Source. These are
+fresh-context calls in an already running process, not cold application
+startup or first-ready latency. Full in-memory JSON-fence loading scales
+from 1.04-1.06 ms at 200 entries to 21.28-21.70 ms at 4,000 entries;
+long-line Unicode Find with 20,000 matches takes 1.35-1.37 ms.
+Large-picker construction stays below 0.61 ms at median, while actual
+worker/interaction readiness is 166-231 ms across the measured widths.
+The 1.5-1.9 s large-picker preparation includes creating its thousands of
+owned fixture files, and is not a real-directory opening latency claim.
+
+### Largest completed WARP drawing costs
+
+All rows below use the same normal viewport, 2,360 x 1,520 physical pixels
+at scale 2. Drawing includes submission, completion waits and CPU
+readback. These medians describe offscreen work, **not native
+input-to-display latency or idle CPU usage**.
+
+| Actual fixture | UI median (ms) | Completed draw/readback median (ms) |
+| --- | ---: | ---: |
+| Final dirty-document confirmation | 0.46-0.51 | 675-735 |
+| Risky-paste confirmation | 0.56-0.60 | 620-666 |
+| Live-session close confirmation | 0.58-0.65 | 523-579 |
+| Markdown Preview, 400 mixed sections | 11.92-12.43 | 256-269 |
+| Markdown Source, 400 sections | 4.03-4.93 | 108-109 |
+| Open File, small ready directory | 0.80-0.81 | 217-233 |
+| Save As, small ready directory | 0.77-0.86 | 180-188 |
+| About licensing | 0.57-0.58 | 193-196 |
+
+The safety confirmations spend 92-95% of measured draw time in the
+CPU-observed draw-completion wait; CPU image copying is another 27-31 ms.
+Thus their large total is not explained by widget construction or
+readback alone. Narrow safety variants still take 162-267 ms. The
+original terminal control takes 84-87 ms at its larger 3,548 x 2,150
+physical target; it is not an equal-area comparison.
+
+### Prioritized follow-ups and retained-frame control
+
+The clearest narrow follow-up is modal-path consistency. The measured
+close, dirty-document and paste confirmations call raw `egui::Modal::show`
+in `app/festerm/src/app/confirmations.rs`, bypassing
+`software_background::show_modal`, which About and both file pickers
+already use for bounded textureless backdrop/frame painting. This is a
+source-confirmed gap, not yet a paired attribution measurement proving
+how much switching those confirmations would save. Any repair must
+preserve modal identity, consequence revalidation, default focus,
+Escape/Cancel semantics and exact pixels; other raw-modal callers are
+not qualified by these three fixtures.
+
+The next CPU target is live Markdown Preview, especially code and tables.
+`MarkdownRenderState::render_blocks` still visits every block and
+`render_source` every source line; existing Source/Outline preparation
+reduces formatting and shaping, not whole-document traversal. Persistent
+bounded preparation needs exact invalidation and must preserve live
+selection, Copy, accessibility, Find and pending navigation. The editor's
+full layout-job and gutter/prefix scans are scaling hypotheses, but its
+measured steady 2,000-line control is substantially cheaper than Preview.
+
+The current prepared-document all-miss retention control passes its
+existing 10% CPU/completed-work overhead ceiling for editor, Preview and
+Split. Balanced off/on/on/off CPU ratios are 0.969, 1.015 and 0.991;
+completed-work ratios are 1.004, 0.981 and 1.019. Every enabled measured
+frame rebuilds, with zero hits and exact final pixels. Ordinary frames
+use roughly 506-579 ms of aggregate process CPU in 55-60 ms elapsed;
+multithreaded WARP CPU must not be confused with single-core wall time.
+This excludes UI construction and readback from timing and is not a
+real scrolling/typing workload.
+
+No native window, pointer, clipboard or ordinary user document was used
+for this baseline. Fresh `Rgba8Unorm` replay targets do not exercise the
+native BGRA complete-frame retained-idle presentation path. Historical
+native idle reductions are therefore neither rerun nor requalified here.
+Exclusive host quietness, physical latency, hardware/native acceptance,
+sustained total resources and the reported indefinite near-zero-CPU
+freeze remain unresolved. No product optimization or behavior change is
+included in this analysis.
+
+## 2026-10-11 safety-confirmation shared painting
+
+Candidate `642ac6b75c6a08f60e5a3b26ddf772a6c5493455` routes the seven
+application confirmation/refusal paths through the existing bounded
+`software_background::show_modal` helper. It does not change consent,
+target/generation revalidation, focus policy or the paste opening-frame
+barrier. The optimized test binary has SHA-256
+`8a55adf2bf40d7f4ce04dbce6850526b13df2297b9e9998f71b12ae782e3d7bc`.
+Two full candidate processes each produced 60 reports and successful native
+outcomes; all 56 expanded scenes per process passed their existing actual-state
+and exact same-frame pixel guards. `target/ui-performance-safety/comparison.json`
+checks source/binary identity, ordered distributions, dimensions, statuses and
+guards against the frozen merged-main baseline above.
+
+| Actual confirmation | Baseline completed median (ms) | Candidate completed median (ms) | Reduction |
+| --- | ---: | ---: | ---: |
+| Final dirty document | 675-735 | 166-170 | 76.2% |
+| Live-session close | 523-579 | 53-57 | 90.1% |
+| Risky paste | 620-666 | 67-69 | 89.4% |
+| Final dirty document, narrow | 251-268 | 79-80 | 69.5% |
+| Live-session close, narrow | 162-173 | 28-32 | 82.2% |
+| Risky paste, narrow | 228-248 | 41-46 | 81.8% |
+
+Ranges are per-process medians. Reduction uses the ratio of the two candidate
+process medians' mean to the two baseline process medians' mean, not pooled
+samples. Normal and narrow targets remain 2,360 x 1,520 and 720 x 1,032 physical
+pixels at scale 2. These are sequential offscreen construction/draw/readback
+experiments, not host-isolated paired native input latency or idle CPU evidence.
+UI construction is mostly unchanged: normal ratios are 0.975, 0.919 and 1.012
+for dirty close, live close and paste; narrow ratios increase to 1.048, 1.107
+and 1.095, still below 0.511 ms at median. Unchanged scenes also vary: the largest
+completed-draw median increase is 9.8% for the inactive middle-chip menu;
+large Preview increases 3.0%. These observations are retained, not attributed
+to this modal-only production change or presented as statistical significance.
+
+The actual-app regression
+`safety_modals_preserve_pixels_focus_and_cancel_with_shared_painting` additionally
+compares ordinary and shared painting in the same prepared fixture, at normal
+and narrow widths and scales 1 and 2. It requires exact pixels, the safe focused
+action, two additional backdrop/frame paints, actual Cancel dismissal and zero
+transport input. Existing helper fallback/identity and application policy
+regressions remain unchanged. Quit, reset, refusal and file-drop use the same
+helper but do not gain independently measured performance claims from these
+three representative confirmations.
+
+Formatting, Clippy, workspace check, Python/assets/traceability and the vendored
+selection/retention/font-atlas and Direct2D self-tests pass locally. Complete
+workspace execution records 2,426 passed, 36 failed and 57 ignored. The 32
+application failures exactly match a new frozen-main application run; the other
+four Windows-security failures match the earlier unchanged-main qualification.
+They require unavailable `SeSecurityPrivilege`, and their assertions were not
+weakened. Hosted required-platform CI remains the release gate. Native focus,
+physical latency, hardware/DPI and sustained resource classifications remain
+open; this does not establish a fix for the unreproduced indefinite freeze.
+
+## 2026-10-11 bounded fenced-line preparation
+
+Markdown candidate `ce71a371abe020af9869e839ae2cbf55b6d457f6`, optimized test
+binary SHA-256
+`c34cde707aff68a7c30f95d8b8dd2d3d49bc31a811f53e7c3b4a2c76d4710ec7`,
+retains snapshot-owned formatting jobs for fenced-code lines. The bound is
+4,096 jobs and 4 MiB of String/section capacities, separate from map/Arc
+allocator overhead and existing document/font memory. No galley or geometry
+survives; the ordinary Label still resolves wrapping, fonts, selection and
+accessibility each frame. All document traversal remains live.
+The comparison baseline is merged main
+`ba74adfff153af981bfccfe338da61cf1cd4c1ec`, binary SHA-256
+`0952319bc038f9061645918d6cefa2c0a411988ec7723003bcf18a3d3bc36512`;
+its full baseline inventory is recorded in [#376](https://github.com/fes/fesTerm/pull/376).
+
+The same-snapshot ordinary/prepared regression proves 400 preparations on each
+ordinary frame and zero new preparations on warmed candidate frames, including
+width, monospace-family replacement, scale, Find and offscreen-byte navigation
+controls. Complete clipped shapes, accessibility and commands remain equal.
+Successful replacement and owner drop release old jobs; failed reload retains
+its previous snapshot. Entry and aggregate payload limits fall back without
+truncating content. Existing selection/Copy and actual renderer pixel regressions
+also execute through the prepared path.
+
+Three fresh original-control construction processes and one full 60-scene WARP
+process passed native outcome, source/binary, sample and report guards; 56 WARP
+scenes retain actual-state/exact-pixel guards. Local evidence and the strict
+`analysis.json` are under `target/ui-performance-markdown/`.
+
+**End-to-end timing improvement is not established.** Mixed Preview medians are
+12.54-13.39 ms versus baseline 10.76-13.38 ms; code-only Preview is 3.66-7.38 ms
+versus 3.65-4.61 ms. One candidate process also slows the unchanged table control
+to 7.63 ms, versus 3.52 and 3.80 ms in the other two candidate processes. These
+adverse/noisy observations are not discarded. The single candidate normal WARP
+Preview median is 10.00 ms construction and 276.59 ms completed draw/readback,
+rather than evidence of a drawing reduction. This change eliminates repeated formatting work, not native
+idle CPU, overall Preview scaling or the reported freeze.
+
+Workspace formatting, Clippy/check, Python/assets/traceability pass. Complete
+local workspace execution records 2,427 passed, the same 36 unchanged-main
+Windows privilege failures, and 57 ignored, before carrying the identical
+timestamp-collision fixture prerequisite from the safety PR. The new fixture
+regression passes separately. Native readability, clipboard, screen-reader,
+physical latency and sustained resources remain unqualified.
+
+## 2026-10-11 streaming editor layout preparation
+
+The editor candidate streams the two already-ordered syntax/Find endpoint
+channels instead of allocating, sorting and deduplicating a third boundary
+vector, and reserves the known text length before copying runs. It introduces
+no galley/revision cache, changes no parser bound and retains live TextEdit
+layout and interaction. The complete-job sorted-cut regression independently
+covers Unicode, empty text/ranges, coincident boundaries and stale endpoints.
+
+Three alternating source-frozen process pairs execute all twelve original
+construction controls: before/after, after/before, before/after. Each scene
+retains its first call, eight warmups and forty steady construction/
+tessellation samples. All six actual native exits and all 72 reports pass
+source/tree/binary, sample-count, finite-value, percentile and scope checks.
+Every paired control has identical item, final shape and vertex counts;
+these counts alone are not an exact-pixel or accessibility oracle.
+
+| Source | Revision | Tree | Optimized test executable SHA-256 |
+| --- | --- | --- | --- |
+| Merged main | `ba74adfff153af981bfccfe338da61cf1cd4c1ec` | `6a2e53b3f86fa626bee3bc80977a19379246abc3` | `0952319bc038f9061645918d6cefa2c0a411988ec7723003bcf18a3d3bc36512` |
+| Editor candidate | `8d34fe32b81c54b09455523a1e6d93b29cfb046c` | `f030d2db3ddd6f336bd6b32551f39fc51e7a812d` | `9c0e64b15500db1105871a2cdba654961437cfbd69456db1f6b1c02036fab8ac` |
+
+Windows x64, optimized actual application test binaries, 1180 x 760 points,
+scale 1, default dark gallery visuals. The archived main binary runs only
+while the checkout is restored to its exact clean source, since the existing
+probe reads live Git provenance. Each candidate run likewise uses its clean
+source; there is no concurrent owned build/test/measurement work. The shared
+host is not independently isolated.
+
+| Actual editor control | Before steady UI medians ms | After steady UI medians ms | Ratio of mean process medians | After slower pairs |
+| --- | --- | --- | ---: | ---: |
+| Syntax, 2,000 lines | 0.3205 / 0.3237 / 0.3237 | 0.3044 / 0.3015 / 0.3053 | 0.9414 | 0/3 |
+| Find, 2,000 capped matches | 0.8613 / 0.8551 / 0.8458 | 0.7945 / 0.8084 / 0.8005 | 0.9380 | 0/3 |
+
+Steady syntax/Find construction observations are 5.9/6.2% lower, not a native
+latency or WARP draw claim. Syntax p95 ranges are 0.3794-0.4596 before and
+0.3409-0.4435 after; Find ranges are 0.9022-0.9274 and 0.8636-0.8968.
+Unchanged controls retain adverse movement: mixed Markdown Preview is 4.5%
+higher in all three pairs, headings 5.0% higher in all three, tables 5.5%
+higher in two, and the large SFTP list 2.5% higher in all three. Source/
+Source-Find are 3.7/5.0% lower despite unchanged source rendering. These
+observations establish neither a universal improvement nor a proven host
+cause or strict regression in unchanged code.
+
+**First-call improvement is not established.** Syntax first UI calls are
+75.81-81.66 ms before and 76.48-78.80 ms after; Find calls are 58.02-58.33 and
+57.62-58.68 ms. Full-text widget/font layout still dominates these fresh-context
+calls. They are not cold-process startup or first-ready latency. No new GPU,
+native presentation, physical input, idle CPU, sustained resource, hardware/
+DPI or near-zero-CPU freeze evidence is granted.
+
+```powershell
+cargo test --release --locked -p festerm --bin festerm --no-run --message-format=json
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+$env:FESTERM_SURFACE_PROFILE_SCENES = 'original-controls'
+# Set a fresh absolute FESTERM_SURFACE_PROFILE_OUT for each process and
+# restore the exact clean source matching the frozen executable first.
+python scripts\windows_test_runner.py --output-root target\ui-performance-editor\measurement-native --timeout-seconds 1800 -- target\ui-performance-editor\frozen-candidate.exe surface_performance::profile_interactive_surfaces --ignored --exact --nocapture --test-threads=1
+```
+
+Owned artifacts under `target\ui-performance-editor` retain the six profiles,
+native receipts, frozen candidate, build receipt and `analysis.json`; the
+existing `ui-performance-ba74-20261011` directory retains the baseline binary.
+These local artifacts and measurements are historical, source-bound evidence;
+they do not qualify the later rebased review head and are not a durable public
+receipt. The evidence-only follow-up does not change measured production code.
+
+## Bounded non-terminal surface matrix
+
+The existing optional `replay_warp_ui_surfaces` and
+`profile_interactive_surfaces` entry points now share a 26-state catalog, each
+at normal and narrow width (52 added variants). The original four WARP controls,
+twelve document/list construction scenes and 48 gallery scenarios are retained.
+The bounded batch covers About/licensing and existing synthetic idle/ready/
+installed updater controllers; expanded chrome and first/middle/last chip menus;
+live/read-only selection, OSC 8 link, frozen enabled/disabled path and history
+menus; live-close/risky-paste/final-dirty-document confirmations; and actual-task
+small/large/error Open File and small/large/error/overwrite Save As states.
+
+**Bounded status:** earlier complete construction/completed-render evidence is
+retained in #349. The source-bound comparisons below add current measurements
+for eight picker and four actual large Markdown controls, not a newer-head
+rerun of the entire matrix or native acceptance. Missing
+updater variants, empty picker readiness (which needs a model-state accessor),
+filter/sort/final-row/reopen interactions, aggregate quit/drop/reset safety
+variants and all native-platform evidence remain explicit prerequisites in
+[`surface-matrix.json`](surface-matrix.json). No existing CP-16/CP-17 budget is
+extended to About or menus, and no favorable menu latency threshold is invented.
+
+The semantic fixture regression covers all 52 variants at both widths.
+Chip preparation settles actual target bounds within 32 frames and, when the
+row scrolls, uses at most eight real scroll-control clicks to put the target
+inside the viewport before secondary-clicking it. It preserves active identity,
+the exact edge-applicable movement/Close assertions and zero transport input.
+This repairs #346's stale-coordinate race during initial active-chip scroll
+reveal, including inactive-middle/read-only-last targets; it neither disables
+production scroll animations nor qualifies completed WARP or native
+input/presentation.
+
+The [existing gallery generator](../../scripts/build_ui_state_doc.py) also
+expands that reconciled audit into a machine-readable report. It lists every
+audited state group and reusable state-profile dimension, with a named
+prerequisite and `currently_unmeasured` or `native_only` status. Supplied v2
+reports may mark **only an exact bounded fixture/metric** `covered`; broader
+slash-separated alternatives remain unqualified. Images never pass native rows.
+
+```powershell
+# Run only after obtaining the exclusive build/measurement slot.
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+$env:FESTERM_SURFACE_PROFILE_OUT = "$PWD\target\evidence\surface-profile-attempt-01"
+$env:FESTERM_WARP_UI_OUT = "$PWD\target\evidence\surface-warp-attempt-01"
+cargo test --release -p festerm --bin festerm profile_interactive_surfaces -- --ignored --nocapture --test-threads=1
+cargo test --release -p festerm --bin festerm replay_warp_ui_surfaces -- --ignored --nocapture --test-threads=1
+python scripts\build_ui_state_doc.py --surface-matrix-report target\evidence\surface-coverage-attempt-01.json --surface-profile target\evidence\surface-profile-attempt-01\profile.json --warp-replay target\evidence\surface-warp-attempt-01
+```
+
+Both probes remain under their existing optional-runner flags
+`FESTERM_RUN_SURFACE_PROFILE=1` / `FESTERM_RUN_WARP_UI_PROBE=1`; neither becomes
+a default benchmark or snapshot gate. The construction probe alone accepts
+`FESTERM_SURFACE_PROFILE_SCENES=original-controls` for its original twelve
+document/list controls and model diagnostics. This explicit subset excludes
+all 52 appended variants, records that scope in its report and aggregate
+runner result, and changes no semantic guard or WARP replay selection.
+Unset the selector (or use `all`) for the full construction matrix.
+No missing variant or native row gains coverage from the controls-only result.
+
+### 2026-10-06 balanced live Preview controls
+
+The qualified frame-local Preview preparation leaf `d055061` is ordinarily
+composed after #366 at clean `f51c88fdee80d10599f2ba2d3bbae9671de4a172`, tree
+`d7c640a202b290f1b75aa480d8854d90898cebb3`. Its archived release executable
+SHA-256 is `945daa0a3ace0ba54426ebcb165ac985235647a1b3ee227c529396a5d9c394e7`.
+The immediate clean before source is
+`46eb139ab4ab6a33781b1fa5ba3720d571b42845`, tree
+`33c631411cb7b5c717d662820a3e99ef365667fa`, archived executable SHA-256
+`006e7dea88f2a796679c0e4c60bec01c75fba80ec41543dc5be133e5b32ea0e2`.
+The earlier Source bounds and current picker diagnostics remain in both.
+
+Six alternating process pairs (three before-first, three after-first) use
+Windows x64 DX12 CPU `Microsoft Basic Render Driver`, `Rgba8Unorm`, scale 2,
+the same physical cumulative fixture path and all four actual 400-section
+Markdown controls. Every child has explicit bounded completion waiting,
+actual exit 0 and stable source/tree/hash. Both agents released all owned
+build/test commands before the timing slot. The branch is restored normally.
+
+All 24 paired encoded PNG comparisons and 240 measured original-renderer
+pixel guards pass. Submitted geometry, callback count and target/image/
+padded-readback payloads match exactly; one existing panel executes in every
+draw. Each source/scene has 120 UI and thirty completed-draw samples, pooled
+with `sorted[(len - 1) * percentile / 100]`, not a median of pair medians.
+
+| Actual viewer | Pooled UI before ms | Pooled UI after ms | Pooled draw/readback before ms | Pooled draw/readback after ms | After draw slower pairs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Preview | 14.100 | 12.872 | 344.216 | 319.671 | 2/6 |
+| Preview narrow | 11.590 | 11.177 | 74.903 | 74.234 | 2/6 |
+| Source | 4.417 | 4.396 | 303.626 | 451.110 | 4/6 |
+| Source narrow | 3.367 | 3.074 | 100.286 | 104.343 | 3/6 |
+
+Preview pooled UI observations are 8.7/3.6% lower, alongside the separate
+deterministic 1600-to-403 preparation/layout-request control (802 with Find
+highlighting every `Item`). Two normal and three narrow UI pair medians are
+adverse. Source drawing has large adverse movement despite unchanged Source
+implementation and identical frozen output/work. That is retained evidence,
+not a strict regression repair, universal speedup or demonstrated host cause.
+Seven completion buckets, ordered samples and all pair-level reversals remain.
+
+Private artifacts under the session root are `fleet-v5-baseline-binary`,
+`fleet-v5-preview-binary` and `fleet-v5-balanced-preview-controls-v1`
+(twelve source/hash/exit receipts, 48 scene reports/PNGs and
+`verified-balanced-summary.json`). The existing independent pair/campaign
+verifiers retain all source, pixel, order, callback, payload and percentile
+guards. The first prepared coordinator AST check rejected misplaced multiline
+PowerShell operators before any runtime; the repaired coordinator parses and
+all twelve actual runs complete. No failed attempt is treated as measurements.
+Shared-host comparisons do not accept isolated GPU timestamps, native
+input/presentation/physical latency, font/process memory or resource retirement.
+
+### 2026-10-06 source-bound picker and Markdown observations
+
+The actual release replay compared clean cumulative
+`5fa487c635b4b43f0aed8017d85d42d9f142f565` against preserved before controls:
+`abb4a018373bd1469f92d534c7bce0dad52ac26c` for Markdown and
+`cbdc2aab6e499656e98f6da8ed2768297f421c56` for pickers. All use Windows x64
+DX12 CPU `Microsoft Basic Render Driver`, `Rgba8Unorm`, scale 2, and the same
+physical picker fixture paths where origin/breadcrumb text is visible.
+The four Markdown controls render the same owned 400-section document,
+not a substitute editor or untrusted external document.
+
+All twelve cross-revision reference PNGs are byte-identical. Every measured
+draw also passes the same-frame original-renderer oracle: twenty Markdown and
+forty picker guards. Ordered samples, finite timing buckets, adapter/format,
+source identity, dimensions, percentile convention and dimension-derived
+target/image/padded-readback payloads were checked independently.
+
+```powershell
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+$env:WGPU_BACKEND = 'dx12'
+# Set a fresh absolute FESTERM_WARP_UI_OUT and the preserved matching
+# FESTERM_WARP_UI_REFERENCE directory for each separately executed subset.
+$env:FESTERM_WARP_UI_SCENES = 'markdown-controls' # Passed: 10.88 seconds.
+cargo test --release --locked -p festerm --bin festerm ui_gallery::replay_warp_ui_surfaces -- --ignored --exact --nocapture --test-threads=1
+$env:FESTERM_WARP_UI_SCENES = 'picker-controls' # Passed: 46.40 seconds.
+cargo test --release --locked -p festerm --bin festerm ui_gallery::replay_warp_ui_surfaces -- --ignored --exact --nocapture --test-threads=1
+```
+
+| Scene | Before UI median (ms) | Current UI median (ms) | Before completed draw/readback median (ms) | Current median (ms) | Actual panel paints before/current |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Markdown Preview normal | 15.750 | 13.678 | 779.833 | 320.413 | 0 / 1 |
+| Markdown Preview narrow | 14.495 | 12.062 | 168.096 | 58.947 | 0 / 1 |
+| Markdown Source normal | 5.777 | 5.774 | 912.492 | 435.244 | 0 / 1 |
+| Markdown Source narrow | 5.463 | 5.101 | 206.244 | 69.948 | 0 / 1 |
+| Open File small ready normal | 0.702 | 0.667 | 1000.309 | 1074.010 | 4 / 4 |
+| Open File small ready narrow | 0.815 | 0.561 | 409.098 | 372.818 | 2 / 2 |
+| Open File error normal | 0.566 | 0.489 | 1005.937 | 1070.618 | 4 / 4 |
+| Open File error narrow | 0.574 | 0.560 | 396.448 | 368.457 | 2 / 2 |
+| Save As small ready normal | 0.558 | 0.740 | 1535.852 | 1017.992 | 2 / 3 |
+| Save As small ready narrow | 0.577 | 0.623 | 473.023 | 369.525 | 2 / 3 |
+| Save As error normal | 0.409 | 0.436 | 1511.286 | 1011.733 | 2 / 3 |
+| Save As error narrow | 0.423 | 0.457 | 461.132 | 339.882 | 2 / 3 |
+
+These shared-host samples show 52-66% lower Markdown and 22-34% lower Save As
+completed draw/readback medians on the combined source. Normal Source UI
+construction is effectively unchanged; zero preparation jobs do not prove a
+net live-UI improvement. Open File's unchanged paint route has opposite wide/
+narrow movement, so no gain or regression is established from that variance.
+Substantial completed drawing cost remains, without attributing it to a modal,
+shadow, font or individual paint operation.
+
+The seven buckets exclude small instrumentation/inter-bucket overhead included
+in the completed total; they need not sum exactly to it. CPU-observed completion
+waiting is not a GPU timestamp. Submitted geometry and temporary pixel/readback
+payloads are not actual rasterized-pixel counts, total GPU allocations or process
+peaks. This comparison does not isolate each cumulative optimization, qualify a
+quiet host, native presentation, input-to-display, real scrolling, Find or omitted
+variants. No syntax-colour normalization or reference-pixel exception was used.
+
+### 2026-10-06 bounded Source geometry observations
+
+Clean cumulative `a295d6596664362e86b31cf7dc56421d22bac432` completed the four
+actual 400-section Markdown controls after the Source/Outline font-metadata
+admission repair. The preserved comparison source is
+`5fa487c635b4b43f0aed8017d85d42d9f142f565`, which already executes the same
+single outer-panel callback. This is not another zero-to-one panel comparison.
+The exact measured release test executable SHA256 is
+`8818649d835fc4a34d9fc123e8abf225925d3b327268602f577844e457738a44`;
+an archived copy was checked against all four report hashes.
+
+The Windows x64 DX12 CPU adapter remains `Microsoft Basic Render Driver`,
+driver `10.0.26100.9278`, target `Rgba8Unorm`, scale 2. All four cross-revision
+reference PNGs are identical, all twenty measured original-renderer guards pass,
+and every baseline/current draw executes one panel callback. Source cleanliness,
+actual fixture readiness, adapter/format, dimensions, ordered samples,
+percentiles, finite completion buckets and dimension-derived payload equations
+were independently checked. The existing release replay command above was used
+with `FESTERM_WARP_UI_SCENES=markdown-controls`, fresh output and the preserved
+current reference directory; the picker-backdrop option was unset.
+
+| Actual viewer | Previous UI median (ms) | Bounded Source UI median (ms) | Previous completed draw/readback median (ms) | Current median (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Preview normal | 13.678 | 10.061 | 320.413 | 332.295 |
+| Preview narrow | 12.062 | 10.217 | 58.947 | 74.529 |
+| Source normal | 5.774 | 3.684 | 435.244 | 457.205 |
+| Source narrow | 5.101 | 2.766 | 69.948 | 103.971 |
+
+Normal/narrow Source construction medians are lower by 36.2%/45.8%, but Preview
+construction also moved and all four completed drawing medians increased
+by 3.7-48.6%. Those adverse samples remain in the record. The measurements are
+noncontemporaneous shared-host observations, not balanced isolated attribution,
+a proven drawing regression cause, or a net latency acceptance. No other owned
+build/probe was active when the replay acquired its runtime slot; this does not
+establish quietness of the shared machine.
+
+Focused CPU controls separately preserve all 4800 live responses/accessibility
+nodes while reducing warm actual layout requests to 34/31 normal/narrow.
+Geometry remains inside the existing 8192-job/4-MiB admission bounds; metadata
+is admitted before cloning at 128 entries per font/family map, 8192 charged
+name bytes and 256 family-reference capacity slots. Exact-limit, over-limit,
+ordinary-fallback and cold-to-warm recovery controls passed. These are specific
+callsite/layout/capacity observations, not global allocator, total-font or RSS
+accounting. Full traversal, Preview work, native scrolling/Find/presentation,
+physical latency, resource caps and broader platform evidence remain open.
+
+### 2026-10-06 balanced Source controls
+
+Six contemporaneous source-frozen process pairs alternate three before/after
+and three after/before orders. Before is exact clean
+`5fa487c635b4b43f0aed8017d85d42d9f142f565`, release executable SHA256
+`8fbaf53b6d1982ac8e85afdb7455f81dfefb0be70d6051b0581ea08a113d390c`;
+after is exact clean `a295d6596664362e86b31cf7dc56421d22bac432`, executable
+`8818649d835fc4a34d9fc123e8abf225925d3b327268602f577844e457738a44`.
+Each archived executable runs the existing exact ignored replay above with
+`markdown-controls`, its matching source held unchanged in the same physical
+fixture worktree, fresh output and the preserved current reference directory.
+The new production picker route is outside this Markdown-only comparison.
+
+All twelve processes complete with actual exit zero, source/binary/cleanliness
+checks before and after execution, and captured stdout/stderr. All four viewer
+controls in every pair preserve the exact encoded PNG: 24 cross-source
+comparisons and 240 measured original-renderer guards across both sources.
+Common submitted geometry/payload counts and the existing one-panel callback
+are identical. Adapter/format/scale remain Windows x64 DX12 CPU
+`Microsoft Basic Render Driver`, driver `10.0.26100.9278`, `Rgba8Unorm`, scale 2.
+No other owned build/probe runs in this slot; other shared-host activity is
+not controlled.
+
+| Actual viewer | Pooled before UI median (ms) | Pooled after UI median (ms) | Before completed draw/readback median (ms) | After median (ms) | After drawing slower in matched pairs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Preview normal | 12.902 | 15.460 | 342.924 | 338.484 | 4 / 6 |
+| Preview narrow | 11.594 | 12.423 | 76.284 | 76.747 | 2 / 6 |
+| Source normal | 6.028 | 4.263 | 463.637 | 468.603 | 2 / 6 |
+| Source narrow | 4.210 | 2.913 | 106.215 | 105.428 | 1 / 6 |
+
+Each pooled UI median covers 120 retained samples per source/scene; each pooled
+completed median covers 30, using `sorted[(len - 1) * percentile / 100]`.
+All six per-pair medians, orders and raw vectors remain available; pooled
+medians are not medians of the six pair medians. Source construction medians
+are 29.3%/30.8% lower, but individual reversals and adverse Preview construction
+remain. Normal Source pooled drawing is 1.1% higher despite four faster
+pair medians, illustrating why aggregate and paired observations both matter.
+The earlier large Source drawing increase is not consistently reproduced.
+These results do not establish its cause, a strict drawing-regression repair,
+isolated GPU timing, a quiet host or native latency/resource acceptance.
+
+An earlier coordinator attempted direct PowerShell invocation of the archived
+Windows-subsystem release tests. The launcher returned before process
+completion, and no complete reports existed at independent verification.
+That attempt is invalid and retained. The corrected driver uses `Start-Process`
+with separate stdout/stderr capture, a 240-second owned-process deadline,
+explicit completion/actual exit status, immutable executable hashes and
+source restoration. Successful launch is never substituted for completion.
+The existing source-bound observations above are not overwritten or relabeled.
+
+### Optional same-frame black-backdrop attribution
+
+After reserving the exclusive runtime slot, set
+`FESTERM_WARP_UI_SCENES=picker-controls` and
+`FESTERM_WARP_UI_PICKER_BACKDROP=textureless-black`, then use the same release
+replay command and a fresh output directory. Unset the backdrop variable for
+the unchanged default replay; other values, selectors and non-Windows-x64
+requests fail explicitly before fixture execution.
+
+When the default picker uses the measured backdrop route, this test-only option
+first selects its ordinary painting through a per-context fixture control.
+The frozen-frame conversion then measures the same original rectangle and
+balanced pairs. No production environment variable disables the optimization;
+an unset option measures the actual default application path.
+
+Each actual picker must have exactly one full-root translucent black,
+untextured, unrounded, unblurred and unstroked backdrop with full viewport
+clipping coverage. Only that original white-UV mesh uses the existing installed
+panel shader; production guards/shaders and all other frozen shapes remain
+unchanged. Missing or ambiguous geometry is not a successful observation.
+`backdrop-attribution.json` preserves six balanced ordered ordinary/textureless
+pairs, exact pixels, the observed additional callback, original geometry/alpha,
+source/adapter/format and the same seven completed-render buckets.
+
+This is an opt-in targeted whole-frame/batching attribution, not a production
+optimization or permission to accept changed pixels. Callback construction is
+outside timed drawing. No shadow, font, native presentation, physical-latency,
+resource-cap or multi-day cause is inferred. Small normal-CI controls check
+selection/matcher refusal and full-frame pixel/order fidelity at two scales;
+actual eight-picker execution remains separately required.
+
+#### 2026-10-06 completed same-frame picker attribution
+
+Clean cumulative `90c0ed5df4920cbf40e3ea96e609ce6f19df1417` completed all eight
+actual picker controls in 109.07 seconds on the same Windows x64 DX12 CPU
+`Microsoft Basic Render Driver`, `Rgba8Unorm`, scale 2. No other owned build or
+probe was active at slot acquisition; this does not establish an otherwise
+quiet shared host. The release test binary SHA256 is
+`b4242be38ffd06ec9fbf680cbbd87e76b53805390735bcfd9022cadbfae057af`.
+
+All eight preserved `5fa487c` reference PNGs are identical. Forty ordinary
+measured original-renderer guards and all ninety-six paired measured pixel
+guards passed. Each backdrop retains RGBA `[0, 0, 0, 100]`, eight vertices and
+thirty indices. The additional panel actually executes once: normal Open File
+4 to 5, narrow Open File 2 to 3, and Save As 3 to 4. Ordered six-pair samples,
+three AB/three BA orders, source/adapter/format, viewport/scale, percentile
+convention, finite completion buckets and dimension-derived payload equations
+were checked independently.
+
+| Actual picker | Ordinary median (ms) | Textureless-black median (ms) | Lower completed draw/readback |
+| --- | ---: | ---: | ---: |
+| Open File ready normal | 1023.614 | 381.466 | 62.7% |
+| Open File ready narrow | 408.965 | 315.784 | 22.8% |
+| Open File error normal | 907.726 | 528.335 | 41.8% |
+| Open File error narrow | 394.636 | 302.896 | 23.2% |
+| Save As ready normal | 1103.716 | 688.421 | 37.6% |
+| Save As ready narrow | 382.145 | 293.165 | 23.3% |
+| Save As error normal | 1078.298 | 657.809 | 39.0% |
+| Save As error narrow | 366.816 | 279.036 | 23.9% |
+
+These same-frame shared-host observations establish a material contribution
+from the backdrop's existing textured route plus its batching, without removing
+dimming, changing its geometry/alpha, or substituting a different fixture.
+They do not isolate shader instructions, qualify strict CPU/native latency,
+or demonstrate a shipping fix: the production backdrop remains unchanged.
+Substantial drawing cost remains. The separate two-scale full-frame fidelity
+regression passed in 0.37 seconds; no native/manual row or budget is accepted.
+
+#### Default picker backdrop route
+
+Only Open File and Save As opt into the installed supported Windows DX12 CPU
+panel renderer for their exact unique full-root translucent black backdrop.
+The ordinary Modal owns content, allocation, IDs, responses and input handling.
+The caller replaces only its newly emitted backdrop shape after checking
+root/visibility/painter opacity/origin/transform, original alpha/clip and
+untextured/unrounded/unstroked/unblurred geometry. Other shapes, modals,
+opaque-frame guards, renderer ownership and unsupported fallback stay intact.
+The two-scale regression compares full pixels and modal/content/backdrop
+responses plus no-renderer, nonzero-origin, transform and colored fallbacks.
+The cumulative default-path record follows; the `90c0ed5` table remains the
+earlier diagnostic source, not a relabeled default-path measurement.
+
+#### 2026-10-06 default picker backdrop observations
+
+Clean cumulative `675a007f7e0b21b7c470e7cd77fdb22d16f2d02c` follows the bounded
+Source successor and completed all eight actual default picker controls in
+30.19 seconds. Comparison controls are the preserved ordinary default replay
+at `90c0ed5df4920cbf40e3ea96e609ce6f19df1417`. Both use the same physical
+fixture paths, Windows x64 DX12 CPU `Microsoft Basic Render Driver`,
+driver `10.0.26100.9278`, `Rgba8Unorm`, scale 2.
+The archived measured release test executable SHA256 is
+`4ffe027ebfb16bbd0e63690c651cae8f86c8e9904b8aee06b7e845c98f15437c`.
+
+All eight reference PNGs are identical and all forty measured original-renderer
+guards pass. Every completed default draw executes exactly one additional
+panel callback: normal Open File 4 to 5, narrow Open File 2 to 3, Save As 3 to 4.
+The independent verifier requires these counts as well as source/adapter/format,
+actual readiness, viewport/scale, ordered finite samples, percentiles,
+completion buckets and dimension-derived payload equations. Its negative
+ordinary control fails the callback requirement despite unchanged pixels.
+
+| Actual picker | Previous UI median (ms) | Default-route UI median (ms) | Previous completed draw/readback median (ms) | Current median (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Open File ready normal | 0.649 | 0.722 | 1032.611 | 550.592 |
+| Open File ready narrow | 0.523 | 0.836 | 404.382 | 284.395 |
+| Open File error normal | 0.474 | 0.553 | 1010.600 | 537.367 |
+| Open File error narrow | 0.375 | 0.442 | 393.196 | 307.779 |
+| Save As ready normal | 0.588 | 0.689 | 1104.993 | 650.405 |
+| Save As ready narrow | 0.565 | 0.632 | 386.072 | 278.477 |
+| Save As error normal | 0.428 | 0.726 | 1083.305 | 623.611 |
+| Save As error narrow | 0.436 | 0.511 | 364.908 | 263.923 |
+
+Completed draw/readback medians are 21.7-46.8% lower, while UI medians increase
+0.067-0.313 ms. UI construction includes the extra callback's original-geometry
+tessellation/preparation; that tradeoff is not removed from the record.
+These noncontemporaneous shared-host observations agree with the earlier
+same-frame route attribution, but are not quiet-host precision, isolated
+shader instructions, physical input/presentation or hardware-platform evidence.
+No other owned build/probe was active at runtime-slot acquisition; shared-host
+quietness is not established. Substantial drawing cost remains.
+
+The opted-in legacy attribution then passed on the same source/binary in
+110.28 seconds, preserving eight PNGs, forty ordinary and ninety-six measured
+balanced paired guards, original alpha/geometry and the one additional callback.
+It explicitly uses the per-context test-only ordinary selector before converting
+the frozen frame; production has no environment switch. The two-scale complete
+pixel/response/fallback regression also passed, explicitly selecting DX12
+without relying on a shell backend setting. Other modals, original dimming,
+opaque-frame guards, shaders and renderer ownership remain unchanged.
+Native interaction, screen-reader, mixed-DPI/hardware, physical latency,
+device/driver retirement, resource caps and multi-day qualification stay open.
+
+### 2026-10-06 opaque picker-frame observations
+
+Clean cumulative `2056b48e7f41598f3a0e48aff4e5133d97264e8e`, tree
+`99763cbd476990ded55cc7c5b84e1ac89254d5f4`, ordinarily composes the frame
+diagnostic after #365 and the preceding bounded Source/default-backdrop fixes.
+The exact archived release executable has SHA-256
+`006e7dea88f2a796679c0e4c60bec01c75fba80ec41543dc5be133e5b32ea0e2`.
+The replay used Windows x64 DX12 CPU `Microsoft Basic Render Driver`,
+`Rgba8Unorm`, scale 2 and the same physical cumulative picker fixture path.
+Explicit bounded owned-process waiting retained actual exit 0, stable source
+and binary, and the complete 67.05-second execution.
+
+All eight actual ready/error normal/narrow pickers preserve the default
+predecessor's encoded PNG bytes. Forty ordinary and ninety-six paired measured
+original-renderer pixel guards pass. Six pairs per scene alternate three
+ordinary-first and three converted-first draws; every converted draw executes
+exactly one additional callback (Open normal 5 to 6, Open narrow 3 to 4, Save As
+4 to 5). The ordinary default backdrop remains converted in both arms. All
+48 converted draws are faster within their pairs:
+
+| Actual picker | Ordinary median ms | Converted frame median ms | Reduction |
+| --- | ---: | ---: | ---: |
+| Open File ready | 552.351 | 206.397 | 62.6% |
+| Open File ready narrow | 307.869 | 144.807 | 53.0% |
+| Open File error | 545.380 | 190.383 | 65.1% |
+| Open File error narrow | 298.463 | 135.824 | 54.5% |
+| Save As ready | 690.796 | 238.464 | 65.5% |
+| Save As ready narrow | 301.157 | 127.549 | 57.6% |
+| Save As error | 656.524 | 207.043 | 68.5% |
+| Save As error narrow | 282.875 | 110.349 | 61.0% |
+
+All raw vectors, seven finite completion buckets, original fill/stroke/
+rounding/blur, viewport/physical dimensions and submitted payload counts remain
+in the reports. Independent checking also requires exact removal of the
+attributed white-UV geometry from ordinary mesh counters, preserved image/
+padded-readback bytes and the original sorted-percentile convention.
+The same unchanged source and executable then complete the earlier actual
+eight-picker backdrop attribution in 101.66 seconds, retaining eight reference
+PNGs, forty ordinary and ninety-six paired guards and its original schema.
+
+Private artifacts are `followup-picker-frame-attribution-warp-v1` (archived
+binary, completion receipt, reports/PNGs and `verified-frame-summary.json`) and
+`followup-picker-frame-legacy-backdrop-warp-v1` (completion receipt and
+`verified-backdrop-summary.json`), under the existing session artifact root.
+The independent frame and legacy verifiers run after actual child completion.
+The first focused-test launcher attempt lacked the actual Python interpreter
+on PATH and selected the Windows Store alias; it is retained as a failed
+launcher, not passing tests. The unchanged-source corrected attempt passes all
+six frame/backdrop admission and two-scale pixel controls; scoped Clippy passes.
+
+These are one shared-host same-frame route/batching observations, not isolated
+shadow cost, shader-instruction attribution or GPU timestamps. Callback
+construction is excluded from drawing; no construction tradeoff is accepted
+from this timing alone. The shadow and dimming are not removed. Production
+frame routing at that measured revision is unchanged; an owned-frame successor
+still needs its own live Modal/fallback, pixels, construction and default-path
+qualification.
+Native presentation, physical latency and total/driver-private memory remain
+open.
+
+### Optional same-frame opaque picker-frame attribution
+
+Set `FESTERM_WARP_UI_SCENES=picker-controls` and
+`FESTERM_WARP_UI_PICKER_FRAME=textureless-frame` after acquiring the exclusive
+runtime slot, then use the existing exact release replay and fresh output.
+The backdrop-attribution option must be unset: the current default optimized
+backdrop stays live, and simultaneous options fail before creating evidence.
+Other selectors, values and non-Windows-x64 requests fail explicitly.
+Unset this option for the production default replay. The test-only replay
+context explicitly disables just owned frame conversion during frame
+attribution, leaving the default backdrop live; production reads no new
+environment variable. Historical backdrop attribution disables both owned
+conversions to retain its original ordinary geometry, batching and schema.
+
+Each frozen actual picker must have exactly one complete opaque frame and
+untextured black shadow pair, with finite positive geometry, an opaque frame
+inside the zero-origin root viewport and its complete frame clipping coverage.
+The existing palette-frame structural predicate is shared, not independently
+reimplemented. Missing, clipped, unsupported or ambiguous candidates fail.
+Original fill, stroke, rounding, shadow alpha/blur and tessellated white-UV
+geometry remain; neither shadow nor dimming is omitted.
+
+`frame-attribution.json` supplements the ordinary report. Six balanced ordered
+pairs require exact original-renderer pixels and one additional executed panel
+callback, preserving the seven completion buckets, geometry/payload counts
+and source/adapter/format/scale identity. Callback construction is outside
+timed drawing. This is targeted whole-frame route/batching attribution for the
+combined shadow/frame geometry, not isolated shadow cost or GPU timestamps,
+a production optimization, native presentation or a total-resource claim.
+The small two-scale complete-frame regression and device-free option/matcher
+controls are distinct from the actual eight-picker execution requirement.
+Historical backdrop fields/oracles remain available through shared mechanics.
+
+### 2026-10-06 default owned picker-frame observations
+
+The narrow production component `85cac236` and append-only GPU fixture repair
+`7b92fa4a` are ordinarily composed after #367 at clean
+`b262aa43aacfeb69d53f92a5c4a2583ee938045f`, tree
+`6b01ce8aa0c92f07665af200e76bc1f8f62ddca7`. Exact archived release executable
+SHA-256 is `5f05979652fc4b95b23d024fac07867f77442f13e6aaf4161efa0c9811bf0a9b`.
+Before controls are clean `f51c88f`/`945daa0a…`, the already qualified Preview
+composition with the old production frame. Both use the same physical fixture
+path, Windows x64 DX12 CPU `Microsoft Basic Render Driver`, `Rgba8Unorm`,
+scale 2 and the actual ready/error normal/narrow Open File/Save As models.
+
+Default before/after executions complete in 35.40/17.27 seconds, actual exit 0
+with stable source/hash and explicit bounded owned-process waiting. All eight
+encoded PNGs equal both the immediate before and preserved original frame
+reference; eighty before/after measured original-renderer guards pass.
+Every after draw executes exactly one additional frame callback: Open normal
+5 to 6, Open narrow 3 to 4, Save As 4 to 5. Exactly the original 216 vertices
+and 1068 indices move out of ordinary mesh counters; target/image/readback
+payloads remain unchanged.
+
+| Actual picker | UI before ms | UI after ms | Draw/readback before ms | Draw/readback after ms | Drawing reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Open File ready | 1.120 | 1.135 | 652.171 | 200.684 | 69.2% |
+| Open File ready narrow | 0.627 | 0.601 | 290.791 | 134.776 | 53.7% |
+| Open File error | 0.579 | 0.644 | 648.002 | 189.754 | 70.7% |
+| Open File error narrow | 0.510 | 0.533 | 284.642 | 126.756 | 55.5% |
+| Save As ready | 0.674 | 0.769 | 722.509 | 238.744 | 67.0% |
+| Save As ready narrow | 0.690 | 0.738 | 312.513 | 125.063 | 60.0% |
+| Save As error | 0.519 | 0.580 | 708.354 | 209.942 | 70.4% |
+| Save As error narrow | 0.748 | 0.617 | 300.635 | 111.470 | 62.9% |
+
+Six construction medians are higher by 0.015-0.096 ms; two are lower by
+0.026/0.131 ms. All twenty UI/tessellation and five completed-draw vectors per
+scene remain, along with seven completion buckets and percentiles. This
+shared-host default comparison is not contemporaneously balanced or an
+all-metrics/native speedup.
+
+The same exact source/binary additionally completes frame attribution in
+65.95 seconds and legacy backdrop attribution in 105.27 seconds. Each preserves
+eight encoded PNGs, forty ordinary and ninety-six six-pair measured guards.
+The frame arm keeps the current backdrop and adds exactly one callback; all
+48 converted draws are faster (51.2-68.6% lower scene medians). Legacy explicitly
+keeps both original shapes and the historical schema/batching/callback oracle.
+Both retain original fill, stroke, rounding, shadow and blur.
+
+All four release two-scale production/backdrop/frame/legacy regressions pass
+at `b262aa4` in 11.89 seconds. The first cumulative `8966` run had three passing
+controls and one failed new fixture: reused RenderState ownership was refused.
+Its full failure and archived `55f24677…` executable remain; the append-only
+fresh-state repair retains all 56 arms, pixels, responses and fallback guards.
+No production predicate or assertion was weakened.
+
+Private artifacts are `fleet-v5-frame-default-before-v1`,
+`fleet-v5-frame-default-after-v1` (`verified-frame-production-summary.json`),
+`fleet-v5-frame-attribution-after-v1` (`verified-frame-summary.json`),
+`fleet-v5-frame-legacy-after-v1` (`verified-backdrop-summary.json`), both frame
+binary archives and `fleet-v5-frame-gpu-controls-v1/v2`, under the session root.
+These are completed default-route and same-frame/batching observations, not
+isolated shadow/shader instructions, GPU timestamps, native presentation,
+physical latency, hardware/mixed-DPI or total/driver-private memory acceptance.
+
+### Prepared owned picker-frame production successor
+
+The production successor opts in only through the existing Open File/Save As
+caller wrapper. After ordinary `Modal::show`, it considers only that call's
+new shapes on its modal layer and converts at most one complete opaque frame
+plus its original untextured translucent black shadow. The candidate must
+match the actual frame rectangle captured after the live content closure;
+a nested frame cannot substitute for an ineligible owned frame. The structural
+`opaque_window_frame` predicate and complete-frame eligibility are shared with
+the existing attribution matcher. Finite positive root/frame/shadow geometry,
+zero root origin, full frame clipping coverage, root/visibility/painter opacity,
+untransformed layers and the installed eligible panel renderer remain required.
+Ambiguous, clipped, unsupported, translucent, shadowless or ineligible geometry
+retains ordinary frame painting. The existing exact backdrop route stays live
+independently; a frame refusal does not disable it. Other modals and all other
+shapes remain ordinary. No shader, fill, stroke, rounding, blur or dimming is
+removed or changed.
+
+`set_picker_frames_enabled` is compiled only for tests and stores an explicit
+per-context choice; normal production does not read a frame environment selector.
+The strict `textureless-frame`/`picker-controls` opt-in still refuses simultaneous
+backdrop attribution. Its ordinary arm disables only frame conversion, so one
+additional executed callback remains required against the live default backdrop.
+The legacy `textureless-black` arm explicitly disables both owned conversions,
+preserving its original shape/geometry/schema and one additional callback rather
+than silently adding the new frame to that historical oracle.
+
+Device-free controls cover actual normal/narrow owned Modal frame selection,
+same-call ownership, clipped/ambiguous refusal, independent diagnostic controls
+and live no-renderer shapes, responses, button/backdrop clicks and Escape.
+`owned_picker_frame_preserves_pixels_responses_and_guarded_fallbacks` covers
+for 1/1.25x complete pixels/responses and callback counts with normal/narrow/light,
+frame/context/no-renderer/other-modal fallbacks and unchanged live backdrop;
+the exact focused regression now passes on explicit DX12 CPU rendering.
+
+The parent's first cumulative `8966` qualification failed only this new test:
+egui-kittest refused a RenderState already used by a preceding comparison arm.
+The complete failure is retained in `fleet-v5-frame-gpu-controls-v1.log` and
+the parent's receipts/archived executable. Fresh RenderState creation inside
+each render arm repairs root fixture ownership; all 14 cases at both scales,
+their original/candidate pixels, live responses and callback/fallback assertions
+are unchanged. No production code or renderer guard is changed by this repair.
+This small correctness test is not an actual eight-picker or performance replay.
+
+The `2056b48`/`006e7dea…` eight-scene record above remains the measured diagnostic
+predecessor; the separate `b262aa4` record now qualifies actual default execution
+and both retained same-binary oracles. For fresh reruns acquire the exclusive
+runtime slot, preserve all two-scale live/fallback controls, default eight
+encoded PNGs/ordinary pixel guards and one extra executed frame callback.
+Retain construction tradeoffs and all draw samples; use separate fresh outputs
+for frame and legacy diagnostics and run full gates. Native presentation, physical
+latency, hardware/mixed-DPI, accessibility and total/driver-private memory remain
+separate; no new manual acceptance or ADR boundary is claimed.
+
+### Gallery capture and shared fixture identity
+
+Gallery generation uses
+`FESTERM_UI_GALLERY_OUT` pointed at a fresh owned directory before updating
+the reviewed document/images. `capture_surface_gallery(SurfaceKind, narrow)`
+is the shared full-root themed fixture API for style review.
+`capture_palette_gallery(narrow)` adds two gallery-only production command-palette
+views for coordinated style review. Palette
+performance remains unmeasured and outside the initial 52-variant probe batch.
+An additional 23 gallery-only style-review variants bring the total to 125,
+without changing the probe scene catalog. The reusable API is
+`capture_style_review_gallery(StyleReviewKind, size, fixture_id)`, returning
+the image and geometry observations. Its nine kinds combine ready-update/licenses,
+filtered long palette identity/secondary/shortcut, deep-directory Open File
+ready/error, `NOTES.md` overwrite/disabled remote, long live close, maximum
+bounded paste, dirty-document close, and applicable overflow controls.
+Each has `752 × 516` and `360 × 516` roots; About, ready Open File, Save As,
+paste and dirty close also have `360 × 240` variants.
+
+Geometry iteration does **not** require the full 125-image generation. The
+existing ignored capture test accepts `FESTERM_UI_GALLERY_SCENES=style-review`
+for these 23 curated cases, or a comma-delimited list of exact scene IDs for a
+smaller iteration. Unknown, empty and duplicate selections fail explicitly.
+Selected captures require `FESTERM_UI_GALLERY_OUT` to name a fresh empty
+evidence directory, preventing partial generation from pruning the published
+gallery or overwriting a failed attempt. With the selector unset, the existing
+full-gallery behavior is unchanged.
+
+```powershell
+# Only after the primary grants the exclusive capture slot:
+$env:FESTERM_UI_GALLERY_SCENES = 'style-review'
+$env:FESTERM_UI_GALLERY_OUT = "$PWD\target\evidence\style-before-attempt-01"
+cargo test -p festerm --bin festerm ui_gallery::capture_ui_state_gallery -- --include-ignored --exact --nocapture --test-threads=1
+# Use a different fresh output for AFTER; do not change physical fixture IDs.
+Remove-Item Env:FESTERM_UI_GALLERY_SCENES
+Remove-Item Env:FESTERM_UI_GALLERY_OUT
+```
+
+These style fixtures assert their actual state at `752 × 516` before resizing
+the same application, without navigation or task reload. This proves worker
+readiness even if a short root virtualizes all rows away. The existing manifest
+records optional `geometry` observations against **`ctx.content_rect()`**, not
+the gallery harness's inset Ui: area/action bounds, actual action heights,
+focus and full palette identity. Missing or off-root controls are observations,
+not passes; no style/native acceptance is inferred. Geometry is also emitted
+to retained capture logs before drawing, preserving diagnostics for a failed
+render. No new snapshot baselines or budgets are introduced.
+
+Keep pre-style f0 production-widget captures and integrated-style captures in
+fresh disjoint output directories, with identical fixture IDs, physical checkout
+roots and renderer settings. Compiled `CARGO_MANIFEST_DIR` can otherwise change
+the visible real origin/breadcrumb across binaries. For the curated style
+entry point only, opt in to **actual shared physical I/O identity** with:
+
+- `FESTERM_UI_SURFACE_FIXTURE_ROOT`: absolute
+  `<controlled-workspace>\target\ui-gallery-owned-comparisons\<run>`;
+- `FESTERM_UI_SURFACE_FIXTURE_RUN`: the same simple run identity as that leaf;
+- `FESTERM_UI_SURFACE_FIXTURE_PHASE`: `baseline`, then `candidate` in a
+  separate sequential test process, with the same selected scene IDs.
+
+The helper creates its control-owner marker itself; do not pre-create an
+unowned control folder or run leaf. The controlled workspace must already
+contain Cargo/Git metadata. Known personal/system/temporary locations,
+username components, root/traversal/UNC/device paths and ancestor/child
+symlinks or Windows reparse points are refused. Baseline cannot adopt an
+existing leaf, even if empty. A persistent control-level run claim also rejects
+reusing a deleted run identity. Candidate requires the completed matching
+baseline ownership, selection and retained evidence/input proofs; each phase
+is claimable once. Baseline inputs remain frozen at the **same real scene paths**.
+Candidate constructors verify/reuse them without rewriting bytes or timestamps,
+with actual workers/documents and unchanged freshness/dirty-close semantics.
+Kind/root-size, file bytes and modified times must match before drawing.
+
+Owned inputs stay present until all selected PNGs/digests and the manifest
+are saved and verified. Baseline completion retains all inputs and its completed
+marker for candidate use. Only candidate completion removes inventoried files and empty
+directories after rechecking ownership/contents; modified or untracked inputs
+are retained instead. Control, phase and input-proof records remain. Failed
+or completed scopes cannot be silently retried/reused: use a fresh run for a
+new baseline/candidate pair, retaining previous records. Evidence directories
+must be fresh and disjoint from each other and the physical input scope.
+
+```powershell
+# Scaffold/runtime checks and the exclusive slot grant must precede use.
+$env:FESTERM_UI_GALLERY_SCENES = 'style-review' # or exact curated IDs
+$env:FESTERM_UI_SURFACE_FIXTURE_RUN = 'style-pair-01'
+$env:FESTERM_UI_SURFACE_FIXTURE_ROOT = 'Q:\src\OSS\fesTerm-ui-fleet\benchmarks\target\ui-gallery-owned-comparisons\style-pair-01'
+$env:FESTERM_UI_SURFACE_FIXTURE_PHASE = 'baseline'
+$env:FESTERM_UI_GALLERY_OUT = "$PWD\target\evidence\style-pair-01-before"
+cargo test -p festerm --bin festerm ui_gallery::capture_ui_state_gallery -- --include-ignored --exact --nocapture --test-threads=1
+# After style integration, keep ROOT/RUN/selector unchanged, even across binaries:
+$env:FESTERM_UI_SURFACE_FIXTURE_PHASE = 'candidate'
+$env:FESTERM_UI_GALLERY_OUT = "$PWD\target\evidence\style-pair-01-after"
+cargo test -p festerm --bin festerm ui_gallery::capture_ui_state_gallery -- --include-ignored --exact --nocapture --test-threads=1
+Remove-Item Env:FESTERM_UI_GALLERY_SCENES, Env:FESTERM_UI_GALLERY_OUT, Env:FESTERM_UI_SURFACE_FIXTURE_ROOT, Env:FESTERM_UI_SURFACE_FIXTURE_RUN, Env:FESTERM_UI_SURFACE_FIXTURE_PHASE
+```
+
+This mode is **unexecuted scaffolding pending the primary's exclusive slot**;
+cross-worktree matched visual claims remain unqualified until its guards and
+sequential runs are validated. The default APIs retain compiled-worktree
+paths and make no matched-identity claim. Manifest captions/geometry state the
+actual physical scene directory and selected mode, never substitute synthetic
+metadata, adopt a generation-losing document, use junctions or sanitize pixels.
+This is not a canonical display-metadata feature or a generic PII-free pipeline.
+The 52-variant probe catalog is unchanged.
+
+An intentional geometry change is not a pixel-equality
+pass. Physical document/picker labels can reveal checkout usernames; review before
+publication or coordinate a canonical-display seam that preserves real generation
+and freshness semantics. Existing 48 baseline images remain untouched until
+authorized reviewed generation.
+
+Completed-render probes instead call raw `Context::run_ui` with production Dark visuals: they
+never submit the filled outer frame used by the visual-only gallery harness.
+
+Each probe output root must be fresh. Per-scene `status.json` and reports retain
+partial attempts if a task/semantic/pixel guard fails. Synthetic comparison
+files live at stable scene-specific paths under this worktree's
+`target/ui-gallery-fixtures/surface-batch`; a successful scene removes them,
+while a failed one retains them. The opt-in shared style scope follows the
+phase-level retention/targeted cleanup contract above instead. Set a fresh simple
+`FESTERM_UI_SURFACE_FIXTURE_RUN` tag to retry without deleting failed inputs.
+Changed fixture paths can change pixels; do not pool or compare mismatched tags.
+References require every matching scene PNG, including new states and dimensions.
+
+v2 records fixture/model preparation, the first fresh-context UI call and first
+tessellation, real-task/interaction readiness frames, eight warmups, and ordered
+steady construction/tessellation samples. Original controls preserve their
+workload order and painting policy. Expanded fixtures enable AccessKit for
+semantic checks; query-tree processing and texture uploads are outside their
+UI timer. Original WARP warm/steady UI samples still include texture-delta
+handling; that boundary is recorded, not pooled with the expanded UI-only bucket.
+The WARP report additionally records renderer initialization, first ready draw
+and five completed draw/sync/readback samples with median/p95/min/max and the
+exact percentile rule. That draw bucket includes renderer tessellation,
+submission, synchronization and CPU image readback. **It is not native
+input-to-display, OS presentation latency or actual idle scheduling.**
+
+Expanded scenes additionally retain five ordered `steady_draw_buckets`
+samples: CPU tessellation, callback preparation/encoding/target creation,
+submission, draw completion wait, readback preparation/submission, readback
+wait and CPU image copying. Each sample records submitted mesh/vertex/index/
+callback counts and the temporary framebuffer, padded readback and image byte
+payloads. Actual textureless-panel paint calls are counted when that production
+pipeline is installed; `null` means no eligible installed panel pipeline,
+not zero-cost rendering. These are not total allocator traffic, actual rasterized pixels,
+driver allocations or GPU timestamps. Completion waits can include driver
+work; they do not isolate GPU execution from scheduling.
+
+The instrumented rendering path uses the same renderer, texture format,
+transparent clear, callback order and readback layout as the original probe.
+Every expanded scene compares all pixels with an original-renderer draw of
+the identical settled frame before measuring, and preserves equality on each
+sample. Two small normal-CI scale cases also cover translucent geometry,
+glyphs and non-aligned readback rows, without new stored snapshot baselines.
+This instrumentation attributes the combined #350 bucket; it changes no
+production picker rendering and makes no efficiency claim by itself.
+
+`FESTERM_WARP_UI_SCENES=picker-controls` selects only the small-ready/error
+Open File and Save As fixtures at both widths (eight scenes).
+`FESTERM_WARP_UI_SCENES=markdown-controls` selects four actual large Markdown
+Preview/Source scenes at normal/narrow widths. Each uses the same owned
+400-section remote-origin snapshot with 400 Rust fences, with no images,
+network, user files or clipboard. Readiness checks the actual rendered heading
+or raw Source marker and the final section's code; it never substitutes the
+text editor or a loading placeholder. Find is explicitly unmeasured.
+
+Unset or `all` retains all four original controls and the 52 existing expanded
+variants, and adds these four Markdown variants. The gallery/construction
+catalog remains unchanged. Empty, unknown,
+composite and non-UTF-8 selections fail before creating output. Reports and
+the Windows optional-suite receipt name the selected scene set; omitted
+variants remain unmeasured. For a bounded diagnostic:
+
+```powershell
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+$env:FESTERM_WARP_UI_SCENES = 'picker-controls'
+$env:FESTERM_WARP_UI_OUT = 'C:\evidence\picker-buckets-attempt-01'
+$env:WGPU_BACKEND = 'dx12'
+cargo test --release --locked -p festerm --bin festerm ui_gallery::replay_warp_ui_surfaces -- --ignored --exact --nocapture --test-threads=1
+```
+
+Use a fresh output path and `markdown-controls` instead for the four Markdown
+scenes. They retain the same seven draw buckets, original-renderer pixel
+guards, actual installed-panel counts and bounded temporary-payload reporting.
+The constructor/steady UI samples include real Preview or Source traversal;
+preparation-cache counters are not a proxy for this measured work. These
+controls do not qualify Find, scrolling interaction, native presentation,
+physical input-to-photon latency or a net gain without matched measurements.
+
+Cold-process start is explicitly `null/not measured`: a fresh context in an
+already-running test process is not a cold application. Package/revision,
+dirty-source state, test-binary SHA256, OS/architecture, process ID, fixture
+root, adapter, scale and sample arrays accompany results. An artifact does not
+prove the host was quiet; execution still requires the primary's exclusive slot
+and retained external logs. #286 and #287 are prerequisites. No host-copy,
+retained-composition or #282 default-on gate is changed.
+
+## Established cause
+
+Hot, process-scoped snapshots on the affected Windows x64 host found worker
+threads executing anonymous, generated pixel-shader code. The automatic
+unwind stops in that JIT code; inspecting the hot thread's raw stack identified
+return addresses in:
+
+```text
+d3d10warp!PixelJITProcessor::ExecuteJIT
+d3d10warp!PixelJITRasterizeTriangleT<0,0>
+d3d10warp!Task_Rasterize
+d3d10warp!ThreadPool::WorkCallBack
+```
+
+The main thread was waiting in `NtUserMsgWaitForMultipleObjectsEx`; PTY
+control/read threads were also waiting. These captures establish software
+pixel rasterization, not an application polling loop or idle worker spin.
+The GUI frame counter measures UI construction, not GPU work completion.
+Previously submitted rendering can still consume CPU after that counter stops.
+
+The same work was captured with Direct2D disabled, including an unchanged
+#240 release (`6b526fb`). A controlled ablation of only the two large Launcher
+panel fills reduced total process CPU from 95.297 to 28.328 CPU-seconds with
+equal final GUI counters and no desktop input. That diagnostic deliberately
+changed appearance; it is not the implementation.
+
+The implementation keeps both fills. On Windows DX12 CPU adapters with
+eight-bit gamma framebuffers, it draws their original egui-tessellated rounded
+and feathered meshes with a textureless color shader. Clipping, color packing,
+blending, dithering, margins and child-widget order are retained. Hardware,
+other backends, sRGB/HDR targets, secondary/transformed viewports, translucent
+painters and shadows retain ordinary frame painting. The initial Launcher
+mitigation does not alter Direct2D selection, discovery scheduling, unread
+indication, or terminal painting policy.
+
+## Remaining application-surface costs
+
+On the v0.6.0 baseline (`7a9b83c`), the real Settings and Profiles surfaces
+still used the general textured shader for their large bordered panels. The
+existing textureless path now also draws those panels, connection forms and
+running-session groups. Borders use the original tessellated vertex colors,
+not an approximation or a separate overpaint. No renderer replacement,
+frame-rate limit, present-mode change, or hardware-adapter policy change is
+introduced.
+
+Profiles also called `detect_default_local_persistence_provider` on every
+paint, enumerating the directories on `PATH` twice. Its default is now
+captured once per window at construction, as intended, and passed to the
+screen without filesystem work on subsequent repaints. Tests supply all
+three defaults independently of the host environment and verify that the
+Local profile editor retains each through repeated paints.
+
+The full-resolution root-UI replay on the same host measured:
+
+| Surface | Baseline UI build (ms) | Candidate UI build (ms) | Baseline completed draw/readback (ms) | Candidate completed draw/readback (ms) |
+|---|---:|---:|---:|---:|
+| Launcher | 0.290 | 0.305 | 364.045 | 313.117 |
+| Settings | 0.625 | 0.768 | 1167.093 | 328.584 |
+| Profiles | 36.693 | 0.214 | 755.283 | 238.558 |
+| Terminal fixture | 2.089 | 2.032 | 82.201 | 84.312 |
+
+These are 20 UI iterations and five completed render/readback iterations per
+surface after warmup, release builds, 3548 x 2150 at 200% scale, using real
+Launcher/Settings/Profiles widgets and synthetic gallery data. The terminal
+fixture exercises the actual terminal view and automatically selected
+Direct2D path, without application chrome or a live PTY. The baseline and
+candidate images match at every pixel for all four fixtures.
+
+Settings and Profiles completed draw/readback fell approximately 72% and
+68%, respectively. The small Launcher and terminal differences are not
+claimed as independent improvements/regressions. UI measurements include
+texture-delta handling; draw/readback includes tessellation, command
+submission, synchronization and CPU image readback. These are diagnostic
+same-host samples, not cross-machine timing gates, native FPS, presentation
+latency, idle CPU budgets, or a Windows Terminal comparison. Window dragging
+remains a separate native responsiveness question.
+
+The replay deliberately uses `Context::run_ui`, as eframe does. The ordinary
+`Harness::build_ui` wrapper adds another large filled frame around the app;
+an initial diagnostic using that wrapper was rejected as unrepresentative.
+
+```powershell
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+$env:FESTERM_WARP_UI_OUT = 'C:\temp\festerm-warp-candidate'
+# Optional: baseline PNGs from the same replay, fixtures and resolution.
+$env:FESTERM_WARP_UI_REFERENCE = 'C:\temp\festerm-warp-baseline'
+cargo test --release -p festerm replay_warp_ui_surfaces -- --ignored --nocapture --test-threads=1
+```
+
+`FESTERM_RUN_WARP_UI_PROBE=1` includes this replay in the optional Windows
+runner; `FESTERM_WARP_UI_OUT` is required. A missing/mismatched reference
+image fails explicitly. No desktop input or real configuration is used.
+
+The candidate also passed the existing native CPU probe, with the real
+application HWND foreground and no input during warmup or sampling:
+
+| Scenario | Total-machine CPU | GUI frames/s |
+|---|---:|---:|
+| Idle Launcher | 0.010% | 0 |
+| Launcher with unread background shell | 0.000% | 0 |
+| Sparse foreground output | 25.979% | 13.681 |
+
+The native desktop in this run was **2880 x 1704 client pixels at 192 DPI**,
+not the historical 3548 x 2150 desktop or the fixed-resolution replay above.
+These samples verify the unchanged idle/output budgets, not a before/after
+native improvement. Direct2D construction was 13.581 frames/s in the output
+case. The script had to terminate its isolated shell-backed processes after
+their WM_CLOSE grace period; the user's existing processes were not operated on.
+
+A separate native Settings-window drag diagnostic was **invalid**, not a
+pass: `SetCursorPos` requested a new point, but the observed cursor returned
+to an earlier point during native movement. A follow-up retaining partial
+samples reproduced the mismatch even after waiting for movement to start.
+No cause is assigned to that cursor behavior and no drag-latency or CPU
+improvement is inferred from these attempts. Real dragging, resize,
+mixed-DPI, multiple windows, and Windows Terminal comparison remain open.
+
+## Inspector/SFTP bounded shared-panel qualification
+
+The `perf/ui-shared-panel-coverage` candidate starts at the validated picker
+repair `64a45c94846309d7bb657c3751327c31ed31c31b` (#286, prerequisite to
+publication). Source inspection establishes eligibility, **not** a slow-site
+finding. The qualified Windows WARP change routes only Inspector's opaque overlay
+frame and SFTP's enclosing pane and table/body frames through `show_frame`.
+The opaque fill, original frame geometry/border, clipping and child order are
+unchanged. All existing adapter/format, shadow, opacity/visibility,
+root-origin, secondary-viewport and transform guards and geometry warnings
+remain intact.
+
+Header/filter/footer frames and the transfer rail are eligible where their
+existing fill/painter meets those guards, but stay ordinary in this first
+candidate: an additional callback is not free. The drawer and collision
+inner/metadata cards also remain ordinary, pending independent draw attribution
+and bounded synthetic transfer-event fixtures. Transparent containers,
+selection rows, error tints, outside-click catchers and modal outer
+shadow/backdrop are not replaced. No listing virtualization, transfer policy,
+styling, update cadence, Direct2D, host-copy or retained-composition change is
+included.
+
+### Prepared correctness coverage
+
+- `textureless_inspector_preserves_pixels_focus_and_click_catcher` compares
+  collapsed/expanded complete Inspector drawing, desktop/narrow geometry,
+  header focus, actions and first-consumed/second-delivered outside clicks.
+- `textureless_sftp_panes_preserve_pixels_geometry_and_selection` compares
+  complete split/narrow file-manager drawing, fractional clips, pane/row
+  geometry, independent selection and filter focus with fixed 100-row panes.
+- Both cover 100%, 125% and 200% scale and count actual callback paints.
+  Shared tests cover all frame/painter exclusions, original unexpected-mesh
+  fallback, and unsupported adapter/format policy. These are live paired
+  framebuffer comparisons with an explicitly pinned production Dark theme,
+  not automatic system-theme selection; there are no new stored snapshots.
+
+The new complete-widget tests and all frame/painter fallback cases passed on
+Windows. The release replay below then passed all 20 paired framebuffer
+comparisons with exact callback attribution. Those measured, bounded routes
+are retained; this does not qualify other call sites, hardware performance,
+native interaction latency or the remaining CP-16/TI-06/FD-05/FD-06 evidence.
+
+### Completed-render comparison and reproduction
+
+Use the existing opt-in release replay path. The new ignored
+`replay_warp_ui_surfaces_shared_panels` also matches the optional runner's
+`replay_warp_ui_surfaces` selector intentionally, so no new benchmark framework
+or runner switch is required. Source-level verification of
+`scripts/run-optional-validation.ps1` found that
+`FESTERM_RUN_WARP_UI_PROBE=1` executes
+`cargo test --release -p festerm replay_warp_ui_surfaces -- --ignored --nocapture --test-threads=1`.
+Rust's substring test filter selects both the existing
+`ui_gallery::replay_warp_ui_surfaces` and the new
+`software_background::tests::replay_warp_ui_surfaces_shared_panels`; this was
+verified from their names and runner command, not by executing either replay.
+The prepared release executable's `replay_warp_ui_surfaces --ignored --list`
+also verifies the two matching ignored test names without rendering. They run
+serially and have disjoint outputs regardless of test order:
+
+- The existing replay writes `launcher.png`, `settings.png`, `profiles.png`
+  and `terminal.png` directly under `FESTERM_WARP_UI_OUT`.
+- The shared-panel replay reserves a **new** `shared-panels` child there with
+  `create_dir`, after asserting that child is absent. Its paired PNGs, raw
+  samples and provenance live only inside that child. Reusing it fails before
+  capture/timing without overwriting the previous attempt.
+
+Use a fresh parent output directory for each aggregate attempt as well, since
+the unchanged original replay owns its root-level files. The new replay uses
+`Context::run_ui`, not the Harness wrapper's
+extra filled frame. Fixtures are synthetic; the local loader is paused and
+no directory/network/real transfer work runs. All GPU fixture contexts pin the
+production Dark theme explicitly before installing its visuals.
+
+Before any renderer setup or timing, the replay archives `source-head.txt`,
+`source-status.txt`, the exact tracked candidate's `git diff --binary
+--full-index --no-ext-diff --no-textconv HEAD` as `candidate.diff`, its SHA-256
+in `candidate.diff.sha256`, and the actual `current_exe()` test executable's
+SHA-256 in `test-executable.sha256`. `provenance.json` binds those hashes to
+HEAD/status and labels the measurement kind/theme. Hashing streams bounded
+64 KiB blocks. All candidate source files in this task are tracked; freeze
+that source from compilation through capture. The standard-SHA256 helper has
+a deterministic `abc` test prepared for the granted validation slot.
+
+Scenes are collapsed Inspector, expanded Inspector with a bounded 64-line
+redacted report, unchanged 100/5000-row SFTP models, and an unchanged-text
+control. Each scene has four ordinary/textureless pairs, ordered AB, BA, AB,
+BA. Each path gets eight warmup constructions and completed warmup/settling
+draws, then retains all 20 individual UI durations, 20 tessellation durations
+and five completed draw/readback durations. PNGs compare every pixel within
+each pair; candidate draws must really execute (the text-only control must
+execute no panel callback). Unsupported devices/formats fail, rather than
+reporting a success-shaped fallback timing.
+
+UI time includes texture-delta handling and callback tessellation/uploads;
+the separate tessellation sample includes shape cloning. Draw/readback time
+includes tessellation, preparation, submission, synchronization and CPU image
+readback of the complete settled widget frame. GPU setup, fixture construction,
+expansion input and PNG/JSON writes are outside these boundaries. These are
+same-executable **ordinary-renderer versus textureless-renderer
+differentials**, not actual shipping before/after comparisons, native
+presentation/input latency, or a two-revision product CPU claim. The archived
+hash identifies the test executable, not a shipping application/installer.
+Any later shipping before/after claim needs independently qualified and hashed
+baseline/candidate shipping binaries and its own matched native evidence.
+
+The 2026-10-01 run used the exclusive `ui-shared-painting` slot after all
+preparation commands exited, with no concurrent fleet builds/captures or
+synthesized desktop input. The actual adapter was DX12 Microsoft Basic Render
+Driver/CPU, driver `10.0.26100.9278`, target `Rgba8Unorm`, 16 logical
+processors, 3548 x 2150 physical pixels at 200% scale.
+
+| Complete widget | Ordinary draw/readback median / p95 (ms) | Textureless draw/readback median / p95 (ms) | Median change | Ordinary → textureless UI median (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Inspector, collapsed | 239.946 / 260.012 | 86.814 / 89.785 | -63.82% | 0.0354 → 0.1073 |
+| Inspector, expanded | 290.176 / 293.583 | 148.071 / 151.194 | -48.97% | 0.0509 → 0.1116 |
+| SFTP, 100 rows/pane | 2050.915 / 2067.273 | 560.250 / 571.812 | -72.68% | 0.9425 → 1.1933 |
+| SFTP, 5000 rows/pane | 2041.661 / 2056.272 | 559.423 / 566.435 | -72.60% | 2.4319 → 2.5270 |
+| Unchanged text control | 76.173 / 77.623 | 75.760 / 76.708 | -0.54% (not an improvement claim) | 0.0046 → 0.0047 |
+
+These medians/p95s pool 20 completed samples per path/scene; UI medians pool
+80 samples. p95 uses sorted index `floor((n - 1) * 0.95)`. Raw ordering and all
+four paired repeats are retained. Every Inspector and SFTP pair reduced
+completed draw/readback: collapsed Inspector 50.28–64.46%, expanded
+48.49–54.99%, SFTP-100 72.61–72.87%, SFTP-5000 54.14–72.71%.
+The lower first ordinary medians (172.756 ms collapsed Inspector and
+1217.225 ms SFTP-5000) are not discarded. Control pairs include adverse
+textureless changes of +0.21% and +0.51% as well as -1.53% and -1.31%;
+no independent control improvement is inferred.
+
+**The UI-build cost increases are real:** callback tessellation/resource setup
+raises the medians by about 0.072, 0.061, 0.251 and 0.095 ms, respectively
+(+203%, +119%, +27%, +4%). The matched complete-draw reductions are much larger
+on this adapter, justifying these routes without claiming faster listing
+models. The SFTP result qualifies the enclosing-pane/table group, not separate
+per-call savings. Header/filter/rail/drawer/collision candidates are not
+promoted on the strength of this result.
+
+The [raw evidence](shared-panels-2026-10-01/) contains every duration, source
+status, versions/context, provenance and a byte-exact compressed source patch.
+The measured source is repair `64a45c94846309d7bb657c3751327c31ed31c31b`
+plus captured diff SHA-256
+`f2c3d0efa819b79a8dc55b8a44ae04198e24a4f54ee13aa4d77fa53ff165e8f0`.
+The actual release **test** executable SHA-256 is
+`ffbb27276352123cc82204282c87b8348e189df6be19708089002bbee48a9214`.
+`candidate.diff.gz` decompresses to the original captured `candidate.diff`
+bytes, avoiding Git line-ending conversion of the hash oracle. Paired PNGs,
+the full log and a hash-verified executable copy remain in the worktree's
+private `target\shared-panel-evidence\scheduled-run-20261001-1541-01` evidence;
+they are not newly required cross-platform snapshot baselines.
+
+To reproduce under an exclusive slot, prepend the tool paths in **every fresh process**,
+and use only the authorized worktree. The shared Cargo target is permitted only
+during that exclusive slot:
+
+```powershell
+Set-Location 'Q:\src\OSS\fesTerm-ui-fleet\painting'
+$env:PATH = 'C:\Users\fswiderski\.cargo\bin;C:\Users\fswiderski\AppData\Local\Programs\Python\Python312;' + $env:PATH
+$env:CARGO_TARGET_DIR = 'Q:\src\OSS\fesTerm\target'
+# Compile/validate first, outside every measurement interval:
+cargo test -p festerm --bin festerm software_background::tests -- --test-threads=1
+cargo test -p festerm --bin festerm inspector -- --test-threads=1
+cargo test -p festerm --bin festerm textureless_sftp_panes -- --test-threads=1
+cargo test --release -p festerm --bin festerm --no-run
+# Only after all preparation processes exit and the primary confirms a quiet interval:
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+$env:FESTERM_WARP_UI_OUT = '.\target\shared-panel-evidence\scheduled-run-01'
+cargo test --release -p festerm --bin festerm replay_warp_ui_surfaces_shared_panels -- --ignored --nocapture --test-threads=1
+```
+
+Before running, also archive Rust and Cargo versions, host/adapter/driver,
+command and absence of competing builds/captures/desktop input. The replay
+captures source/executable provenance itself before timing; its raw-sample JSON
+references that provenance and records adapter/format, dimensions/DPI,
+durations and callback counts. Retain logs, paired images, provenance and all
+adverse results. Use a fresh run-specific parent output folder and never delete
+an earlier `shared-panels` child to make a retry pass. Compare per-pair median
+and tails, preserve warmup
+versus measured boundaries, and check the unchanged control for drift. Do not
+quiet-rerun failures into a pass. Remove unhelpful call-site substitutions,
+rather than spreading the path or changing fidelity/cadence to improve a number.
+
+Only after targeted correctness and the completed comparison should the full
+repository CI-equivalent commands run, including `cargo fmt`, workspace
+Clippy/tests/check, Python script and Direct2D unit suites, font/emoji/icon,
+packaging, traceability (also against #286's eventual merge base) and
+`python scripts/build_ui_state_doc.py --check`. Native TI-06, FD-05/06 and
+CP-16 evidence remains separately classified; this replay cannot qualify it.
+
+### Qualification checks and environment limitation
+
+The Windows qualification passed `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` (1,905 passed, 52 ignored), and
+`cargo check --workspace`. Focused Inspector (11 passed, one ignored), SFTP
+full-widget, and fallback pixel tests also passed before measurement; the
+ignored release replay passed all 20 complete-frame comparisons. Initial
+test-scaffold compilation, unapplied texture-delta, and uninitialized-root
+screen-descriptor failures were fixed without relaxing rendering assertions.
+
+The unmodified command
+`python -m unittest discover -s scripts/tests -p "test_*.py"` initially failed
+one of 69 tests (three skipped): the AppImage shell/heredoc syntax test launched
+the System32 WSL `bash.exe`, with no installed distributions. Prepending Git
+Bash to `PATH` still failed: `shutil.which` and PowerShell resolved Git Bash,
+but a bare Windows `CreateProcess` invocation still selected the System32
+stub. Both failed attempts and the actual resolver diagnostic are retained,
+not reported as successful runs.
+
+The same 69-test discovery then passed (three skipped) using
+`python target\shared-panel-evidence\full-validation-20261001-01\run_script_tests_with_git_bash.py`.
+That driver supplies the explicit installed
+`C:\Program Files\Git\bin\bash.exe` as `Popen(executable=...)` **only** for
+bare `bash` argument lists. The actual workflow payload goes to Bash `-n`;
+test selection, child execution, return codes, stdout/stderr and all
+assertions remain unchanged. The line-ending-normalized
+[archived resolver](shared-panels-2026-10-01/git-bash-test-resolver.py)
+can reproduce that environment-only correction from the repository root.
+This is not a claim that the raw Windows command succeeded.
+
+The following also passed:
+
+- `python -m unittest discover -s scripts/tests -p "test_windows_*.py" -v`
+  (five tests);
+- `python -m unittest discover -s validation/direct2d -p "test_*.py"`
+  (five tests);
+- `.\validation\direct2d\run.ps1 -ResultDirectory .\target\shared-panel-evidence\direct2d-self-test-20261001-01 -SelfTestOnly`
+  with `FESTERM_RUN_OPTIONAL_VALIDATION=1` (seven native checks and five Python
+  tests; no desktop workload);
+- `python scripts\manage_bundled_font.py`;
+- `python scripts\check_unicode_emoji_data.py`;
+- `python scripts\validate-icons.py --check`;
+- `python scripts\generate_windows_icon.py --check`;
+- `python scripts\check_packaging.py`;
+- `python scripts\check_validation_traceability.py`;
+- `python scripts\build_ui_state_doc.py --check`;
+- `git diff --check`.
+
+Validation logs remain in
+`target\shared-panel-evidence\full-validation-20261001-01`. The measured patch
+still reverse-applies cleanly against all three current Rust source files;
+later result documentation does not change the timed implementation. The
+complete optional-validation aggregator was not executed: the compiled
+release selector listing confirms both ignored replays match, and the fresh
+child guarantees disjoint outputs. Linux/macOS CI and Linux-only esctest2
+remain external checks. #286 remains an unmerged prerequisite; #288's
+Markdown work and mixed residual are not qualified here. The historical
+Launcher native evidence below is separate from this Inspector/SFTP
+renderer differential.
+
+## Native evidence
+
+Host: 16 logical processors, DX12 Microsoft Basic Render Driver/WARP
+`10.0.26100.9278`, verified application client 3548 x 2150 physical pixels,
+192 DPI. No builds ran during measurements.
+
+A fixed 32-second diagnostic launched an isolated background-shell/Launcher
+configuration, maximized three seconds after finding the real application
+HWND, and requested two `WM_PAINT` invalidations approximately 14 and 14.5
+seconds after maximizing. This deliberately probes late rendering work; it
+does not redefine the ordinary idle-qualification workload.
+
+| Unprofiled, input-free run | Total process CPU seconds | Final GUI frame counter |
+|---|---:|---:|
+| Unchanged #240 | 115.438 | 18 |
+| Textureless-panel candidate | 33.656 | 18 |
+
+That is about **71% less CPU work with equal GUI frame activity**. These are
+process CPU totals through the fixed diagnostic interval, excluding cleanup,
+not instantaneous CPU percentages or a claim about physical presentation FPS.
+
+A separate profiled #240 run captured hot shader execution during a 91.610%
+CPU interval near the end of warmup. Its second requested repaint was delayed
+slightly beyond the nominal warmup boundary, and it built one GUI frame during
+the following sample. Its 7.867% post-warmup average is diagnostic evidence,
+**not a failed zero-frame idle qualification**. Profiling overhead is not
+included in the unprofiled comparison above.
+
+The unchanged official probe, with neither profiling nor injected repaints,
+then measured the isolated candidate before integrating #249-#252:
+
+| Scenario | Total-machine CPU | GUI frames/s | Result |
+|---|---:|---:|---|
+| Maximized Launcher | 0.000% | 0 | Pass |
+| Launcher with unread background shell | 0.010% | 0 | Pass |
+| Sparse foreground output | 24.052% | 11.985 | Pass |
+
+All three had input-free warmup and samples. The 3-second/15-second warmup,
+5% idle ceiling, 30% output ceiling and 5-GUI-frame/s output floor are
+unchanged. Earlier input-contaminated diagnostic runs and historical CPU
+failures are retained; they are not silently reclassified as passing results.
+This identifies and mitigates the reproduced rasterization burst, rather than
+retroactively assigning a cause to every older sample without hot evidence.
+
+After rebasing onto `170b023` (the integrated #249-#252 rendering work), the
+candidate passed the official probe again at the same size/DPI with no input:
+Launcher 0.000%, unread-background 0.010%, and sparse output 23.423% at
+12.387 GUI frames/s. The rebased workspace passed 1,821 tests (47 ignored);
+the separate opt-in full-resolution replay also passed. The isolation
+comparison above is not presented as a measurement of those other changes.
+
+## Repeatable draw-cost probe
+
+On a Windows DX12 CPU adapter:
+
+```powershell
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+cargo test -p festerm replay_large_warp_panels -- --ignored --nocapture
+```
+
+The opt-in replay uses two large rounded panels at 3548 x 2150 pixels,
+compares the complete ordinary/native framebuffers, verifies that native
+painting executed, and reports five completed draw/readback durations per
+path after warmup. It requires no desktop input or user configuration.
+Readback is included: these timings are not application idle CPU or
+presentation-latency measurements, and are not a cross-machine timing gate.
+Set `FESTERM_RUN_WARP_PANEL_PROBE=1` to include it in
+`scripts/run-optional-validation.ps1`.
+
+Normal CI compares every pixel at 100%, 125% and 200% scale with clipping and
+dithering on/off, including bordered panels. Separate cases verify opacity
+and sRGB fallback;
+adapter-policy tests reject hardware and non-Windows/non-DX12 paths.
+
+Use independently staged baseline/candidate binaries for native comparisons,
+then run the existing `scripts/check-windows-idle-rendering.ps1`. Do not
+share one Cargo target directory between different worktrees when preparing
+baseline binaries.
+
+For further profiling, capture while the worker is actually hot. The existing
+post-budget CDB capture can be too late. Live unsuspended thread contexts also
+proved misleading in this investigation; briefly balanced thread suspension
+followed by a process snapshot preserved the active JIT instruction pointers.
+Raw process snapshots can contain sensitive memory and must remain private
+until reviewed. Quiet reruns alone do not establish a fix.
+
+## Small Preview navigation campaign
+
+`direct2d::preview_navigation::profile_small_preview_navigation` is an ignored,
+test-only companion to the large-document profiles. It exercises the real
+`MarkdownPreviewPane` without fixture files, windows, desktop input, clipboard, PTYs,
+network, or native terminal callbacks. No production API change is needed.
+Only release Windows x64 DX12 **Microsoft Basic Render** CPU/WARP is admitted;
+adapter/backend/format mismatches refuse, never silently substitute hardware.
+The shell aggregate records `windows-x64-required` instead of running a
+zero-test filter on unsupported platforms.
+
+### Workload and interpretation
+
+Eleven owned fixtures: 16 prose paragraphs; one 5/15/30-row, three-column
+table; identical plain/Rust-highlighted fenced payloads at 20/100/300 lines;
+and a mixed 5-row table/20-line Rust fence. Every fixture has the same two
+navigation headings. Each has four fresh-context modes: warm stationary,
+continuous 36-point wheel, page-unit wheel, and alternating heading requests.
+Wheel direction reverses every eight frames; headings alternate every eight
+frames. Page-unit wheel is **not keyboard PageDown**. Context time advances
+deterministically at 60 Hz with scroll-to animation disabled; this is not a
+claim that the application runs at 60 Hz.
+
+Pin 640×400 logical points, 960×600 physical pixels, 150% DPI, Dark theme.
+Both controls use egui's default font definitions and fesTerm's visuals, not
+the native application's bundled-font installation.
+Eight complete warmup frames precede 32 measured frames per fixture/mode:
+1,408 measured frames, 1,760 completed offscreen draws. A three-minute
+workload guard refuses incomplete campaigns (device waits have separate
+ten-second timeouts). No speedup threshold is built into this evidence tool.
+Small content can fit or reach an end: report **requests and real nonzero
+scroll-offset changes separately**, including no-effect requests. Never
+normalize by requests as though they were all effective movement. Each
+navigation route must change actual offsets somewhere; stationary must not.
+
+Stdout contains JSON metadata, individual frame records, summaries, and a
+final `small-preview-navigation-complete` record. Libtest adds non-JSON lines;
+retain the original log and parse only lines beginning `{`. A pass requires
+both the final complete record and successful test exit, not partial samples.
+Records contain only owned fixture names, numeric metrics, hashes and the
+validated adapter name, not source/executable/receipt paths or user contents.
+
+UI build and tessellation are separate wall times. Texture-delta sets/frees
+and RGBA payload bytes, mesh jobs, unique clips, vertices/indices, and the
+renderer’s actual staged mesh-byte counter accompany every sample. Texture
+upload timing flushes queue writes and waits separately. Completed render
+wall time and process CPU time cover `profile::draw_composed`, which submits
+and waits for completion; they are **not host-return-only timing**. They
+exclude the preceding frontend construction, tessellation and texture phase,
+and exclude presentation/readback. Ordinary mesh replay has no retained-frame
+shortcut or native Direct2D terminal callback. These are offscreen component
+costs, **not physical input-to-display latency**, event-loop idle CPU, native
+resource acceptance or full-app responsiveness. CP-18 remains open.
+
+### Source-pinned baseline/candidate procedure
+
+Use the **identical benchmark module and registration** on original main
+`2268fd1a` plus this test-only campaign, and on each independently fixed
+candidate. Keep staged test executables and evidence directories separate.
+Separate worktrees and Cargo targets are the default. Build from committed,
+clean, frozen trees; do not infer
+the compiled source from runtime `git HEAD`. Capture build command, source
+commit/tree, compiler version, successful build log, and the actual
+release **test-executable** hash, not the application hash. A self-authored
+receipt without that frozen build procedure is not source attestation.
+
+A serial alternative may reuse one fixed worktree and target when Git confirms
+the compared revisions change only the application/tests/documentation, not
+dependencies, manifests or build configuration. Stage the baseline first, then
+run `cargo clean --release -p festerm` before building the candidate, recording
+that command in its receipt. Never change that worktree during a build or run
+concurrent builds in the reused target. This retains identical dependency
+artifacts while forcing a fresh application compilation.
+
+Example preparation in **each chosen clean worktree**, with a fresh relative
+artifact directory (do not reuse baseline and candidate directories):
+
+```powershell
+$out = Join-Path (Get-Location) 'target\preview-navigation-evidence\build'
+if (Test-Path $out) { throw 'Use a fresh artifact directory' }
+if (git status --porcelain) { throw 'Commit/freeze the benchmark and source first' }
+$revision = (git rev-parse HEAD).Trim()
+$tree = (git rev-parse 'HEAD^{tree}').Trim()
+New-Item -ItemType Directory $out | Out-Null
+rustc --version --verbose | Set-Content "$out\rustc.txt"
+cargo test --release --locked -p festerm --bin festerm --no-run --message-format=json `
+    2> "$out\build.stderr" | Set-Content "$out\build.jsonl"
+if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+if ((git rev-parse HEAD).Trim() -ne $revision -or (git status --porcelain)) {
+    throw 'Source changed during build'
+}
+$artifacts = @(Get-Content "$out\build.jsonl" | ForEach-Object {
+    $item = $_ | ConvertFrom-Json
+    if ($item.reason -eq 'compiler-artifact' -and $item.target.name -eq 'festerm' `
+        -and $item.profile.test -and $item.executable) { $item.executable }
+})
+if ($artifacts.Count -ne 1) { throw 'Expected exactly one festerm test executable' }
+Copy-Item $artifacts[0] "$out\festerm-tests.exe"
+@{
+    source_revision = $revision
+    source_tree = $tree
+    test_binary_sha256 = (Get-FileHash "$out\festerm-tests.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+    benchmark_sha256 = (Get-FileHash 'app\festerm\src\direct2d\preview_navigation.rs' -Algorithm SHA256).Hash.ToLowerInvariant()
+    build_command = 'cargo test --release --locked -p festerm --bin festerm --no-run --message-format=json'
+} | ConvertTo-Json | Set-Content "$out\build-receipt.json"
+```
+
+The test checks the receipt’s binary hash against `current_exe()` and its
+benchmark hash against **compiled-in** module bytes. Source commit/tree fields
+are syntax-validated and attributed explicitly to the external build receipt;
+the test cannot retrospectively prove a compiler consumed a particular tree.
+Archive the receipt/build logs/compiler record together. Keep the target,
+features, toolchain, viewport/DPI, fonts, host and adapter unchanged.
+
+Run the staged executable, not an unbound runtime checkout:
+
+```powershell
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+$env:FESTERM_PREVIEW_NAVIGATION_BUILD_RECEIPT = "$out\build-receipt.json"
+$process = Start-Process -FilePath "$out\festerm-tests.exe" -ArgumentList @(
+    'direct2d::preview_navigation::profile_small_preview_navigation',
+    '--exact', '--ignored', '--nocapture', '--test-threads=1'
+) -RedirectStandardOutput "$out\run.log" -RedirectStandardError "$out\run.stderr" -PassThru
+if (-not $process.WaitForExit(240000)) {
+    Stop-Process -Id $process.Id
+    throw 'Campaign process exceeded four minutes'
+}
+[void]$process.WaitForExit()
+if ($process.ExitCode -ne 0) { throw 'Campaign failed; retain both logs' }
+# Also require the complete JSON record and expected sample counts described above.
+```
+
+Explicit process waiting and redirected standard handles are required: release
+application test executables use the Windows GUI subsystem. A direct PowerShell
+invocation can return empty output and a stale exit code without qualifying the
+test. The aggregate runner checks both actual process exit and the complete
+record, retains uniquely named logs beside its result file, and rejects timeouts.
+
+Parent orchestration should stage A=baseline and B=one fix, then execute
+independent A/B/B/A blocks (prefer at least two blocks), swapping **both**
+executable and receipt per sample. Use unique log names; do not overwrite
+previous attempts. Require identical benchmark hashes and fixture/frame
+counts across controls. Compare matched fixture/navigation stages and raw
+distributions, not only pooled means; report adverse/unchanged cases and
+scroll-change counts. Compare the two fixes independently before combining.
+The protocol itself does not imply a gain or native qualification; measured
+observations are recorded separately below.
+
+### 2026-10-27 source-bound small Preview observations
+
+The protocol above was executed for #408 (table-only), #409 (code-only), and
+their combined production source. Two independent A/B/B/A blocks per single
+fix and one combined block completed **20 actual test processes, 28,160
+measured frames and 35,200 completed offscreen draws**. Every process exited
+zero and emitted its complete record. All 132 fixture/navigation comparisons
+have matching actual scroll offsets and request/change counts across controls.
+The [complete generated results](preview-navigation-20261027.json) retain
+all cases, component p50/p95, geometry/payload counts, adverse pair counts,
+ordered process receipts and source/tree/executable hashes.
+
+The frozen source controls are available in the fork:
+
+| Control | Source revision |
+| --- | --- |
+| Main plus identical test harness | [`a4f46606`](https://github.com/fswiderski/fesTerm/commit/a4f46606b3cb241bc9b417a11a12af21641ecebe) |
+| Code-only production viewer | [`62ec18e8`](https://github.com/fswiderski/fesTerm/commit/62ec18e8d5d079451ea31553fc0963fb4e1e270d) |
+| Table-only production viewer | [`7963bd64`](https://github.com/fswiderski/fesTerm/commit/7963bd64f25362c1c051faf0c4ea7a62aa5542ff) |
+| Combined production viewer | [`a6e70a21`](https://github.com/fswiderski/fesTerm/commit/a6e70a21e5c61520dced72d0b30192f24a877b87) |
+
+Measurement-only single-fix trees retain cumulative documentation, but their
+`markdown_viewer.rs` files exactly match the corresponding independent PR
+sources. They are controls, not additional product branches to merge.
+The one fixed-worktree/target serial procedure above was used, with a clean
+application compilation before each build and unchanged dependencies.
+Compiler: `rustc 1.98.1 (48a229cea 2026-09-01)`, Windows x64 MSVC.
+All four compiled benchmark-module SHA-256 values are
+`d41449cbe71faf61a7c583af8cba71ab0b7e7db70794296447b533eae329a6dc`.
+All owned builds and other tests were stopped for the balanced campaigns.
+The shared host is not certified quiet. Earlier pilots, including the failed
+scroll-ID observation and empty direct-PowerShell invocation, are retained
+locally and excluded. Original logs, binaries and build receipts remain local;
+the public summary is not a public binary attestation.
+
+Representative **point-wheel** pooled medians follow. Single-fix rows have
+128 measured samples per control and four matched process pairs; combined
+rows have 64 samples and two pairs. Milliseconds are separate components,
+not native frame/presentation or input-to-display times.
+
+| Source / fixture | UI before / after ms | Completed WARP before / after ms | Adverse draw pairs |
+| --- | --- | --- | --- |
+| Table-only, 30 body rows | 0.357 / 0.401 | 71.136 / 37.701 | 0/4 |
+| Table-only, 5 body rows | 0.193 / 0.230 | 22.546 / 23.828 | 4/4 |
+| Code-only, 300 Rust lines | 1.037 / 0.583 | 91.137 / 95.349 | 3/4 |
+| Code-only, 20 Rust lines | 0.268 / 0.241 | 88.362 / 98.522 | 3/4 |
+| Combined, 30 body rows | 0.270 / 0.252 | 71.876 / 40.818 | 0/2 |
+| Combined, 300 Rust lines | 0.687 / 0.363 | 86.158 / 87.304 | 1/2 |
+| Combined, mixed | 0.232 / 0.199 | 64.798 / 63.023 | 1/2 |
+| Combined, unchanged prose | 0.245 / 0.321 | 26.213 / 27.183 | 1/2 |
+
+The 30-row table's independent point-wheel mesh falls from 1,336 to 856
+vertices, 4,014 to 2,214 indices and 42,824 to 26,024 staged bytes: 39.2%
+less staged payload, alongside the 47.0% lower completed-draw median.
+Its draw p95 is 80.212 to 45.441 ms. Page-unit wheel has a 32.2% lower draw
+median, with one of four adverse pairs. This does **not** make every table
+faster: the 5-row point-wheel draw median rises 5.7% and p95 rises from
+33.372 to 48.145 ms, despite 12.7% less staged payload.
+
+The 300-line Rust fence's independent UI median is 43.8% lower and p95 moves
+1.234 to 1.070 ms, with zero adverse UI pairs. Page-unit wheel UI is 47.4%
+lower; plain 300-line point-wheel UI is 49.6% lower. Submitted code meshes
+are unchanged. Completed Rust point-wheel drawing instead rises 4.6%, and
+its draw p95 rises 100.150 to 147.380 ms. These are preparation savings,
+**not a demonstrated code-fence scrolling-latency repair**.
+
+Unchanged controls also move substantially: prose UI is 31.3% lower in the
+code-only block, while unchanged plain 300-line page-wheel drawing is 58.8%
+slower in the table-only block. Neither shift can be attributed to the
+unexercised optimization. Keep these adverse/unchanged cases rather than
+normalizing them away or promising a universal speedup.
+
+Completed drawing still dominates the combined code/mixed cases, even after
+the deterministic repeated-work fixes. The next architecture prerequisite is
+**CP-18 native retained-scroll qualification**: profile the actual application's
+whole-frame route and document invalidation, then review an ADR for bounded
+document-coordinate retention if that evidence supports it. This campaign
+deliberately bypasses the existing retention route; it cannot by itself qualify
+a renderer redesign, native responsiveness or parity with VS Code. No such
+redesign or new default-on rendering policy is delivered by these PRs.
+
+The existing optional aggregate also dispatches the prepared executable when
+`FESTERM_RUN_PREVIEW_NAVIGATION_PROFILE=1`,
+`FESTERM_PREVIEW_NAVIGATION_TEST_EXE=<staged test exe>` and
+`FESTERM_PREVIEW_NAVIGATION_BUILD_RECEIPT=<matching receipt>` are set.
+It first lists ignored tests to refuse stale executables with zero matches.
+The aggregate includes other, potentially native suites; use the focused
+executable command above when desktop interaction is not authorized.

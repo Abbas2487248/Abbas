@@ -1,0 +1,11652 @@
+//! Application-level tab and session model.
+//!
+//! This module is the application coordinator described in
+//! `docs/application-command-model.md`: it owns the always-nonempty tab
+//! collection (Launcher, Settings, Local Shell, and SSH session tabs), the active
+//! tab cursor, and `AppCommand` dispatch. Invocation surfaces (chip clicks,
+//! launcher buttons, and future shortcuts/command palette entries) send the
+//! same `AppCommand` values here rather than each implementing their own
+//! session or tab policy.
+//!
+//! It does not implement terminal protocol semantics: each session tab still
+//! routes session output through the single-writer `Terminal` +
+//! `SessionController` pair defined in `session_controller.rs`.
+
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc::{self, Receiver, TryRecvError},
+    Arc,
+};
+use std::thread::JoinHandle;
+
+const MAX_PENDING_OPEN_REFUSAL_NOTICES: usize = 16;
+
+mod panes;
+pub use panes::PaneClosePlan;
+
+use eframe::egui;
+use festerm_config::{
+    ChipLayoutPreference, ConfigError, Configuration, DurableSessionIdentity,
+    EmojiPresentationPreference, ImageMemoryBudgetPreference, InterfaceSettings,
+    PersistenceConfiguration, PersistenceProviderKind, ScrollSpeedPreference,
+    ScrollbackLimitPreference, SessionAlias, SftpPaneOrderPreference,
+    SshPortForwardDirection as ConfigSshPortForwardDirection, SshProfileConfiguration,
+    TerminalFontPreference, WorkspaceConfiguration, WorkspaceTab,
+};
+use festerm_core::{
+    Dimensions, Terminal, TerminalTextSnapshot, TerminalTextSnapshotRefusal,
+    TerminalTextSnapshotScreen,
+};
+use festerm_document::{DocumentId, RemoteOrigin, SaveOutcome, TextDocument};
+use festerm_markdown::RemoteMarkdownSource;
+use festerm_pty::{
+    default_local_profile_with_powershell_preference, LocalProfile, LocalPtySession,
+};
+use festerm_secret_store::{SecretBytes, SecretStore};
+use festerm_serial::{LineSettings, SerialSession, SerialSessionError};
+use festerm_session::{
+    AutomationEpoch, HostKeyPrompt, PasswordPrompt, ReserveAutomationInputError,
+    ReservedAutomationInput, Session, SessionErrorKind, SessionEvent, SessionEventNotifier,
+    SessionId, SessionLifecycle, SessionMetrics, SessionSendError, SessionTryReceiveError,
+    ShutdownError, ShutdownResult, SshPortForwardDirection, SshPortForwardRuntime,
+    SshPortForwardState, TerminalSize,
+};
+use festerm_sessiond::{PersistentSession, PersistentSessionError};
+use festerm_ssh::{
+    HostKeyDecisionResolutionError, HostTrustDecision, LiveRemoteFileRequestor,
+    PasswordDecisionResolutionError, SessionStrategy, SftpTerminalSession,
+    SftpTerminalSessionStartError, SshAuthentication, SshConnectionProfile, SshLivenessCheckError,
+    SshPortForwardRequestError, SshPortForwardSpec, SshReconnectError, SshSession,
+    SshSessionOptions, SshSessionStartError,
+};
+use festerm_ui_egui::{
+    chrome::{ChipLayout, ChipStatus},
+    TerminalView,
+};
+
+use std::rc::Rc;
+
+use crate::documents::{DocumentRegistry, OpenFailure, SharedDocuments};
+use crate::markdown_viewer::MarkdownViewerTab;
+use crate::session_controller::{seed_session_startup_failure, terminal_size, SessionController};
+use crate::sftp_file_manager::{
+    local_home_directory, AuthenticationFormState, SftpFileManagerAuthentication,
+    SftpFileManagerLaunchTarget, SftpFileManagerTab,
+};
+use crate::terminal_paths::{
+    bind_live_remote_request, open_local_command, open_remote_request, resolve_context_menu_action,
+    LocalTerminalOrigin, RemoteTerminalOrigin, TerminalFilesystemOrigin, TerminalPathMenuState,
+    TerminalPathOpenRequest, TerminalPathWorkerResult,
+};
+use crate::text_editor::TextEditorTab;
+
+const TERMINAL_HISTORY_SNAPSHOT_NAME_PREFIX: &str = "terminal-history";
+const NEW_TEXT_DOCUMENT_NAME_PREFIX: &str = "Untitled";
+const NEW_TEXT_DOCUMENT_LABEL: &str = "New unsaved file";
+
+/// Stable application-level tab identifier.
+///
+/// Distinct from `festerm_session::SessionId`: Launcher and Settings tabs
+/// have no backend session, and a tab's identity must outlive any particular
+/// session attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TabId(u64);
+
+impl TabId {
+    #[cfg(test)]
+    pub(crate) fn next_for_test() -> Self {
+        Self::next()
+    }
+
+    fn next() -> Self {
+        static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Opaque numeric form used only to correlate chip presentation identity;
+    /// it carries no terminal content.
+    pub const fn chip_id(self) -> u64 {
+        self.0
+    }
+
+    /// Reverses [`Self::chip_id`] for a chip belonging to a *different*
+    /// window, which this window cannot look up in its own tab list
+    /// (ADR 0033). Identifiers are process-wide unique, so the value is
+    /// meaningful in any window; a value naming no live tab is harmless,
+    /// because every consumer resolves it against a real tab list and falls
+    /// back when it finds none.
+    pub const fn from_chip_id(chip_id: u64) -> Self {
+        Self(chip_id)
+    }
+}
+
+/// Uses egui's thread-safe wake mechanism instead of polling for PTY output.
+struct EguiRepaintNotifier(egui::Context);
+
+impl SessionEventNotifier for EguiRepaintNotifier {
+    fn notify(&self) {
+        // egui 0.36's zero-delay API schedules TWO frames for widget settling.
+        // Session events are consumed before painting, so only one is needed.
+        // Its nonzero API avoids that extra frame; one nanosecond is not a
+        // frame-rate budget (egui subtracts predicted frame time before waking).
+        self.0
+            .request_repaint_after(std::time::Duration::from_nanos(1));
+    }
+}
+
+fn make_notifier(context: &egui::Context) -> Arc<dyn SessionEventNotifier> {
+    Arc::new(EguiRepaintNotifier(context.clone()))
+}
+
+#[cfg(feature = "experimental-dev-tunnels")]
+#[path = "tunnel_reconnect.rs"]
+pub(crate) mod tunnel_reconnect;
+#[cfg(all(test, windows, target_arch = "x86_64"))]
+pub(crate) fn session_notifier_for_test(context: &egui::Context) -> Arc<dyn SessionEventNotifier> {
+    make_notifier(context)
+}
+
+/// Concrete transports that can occupy an application session tab.
+///
+/// The application owns this narrow sum type so terminal/UI code sees only
+/// the common `Session` contract. SSH host-key verification remains the
+/// existing `SessionEvent::HostKeyVerification` boundary handled by
+/// `SessionController`; no secret material is exposed here.
+pub enum ApplicationSession {
+    Local(LocalPtySession),
+    Persistent(PersistentSession),
+    #[cfg_attr(not(feature = "experimental-dev-tunnels"), allow(dead_code))]
+    DevTunnel(PersistentSession),
+    Ssh(SshSession),
+    Sftp(SftpTerminalSession),
+    Serial(SerialSession),
+    #[cfg(test)]
+    TestSsh(crate::session_controller::fake::FakeSshSession),
+    #[cfg(test)]
+    TestLocal(crate::session_controller::fake::FakeSshSession),
+}
+
+/// The host-key decisions exposed by the application (ADR 0020).
+///
+/// `AcceptAndPersist` accepts the current connection exactly like
+/// `AcceptOnce` at the SSH transport (`festerm-ssh` already treats both
+/// identically for one connection); the durable trust-record write itself
+/// is a composition-root concern (secret-store-adjacent, needs the
+/// configuration reloader) and is intercepted in `FesTermApp::screen_command`
+/// rather than handled inside `AppState::dispatch`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostKeyTrustDecision {
+    Reject,
+    AcceptOnce,
+    AcceptAndPersist,
+}
+
+impl From<HostKeyTrustDecision> for HostTrustDecision {
+    fn from(value: HostKeyTrustDecision) -> Self {
+        match value {
+            HostKeyTrustDecision::Reject => Self::Reject,
+            HostKeyTrustDecision::AcceptOnce => Self::AcceptOnce,
+            HostKeyTrustDecision::AcceptAndPersist => Self::AcceptAndPersist,
+        }
+    }
+}
+
+/// An application-level failure to resolve a displayed host-key request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostKeyTrustResolutionError {
+    NoPendingPrompt,
+    NotRemoteSession,
+    Transport(HostKeyDecisionResolutionError),
+}
+
+impl std::fmt::Display for HostKeyTrustResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPendingPrompt => formatter.write_str("no host-key prompt is pending"),
+            Self::NotRemoteSession => {
+                formatter.write_str("the tab is not a remote SSH/SFTP session")
+            }
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// An application-level failure to resolve a displayed interactive password
+/// request. Mirrors [`HostKeyTrustResolutionError`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasswordResolutionError {
+    NoPendingPrompt,
+    NotRemoteSession,
+    Transport(PasswordDecisionResolutionError),
+}
+
+impl std::fmt::Display for PasswordResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPendingPrompt => formatter.write_str("no password prompt is pending"),
+            Self::NotRemoteSession => {
+                formatter.write_str("the tab is not a remote SSH/SFTP session")
+            }
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// An application-level failure to request a transport reconnect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionReconnectError {
+    NotReconnectable,
+    Transport(SshReconnectError),
+    Persistent(PersistentSessionError),
+}
+
+impl std::fmt::Display for SessionReconnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReconnectable => formatter.write_str("the tab does not support reconnecting"),
+            Self::Transport(error) => error.fmt(formatter),
+            Self::Persistent(error) => error.fmt(formatter),
+        }
+    }
+}
+
+pub(crate) const SAVED_SSH_PROFILE_FORWARD_LIMIT_MESSAGE: &str =
+    "This saved SSH profile has more than 128 port-forward mappings; reduce them before launching.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfiguredSshProfileLaunchError {
+    MissingProfile,
+    InvalidConnectionProfile,
+    PortForwards(festerm_ssh::SshPortForwardConfigurationError),
+}
+
+impl ConfiguredSshProfileLaunchError {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::MissingProfile => "This saved SSH profile is no longer available.",
+            Self::InvalidConnectionProfile => {
+                "This saved SSH profile has invalid connection settings."
+            }
+            Self::PortForwards(festerm_ssh::SshPortForwardConfigurationError::InventoryLimit) => {
+                SAVED_SSH_PROFILE_FORWARD_LIMIT_MESSAGE
+            }
+            Self::PortForwards(_) => "This saved SSH profile has invalid port-forward settings.",
+        }
+    }
+}
+
+impl std::fmt::Display for ConfiguredSshProfileLaunchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for ConfiguredSshProfileLaunchError {}
+
+impl ApplicationSession {
+    pub fn take_recovered_terminal(&self) -> Option<Terminal> {
+        match self {
+            Self::Persistent(session) | Self::DevTunnel(session) => {
+                session.take_recovered_terminal()
+            }
+            Self::Local(_) | Self::Ssh(_) | Self::Sftp(_) | Self::Serial(_) => None,
+            #[cfg(test)]
+            Self::TestSsh(session) => session.take_recovered_terminal(),
+            #[cfg(test)]
+            Self::TestLocal(_) => None,
+        }
+    }
+
+    pub fn recovery_protocol_is_authoritative(&self) -> bool {
+        match self {
+            Self::Persistent(session) | Self::DevTunnel(session) => {
+                session.recovery_protocol_is_authoritative()
+            }
+            Self::Local(_) | Self::Ssh(_) | Self::Sftp(_) | Self::Serial(_) => false,
+            #[cfg(test)]
+            Self::TestSsh(session) => session.recovery_protocol_is_authoritative(),
+            #[cfg(test)]
+            Self::TestLocal(_) => false,
+        }
+    }
+
+    /// Resolves a host-key prompt through an SSH session without exposing its
+    /// resolver to GUI code or allowing persistent acceptance.
+    pub fn resolve_host_key_prompt(
+        &self,
+        prompt: &HostKeyPrompt,
+        decision: HostKeyTrustDecision,
+    ) -> Result<(), HostKeyTrustResolutionError> {
+        let resolver = match self {
+            Self::Ssh(session) => session.host_key_decision_resolver(),
+            Self::Sftp(session) => session.host_key_decision_resolver(),
+            Self::Local(_) | Self::Persistent(_) | Self::DevTunnel(_) | Self::Serial(_) => {
+                return Err(HostKeyTrustResolutionError::NotRemoteSession)
+            }
+            #[cfg(test)]
+            Self::TestSsh(_) | Self::TestLocal(_) => {
+                return Err(HostKeyTrustResolutionError::NotRemoteSession)
+            }
+        };
+        resolver
+            .resolve(prompt, decision.into())
+            .map_err(HostKeyTrustResolutionError::Transport)
+    }
+
+    /// Resolves an interactive password prompt through an SSH session
+    /// without exposing its resolver to GUI code. Mirrors
+    /// [`Self::resolve_host_key_prompt`].
+    pub fn resolve_password_prompt(
+        &self,
+        prompt: &PasswordPrompt,
+        password: String,
+    ) -> Result<(), PasswordResolutionError> {
+        let resolver = match self {
+            Self::Ssh(session) => session.password_decision_resolver(),
+            Self::Sftp(session) => session.password_decision_resolver(),
+            Self::Local(_) | Self::Persistent(_) | Self::DevTunnel(_) | Self::Serial(_) => {
+                return Err(PasswordResolutionError::NotRemoteSession)
+            }
+            #[cfg(test)]
+            Self::TestSsh(_) | Self::TestLocal(_) => {
+                return Err(PasswordResolutionError::NotRemoteSession)
+            }
+        };
+        resolver
+            .resolve(prompt, password)
+            .map_err(PasswordResolutionError::Transport)
+    }
+
+    /// Reports whether this session can accept a nonblocking user reconnect
+    /// request. Nonpersistent local sessions have no transport to reattach.
+    pub fn reconnect_available(&self) -> bool {
+        match self {
+            Self::Ssh(session) => session.reconnect_available(),
+            Self::Persistent(session) => session.reconnect_available(),
+            #[cfg(test)]
+            Self::TestSsh(session) => session.reconnect_available(),
+            _ => false,
+        }
+    }
+
+    /// Queues one user-directed SSH reconnect or native daemon reattachment.
+    pub fn try_reconnect(&self) -> Result<(), SessionReconnectError> {
+        match self {
+            Self::Ssh(session) => session
+                .try_reconnect()
+                .map_err(SessionReconnectError::Transport),
+            Self::Persistent(session) => session
+                .try_reconnect()
+                .map_err(SessionReconnectError::Persistent),
+            #[cfg(test)]
+            Self::TestSsh(session) => session
+                .try_reconnect()
+                .map_err(SessionReconnectError::Transport),
+            _ => Err(SessionReconnectError::NotReconnectable),
+        }
+    }
+
+    /// Queues one on-demand SSH-level liveness probe (ADR 0018). A local
+    /// session has no transport to probe, so this is always a silent no-op
+    /// for it rather than an error: callers triggering this across every
+    /// open tab (e.g. after an OS wake/network-change signal) should not
+    /// have to distinguish tab kinds first.
+    fn try_check_liveness(&self) -> Result<(), SshLivenessCheckError> {
+        match self {
+            Self::Ssh(session) => session.try_check_liveness(),
+            Self::Local(_)
+            | Self::Persistent(_)
+            | Self::DevTunnel(_)
+            | Self::Sftp(_)
+            | Self::Serial(_) => Ok(()),
+            #[cfg(test)]
+            Self::TestSsh(_) | Self::TestLocal(_) => Ok(()),
+        }
+    }
+
+    /// Whether this session currently supports live SSH port-forward operations.
+    pub fn live_port_forwarding_available(&self) -> bool {
+        match self {
+            Self::Ssh(session) => session.lifecycle() == SessionLifecycle::Running,
+            #[cfg(test)]
+            Self::TestSsh(session) => session.lifecycle() == SessionLifecycle::Running,
+            #[cfg(test)]
+            Self::TestLocal(_) => false,
+            Self::Local(_)
+            | Self::Persistent(_)
+            | Self::DevTunnel(_)
+            | Self::Sftp(_)
+            | Self::Serial(_) => false,
+        }
+    }
+
+    /// Adds one live-only SSH port forward to the connected session.
+    pub fn try_add_port_forward(
+        &self,
+        forward: impl SshPortForwardSpec,
+    ) -> Result<(), SshPortForwardRequestError> {
+        match self {
+            Self::Ssh(session) => session.try_add_port_forward(forward),
+            #[cfg(test)]
+            Self::TestSsh(session) => session.try_add_port_forward(forward),
+            #[cfg(test)]
+            Self::TestLocal(_) => Err(SshPortForwardRequestError::NotRunning),
+            Self::Local(_)
+            | Self::Persistent(_)
+            | Self::DevTunnel(_)
+            | Self::Sftp(_)
+            | Self::Serial(_) => Err(SshPortForwardRequestError::NotRunning),
+        }
+    }
+
+    /// Removes one SSH port forward identified by its listening bind tuple.
+    pub fn try_remove_port_forward(
+        &self,
+        direction: SshPortForwardDirection,
+        bind_host: impl Into<String>,
+        bind_port: u16,
+    ) -> Result<(), SshPortForwardRequestError> {
+        let bind_host = bind_host.into();
+        match self {
+            Self::Ssh(session) => session.try_remove_port_forward(direction, bind_host, bind_port),
+            #[cfg(test)]
+            Self::TestSsh(session) => {
+                session.try_remove_port_forward(direction, bind_host, bind_port)
+            }
+            #[cfg(test)]
+            Self::TestLocal(_) => Err(SshPortForwardRequestError::NotRunning),
+            Self::Local(_)
+            | Self::Persistent(_)
+            | Self::DevTunnel(_)
+            | Self::Sftp(_)
+            | Self::Serial(_) => Err(SshPortForwardRequestError::NotRunning),
+        }
+    }
+
+    /// Requests a fresh snapshot of the connected SSH session's active port forwards.
+    pub fn try_query_port_forwards(&self) -> Result<(), SshPortForwardRequestError> {
+        match self {
+            Self::Ssh(session) => session.try_query_port_forwards(),
+            #[cfg(test)]
+            Self::TestSsh(session) => session.try_query_port_forwards(),
+            #[cfg(test)]
+            Self::TestLocal(_) => Err(SshPortForwardRequestError::NotRunning),
+            Self::Local(_)
+            | Self::Persistent(_)
+            | Self::DevTunnel(_)
+            | Self::Sftp(_)
+            | Self::Serial(_) => Err(SshPortForwardRequestError::NotRunning),
+        }
+    }
+
+    pub fn sftp_working_directories(&self) -> Option<(String, PathBuf)> {
+        match self {
+            Self::Sftp(session) => session.working_directories().map(|directories| {
+                (
+                    directories.remote().to_owned(),
+                    directories.local().to_path_buf(),
+                )
+            }),
+            Self::Local(_)
+            | Self::Persistent(_)
+            | Self::DevTunnel(_)
+            | Self::Ssh(_)
+            | Self::Serial(_) => None,
+            #[cfg(test)]
+            Self::TestSsh(session) => session.terminal_file_cwd().map(|cwd| (cwd, PathBuf::new())),
+            #[cfg(test)]
+            Self::TestLocal(_) => None,
+        }
+    }
+
+    pub fn verified_host_key_fingerprint(&self) -> Option<String> {
+        match self {
+            Self::Ssh(session) => session.verified_host_key_fingerprint(),
+            Self::Sftp(session) => session.verified_host_key_fingerprint(),
+            Self::Local(_) | Self::Persistent(_) | Self::DevTunnel(_) | Self::Serial(_) => None,
+            #[cfg(test)]
+            Self::TestSsh(session) => session.terminal_file_fingerprint(),
+            #[cfg(test)]
+            Self::TestLocal(_) => None,
+        }
+    }
+
+    pub fn live_remote_file_requestor(&self) -> Option<LiveRemoteFileRequestor> {
+        match self {
+            Self::Ssh(session) => Some(session.remote_file_requestor()),
+            Self::Sftp(session) => Some(session.remote_file_requestor()),
+            Self::Local(_) | Self::Persistent(_) | Self::DevTunnel(_) | Self::Serial(_) => None,
+            #[cfg(test)]
+            Self::TestSsh(_) | Self::TestLocal(_) => None,
+        }
+    }
+}
+
+impl Session for ApplicationSession {
+    fn terminal_replies_owned_by_backend(&self) -> bool {
+        self.recovery_protocol_is_authoritative()
+    }
+
+    fn id(&self) -> SessionId {
+        match self {
+            Self::Local(session) => session.id(),
+            Self::Persistent(session) | Self::DevTunnel(session) => session.id(),
+            Self::Ssh(session) => session.id(),
+            Self::Sftp(session) => session.id(),
+            Self::Serial(session) => session.id(),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => session.id(),
+        }
+    }
+
+    fn lifecycle(&self) -> SessionLifecycle {
+        match self {
+            Self::Local(session) => session.lifecycle(),
+            Self::Persistent(session) | Self::DevTunnel(session) => session.lifecycle(),
+            Self::Ssh(session) => session.lifecycle(),
+            Self::Sftp(session) => session.lifecycle(),
+            Self::Serial(session) => session.lifecycle(),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => session.lifecycle(),
+        }
+    }
+
+    fn automation_epoch(&self) -> Option<Arc<AutomationEpoch>> {
+        match self {
+            Self::Local(session) => session.automation_epoch(),
+            Self::Persistent(session) | Self::DevTunnel(session) => session.automation_epoch(),
+            Self::Ssh(session) => session.automation_epoch(),
+            Self::Sftp(session) => session.automation_epoch(),
+            Self::Serial(session) => session.automation_epoch(),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => session.automation_epoch(),
+        }
+    }
+
+    fn metrics(&self) -> SessionMetrics {
+        match self {
+            Self::Local(session) => session.metrics(),
+            Self::Persistent(session) | Self::DevTunnel(session) => session.metrics(),
+            Self::Ssh(session) => session.metrics(),
+            Self::Sftp(session) => session.metrics(),
+            Self::Serial(session) => session.metrics(),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => session.metrics(),
+        }
+    }
+
+    fn try_send_input(&self, bytes: &[u8]) -> Result<(), SessionSendError> {
+        match self {
+            Self::Local(session) => session.try_send_input(bytes),
+            Self::Persistent(session) | Self::DevTunnel(session) => session.try_send_input(bytes),
+            Self::Ssh(session) => session.try_send_input(bytes),
+            Self::Sftp(session) => session.try_send_input(bytes),
+            Self::Serial(session) => session.try_send_input(bytes),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => session.try_send_input(bytes),
+        }
+    }
+
+    fn reserve_automation_input(
+        &self,
+        controller_instance: u64,
+        bytes: &[u8],
+    ) -> Result<ReservedAutomationInput, ReserveAutomationInputError> {
+        match self {
+            Self::Local(session) => session.reserve_automation_input(controller_instance, bytes),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => {
+                session.reserve_automation_input(controller_instance, bytes)
+            }
+            _ => Err(ReserveAutomationInputError::Unsupported),
+        }
+    }
+
+    fn try_resize(&self, size: TerminalSize) -> Result<(), SessionSendError> {
+        match self {
+            Self::Local(session) => session.try_resize(size),
+            Self::Persistent(session) | Self::DevTunnel(session) => session.try_resize(size),
+            Self::Ssh(session) => session.try_resize(size),
+            Self::Sftp(session) => session.try_resize(size),
+            Self::Serial(session) => session.try_resize(size),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => session.try_resize(size),
+        }
+    }
+
+    fn try_shutdown(&self) -> Result<(), SessionSendError> {
+        match self {
+            Self::Local(session) => session.try_shutdown(),
+            Self::Persistent(session) | Self::DevTunnel(session) => session.try_shutdown(),
+            Self::Ssh(session) => session.try_shutdown(),
+            Self::Sftp(session) => session.try_shutdown(),
+            Self::Serial(session) => session.try_shutdown(),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => session.try_shutdown(),
+        }
+    }
+
+    fn try_recv_event(&self) -> Result<SessionEvent, SessionTryReceiveError> {
+        match self {
+            Self::Local(session) => session.try_recv_event(),
+            Self::Persistent(session) | Self::DevTunnel(session) => session.try_recv_event(),
+            Self::Ssh(session) => session.try_recv_event(),
+            Self::Sftp(session) => session.try_recv_event(),
+            Self::Serial(session) => session.try_recv_event(),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => session.try_recv_event(),
+        }
+    }
+
+    fn shutdown(&self, timeout: std::time::Duration) -> Result<ShutdownResult, ShutdownError> {
+        match self {
+            Self::Local(session) => session.shutdown(timeout),
+            Self::Persistent(session) | Self::DevTunnel(session) => session.shutdown(timeout),
+            Self::Ssh(session) => session.shutdown(timeout),
+            Self::Sftp(session) => session.shutdown(timeout),
+            Self::Serial(session) => session.shutdown(timeout),
+            #[cfg(test)]
+            Self::TestSsh(session) | Self::TestLocal(session) => session.shutdown(timeout),
+        }
+    }
+}
+
+/// A running local-shell or SSH session tab: the terminal, its controller,
+/// and presentation view. `SessionController` remains the sole terminal
+/// writer.
+struct RecordingAutoEnrollment {
+    pending: festerm_recording::PendingEnrollment,
+    generation: u64,
+}
+
+pub struct SessionTab {
+    remote_files: Option<crate::remote_files::RemoteFileCapability>,
+    pub terminal: Terminal,
+    pub controller: SessionController<ApplicationSession>,
+    recording_auto_enrollment: Option<RecordingAutoEnrollment>,
+    pub view: TerminalView,
+    /// Stable primary identity (`docs/gui-design.md` "Identity precedence").
+    /// Transient terminal-provided titles are shown as secondary metadata and
+    /// must never replace this.
+    pub label: String,
+    default_label: String,
+    explicit_alias: Option<SessionAlias>,
+    /// Associated native reattachment seed, never authority over this view.
+    alias_identity: Option<DurableSessionIdentity>,
+    name_save_pending: bool,
+    name_edit_revision: u64,
+    #[cfg(test)]
+    test_durable_identity: Option<DurableSessionIdentity>,
+    /// Static connection metadata resolved before a session starts. This gives
+    /// the chip useful secondary identity before the child emits an OSC title.
+    pub launch_secondary: Option<String>,
+    /// The configuration profile that explicitly launched this local session.
+    ///
+    /// Default, ad-hoc, and SSH sessions deliberately leave this empty. It is
+    /// metadata only; no runtime process or connection state is captured.
+    pub profile_identifier: Option<String>,
+    /// Non-secret immutable launch facts exposed to application-owned
+    /// presentation such as the Session Inspector.
+    pub inspector_transport: InspectorTransport,
+    /// Whether the one-shot "scrollback limit reached" transient notice has
+    /// already been shown for this tab (M9: eviction notices). Latches once
+    /// `true` so continued eviction from a sustained-output workload does
+    /// not repeatedly re-trigger the notice every frame.
+    pub eviction_notice_shown: bool,
+    /// Present only when this session authenticated with a plain password.
+    /// See [`SshPasswordRetryState`].
+    pub ssh_password_retry: Option<SshPasswordRetryState>,
+    /// Whether this session has emitted output since the tab was last the
+    /// active/focused tab (feature request #68). Set whenever output is
+    /// pumped into a *non-active* tab's terminal; cleared whenever the tab
+    /// becomes active. Purely a presentation cue for the chip's static unread
+    /// marker — it never changes `ChipStatus`/connection-state semantics.
+    pub has_new_output_since_active: bool,
+    /// Whether the latest shared ingest pass ended without draining this
+    /// session's queued transport events (ADR 0079), so terminal modes such
+    /// as bracketed paste may be stale until a later update parses them.
+    pub output_ingest_deferred: bool,
+    /// Terminal-content find-bar state (`docs/gui-design.md`
+    /// "Terminal-content search"). Never logged or persisted.
+    pub search: crate::search::TerminalSearchState,
+    terminal_path: TerminalPathState,
+    /// Present for a Dev Tunnel tab that can be connected again in place.
+    #[cfg(feature = "experimental-dev-tunnels")]
+    tunnel: Option<tunnel_reconnect::TunnelTab>,
+}
+
+/// Exact per-transport counts of sessions that would lose something by
+/// closing, used to build the aggregate application-quit confirmation
+/// message (`docs/gui-design.md` "Closing sessions and quitting").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveSessionCounts {
+    pub local: usize,
+    pub ssh: usize,
+    pub serial: usize,
+}
+
+impl LiveSessionCounts {
+    pub const fn total(&self) -> usize {
+        self.local + self.ssh + self.serial
+    }
+}
+
+/// Narrow transport metadata safe for application chrome. Keeping this owned
+/// by the tab prevents egui code from reaching into PTY or SSH backends.
+pub enum InspectorTransport {
+    #[cfg_attr(not(feature = "experimental-dev-tunnels"), allow(dead_code))]
+    DevTunnel {
+        host: String,
+        port: u16,
+        account: Option<(u64, String)>,
+    },
+    Local {
+        persistence: Option<InspectorPersistence>,
+    },
+    Ssh {
+        username: String,
+        host: String,
+        port: u16,
+        /// The durable remote-session provider and name this connection
+        /// attaches to or creates, if any (ADR 0018). `None` means this is
+        /// an ordinary manual-recovery plain shell. This drives the
+        /// Reconnect-vs-Resume language distinction in application chrome;
+        /// it is presentation metadata only and never itself a live process
+        /// or connection handle.
+        persistence: Option<InspectorPersistence>,
+    },
+    Sftp {
+        username: String,
+        host: String,
+        port: u16,
+    },
+    Serial {
+        device: String,
+        baud_rate: u32,
+        data_bits: festerm_config::SerialDataBits,
+        parity: festerm_config::SerialParity,
+        stop_bits: festerm_config::SerialStopBits,
+        flow_control: festerm_config::SerialFlowControl,
+    },
+}
+
+/// Non-secret durable-session facts surfaced to application chrome.
+#[derive(Clone)]
+pub struct InspectorPersistence {
+    pub provider_label: &'static str,
+    pub session_name: String,
+}
+
+/// `provider · session name` for a transport that attaches to a durable
+/// session (feature request #168).
+///
+/// Only local shells and SSH connections can carry one; SFTP and serial
+/// have no durable session to name, and a plain shell or plain SSH
+/// connection carries `None` rather than an empty placeholder.
+fn durable_session_label_for(transport: &InspectorTransport) -> Option<String> {
+    let persistence = match transport {
+        InspectorTransport::Local { persistence } | InspectorTransport::Ssh { persistence, .. } => {
+            persistence.as_ref()
+        }
+        InspectorTransport::Sftp { .. }
+        | InspectorTransport::Serial { .. }
+        | InspectorTransport::DevTunnel { .. } => None,
+    }?;
+    Some(format!(
+        "{} · {}",
+        persistence.provider_label, persistence.session_name
+    ))
+}
+
+fn terminal_history_snapshot_label(
+    session_label: &str,
+    screen: TerminalTextSnapshotScreen,
+    retained_history_was_evicted: bool,
+) -> String {
+    let screen = match screen {
+        TerminalTextSnapshotScreen::Primary => "current primary screen",
+        TerminalTextSnapshotScreen::Alternate => "current alternate screen",
+    };
+    let truncated = if retained_history_was_evicted {
+        " · older retained history was already discarded"
+    } else {
+        ""
+    };
+    format!(
+        "{session_label} · terminal history snapshot · retained primary history and {screen}{truncated}"
+    )
+}
+
+/// A restored SSH workspace surface that deliberately has no live session.
+///
+/// Workspace metadata contains destination details but never authentication or
+/// trust material, so restoration must return the user to the transient
+/// authentication form instead of starting a transport.
+pub struct SshAuthenticationRequiredTab {
+    pub profile: SshProfileConfiguration,
+    pub alias: Option<SessionAlias>,
+}
+
+/// A restored SFTP workspace surface that deliberately has no live session.
+///
+/// Workspace metadata contains destination details but never authentication or
+/// trust material, so restoration must return the user to the transient
+/// authentication form instead of starting a transport.
+pub struct SftpAuthenticationRequiredTab {
+    pub profile: SshProfileConfiguration,
+    pub alias: Option<SessionAlias>,
+}
+
+/// A GUI SFTP file-manager launch surface that has destination metadata but no
+/// live authenticated subsystem yet. Its transient authentication draft is
+/// owned by this exact content instance, so replacing or closing the surface
+/// drops the draft even when the surrounding [`TabId`] is preserved.
+pub struct SftpFileManagerAuthenticationRequiredTab {
+    pub target: SftpFileManagerLaunchTarget,
+    pub return_to_profiles: bool,
+    pub(crate) authentication: AuthenticationFormState,
+}
+
+impl SftpFileManagerAuthenticationRequiredTab {
+    fn new(target: SftpFileManagerLaunchTarget, return_to_profiles: bool) -> Self {
+        Self {
+            target,
+            return_to_profiles,
+            authentication: AuthenticationFormState::default(),
+        }
+    }
+}
+
+/// Maximum number of in-connection password reprompts before falling back
+/// to the ordinary failed-session presentation, matching `ssh`'s own
+/// default `NumberOfPasswordPrompts` limit. Interactive sessions bound their
+/// own in-connection attempts at `festerm_ssh::MAX_INTERACTIVE_PASSWORD_ATTEMPTS`;
+/// this bounds the outer, full-reconnect retry episode that follows an
+/// explicit typed-password rejection.
+pub const MAX_SSH_PASSWORD_PROMPT_ATTEMPTS: u8 = 3;
+
+/// Retained only for a plain-password-authenticated SSH session (never
+/// public-key or native-stored-password): a rejected private key or stored
+/// password is a configuration problem, not something retyping in this tab
+/// fixes. Lets a rejected password reprompt in-tab instead of surfacing a
+/// raw failed session, bounded by `MAX_SSH_PASSWORD_PROMPT_ATTEMPTS`.
+pub struct SshPasswordRetryState {
+    pub profile: SshConnectionProfile,
+    pub profile_identifier: Option<String>,
+    pub options: SshSessionOptions,
+    pub attempts: u8,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TerminalPathState {
+    origin: Option<TerminalFilesystemOrigin>,
+    menu: Option<TerminalPathMenuState>,
+    frozen_authority: Option<FrozenTerminalAuthority>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenTerminalAuthority {
+    origin: Option<TerminalFilesystemOrigin>,
+    lifecycle_generation: u64,
+}
+
+struct PendingTerminalPathOpen {
+    source_generation: u64,
+    source: TabId,
+    origin: Option<TerminalFilesystemOrigin>,
+    receiver: Receiver<TerminalPathWorkerResult>,
+    handle: Option<JoinHandle<()>>,
+}
+
+/// Groups `from_session_result`'s non-outcome parameters so the function
+/// stays under clippy's argument-count lint; `from_local_session_result`
+/// and `from_ssh_session_result` each build one of these instead of passing
+/// their transport-specific fields through separately.
+struct SessionResultMeta<'a> {
+    label: &'a str,
+    launch_secondary: Option<String>,
+    profile_identifier: Option<String>,
+    session_name: &'static str,
+    inspector_transport: InspectorTransport,
+    ssh_password_retry: Option<SshPasswordRetryState>,
+}
+
+impl SessionTab {
+    pub fn explicit_alias(&self) -> Option<&SessionAlias> {
+        self.explicit_alias.as_ref()
+    }
+
+    pub(crate) fn can_use_default_name(&self) -> bool {
+        self.explicit_alias().is_some() || self.name_save_pending
+    }
+
+    fn set_alias(&mut self, alias: Option<SessionAlias>) {
+        self.label = alias.as_ref().map_or_else(
+            || self.default_label.clone(),
+            |alias| alias.as_str().to_owned(),
+        );
+        self.explicit_alias = alias;
+    }
+
+    fn durable_identity(&self) -> Option<DurableSessionIdentity> {
+        #[cfg(test)]
+        if let Some(identity) = &self.test_durable_identity {
+            return Some(identity.clone());
+        }
+        let Some(ApplicationSession::Persistent(session)) = self.controller.session() else {
+            return None;
+        };
+        native_alias_identity(&session.native_identity()?)
+    }
+
+    fn restore_alias(&mut self, alias: Option<&SessionAlias>) {
+        self.set_alias(alias.cloned());
+    }
+
+    /// Only newly opened native views are seeded; saved views own their alias.
+    fn seed_native_alias(&mut self, configuration: &Configuration) {
+        if self.explicit_alias.is_some() || self.name_save_pending {
+            return;
+        }
+        if let Some(identity) = self.durable_identity() {
+            let alias = configuration.durable_session_alias(&identity).cloned();
+            self.alias_identity = alias.as_ref().map(|_| identity);
+            self.set_alias(alias);
+        }
+    }
+
+    fn set_scrollback_limit(&mut self, preference: ScrollbackLimitPreference) {
+        if matches!(
+            self.inspector_transport,
+            InspectorTransport::DevTunnel { .. }
+        ) {
+            return;
+        }
+        let authoritative = self
+            .controller
+            .session()
+            .is_some_and(ApplicationSession::recovery_protocol_is_authoritative);
+        if let Some(ApplicationSession::Persistent(session)) = self.controller.session() {
+            if let Err(error) = session.sync_recovery_scrollback_limit(preference.bytes()) {
+                tracing::warn!(
+                    target: "festerm::session",
+                    %error,
+                    "could not sync persistent-session scrollback limit for recovery"
+                );
+            }
+        }
+        if !authoritative {
+            self.terminal.set_scrollback_limit(preference.bytes());
+        }
+    }
+
+    fn apply_color_scheme(&mut self) {
+        if matches!(
+            self.inspector_transport,
+            InspectorTransport::DevTunnel { .. }
+        ) {
+            return;
+        }
+        let scheme = festerm_ui_egui::terminal_color_scheme();
+        let authoritative = self
+            .controller
+            .session()
+            .is_some_and(ApplicationSession::recovery_protocol_is_authoritative);
+        if let Some(ApplicationSession::Persistent(session)) = self.controller.session() {
+            if let Err(error) = session.sync_recovery_color_scheme(scheme) {
+                tracing::warn!(
+                    target: "festerm::session",
+                    %error,
+                    "could not sync persistent-session color scheme for recovery"
+                );
+            }
+        }
+        if !authoritative {
+            self.terminal.set_color_scheme(scheme);
+        }
+    }
+
+    pub fn apply_frontend_terminal_configuration(&mut self, preference: ScrollbackLimitPreference) {
+        self.set_scrollback_limit(preference);
+        self.apply_color_scheme();
+        self.controller.record_configuration(&self.terminal);
+    }
+
+    pub fn sync_recovery_clear(&self) -> Result<(), PersistentSessionError> {
+        match self.controller.session() {
+            Some(ApplicationSession::Persistent(session)) => {
+                session.sync_recovery_bytes(b"\x1b[2J\x1b[3J\x1b[H")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn sync_recovery_reset(&self) -> Result<(), PersistentSessionError> {
+        match self.controller.session() {
+            Some(ApplicationSession::Persistent(session)) => session.sync_recovery_reset(),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn adopt_recovered_terminal(&mut self) -> bool {
+        let Some(recovered) = self
+            .controller
+            .session()
+            .and_then(ApplicationSession::take_recovered_terminal)
+        else {
+            return false;
+        };
+        self.terminal = recovered;
+        self.search.terminal_replaced(&self.terminal);
+        self.view.reset_recovery_layout();
+        self.controller.end_recording_on_replacement();
+        true
+    }
+
+    fn start_recording_auto_enrollment(
+        &mut self,
+        recording: &festerm_recording::SharedRecording,
+        scrollback_limit: ScrollbackLimitPreference,
+    ) {
+        let Some(session) = self.controller.session() else {
+            return;
+        };
+        if matches!(self.inspector_transport, InspectorTransport::Sftp { .. }) {
+            return;
+        }
+        match recording.is_recording() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::error!("Could not inspect recording before including a session: {error}");
+                return;
+            }
+        }
+        let authoritative = session.recovery_protocol_is_authoritative();
+        if matches!(
+            session,
+            ApplicationSession::Persistent(_) | ApplicationSession::DevTunnel(_)
+        ) && !authoritative
+        {
+            Self::fail_recording_auto_enrollment(
+                recording,
+                "legacy session recovery cannot be included safely",
+            );
+            return;
+        }
+        if authoritative {
+            match recording.reserve_enrollment() {
+                Ok(pending) => {
+                    self.recording_auto_enrollment = Some(RecordingAutoEnrollment {
+                        pending,
+                        generation: self.controller.lifecycle_generation(),
+                    });
+                    if self.adopt_recovered_terminal() {
+                        self.apply_frontend_terminal_configuration(scrollback_limit);
+                        self.complete_recording_auto_enrollment();
+                    }
+                }
+                Err(error) => Self::fail_recording_auto_enrollment(recording, &error),
+            }
+            return;
+        }
+        if let Err(error) = self.view.validate_recording_view(&self.terminal) {
+            Self::fail_recording_auto_enrollment(recording, error);
+            return;
+        }
+        match recording.enroll(&self.terminal) {
+            Ok(stream) => self.controller.attach_recording_stream(stream),
+            Err(error) => Self::fail_recording_auto_enrollment(recording, &error),
+        }
+    }
+
+    fn fail_recording_auto_enrollment(
+        recording: &festerm_recording::SharedRecording,
+        error: impl std::fmt::Display,
+    ) {
+        tracing::warn!("Could not include a new terminal session in the recording: {error}");
+        match recording.is_recording() {
+            Ok(true) => {
+                if let Err(stop_error) = recording
+                    .fail_integrity("Recording stopped because a new session could not be included")
+                {
+                    tracing::error!(
+                        "Could not stop recording after enrollment failed: {stop_error}"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(state_error) => {
+                tracing::error!(
+                    "Could not inspect recording after enrollment failed: {state_error}"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn complete_recording_auto_enrollment(&mut self) {
+        let Some(enrollment) = self.recording_auto_enrollment.take() else {
+            return;
+        };
+        if enrollment.generation != self.controller.lifecycle_generation() {
+            return;
+        }
+        if let Err(error) = self.view.validate_recording_view(&self.terminal) {
+            tracing::warn!("Could not include a recovered terminal in the recording: {error}");
+            return;
+        }
+        match enrollment.pending.enroll(&self.terminal) {
+            Ok(stream) => self.controller.attach_recording_stream(stream),
+            Err(error) => {
+                tracing::warn!("Could not include a recovered terminal in the recording: {error}");
+            }
+        }
+    }
+
+    pub fn pump_session_events(&mut self) -> bool {
+        self.pump_session_events_with_slice().hit_limit
+    }
+
+    pub(crate) fn pump_session_events_with_slice(
+        &mut self,
+    ) -> crate::session_controller::PumpResult {
+        let view = &mut self.view;
+        let result = self.controller.pump_events_with_resize_slice(
+            &mut self.terminal,
+            |terminal, dimensions| {
+                !matches!(
+                    view.apply_terminal_resize(terminal, dimensions),
+                    festerm_ui_egui::ResizeOutcome::Rejected
+                )
+            },
+        );
+        if self
+            .recording_auto_enrollment
+            .as_ref()
+            .is_some_and(|enrollment| {
+                enrollment.generation != self.controller.lifecycle_generation()
+                    || self.controller.last_pump_output_received()
+                    || self.controller.last_pump_closed()
+                    || matches!(
+                        self.controller.lifecycle(),
+                        Some(
+                            SessionLifecycle::Failed(_)
+                                | SessionLifecycle::Disconnected(_)
+                                | SessionLifecycle::Exited(_)
+                                | SessionLifecycle::Stopped
+                        )
+                    )
+            })
+        {
+            self.recording_auto_enrollment = None;
+        }
+        result
+    }
+
+    /// Starts a fresh default local session. `window_dimensions`, when
+    /// supplied, is the currently rendered window's terminal grid size (see
+    /// `AppState::current_session_dimensions`); a new tab created from an
+    /// already-sized window should start at that size rather than the
+    /// application's baseline default, so it matches the window instead of
+    /// visibly snapping it back to 80x24 on the very next resize.
+    fn start_default(
+        context: &egui::Context,
+        window_dimensions: Option<Dimensions>,
+        prefer_powershell: bool,
+    ) -> Self {
+        let dimensions = window_dimensions
+            .unwrap_or_else(|| Dimensions::new(80, 24).expect("default dimensions are valid"));
+        let size = terminal_size(dimensions).expect("default dimensions fit PTY limits");
+        let profile = Self::default_local_profile_for_session(prefer_powershell);
+        let launch_secondary = profile.as_ref().ok().and_then(local_profile_secondary);
+        let result = profile
+            .map_err(|error| error.to_string())
+            .and_then(|profile| {
+                LocalPtySession::start_with_notifier(profile, size, make_notifier(context))
+                    .map(ApplicationSession::Local)
+                    .map_err(|error| error.to_string())
+            });
+        Self::from_local_session_result(
+            result,
+            dimensions,
+            "Local Shell",
+            launch_secondary,
+            None,
+            None,
+        )
+    }
+
+    fn default_local_profile_for_session(
+        prefer_powershell: bool,
+    ) -> Result<LocalProfile, festerm_pty::LocalProfileError> {
+        default_local_profile_with_powershell_preference(prefer_powershell).map(|profile| {
+            profile.with_working_directory(crate::sftp_file_manager::local_home_directory())
+        })
+    }
+
+    /// Starts the application's first tab, honoring an optional
+    /// native-window-smoke profile override (see `native_smoke.rs`). Used
+    /// only once, for the initial tab at startup.
+    pub(crate) fn start_primary(
+        context: &egui::Context,
+        smoke_profile: Option<LocalProfile>,
+        prefer_powershell: bool,
+    ) -> Self {
+        let dimensions = Dimensions::new(80, 24).expect("default dimensions are valid");
+        let size = terminal_size(dimensions).expect("default dimensions fit PTY limits");
+        let notifier = make_notifier(context);
+        let launch_secondary = smoke_profile
+            .as_ref()
+            .and_then(local_profile_secondary)
+            .or_else(|| {
+                default_local_profile_with_powershell_preference(prefer_powershell)
+                    .ok()
+                    .and_then(|profile| local_profile_secondary(&profile))
+            });
+        let result = match smoke_profile {
+            Some(profile) => LocalPtySession::start_with_notifier(profile, size, notifier),
+            None => LocalPtySession::start_default_with_powershell_preference(
+                size,
+                notifier,
+                prefer_powershell,
+            ),
+        };
+        Self::from_local_session_result(
+            result.map(ApplicationSession::Local),
+            dimensions,
+            "Local Shell",
+            launch_secondary,
+            None,
+            None,
+        )
+    }
+
+    /// Starts a local PTY from reusable, secret-free profile metadata.
+    /// `window_dimensions` behaves like it does for `start_default`: a new
+    /// tab opened against an already-sized window starts at that size.
+    fn start_local_profile(
+        profile: LocalProfile,
+        profile_id: &str,
+        persistence: Option<&PersistenceConfiguration>,
+        context: &egui::Context,
+        window_dimensions: Option<Dimensions>,
+        scrollback_limit: ScrollbackLimitPreference,
+    ) -> Self {
+        let profile = crate::environment::with_corrected_local_path(profile);
+        let dimensions = window_dimensions
+            .unwrap_or_else(|| Dimensions::new(80, 24).expect("default dimensions are valid"));
+        let size = terminal_size(dimensions).expect("default dimensions fit PTY limits");
+        let launch_secondary = local_profile_secondary(&profile);
+        let inspector_persistence = persistence.map(|persistence| InspectorPersistence {
+            provider_label: persistence.provider().label(),
+            session_name: persistence.session_name().to_owned(),
+        });
+        let result = match persistence {
+            Some(persistence)
+                if persistence.provider() == PersistenceProviderKind::FestermSessiond =>
+            {
+                PersistentSession::start_with_notifier(
+                    persistence.session_name(),
+                    &profile,
+                    size,
+                    scrollback_limit.bytes(),
+                    make_notifier(context),
+                )
+                .map(ApplicationSession::Persistent)
+                .map_err(|error| error.to_string())
+            }
+            _ => LocalPtySession::start_with_notifier(profile, size, make_notifier(context))
+                .map(ApplicationSession::Local)
+                .map_err(|error| error.to_string()),
+        };
+        Self::from_local_session_result(
+            result,
+            dimensions,
+            profile_id,
+            launch_secondary,
+            Some(profile_id.to_owned()),
+            inspector_persistence,
+        )
+    }
+
+    /// Attaches to an already-running, unattached `festerm-sessiond` session
+    /// discovered on the Launcher's "Resume" list (feature request #70),
+    /// without going through any saved profile's start-if-missing logic.
+    fn start_resumed_session(
+        selected: &festerm_sessiond::UnattachedSession,
+        context: &egui::Context,
+    ) -> Self {
+        let name = &selected.name;
+        let dimensions = Dimensions::new(80, 24).expect("default dimensions are valid");
+        let result =
+            PersistentSession::resume_discovered_with_notifier(selected, make_notifier(context))
+                .map(ApplicationSession::Persistent)
+                .map_err(|error| error.to_string());
+        let inspector_persistence = Some(InspectorPersistence {
+            provider_label: PersistenceProviderKind::FestermSessiond.label(),
+            session_name: name.to_owned(),
+        });
+        Self::from_local_session_result(result, dimensions, name, None, None, inspector_persistence)
+    }
+
+    /// Starts the prevalidated attach-only provider client. No saved profile
+    /// backs this launch, so workspace/Inspector metadata cannot claim one.
+    fn start_multiplexer_session(
+        profile: LocalProfile,
+        label: &str,
+        persistence: &PersistenceConfiguration,
+        context: &egui::Context,
+        window_dimensions: Option<Dimensions>,
+    ) -> Self {
+        let profile = crate::environment::with_corrected_local_path(profile);
+        let dimensions = window_dimensions
+            .unwrap_or_else(|| Dimensions::new(80, 24).expect("default dimensions are valid"));
+        let size = terminal_size(dimensions).expect("default dimensions fit PTY limits");
+        let launch_secondary = local_profile_secondary(&profile);
+        let inspector_persistence = Some(InspectorPersistence {
+            provider_label: persistence.provider().label(),
+            session_name: persistence.session_name().to_owned(),
+        });
+        let result = LocalPtySession::start_with_notifier(profile, size, make_notifier(context))
+            .map(ApplicationSession::Local)
+            .map_err(|error| error.to_string());
+        Self::from_local_session_result(
+            result,
+            dimensions,
+            label,
+            launch_secondary,
+            None,
+            inspector_persistence,
+        )
+    }
+
+    fn start_ssh(
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        options: SshSessionOptions,
+        profile_id: Option<&str>,
+        prior_password_attempts: u8,
+        context: &egui::Context,
+    ) -> Self {
+        let size = profile.initial_size();
+        let dimensions = Dimensions::new(usize::from(size.columns()), usize::from(size.rows()))
+            .expect("validated SSH terminal size fits terminal dimensions");
+        let label = format!("{}@{}", profile.username(), profile.identity().host());
+        let launch_secondary = Some(format!(
+            "SSH · {}:{}",
+            profile.identity().host(),
+            profile.identity().port()
+        ));
+        let persistence = match options.strategy() {
+            SessionStrategy::PlainShell => None,
+            SessionStrategy::Persistent {
+                provider,
+                session_name,
+            } => Some(InspectorPersistence {
+                provider_label: provider.label(),
+                session_name: session_name.as_str().to_owned(),
+            }),
+        };
+        let inspector_transport = InspectorTransport::Ssh {
+            username: profile.username().to_owned(),
+            host: profile.identity().host().to_owned(),
+            port: profile.identity().port(),
+            persistence,
+        };
+        // Only a plain-password attempt can be usefully retried by
+        // reprompting for a fresh password in-tab: a rejected private key or
+        // native-stored password is a configuration problem, not something
+        // retyping fixes (see `SshPasswordRetryState`).
+        let password_retry = matches!(authentication, SshAuthentication::Password(_)).then(|| {
+            SshPasswordRetryState {
+                profile: profile.clone(),
+                profile_identifier: profile_id.map(str::to_owned),
+                options: options.clone(),
+                attempts: prior_password_attempts,
+            }
+        });
+        let result = SshSession::start_with_notifier_and_options(
+            profile,
+            authentication,
+            options,
+            make_notifier(context),
+        )
+        .map(ApplicationSession::Ssh);
+        Self::from_ssh_session_result(
+            result,
+            dimensions,
+            &label,
+            launch_secondary,
+            profile_id.map(str::to_owned),
+            inspector_transport,
+            password_retry,
+        )
+    }
+
+    fn start_sftp(
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        local_working_directory: Option<PathBuf>,
+        known_host_fingerprint: Option<String>,
+        profile_id: Option<&str>,
+        context: &egui::Context,
+    ) -> Self {
+        let size = profile.initial_size();
+        let dimensions = Dimensions::new(usize::from(size.columns()), usize::from(size.rows()))
+            .expect("validated SFTP terminal size fits terminal dimensions");
+        let label = profile_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}@{}", profile.username(), profile.identity().host()));
+        let launch_secondary = Some(format!(
+            "SFTP · {}:{}",
+            profile.identity().host(),
+            profile.identity().port()
+        ));
+        let inspector_transport = InspectorTransport::Sftp {
+            username: profile.username().to_owned(),
+            host: profile.identity().host().to_owned(),
+            port: profile.identity().port(),
+        };
+        let result = SftpTerminalSession::start_with_notifier(
+            profile,
+            authentication,
+            local_working_directory,
+            known_host_fingerprint,
+            make_notifier(context),
+        )
+        .map(ApplicationSession::Sftp);
+        Self::from_sftp_session_result(
+            result,
+            dimensions,
+            &label,
+            launch_secondary,
+            profile_id.map(str::to_owned),
+            inspector_transport,
+        )
+    }
+
+    fn from_local_session_result<E: std::fmt::Display>(
+        result: Result<ApplicationSession, E>,
+        dimensions: Dimensions,
+        label: &str,
+        launch_secondary: Option<String>,
+        profile_identifier: Option<String>,
+        persistence: Option<InspectorPersistence>,
+    ) -> Self {
+        Self::from_session_result(
+            result,
+            dimensions,
+            SessionResultMeta {
+                label,
+                launch_secondary,
+                profile_identifier,
+                session_name: "Local shell",
+                inspector_transport: InspectorTransport::Local { persistence },
+                ssh_password_retry: None,
+            },
+        )
+    }
+
+    fn from_ssh_session_result(
+        result: Result<ApplicationSession, SshSessionStartError>,
+        dimensions: Dimensions,
+        label: &str,
+        launch_secondary: Option<String>,
+        profile_identifier: Option<String>,
+        inspector_transport: InspectorTransport,
+        password_retry: Option<SshPasswordRetryState>,
+    ) -> Self {
+        Self::from_session_result(
+            result,
+            dimensions,
+            SessionResultMeta {
+                label,
+                launch_secondary,
+                profile_identifier,
+                session_name: "SSH session",
+                inspector_transport,
+                ssh_password_retry: password_retry,
+            },
+        )
+    }
+
+    fn from_sftp_session_result(
+        result: Result<ApplicationSession, SftpTerminalSessionStartError>,
+        dimensions: Dimensions,
+        label: &str,
+        launch_secondary: Option<String>,
+        profile_identifier: Option<String>,
+        inspector_transport: InspectorTransport,
+    ) -> Self {
+        Self::from_session_result(
+            result,
+            dimensions,
+            SessionResultMeta {
+                label,
+                launch_secondary,
+                profile_identifier,
+                session_name: "SFTP session",
+                inspector_transport,
+                ssh_password_retry: None,
+            },
+        )
+    }
+
+    /// Starts a serial session from explicit line settings, optionally tied
+    /// to a saved profile. `window_dimensions` follows the same pattern as
+    /// `start_default`/`start_local_profile`.
+    fn start_serial(
+        settings: LineSettings,
+        profile_id: Option<&str>,
+        context: &egui::Context,
+        window_dimensions: Option<Dimensions>,
+    ) -> Self {
+        let dimensions = window_dimensions
+            .unwrap_or_else(|| Dimensions::new(80, 24).expect("default dimensions are valid"));
+        let label = profile_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| settings.device().to_owned());
+        let launch_secondary = Some(format!("Serial · {} baud", settings.baud_rate()));
+        let inspector_transport = inspector_transport_from_settings(&settings);
+        let result = SerialSession::open_with_notifier(settings, make_notifier(context))
+            .map(ApplicationSession::Serial);
+        Self::from_serial_session_result(
+            result,
+            dimensions,
+            &label,
+            launch_secondary,
+            profile_id.map(str::to_owned),
+            inspector_transport,
+        )
+    }
+
+    fn from_serial_session_result(
+        result: Result<ApplicationSession, SerialSessionError>,
+        dimensions: Dimensions,
+        label: &str,
+        launch_secondary: Option<String>,
+        profile_identifier: Option<String>,
+        inspector_transport: InspectorTransport,
+    ) -> Self {
+        Self::from_session_result(
+            result,
+            dimensions,
+            SessionResultMeta {
+                label,
+                launch_secondary,
+                profile_identifier,
+                session_name: "Serial session",
+                inspector_transport,
+                ssh_password_retry: None,
+            },
+        )
+    }
+
+    fn from_session_result<E: std::fmt::Display>(
+        result: Result<ApplicationSession, E>,
+        dimensions: Dimensions,
+        meta: SessionResultMeta<'_>,
+    ) -> Self {
+        let SessionResultMeta {
+            label,
+            launch_secondary,
+            profile_identifier,
+            session_name,
+            inspector_transport,
+            ssh_password_retry,
+        } = meta;
+        let mut terminal =
+            Terminal::new(dimensions).expect("default terminal allocation should succeed");
+        // Color queries have to be answered with the shades this front end
+        // paints, not with the core's stand-in defaults.
+        terminal.set_color_scheme(festerm_ui_egui::terminal_color_scheme());
+        let controller = match result {
+            Ok(session) => {
+                if matches!(
+                    &session,
+                    ApplicationSession::Persistent(_) | ApplicationSession::DevTunnel(_)
+                ) && !session.recovery_protocol_is_authoritative()
+                {
+                    terminal.set_semantics(festerm_core::TerminalSemantics::Legacy);
+                }
+                tracing::info!(
+                    target: "festerm::session",
+                    session = %session.id(),
+                    %session_name,
+                    "started session"
+                );
+                SessionController::with_named_session(session, session_name)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                tracing::error!(
+                    target: "festerm::session",
+                    %error,
+                    %session_name,
+                    "could not start session"
+                );
+                seed_session_startup_failure(&mut terminal, &message, session_name);
+                SessionController::with_named_startup_error(message, session_name)
+            }
+        };
+        Self {
+            remote_files: None,
+            terminal,
+            controller,
+            recording_auto_enrollment: None,
+            view: TerminalView::default(),
+            label: label.to_owned(),
+            default_label: label.to_owned(),
+            explicit_alias: None,
+            alias_identity: None,
+            name_save_pending: false,
+            name_edit_revision: 0,
+            #[cfg(test)]
+            test_durable_identity: None,
+            launch_secondary,
+            profile_identifier,
+            inspector_transport,
+            eviction_notice_shown: false,
+            ssh_password_retry,
+            has_new_output_since_active: false,
+            output_ingest_deferred: false,
+            search: crate::search::TerminalSearchState::default(),
+            terminal_path: TerminalPathState::default(),
+            #[cfg(feature = "experimental-dev-tunnels")]
+            tunnel: None,
+        }
+    }
+
+    pub(crate) fn terminal_context_menu_action(
+        &self,
+    ) -> Option<festerm_ui_egui::TerminalContextMenuAction> {
+        self.terminal_path
+            .menu
+            .as_ref()
+            .map(TerminalPathMenuState::ui_action)
+    }
+
+    pub(crate) fn prepare_terminal_link_context(&mut self) {
+        self.view.set_file_link_context(
+            self.controller.lifecycle_generation(),
+            matches!(self.inspector_transport, InspectorTransport::Local { .. }),
+        );
+    }
+
+    pub(crate) fn update_terminal_context_menu(&mut self, context: &egui::Context) -> bool {
+        if (self.view.rectangle_copy_active() || self.terminal_path.frozen_authority.is_some())
+            && self.terminal_path.frozen_authority.as_ref()
+                != Some(&self.current_terminal_authority())
+        {
+            self.view.cancel_rectangle_copy_with_context(context);
+            self.terminal_path.menu = None;
+            self.terminal_path.frozen_authority = None;
+            return true;
+        }
+        if !self.view.rectangle_copy_active() {
+            self.terminal_path.frozen_authority = None;
+        }
+        self.terminal_path.origin = self.terminal_filesystem_origin();
+        let Some(target) = self.view.context_menu_target() else {
+            let cleared = self.terminal_path.menu.take().is_some();
+            return cleared;
+        };
+        if self
+            .terminal_path
+            .menu
+            .as_ref()
+            .is_some_and(|state| state.generation() == target.generation)
+        {
+            return false;
+        }
+        let next = if let Some(capture) = self.view.context_menu_text() {
+            crate::terminal_paths::resolve_frozen_context_menu_action(
+                capture,
+                target.generation,
+                self.terminal_path.origin.as_ref(),
+            )
+        } else {
+            resolve_context_menu_action(&self.terminal, target, self.terminal_path.origin.as_ref())
+        };
+        let changed = self.terminal_path.menu != next;
+        self.terminal_path.menu = next;
+        changed
+    }
+
+    fn terminal_path_open_request(&self) -> Option<TerminalPathOpenRequest> {
+        if (self.view.rectangle_copy_active() || self.terminal_path.frozen_authority.is_some())
+            && self.terminal_path.frozen_authority.as_ref()
+                != Some(&self.current_terminal_authority())
+        {
+            return None;
+        }
+        self.terminal_path
+            .menu
+            .as_ref()
+            .and_then(TerminalPathMenuState::open_request)
+    }
+
+    fn current_terminal_authority(&self) -> FrozenTerminalAuthority {
+        FrozenTerminalAuthority {
+            origin: self.terminal_filesystem_origin(),
+            lifecycle_generation: self.controller.lifecycle_generation(),
+        }
+    }
+
+    fn begin_rectangle_copy(
+        &mut self,
+        trim: bool,
+    ) -> Result<(), festerm_ui_egui::RectangleCopyError> {
+        if self.view.rectangle_copy_active() {
+            return Ok(());
+        }
+        let authority = self.current_terminal_authority();
+        self.view.begin_rectangle_copy(&self.terminal, trim)?;
+        self.terminal_path.frozen_authority = Some(authority);
+        Ok(())
+    }
+
+    fn live_remote_file_requestor(&self) -> Option<crate::remote_files::RemoteFileCapability> {
+        matches!(self.controller.lifecycle(), Some(SessionLifecycle::Running))
+            .then(|| {
+                self.remote_files.clone().or_else(|| {
+                    self.controller
+                        .session()
+                        .and_then(ApplicationSession::live_remote_file_requestor)
+                        .map(crate::remote_files::RemoteFileCapability::Sftp)
+                })
+            })
+            .flatten()
+    }
+
+    fn terminal_filesystem_origin(&self) -> Option<TerminalFilesystemOrigin> {
+        let live_transport_available =
+            matches!(self.controller.lifecycle(), Some(SessionLifecycle::Running));
+        let lifecycle_generation = self.live_remote_file_requestor().map_or_else(
+            || self.controller.lifecycle_generation(),
+            |requestor| requestor.transport_generation(),
+        );
+        let verified_host_key_fingerprint = self
+            .live_remote_file_requestor()
+            .and_then(|files| files.verified_endpoint_identity())
+            .or_else(|| {
+                self.controller
+                    .session()
+                    .and_then(ApplicationSession::verified_host_key_fingerprint)
+            });
+        match &self.inspector_transport {
+            InspectorTransport::DevTunnel { host, port, .. } => {
+                Some(TerminalFilesystemOrigin::Remote(RemoteTerminalOrigin {
+                    session_binding: self
+                        .live_remote_file_requestor()
+                        .map_or_else(String::new, |files| files.binding_key()),
+                    provider: self.live_remote_file_requestor().map_or(
+                        crate::remote_files::RemoteFileProvider::DevTunnelPosix,
+                        |files| files.provider(),
+                    ),
+                    host: host.clone(),
+                    port: *port,
+                    username: "remote OS user".into(),
+                    profile_identifier: self.profile_identifier.clone(),
+                    lifecycle_generation,
+                    verified_host_key_fingerprint,
+                    live_transport_available: live_transport_available
+                        && self.live_remote_file_requestor().is_some(),
+                    trusted_working_directory: None,
+                }))
+            }
+            InspectorTransport::Local { .. } => {
+                Some(TerminalFilesystemOrigin::Local(LocalTerminalOrigin {
+                    home_directory: Some(local_home_directory()),
+                }))
+            }
+            InspectorTransport::Ssh {
+                username,
+                host,
+                port,
+                ..
+            } => Some(TerminalFilesystemOrigin::Remote(RemoteTerminalOrigin {
+                session_binding: self
+                    .live_remote_file_requestor()
+                    .map_or_else(String::new, |files| files.binding_key()),
+                provider: crate::remote_files::RemoteFileProvider::Sftp,
+                host: host.clone(),
+                port: *port,
+                username: username.clone(),
+                profile_identifier: self.profile_identifier.clone(),
+                lifecycle_generation,
+                verified_host_key_fingerprint,
+                live_transport_available,
+                trusted_working_directory: None,
+            })),
+            InspectorTransport::Sftp {
+                username,
+                host,
+                port,
+                ..
+            } => Some(TerminalFilesystemOrigin::Remote(RemoteTerminalOrigin {
+                session_binding: self
+                    .live_remote_file_requestor()
+                    .map_or_else(String::new, |files| files.binding_key()),
+                provider: crate::remote_files::RemoteFileProvider::Sftp,
+                host: host.clone(),
+                port: *port,
+                username: username.clone(),
+                profile_identifier: self.profile_identifier.clone(),
+                lifecycle_generation,
+                verified_host_key_fingerprint,
+                live_transport_available,
+                trusted_working_directory: self
+                    .controller
+                    .session()
+                    .and_then(ApplicationSession::sftp_working_directories)
+                    .map(|(remote, _)| remote),
+            })),
+            InspectorTransport::Serial { .. } => None,
+        }
+    }
+
+    /// Compact, accessible connection-state vocabulary for the chip status
+    /// dot (`docs/gui-design.md` "Connection states").
+    pub fn chip_status(&self) -> ChipStatus {
+        if self.controller.start_error().is_some() {
+            return ChipStatus::Failed;
+        }
+
+        match self.controller.lifecycle() {
+            None | Some(SessionLifecycle::Starting) => ChipStatus::Starting,
+            Some(SessionLifecycle::Running) => ChipStatus::Connected,
+            Some(SessionLifecycle::Stopping | SessionLifecycle::Disconnected(_)) => {
+                ChipStatus::Disconnected
+            }
+            Some(SessionLifecycle::Exited(_) | SessionLifecycle::Stopped) => ChipStatus::Exited,
+            Some(SessionLifecycle::Failed(_)) => ChipStatus::Failed,
+        }
+    }
+
+    /// Whether viewport-local Paste may enqueue input for this generation.
+    pub fn accepts_input(&self) -> bool {
+        self.controller.start_error().is_none()
+            && matches!(self.controller.lifecycle(), Some(SessionLifecycle::Running))
+    }
+
+    pub(crate) fn recording_eligible(&self) -> bool {
+        self.accepts_input() && !matches!(self.inspector_transport, InspectorTransport::Sftp { .. })
+    }
+
+    /// Whether the terminal viewport should still deliver typed keystrokes
+    /// and mouse-reporting bytes to the transport. Once a session has
+    /// stopped, exited, failed, or (per ADR 0018) disconnected without an
+    /// explicit user-initiated reconnect, history becomes read-only: scroll,
+    /// selection, and copy keep working, but typed input must not be
+    /// attempted (`docs/gui-action-graph.md` `HIST-06`/`SSH-02`). Mirrors the
+    /// same "still alive" states as `close_requires_confirmation`, which is
+    /// slightly looser than `accepts_input` (Paste is Running-only).
+    pub fn accepts_typed_input(&self) -> bool {
+        self.controller.start_error().is_none()
+            && matches!(
+                self.controller.lifecycle(),
+                Some(SessionLifecycle::Starting | SessionLifecycle::Running)
+            )
+    }
+
+    /// Whether closing this tab still ends an owned transport attempt or live
+    /// transport and therefore requires explicit destructive confirmation.
+    pub fn close_requires_confirmation(&self) -> bool {
+        if matches!(
+            self.inspector_transport,
+            InspectorTransport::DevTunnel { .. }
+        ) {
+            return false;
+        }
+        !matches!(
+            &self.inspector_transport,
+            InspectorTransport::Local {
+                persistence: Some(_)
+            }
+        ) && self.controller.start_error().is_none()
+            && matches!(
+                self.controller.lifecycle(),
+                Some(SessionLifecycle::Starting | SessionLifecycle::Running)
+            )
+    }
+
+    /// Content-free locality/transport text for the status bar.
+    pub fn system_label(&self) -> &'static str {
+        match &self.inspector_transport {
+            InspectorTransport::DevTunnel { .. } => "Remote · Experimental Dev Tunnel",
+            InspectorTransport::Ssh { .. } => "Remote",
+            InspectorTransport::Sftp { .. } => "Remote",
+            InspectorTransport::Serial { .. } => "Serial",
+            InspectorTransport::Local { .. } if cfg!(windows) => "Local · Windows",
+            InspectorTransport::Local { .. } if cfg!(target_os = "macos") => "Local · macOS",
+            InspectorTransport::Local { .. } => "Local · Linux",
+        }
+    }
+
+    /// `provider · session name` for the durable session this tab attaches
+    /// to, when it has one -- the stable identity the terminal-provided
+    /// title cannot supply (feature request #168).
+    ///
+    /// Reuses the same non-secret metadata Session Inspector already shows,
+    /// so this never introduces a new source of truth. SFTP and serial tabs
+    /// have no durable session, and an ordinary plain shell or plain SSH
+    /// connection carries `None`.
+    pub fn durable_session_label(&self) -> Option<String> {
+        durable_session_label_for(&self.inspector_transport)
+    }
+
+    pub fn dynamic_secondary(&self) -> Option<String> {
+        self.controller
+            .session()
+            .and_then(ApplicationSession::sftp_working_directories)
+            .map(|(remote, local)| format!("{remote} · {}", local.display()))
+    }
+
+    /// Transport-specific factual state for the persistent status bar.
+    pub fn status_bar_label(&self) -> &'static str {
+        match (&self.inspector_transport, self.chip_status()) {
+            (_, ChipStatus::Starting) => "Starting",
+            (_, ChipStatus::Reconnecting) => "Reconnecting",
+            (_, ChipStatus::Disconnected) => "Disconnected",
+            (_, ChipStatus::AuthRequired) => "Authentication required",
+            (_, ChipStatus::Failed) => "Failed",
+            (_, ChipStatus::Exited) => "Exited",
+            (InspectorTransport::Local { .. }, ChipStatus::Connected) => "Running",
+            (
+                InspectorTransport::Ssh { .. }
+                | InspectorTransport::Sftp { .. }
+                | InspectorTransport::DevTunnel { .. },
+                ChipStatus::Connected,
+            ) => "Connected",
+            (InspectorTransport::Serial { .. }, ChipStatus::Connected) => "Open",
+            // A session tab cannot carry a document's state.
+            (
+                _,
+                ChipStatus::Neutral
+                | ChipStatus::DocumentSaved
+                | ChipStatus::DocumentUnsaved
+                | ChipStatus::DocumentConflict,
+            ) => "",
+        }
+    }
+
+    pub fn recovery_retry_message(&self) -> Option<&'static str> {
+        let Some(SessionLifecycle::Disconnected(error)) = self.controller.lifecycle() else {
+            return None;
+        };
+        if matches!(
+            self.inspector_transport,
+            InspectorTransport::DevTunnel { .. }
+        ) {
+            if error.message() == festerm_sessiond::DISPLACED_REASON {
+                return Some("Another client took over this Dev Tunnel session. Reconnect to take it back. Queued input is discarded, never replayed.");
+            }
+            return Some("Dev Tunnel connection lost. Reconnect to resume it. Queued input is discarded, never replayed.");
+        }
+        (matches!(
+            self.inspector_transport,
+            InspectorTransport::Local {
+                persistence: Some(_)
+            }
+        ) && error.message() == festerm_sessiond::RECOVERY_RETRY_MESSAGE)
+            .then_some(festerm_sessiond::RECOVERY_RETRY_MESSAGE)
+    }
+
+    /// The active SSH host-key request, if the transport is waiting for one.
+    /// Local tabs never expose this UI state.
+    pub fn host_key_prompt(&self) -> Option<&HostKeyPrompt> {
+        matches!(
+            self.controller.session(),
+            Some(ApplicationSession::Ssh(_) | ApplicationSession::Sftp(_))
+        )
+        .then(|| self.controller.host_key_prompt())
+        .flatten()
+    }
+
+    /// Sends a nonblocking, one-time host-key decision to the SSH worker.
+    ///
+    /// The prompt is cleared after either outcome so stale UI cannot submit
+    /// the same decision again. A future request arrives through the normal
+    /// event boundary and replaces this state.
+    pub fn resolve_host_key_trust(
+        &mut self,
+        decision: HostKeyTrustDecision,
+    ) -> Result<(), HostKeyTrustResolutionError> {
+        let prompt = self
+            .host_key_prompt()
+            .cloned()
+            .ok_or(HostKeyTrustResolutionError::NoPendingPrompt)?;
+        let result = self
+            .controller
+            .session()
+            .expect("an SSH host-key prompt requires a session")
+            .resolve_host_key_prompt(&prompt, decision);
+        self.controller.clear_host_key_prompt(&prompt);
+        result
+    }
+
+    /// The active in-terminal interactive password request, if the transport
+    /// is waiting for one. Local tabs never expose this UI state. Mirrors
+    /// [`Self::host_key_prompt`].
+    pub fn password_prompt(&self) -> Option<&PasswordPrompt> {
+        matches!(
+            self.controller.session(),
+            Some(ApplicationSession::Ssh(_) | ApplicationSession::Sftp(_))
+        )
+        .then(|| self.controller.password_prompt())
+        .flatten()
+    }
+
+    /// Sends a password value to the already-connected SSH worker for the
+    /// current interactive prompt, feeding it into the live session rather
+    /// than requiring it blind before a connection exists. Mirrors
+    /// [`Self::resolve_host_key_trust`].
+    pub fn resolve_ssh_password(
+        &mut self,
+        password: String,
+    ) -> Result<(), PasswordResolutionError> {
+        let prompt = self
+            .password_prompt()
+            .cloned()
+            .ok_or(PasswordResolutionError::NoPendingPrompt)?;
+        let result = self
+            .controller
+            .session()
+            .expect("an SSH password prompt requires a session")
+            .resolve_password_prompt(&prompt, password);
+        self.controller.clear_password_prompt(&prompt);
+        result
+    }
+
+    /// Reports whether the transport can accept a user-directed reconnect.
+    pub fn reconnect_available(&self) -> bool {
+        #[cfg(feature = "experimental-dev-tunnels")]
+        if self.tunnel.is_some() {
+            return matches!(
+                self.controller.lifecycle(),
+                Some(SessionLifecycle::Disconnected(_) | SessionLifecycle::Failed(_))
+            );
+        }
+        self.controller
+            .session()
+            .is_some_and(ApplicationSession::reconnect_available)
+    }
+
+    /// Queues a reconnect without waiting for network activity on the GUI
+    /// thread. Rejection becomes ordinary content-free session diagnostics.
+    pub fn request_reconnect(&mut self) -> Result<(), SessionReconnectError> {
+        let result = self
+            .controller
+            .session()
+            .ok_or(SessionReconnectError::NotReconnectable)?
+            .try_reconnect();
+        if result.is_ok() {
+            self.controller.advance_lifecycle_generation();
+            self.view.request_focus_on_next_frame();
+        }
+        result
+    }
+
+    /// Whether the current live transport can accept SSH port-forward requests.
+    pub fn live_port_forwarding_available(&self) -> bool {
+        self.controller
+            .session()
+            .is_some_and(ApplicationSession::live_port_forwarding_available)
+    }
+
+    /// Whether this tab owns an SSH session transport, regardless of its current lifecycle state.
+    pub fn is_ssh_session(&self) -> bool {
+        match self.controller.session() {
+            Some(ApplicationSession::Ssh(_)) => true,
+            #[cfg(test)]
+            Some(ApplicationSession::TestSsh(_)) => true,
+            #[cfg(test)]
+            Some(ApplicationSession::TestLocal(_)) => false,
+            Some(ApplicationSession::Local(_))
+            | Some(ApplicationSession::Persistent(_))
+            | Some(ApplicationSession::DevTunnel(_))
+            | Some(ApplicationSession::Sftp(_))
+            | Some(ApplicationSession::Serial(_))
+            | None => false,
+        }
+    }
+
+    /// The most recent live SSH port-forward snapshot for this tab.
+    pub fn port_forwards(&self) -> &[SshPortForwardRuntime] {
+        self.controller.port_forwards()
+    }
+
+    /// Count of currently active port forwards, excluding failed entries.
+    pub fn active_port_forward_count(&self) -> usize {
+        self.port_forwards()
+            .iter()
+            .filter(|forward| forward.state() == SshPortForwardState::Active)
+            .count()
+    }
+
+    /// Requests a fresh port-forward snapshot from the live SSH worker.
+    pub fn query_port_forwards(&self) -> Result<(), SshPortForwardRequestError> {
+        self.controller
+            .session()
+            .ok_or(SshPortForwardRequestError::NotRunning)?
+            .try_query_port_forwards()
+    }
+
+    /// Adds one live-only SSH port forward to the current tab's SSH session.
+    pub fn add_port_forward(
+        &self,
+        forward: impl SshPortForwardSpec,
+    ) -> Result<(), SshPortForwardRequestError> {
+        self.controller
+            .session()
+            .ok_or(SshPortForwardRequestError::NotRunning)?
+            .try_add_port_forward(forward)
+    }
+
+    /// Removes one live SSH port forward identified by its listening tuple.
+    pub fn remove_port_forward(
+        &self,
+        direction: SshPortForwardDirection,
+        bind_host: impl Into<String>,
+        bind_port: u16,
+    ) -> Result<(), SshPortForwardRequestError> {
+        self.controller
+            .session()
+            .ok_or(SshPortForwardRequestError::NotRunning)?
+            .try_remove_port_forward(direction, bind_host, bind_port)
+    }
+}
+
+fn local_profile_secondary(profile: &LocalProfile) -> Option<String> {
+    profile
+        .executable()
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+}
+
+fn inspector_transport_from_settings(settings: &LineSettings) -> InspectorTransport {
+    InspectorTransport::Serial {
+        device: settings.device().to_owned(),
+        baud_rate: settings.baud_rate(),
+        data_bits: settings.data_bits().into(),
+        parity: settings.parity().into(),
+        stop_bits: settings.stop_bits().into(),
+        flow_control: settings.flow_control().into(),
+    }
+}
+
+/// The content of one tab.
+///
+/// Launcher and Settings are non-session application surfaces
+/// (`docs/gui-design.md` "Launcher as a tab", "Settings as an application
+/// surface"); they carry no `Session`/`Terminal` pair.
+pub enum TabContent {
+    Launcher,
+    Settings,
+    Profiles,
+    SshAuthenticationRequired(SshAuthenticationRequiredTab),
+    SftpAuthenticationRequired(SftpAuthenticationRequiredTab),
+    MarkdownViewer(Box<MarkdownViewerTab>),
+    TextEditor(Box<TextEditorTab>),
+    SftpFileManagerAuthenticationRequired(Box<SftpFileManagerAuthenticationRequiredTab>),
+    SftpFileManager(Box<SftpFileManagerTab>),
+    Session(Box<SessionTab>),
+}
+
+impl TabContent {
+    /// Whether a tab holding this content may be moved into another window
+    /// or detached into a new one (ADR 0033).
+    ///
+    /// Launcher, Settings, and Profiles are per-window singletons that every
+    /// window opens for itself on demand, so moving one would only strip its
+    /// source window of the surface it was showing; everything else carries
+    /// per-tab state (a live session, a file being viewed) that exists in
+    /// exactly one place and therefore travels with the tab.
+    pub const fn movable_across_windows(&self) -> bool {
+        !matches!(self, Self::Launcher | Self::Settings | Self::Profiles)
+    }
+
+    /// Whether leaving a tab holding this content is worth remembering, so
+    /// that closing whatever was opened next returns here.
+    ///
+    /// The same three per-window singletons are excluded, for the same
+    /// underlying reason: Launcher, Settings and Profiles are surfaces a user
+    /// passes *through* on the way to doing something, and every window can
+    /// reopen one at any time. Being returned to Settings because that is
+    /// where a file was opened from would be an answer to a question nobody
+    /// asked.
+    pub const fn remembered_as_last_used(&self) -> bool {
+        !matches!(self, Self::Launcher | Self::Settings | Self::Profiles)
+    }
+}
+
+/// The document a tab is a view of, for the reference count that decides which
+/// close is the final one. Only the editor holds documents: the Markdown
+/// viewer reads files and remote snapshots of its own.
+fn view_document(content: &TabContent) -> Option<DocumentId> {
+    match content {
+        TabContent::TextEditor(editor) => Some(editor.document()),
+        _ => None,
+    }
+}
+
+/// What the dirty-close prompt needs to name the document it is asking about
+/// (ADR 0034 §7). Carries the origin as well as the file name because the
+/// prompt can be raised from a background window or by a quit closing several
+/// documents at once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DirtyDocumentClose {
+    pub(crate) document: DocumentId,
+    pub(crate) title: String,
+    pub(crate) origin: String,
+}
+
+pub struct Tab {
+    pub id: TabId,
+    durable_id: String,
+    pane_id: String,
+    pub content: TabContent,
+}
+
+/// A pending request to move one tab into another window, or out to a new
+/// one (ADR 0033).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabMoveRequest {
+    /// The tab to move, always owned by the window recording the request.
+    pub moved: TabId,
+    /// The destination window's viewport, or `None` to detach into a new one.
+    pub target: Option<egui::ViewportId>,
+    /// A tab in the *destination* window to insert before, resolved there.
+    pub before: Option<TabId>,
+    /// Where the drop happened, in screen coordinates, used to place a
+    /// detached window under the pointer that released it.
+    pub screen_position: egui::Pos2,
+}
+
+/// Which blank profile editor `AppCommand::CreateProfile` should open.
+///
+/// The Launcher's New Profile control has to say *what* it is creating, so
+/// the kind travels with the command rather than being chosen again once
+/// the Profiles surface is on screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NewProfileKind {
+    Local,
+    Ssh,
+    Sftp,
+    Serial,
+    DevTunnel,
+    /// The Dev Tunnel host-setup surface rather than a profile editor.
+    HostSetup,
+    SshFromDraft(SshProfileDraftSeed),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshPortForwardDraftSeed {
+    pub direction: ConfigSshPortForwardDirection,
+    pub bind_host: String,
+    pub bind_port: String,
+    pub destination_host: String,
+    pub destination_port: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshProfileDraftSeed {
+    pub name: String,
+    pub host: String,
+    pub port: String,
+    pub username: String,
+    pub port_forwards: Vec<SshPortForwardDraftSeed>,
+    pub durable_session_enabled: bool,
+    pub durable_session_provider: PersistenceProviderKind,
+    pub durable_session_name: String,
+}
+
+/// Product-level application actions dispatched from any invocation surface
+/// (chip row, launcher buttons, and future shortcuts/command palette), per
+/// `docs/application-command-model.md`. UI code must not implement its own
+/// copy of these operations.
+#[derive(Debug)]
+pub enum AppCommand {
+    #[cfg(feature = "experimental-dev-tunnels")]
+    ImportPublicDevTunnelProfile {
+        import: crate::tunnel_profile_import::PublicProfileImport,
+    },
+    /// Lists the shared account's bridge tunnels to create a profile from.
+    BrowseDevTunnels {
+        account: String,
+    },
+    /// Signs in with GitHub and stores the result as a shared account. Signing
+    /// in as an account that already exists re-authenticates it.
+    AddDevTunnelAccount,
+    /// Signs an account out: its credential is deleted and profiles using it
+    /// become unauthenticated.
+    RemoveDevTunnelAccount {
+        account: String,
+    },
+    /// Connects a listed running tunnel once, with its account's sign-in and
+    /// without saving a profile.
+    ConnectRunningDevTunnel {
+        locator: String,
+    },
+    /// The New Session Dev Tunnel form's Connect. With `save_as` it saves a
+    /// profile of that name first; otherwise nothing is saved. `takeover`
+    /// asks the host to displace an attached client.
+    ConnectDevTunnelForm {
+        tunnel: String,
+        account: Option<String>,
+        takeover: bool,
+        save_as: Option<String>,
+    },
+    /// Saves a native Dev Tunnel profile and immediately connects it, signing
+    /// in first when it has no account.
+    SaveAndConnectDevTunnel {
+        profile: festerm_config::Profile,
+    },
+    StartConfiguredDevTunnelProfile {
+        profile_id: String,
+    },
+    StoreDevTunnelConnectToken {
+        profile_id: String,
+        token: TunnelConnectToken,
+    },
+    #[cfg(feature = "experimental-dev-tunnels")]
+    ConnectDevTunnel(crate::tunnel_activation::Launch),
+    /// "New Tab opens the session launcher" (`docs/gui-design.md`
+    /// "Interaction Conventions").
+    OpenLauncher,
+    /// Opens (or focuses) the singleton Settings application surface.
+    OpenSettings,
+    /// Application-scoped recording surfaces.
+    OpenRecording,
+    OpenRecordingSettings,
+    OpenRecordingLibrary,
+    /// Moves one tab into another window, or - with `target: None` - out to a
+    /// new window of its own at `screen_position` (ADR 0033).
+    ///
+    /// Like `OpenWindow`, this only records the request: the move mutates two
+    /// windows at once, and only the composition root can hold both.
+    MoveTabToWindow {
+        moved: TabId,
+        target: Option<egui::ViewportId>,
+        before: Option<TabId>,
+        screen_position: egui::Pos2,
+    },
+    /// Requests one additional fesTerm window (ADR 0032). Window creation is
+    /// an Application-scoped act, so this only records the request; the
+    /// composition root drains it after this window's pass and spawns the
+    /// new viewport, which is why nothing here borrows the window list.
+    OpenWindow,
+    /// Opens (or focuses) the singleton Profiles management application
+    /// surface.
+    OpenProfiles,
+    /// Opens the Profiles surface with a blank editor of `kind` already
+    /// open. Distinct from `OpenProfiles`, which lands on the list.
+    CreateProfile {
+        kind: NewProfileKind,
+    },
+    /// Opens the Profiles surface on the "Set up a Dev Tunnel host" panel.
+    OpenDevTunnelHostSetup,
+    /// Opens the exact installer script embedded in this build as a read-only
+    /// untitled editor tab so it can be reviewed before it is run.
+    OpenHostSetupScript {
+        platform: festerm_host_setup::HostPlatform,
+    },
+    /// Opens the Profiles surface in a new SSH profile editor pre-populated
+    /// from a one-off SSH launch draft. This carries only connection metadata;
+    /// transient passwords and keys never leave the launch form.
+    CreateSshProfileFromDraft {
+        draft: SshProfileDraftSeed,
+    },
+    /// Opens the shared file picker. The composition root routes Markdown to
+    /// editor Preview and other bounded text to Edit.
+    OpenMarkdownWorkspace,
+    OpenLocalMarkdownFile {
+        path: PathBuf,
+        /// Legacy caller context retained for command compatibility. Local
+        /// dispatch focuses or opens the one document registry entry for
+        /// `path`.
+        replacing: Option<TabId>,
+    },
+    /// Opens a second editor view of the document the active editor holds.
+    /// One document may have many views; this is how a reader asks for one.
+    OpenAnotherEditorView,
+    /// Opens a Markdown file already fetched (in memory) from a remote SFTP
+    /// session — e.g. from double-clicking a `.md` file in the SFTP file
+    /// manager (issue #133). `source` pins the snapshot's verified remote
+    /// origin; `content` is the file's full bytes.
+    OpenRemoteMarkdownSnapshot {
+        source: RemoteMarkdownSource,
+        display_path: String,
+        content: Vec<u8>,
+    },
+    /// Opens a remote text snapshot already fetched from a verified SFTP
+    /// origin.
+    OpenRemoteTextSnapshot {
+        origin: RemoteOrigin,
+        text: TextDocument,
+        read_only: bool,
+    },
+    /// Opens the currently frozen terminal path candidate for one session
+    /// tab, if that candidate resolved safely.
+    OpenTerminalDetectedPath {
+        tab_id: TabId,
+    },
+    /// Revalidates one terminal's captured hyperlink without retargeting another session.
+    OpenTerminalHyperlink {
+        tab_id: TabId,
+        lifecycle_generation: u64,
+        target: ExternalLinkTarget,
+    },
+    /// Opens an explicit terminal hyperlink after application-owned URL
+    /// validation. Terminal presentation emits intent only.
+    OpenExternalLink {
+        target: ExternalLinkTarget,
+    },
+    /// Opens (or focuses) the singleton Profiles surface directly into the
+    /// editor for one existing profile, e.g. from a Launcher card's edit
+    /// icon.
+    OpenProfileEditor {
+        identifier: String,
+    },
+    /// A separate action that opens the default local profile directly,
+    /// bypassing the launcher for users who prefer that workflow.
+    StartLocalSession,
+    /// Starts one transient local session from explicit launcher metadata
+    /// without creating or recording a saved profile.
+    StartLocalSessionWithProfile {
+        profile: LocalProfile,
+    },
+    /// Starts a local session from a reusable configuration profile. The
+    /// profile identifier is resolved only against this application's
+    /// explicitly supplied immutable configuration.
+    StartConfiguredLocalProfile {
+        profile_id: String,
+    },
+    /// Starts one SSH transport from explicitly supplied, secret-free
+    /// connection metadata, transient authentication, and explicit session
+    /// options. Launcher invocation surfaces validate input into these typed
+    /// values; this does not create a persisted profile.
+    StartSshSession {
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        options: SshSessionOptions,
+    },
+    /// Starts one text-mode SFTP transport from explicitly supplied, secret-free
+    /// connection metadata and transient authentication.
+    StartSftpSession {
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+    },
+    /// Opens the GUI SFTP authentication surface for a destination.
+    OpenSftpFileManager {
+        target: SftpFileManagerLaunchTarget,
+    },
+    /// Starts a GUI SFTP file-manager tab from explicit destination metadata
+    /// and an explicit credential.
+    StartSftpFileManager {
+        target: SftpFileManagerLaunchTarget,
+        authentication: SftpFileManagerAuthentication,
+    },
+    /// Sends an existing GUI SFTP file-manager tab (identified by
+    /// `tab_id`) back to the pre-connect authentication surface, in place,
+    /// with the destination fields editable. Dispatched from the
+    /// "Edit connection…" action on a failed-to-connect tab's banner, so a
+    /// typo'd host/port/username can be fixed without abandoning the tab
+    /// for a brand new one.
+    RetrySftpFileManagerConnection {
+        tab_id: TabId,
+        target: SftpFileManagerLaunchTarget,
+    },
+    /// Starts an existing configured SSH profile by resolving its native
+    /// stored password on the SSH worker. This command has no password value.
+    StartStoredPasswordSshProfile {
+        profile_id: String,
+        options: SshSessionOptions,
+    },
+    /// Starts an existing configured SFTP profile by resolving its native
+    /// stored password on the SFTP worker. This command has no password value.
+    StartStoredPasswordSftpProfile {
+        profile_id: String,
+    },
+    /// Launches a saved SSH profile the same way a saved local profile
+    /// launches: from a Launcher/Profiles card, with no upfront password
+    /// prompt in the launch surface itself. The composition root
+    /// (`FesTermApp::screen_command`) resolves whether the profile has a
+    /// stored native-secret credential first: with one, it behaves exactly
+    /// like `StartStoredPasswordSshProfile`; without one, it is fully
+    /// handled by `AppState::start_configured_ssh_profile_interactive`
+    /// (openssh-style in-terminal password prompt, no composition-root
+    /// resource needed). Never reaches `AppState::dispatch` for real work.
+    StartConfiguredSshProfile {
+        profile_id: String,
+    },
+    /// Launches a saved SSH profile as a text-mode SFTP tab.
+    StartConfiguredSftpProfile {
+        profile_id: String,
+    },
+    /// Opens the GUI SFTP authentication surface for a saved SSH profile.
+    OpenConfiguredSftpFileManagerProfile {
+        profile_id: String,
+    },
+    /// Starts a saved profile's GUI SFTP surface using its opaque
+    /// native-store password or private-key reference.
+    StartStoredSftpFileManagerProfile {
+        profile_id: String,
+    },
+    /// Starts a serial session from explicitly supplied line settings. The
+    /// Launcher's serial form validates input into a `LineSettings` value;
+    /// this does not create a persisted profile.
+    StartSerialSession {
+        settings: LineSettings,
+    },
+    /// Starts a serial session from a saved serial profile. Mirrors
+    /// `StartConfiguredLocalProfile`.
+    StartConfiguredSerialProfile {
+        profile_id: String,
+    },
+    /// Opens a local file in the native editor, binding to the document if it
+    /// is already open somewhere else (ADR 0034 §2).
+    OpenTextEditor {
+        path: PathBuf,
+    },
+    /// Opens a new empty untitled document in the native editor.
+    NewTextDocument,
+    /// Freezes the active terminal's retained text into a new independent
+    /// editor snapshot.
+    OpenTerminalHistoryInEditor,
+    /// Repaints this terminal's local presentation without protocol effects.
+    RedrawTerminal(TabId),
+    BeginRectangleCopy(TabId),
+    SmartSelect(TabId, festerm_ui_egui::SmartSelectionScope),
+    /// Opens a new independent terminal snapshot and immediately asks where
+    /// to save it.
+    SaveTerminalHistoryAs,
+    /// Writes the active editor's document back to its origin.
+    SaveTextDocument,
+    /// Asks for a destination. The picker is an application overlay, so this
+    /// only opens it; the write happens on `SaveTextDocumentTo`.
+    SaveTextDocumentAs,
+    /// Writes the active document to a destination the user has chosen and
+    /// confirmed, and moves this view onto it.
+    SaveTextDocumentTo {
+        path: PathBuf,
+        destination: crate::document_store::ConfirmedDestination,
+    },
+    /// Re-checks the active editor's document against its source.
+    RefreshTextDocument,
+    /// Replaces the active editor's buffer with what the source holds,
+    /// discarding unsaved changes. Only reachable from a conflict banner.
+    ReloadTextDocument,
+    /// Dismisses a conflict banner without writing anything.
+    KeepMyTextVersion,
+    /// Reloads the active standalone Markdown viewer. Saved-local editor
+    /// Preview follows the document refresh commands instead.
+    ReloadMarkdown,
+    ToggleMarkdownPreviewSource,
+    ToggleMarkdownOutline,
+    OpenMarkdownFind,
+    NavigateMarkdownFind {
+        reverse: bool,
+    },
+    LoadMarkdownLocalImage {
+        reference_index: usize,
+    },
+    /// Requests that the composition root store a password for an existing
+    /// configured SSH profile before starting it. The value is redacted from
+    /// debug output and moved to the background store worker.
+    StoreSshPassword {
+        profile_id: String,
+        password: PasswordToStore,
+        options: SshSessionOptions,
+    },
+    /// Requests that the composition root store a password for an existing
+    /// configured SSH profile before starting it as SFTP.
+    StoreSftpPassword {
+        profile_id: String,
+        password: PasswordToStore,
+    },
+    /// Requests that the composition root store or replace a password for
+    /// an existing configured SSH profile from the Profiles editor, with no
+    /// follow-up launch (unlike `StoreSshPassword`, which is submitted from
+    /// a live connect form and auto-launches once the credential is saved).
+    StoreProfilePassword {
+        profile_id: String,
+        password: PasswordToStore,
+    },
+    /// Requests that the composition root store or replace a private-key
+    /// credential (with an optional passphrase) for an existing configured
+    /// SSH profile from the Profiles editor. Mirrors
+    /// `StoreProfilePassword`, but for certificate/private-key
+    /// authentication instead of a password.
+    StoreProfilePrivateKey {
+        profile_id: String,
+        private_key: PrivateKeyToStore,
+    },
+    /// Resolves the displayed host-key request for one specific SSH or GUI
+    /// SFTP tab.
+    ///
+    /// `AcceptAndPersist` (ADR 0020) additionally requires the composition
+    /// root to write a durable trust record before this command reaches
+    /// `AppState::dispatch`, mirroring how `StoreSshPassword` needs the
+    /// configuration reloader; `FesTermApp::screen_command` reads the
+    /// pending prompt and persists it first, then still routes this command
+    /// through `AppState::dispatch` unchanged so the SSH-level decision is
+    /// resolved identically to `AcceptOnce`.
+    ResolveHostKeyTrust {
+        tab: TabId,
+        decision: HostKeyTrustDecision,
+    },
+    /// Resolves the in-terminal, live-session interactive password prompt
+    /// for one specific SSH tab (see [`festerm_ssh::SshAuthentication::interactive`]):
+    /// unlike `ResolveHostKeyTrust`, this feeds a value into the already-
+    /// connected worker rather than a one-shot decision enum.
+    ResolveSshPassword {
+        tab: TabId,
+        password: String,
+    },
+    /// Requests one bounded fresh SSH transport attempt for `tab`. Local,
+    /// stopped, or already-reconnecting tabs reject this safely.
+    ReconnectSession(TabId),
+    ActivateTab(TabId),
+    CombinePanes {
+        source: TabId,
+        target: TabId,
+        side: festerm_config::PaneSide,
+        expected_revision: u64,
+    },
+    SeparatePane(TabId),
+    /// Revision-checked separation for staged handle/tab-strip gestures.
+    DetachPane {
+        view: TabId,
+        expected_revision: u64,
+    },
+    FocusPaneDirection(festerm_config::PaneSide),
+    ResizeFocusedPane {
+        axis: festerm_config::PaneAxis,
+        increase: bool,
+    },
+    ClosePaneGroup {
+        plan: PaneClosePlan,
+        discard: Vec<festerm_document::DocumentId>,
+    },
+    SetPanePreset {
+        view: TabId,
+        preset: festerm_config::PanePreset,
+    },
+    SwapPanes {
+        first: TabId,
+        second: TabId,
+        expected_revision: u64,
+    },
+    SeparatePaneGroup(TabId),
+    EqualizePanes(TabId),
+    ZoomPane(TabId),
+    FocusNextPane {
+        reverse: bool,
+    },
+    RenamePaneGroup {
+        view: TabId,
+        label: String,
+    },
+    ResizePaneSplit {
+        view: TabId,
+        path: Vec<bool>,
+        ratio: u16,
+        expected_revision: u64,
+    },
+    /// Activates the next/previous tab in stable list order
+    /// (`docs/gui-design.md` "Next/Previous Tab switch predictably" —
+    /// predictable and independent of visual wrapping).
+    ActivateNextTab,
+    ActivatePreviousTab,
+    CloseTab(TabId),
+    /// `:q!` and `ZQ`: close this view and throw away what it has not saved,
+    /// without asking. The exclamation mark is the question, already answered
+    /// — a reader who typed it has said what they want more plainly than a
+    /// dialog could ask.
+    DiscardAndCloseTab(TabId),
+    /// Reorders `moved` to sit immediately before `before` (or at the end of
+    /// the row if `None`), preserving the moved tab's identity/state and the
+    /// current active tab.
+    ReorderTab {
+        moved: TabId,
+        before: Option<TabId>,
+    },
+    /// Moves one tab exactly one position while preserving active identity.
+    MoveTabLeft(TabId),
+    MoveTabRight(TabId),
+    /// Renames a session tab's stable primary identity (label). No-op for
+    /// Launcher/Settings tabs, whose names are fixed.
+    RenameTab(TabId, String),
+    /// Removes the override, rather than saving today's default as an alias.
+    UseDefaultSessionName(TabId),
+    ToggleSessionInspector,
+    /// Flips between wrapped and single-row-scroll chip layout
+    /// (`docs/gui-design.md` "Wrapping must remain user-configurable").
+    ToggleChipLayout,
+    /// Toggles the bottom status bar on/off (`docs/gui-design.md`
+    /// "Contextual status region" / "the status bar should be configurable
+    /// on/off").
+    ToggleStatusBar,
+    /// Toggles whether chips show their secondary detail line
+    /// (`docs/gui-design.md` "Show session details in chips"). When off,
+    /// every chip is a compact single-line chip and the active session's
+    /// detail relocates to the status bar instead.
+    ToggleShowSessionDetails,
+    /// Toggles the app-wide compact pane handle hover preference.
+    TogglePaneHandles,
+    /// Toggles the stronger pane-only focus contrast treatment.
+    TogglePaneHighContrast,
+    /// Toggles whether closing a live session requires confirmation.
+    ToggleConfirmSessionClose,
+    /// Toggles whether Windows default local sessions prefer the per-user
+    /// PowerShell app-execution alias over `%COMSPEC%`. Only the Windows
+    /// settings UI (`screens.rs`) ever constructs this, so non-Windows
+    /// builds would otherwise flag it as dead code.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    TogglePreferPowershell,
+    /// Toggles whether Dev Tunnel sign-in/connect extends the tunnel's lifetime.
+    ToggleExtendDevTunnelLifetime,
+    ToggleShowRunningDevTunnels,
+    SetDevTunnelExtensionDays(u32),
+    /// Toggles whether the default Local Shell launcher card opens its
+    /// executable/arguments/directory form instead of launching immediately.
+    ToggleCustomizeLocalShell,
+    /// Toggles whether the open-tab list and active tab persist across
+    /// restarts (`docs/gui-design.md` "Workspace restore" - explicit
+    /// opt-in, off by default).
+    ToggleRestoreWorkspace,
+    /// Selects the supported primary terminal face without changing
+    /// application-chrome typography.
+    SetTerminalFont(TerminalFontPreference),
+    SetKeyboardBindings(festerm_config::KeyboardBindings),
+    SetInputRecording {
+        tab: TabId,
+        enabled: bool,
+    },
+    ClearInputRecording(TabId),
+    CopyInputRecording(TabId),
+    /// Enables or disables eligible multi-cell shaping runs. Cell ownership
+    /// remains authoritative regardless of the selected font.
+    ToggleTerminalLigatures,
+    /// Selects the deterministic color or monochrome emoji presentation path
+    /// without changing core-owned cell geometry.
+    SetEmojiPresentation(EmojiPresentationPreference),
+    /// Selects a clickstop scaling how far one trackpad/wheel scroll step
+    /// moves the scrollback viewport (feature request #67).
+    SetScrollSpeed(festerm_config::ScrollSpeedPreference),
+    ToggleRectangleCopyTrimTrailingSpaces,
+    RetryTerminalFontDownload,
+    /// Remembers how a text editor view was last set up, so the next one opens
+    /// the way the reader works rather than the way the defaults do.
+    SetEditorSettings(festerm_config::EditorSettings),
+    /// Selects the retained primary-history budget for sessions created
+    /// after this preference changes.
+    SetScrollbackLimit(ScrollbackLimitPreference),
+    SetImageMemoryBudget(ImageMemoryBudgetPreference),
+    /// Toggles whether holding the quick-switch modifier (Cmd on macOS, Ctrl
+    /// elsewhere) overlays each eligible chip's quick-switch number in
+    /// place of its usual status presentation (feature request #69).
+    ToggleQuickSwitchOverlay,
+    /// Toggles whether the Launcher's New Session list uses a responsive
+    /// multi-column layout for saved profiles when the window is wide
+    /// enough (feature request #64).
+    ToggleCompactLauncherGrid,
+    /// Toggles whether the New Session/Launcher screen surfaces locally
+    /// running, unattached `festerm-sessiond` sessions as one-click
+    /// "Resume" entries (feature request #70).
+    ToggleShowResumableSessions,
+    /// Toggles whether the status bar names the durable session the active
+    /// terminal is attached to (feature request #168).
+    ToggleDurableSessionInStatusBar,
+    /// Toggles the occasional background check for a newer fesTerm release.
+    ToggleAutomaticUpdateChecks,
+    ToggleMcpEnabled,
+    ToggleJavascriptEnabled,
+    RetryAutomationSettings,
+    OpenWorkflowPicker,
+    Automation(crate::automation::NativeCommand),
+    /// Sets or clears the default starting local directory for new SFTP sessions.
+    SetDefaultSftpLocalDirectory(Option<PathBuf>),
+    /// Sets the visual left/right order for GUI SFTP panes.
+    SetSftpPaneOrder(SftpPaneOrderPreference),
+    /// Resumes a locally running, unattached `festerm-sessiond` session by
+    /// name, surfaced via the Launcher's "Resume" list (feature request
+    /// #70). The composition root attaches to it and opens a new tab.
+    ResumeUnattachedSession {
+        session: festerm_sessiond::UnattachedSession,
+    },
+    /// Attaches only to the selected locally running tmux or GNU screen session,
+    /// surfaced via the Launcher's "tmux sessions"/"GNU Screen sessions"
+    /// quick-connect widgets. Unlike `ResumeUnattachedSession`, an already
+    /// attached tmux/screen session is a normal, supported target: both
+    /// multiplexers natively allow more than one client, so this is offered
+    /// even for sessions another client is already attached to.
+    ResumeMultiplexerSession {
+        provider: PersistenceProviderKind,
+        /// Provider-namespaced identity and display metadata from discovery.
+        session: crate::multiplexer_sessions::MultiplexerSession,
+    },
+    RefreshRunningSessions,
+    /// The composition root confirms before dispatching this destructive action.
+    TerminateUnattachedSession {
+        session: festerm_sessiond::UnattachedSession,
+    },
+    /// Resets chip layout and status-bar visibility to their defaults after
+    /// explicit confirmation (`docs/gui-design.md` "Wrapping must remain
+    /// user-configurable").
+    ResetInterfaceSettings,
+    /// Creates or edits a profile (docs/gui-design.md "Profile editing").
+    /// Both are the same upsert-by-identifier write; the composition root
+    /// (`FesTermApp::screen_command`) fully intercepts this to persist
+    /// through the configuration reloader, mirroring `StoreSshPassword` —
+    /// it never reaches `AppState::dispatch`.
+    SaveProfile {
+        profile: festerm_config::Profile,
+    },
+    SaveLocalProfile {
+        tab_id: TabId,
+        request: egui::Id,
+        original_id: Option<String>,
+        profile: festerm_config::Profile,
+        expose: bool,
+        explicit_enable: bool,
+    },
+    #[cfg(feature = "experimental-dev-tunnels")]
+    LocalTunnelHost {
+        profile_id: String,
+        action: LocalHostAction,
+    },
+    #[cfg(feature = "experimental-dev-tunnels")]
+    LocalTunnelCleanup {
+        installation: String,
+        action: LocalHostAction,
+    },
+    /// Persists a native Dev Tunnel profile edited in the Profiles surface and
+    /// reports the committed/failed outcome back to the editor
+    /// (`screens::profiles::report_dev_tunnel_save_outcome`) so it closes to
+    /// the list only on a successful write and otherwise keeps the exact draft
+    /// with an actionable error. Fully intercepted by the composition root
+    /// like `SaveProfile`; it never connects.
+    SaveDevTunnelProfile {
+        tab_id: TabId,
+        request: egui::Id,
+        profile: festerm_config::Profile,
+    },
+    /// Creates a profile and stores its initial native credential only after
+    /// the profile metadata has been persisted successfully.
+    SaveProfileWithCredential {
+        profile: festerm_config::Profile,
+        credential: ProfileCredentialToStore,
+    },
+    /// Deletes a profile the user has explicitly confirmed, after any
+    /// workspace-tab references have been reported
+    /// (`Configuration::workspace_tab_references`). Fully intercepted by the
+    /// composition root like `SaveProfile`.
+    DeleteProfile {
+        identifier: String,
+    },
+    /// Reorders a saved profile via drag-and-drop on the Profiles surface
+    /// (`Configuration::with_reordered_profiles`), reflected in the
+    /// Launcher's own profile ordering too since both read
+    /// `Configuration::profiles` in document order. Fully intercepted by the
+    /// composition root like `SaveProfile`.
+    ReorderProfiles {
+        moved: String,
+        before: Option<String>,
+    },
+}
+
+#[cfg(feature = "experimental-dev-tunnels")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalHostAction {
+    Retry,
+    SignIn,
+    CancelSignIn,
+    RecreateMissing,
+    NewShell,
+    RevokeUnreferenced,
+}
+
+impl AppCommand {
+    /// The saved profile this command launches, if any.
+    ///
+    /// Only commands that actually start a session from a stored definition
+    /// count: opening a profile's editor is not a use of that profile, and
+    /// counting it would make the launcher's ordering track editing rather
+    /// than working.
+    pub fn launched_profile_id(&self) -> Option<&str> {
+        match self {
+            Self::StartConfiguredLocalProfile { profile_id }
+            | Self::StartConfiguredSshProfile { profile_id }
+            | Self::StartConfiguredSftpProfile { profile_id }
+            | Self::StartConfiguredSerialProfile { profile_id }
+            | Self::StartConfiguredDevTunnelProfile { profile_id }
+            | Self::StartStoredPasswordSshProfile { profile_id, .. } => Some(profile_id),
+            _ => None,
+        }
+    }
+}
+
+/// A one-shot password value awaiting native-store insertion.
+///
+/// It has no public getter and redacts `Debug`, so application commands remain
+/// safe to inspect in UI tests and diagnostics.
+pub struct PasswordToStore(String);
+
+/// One session-only connect capability. Never OAuth or a bridge host token.
+pub struct TunnelConnectToken(zeroize::Zeroizing<String>);
+pub(crate) const TUNNEL_TOKEN_STORE_PREFIX: &[u8] = b"fesTerm:dev-tunnel-connect:v1\0";
+impl TunnelConnectToken {
+    pub(crate) fn is_valid(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len() <= 16 * 1024
+            && self.0.bytes().all(|byte| byte.is_ascii_graphic())
+    }
+
+    pub(crate) fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+    pub(crate) fn into_stored_secret(self) -> SecretBytes {
+        let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(
+            TUNNEL_TOKEN_STORE_PREFIX.len() + self.0.len(),
+        ));
+        bytes.extend_from_slice(TUNNEL_TOKEN_STORE_PREFIX);
+        bytes.extend_from_slice(self.0.as_bytes());
+        SecretBytes::copy_from_slice(&bytes)
+    }
+}
+impl std::fmt::Debug for TunnelConnectToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TunnelConnectToken([REDACTED])")
+    }
+}
+
+/// A normalized external URL whose contents stay out of command diagnostics.
+pub struct ExternalLinkTarget(String);
+
+/// Initial native credential submitted while creating an SSH or SFTP profile.
+pub enum ProfileCredentialToStore {
+    Password(PasswordToStore),
+    PrivateKey(PrivateKeyToStore),
+}
+
+impl std::fmt::Debug for ProfileCredentialToStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password(_) => {
+                formatter.write_str("ProfileCredentialToStore::Password([REDACTED])")
+            }
+            Self::PrivateKey(_) => {
+                formatter.write_str("ProfileCredentialToStore::PrivateKey([REDACTED])")
+            }
+        }
+    }
+}
+
+impl ExternalLinkTarget {
+    pub(crate) fn new(target: String) -> Self {
+        Self(target)
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ExternalLinkTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ExternalLinkTarget([REDACTED])")
+    }
+}
+
+impl PasswordToStore {
+    pub(crate) fn new(password: String) -> Self {
+        Self(password)
+    }
+
+    pub(crate) fn into_secret_bytes(self) -> SecretBytes {
+        SecretBytes::from_secret_string(self.0)
+    }
+}
+
+impl std::fmt::Debug for PasswordToStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PasswordToStore([REDACTED])")
+    }
+}
+
+/// A one-shot private key + optional passphrase awaiting native-store
+/// insertion.
+///
+/// It has no public getter and redacts `Debug`, so application commands remain
+/// safe to inspect in UI tests and diagnostics.
+pub struct PrivateKeyToStore {
+    key_text: String,
+    passphrase: Option<String>,
+}
+
+impl PrivateKeyToStore {
+    pub(crate) fn new(key_text: String, passphrase: Option<String>) -> Self {
+        Self {
+            key_text,
+            passphrase,
+        }
+    }
+
+    pub(crate) fn into_secret_bytes(self) -> SecretBytes {
+        festerm_ssh::encode_stored_private_key(&self.key_text, self.passphrase.as_deref())
+    }
+}
+
+impl std::fmt::Debug for PrivateKeyToStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PrivateKeyToStore([REDACTED])")
+    }
+}
+
+/// Converts the saved interface preference into the UI-crate layout enum
+/// used by rendering. This is the one place `AppState` bridges the
+/// config-crate and UI-crate chip layout types.
+/// How many tabs back the "return to where I just was" history reaches. A
+/// window with more open tabs than this has long since stopped being a list
+/// anyone navigates by memory, and the history is a convenience rather than a
+/// record: forgetting the oldest entry costs nothing.
+const ACTIVATION_HISTORY_LIMIT: usize = 32;
+
+const fn chip_layout_from_preference(preference: ChipLayoutPreference) -> ChipLayout {
+    match preference {
+        ChipLayoutPreference::Wrap => ChipLayout::Wrap,
+        ChipLayoutPreference::SingleRowScroll => ChipLayout::SingleRowScroll,
+    }
+}
+
+/// Converts a live UI chip layout back into the persisted preference.
+const fn chip_layout_to_preference(layout: ChipLayout) -> ChipLayoutPreference {
+    match layout {
+        ChipLayout::Wrap => ChipLayoutPreference::Wrap,
+        ChipLayout::SingleRowScroll => ChipLayoutPreference::SingleRowScroll,
+    }
+}
+
+/// Pending naming edits collected before moving or closing windows.
+#[derive(Default)]
+pub(crate) struct SessionNameChanges {
+    pub(crate) changed: bool,
+    pub(crate) durable_aliases: Vec<(DurableSessionIdentity, Option<SessionAlias>, u64)>,
+    pub(crate) persistence_unavailable: bool,
+    pub(crate) capacity_exceeded: bool,
+    pub(crate) validation_failure: Option<ConfigError>,
+}
+
+fn native_alias_identity(
+    identity: &festerm_sessiond::NativeSessionIdentity,
+) -> Option<DurableSessionIdentity> {
+    DurableSessionIdentity::native(
+        &identity.name,
+        identity.pid,
+        identity.created_at_unix_ms,
+        &identity.endpoint,
+    )
+    .ok()
+}
+
+struct PendingResume {
+    requires_running_sessions: bool,
+    recording_auto_enrollment: Option<festerm_recording::RecordingId>,
+    target: TabId,
+    receiver: std::sync::mpsc::Receiver<Result<SessionTab, String>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PendingResume {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct PendingNativeTermination {
+    receiver: std::sync::mpsc::Receiver<Result<(), String>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+pub struct AppState {
+    keyboard_bindings: festerm_config::KeyboardBindings,
+    #[cfg(test)]
+    interface_settings_snapshot_count: std::cell::Cell<usize>,
+    pub discovery: crate::discovery::Discovery,
+    pub resume_error: Option<String>,
+    pending_resume: Option<PendingResume>,
+    recording_auto_enrollment: Option<festerm_recording::SharedRecording>,
+    pending_native_termination: Option<PendingNativeTermination>,
+    #[cfg(feature = "experimental-dev-tunnels")]
+    tunnel_reconnects: tunnel_reconnect::TunnelReconnects,
+    tabs: Vec<Tab>,
+    pane_groups: Vec<festerm_config::PaneGroup<TabId>>,
+    pane_scale: f32,
+    pane_chip_ids: std::collections::HashMap<String, TabId>,
+    pane_zoom: Option<TabId>,
+    pane_revision: u64,
+    pane_error: Option<String>,
+    pane_available: egui::Vec2,
+    pane_minimum: egui::Vec2,
+    active: TabId,
+    presentation_workspace: Option<crate::automation::WorkspaceRevision>,
+    /// Which tabs were looked at, oldest first, so that closing the active tab
+    /// can return to the one it was opened from rather than to whichever tab
+    /// happens to sit next to it. Only tabs carrying their own content are
+    /// recorded: Launcher, Settings and Profiles are per-window singletons a
+    /// user passes through, not places to be sent back to. Window-local, and
+    /// deliberately not part of the persisted workspace — "where I just was"
+    /// does not survive a restart.
+    activation_history: Vec<TabId>,
+    /// Every text document open anywhere in the application (ADR 0034 §2).
+    /// Held here so tabs and command dispatch reach it, but owned by the
+    /// process: secondary windows are given the registry that already exists.
+    documents: SharedDocuments,
+    configuration: Configuration,
+    inspector_open: bool,
+    input_ownership_epoch: u64,
+    chip_layout: ChipLayout,
+    status_bar_visible: bool,
+    show_session_details: bool,
+    show_pane_handles: bool,
+    pane_high_contrast: bool,
+    confirm_session_close: bool,
+    prefer_powershell: bool,
+    customize_local_shell: bool,
+    extend_dev_tunnel_lifetime: bool,
+    show_running_dev_tunnels: bool,
+    dev_tunnel_extension_days: u32,
+    /// Whether the open-tab list and active tab persist across restarts
+    /// (`docs/gui-design.md` "Workspace restore"). Off by default and,
+    /// unlike the other interface preferences here, deliberately explicit:
+    /// resurrecting a previous session's tabs is a bigger behavioral change
+    /// than a cosmetic chip-layout/status-bar choice, so it needs its own
+    /// opt-in rather than defaulting on.
+    restore_workspace: bool,
+    terminal_font: TerminalFontPreference,
+    terminal_ligatures: bool,
+    emoji_presentation: EmojiPresentationPreference,
+    scroll_speed: ScrollSpeedPreference,
+    rectangle_copy_trim_trailing_spaces: bool,
+    scrollback_limit: ScrollbackLimitPreference,
+    image_memory_budget: ImageMemoryBudgetPreference,
+    /// How the next text editor view starts out. Options stay per-view once a
+    /// view is open; this is only where a new one begins.
+    editor: festerm_config::EditorSettings,
+    quick_switch_overlay: bool,
+    compact_launcher_grid: bool,
+    /// Whether the New Session/Launcher screen surfaces locally running,
+    /// unattached `festerm-sessiond` sessions as one-click "Resume" entries
+    /// (feature request #70).
+    show_resumable_sessions: bool,
+    /// Whether the status bar names the durable session the active terminal
+    /// is attached to (feature request #168).
+    show_durable_session_in_status_bar: bool,
+    /// Whether fesTerm occasionally checks GitHub for a newer release.
+    automatic_update_checks: bool,
+    mcp_enabled: bool,
+    javascript_enabled: bool,
+    /// Visual left/right order for GUI SFTP panes.
+    sftp_pane_order: SftpPaneOrderPreference,
+    /// The default starting local directory for new SFTP sessions.
+    default_sftp_local_directory: Option<PathBuf>,
+    /// Set by `AppCommand::MoveTabToWindow`, drained once by
+    /// `FesTermApplication` after this window's pass (ADR 0033).
+    pending_tab_move: Option<TabMoveRequest>,
+    /// Set by `AppCommand::OpenWindow`, so the composition root can spawn an
+    /// additional window after this window's pass has finished borrowing it
+    /// (ADR 0032). Drained once by `FesTermApplication`.
+    window_open_requested: bool,
+    /// Set when a view asks for a Save As destination. The picker is an
+    /// application overlay rather than tab state, so the application takes
+    /// this each frame and opens it.
+    save_as_requested: bool,
+    /// A history snapshot that was honestly refused before an editor buffer
+    /// was allocated. Drained by the composition root into a transient notice.
+    history_snapshot_refusal: Option<TerminalTextSnapshotRefusal>,
+    rectangle_copy_refusal: Option<festerm_ui_egui::RectangleCopyError>,
+    /// The last file that could not be opened, waiting to be shown to the
+    /// reader. A refusal that nobody reports is indistinguishable from a
+    /// click that did nothing.
+    open_refusal: Option<(PathBuf, OpenFailure)>,
+    pending_open_refusal_notices: VecDeque<crate::overlay_state::OpenRefusalNotice>,
+    sftp_cleanup_sender: mpsc::SyncSender<crate::overlay_state::OpenRefusalNotice>,
+    sftp_cleanup_receiver: Receiver<crate::overlay_state::OpenRefusalNotice>,
+    pending_terminal_path_opens: Vec<PendingTerminalPathOpen>,
+    /// Set by `AppCommand::OpenProfileEditor` so the just-(re)activated
+    /// singleton Profiles tab opens directly into that profile's editor
+    /// instead of the list. Consumed once by `FesTermApp::screen_command`
+    /// via `take_pending_profile_edit`, since per-tab UI state lives in
+    /// `egui`'s `ui.data`, not here.
+    pending_profile_edit: Option<String>,
+    /// Set by `AppCommand::CreateProfile` so the Profiles surface opens
+    /// straight into a blank editor of the requested kind.
+    pending_profile_create: Option<NewProfileKind>,
+    /// Set whenever a dispatched command launches a saved profile, so the
+    /// composition root can stamp that profile's last-used time and persist
+    /// it once per frame. Recorded here rather than at each launch surface
+    /// so every path -- launcher row, row menu, command palette, workspace
+    /// restore -- is covered by one rule.
+    pending_profile_usage: Option<String>,
+    /// Set whenever a tab-list mutation (open/close/reorder/rename/activate)
+    /// changes what `capture_workspace_configuration` would produce, so the
+    /// composition root can autosave the workspace without every invocation
+    /// surface (chip row, palette, shortcuts, launcher) needing its own
+    /// explicit "Save workspace" call (`docs/gui-design.md`
+    /// "Configuration": save/restore is automatic, not a manual action).
+    /// Consumed once per frame via `take_workspace_dirty`.
+    workspace_dirty: bool,
+    session_names_dirty: bool,
+    pending_durable_aliases: Vec<(DurableSessionIdentity, Option<SessionAlias>, u64)>,
+    session_name_persistence_unavailable: bool,
+    session_name_capacity_exceeded: bool,
+    session_name_validation_failure: Option<ConfigError>,
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        let mut documents = self.documents.borrow_mut();
+        for tab in &self.tabs {
+            if let Some(document) = view_document(&tab.content) {
+                documents.release(document);
+            }
+        }
+    }
+}
+
+impl AppState {
+    /// Builds the `AppState` fields derived purely from `Configuration`'s
+    /// interface settings (chip layout, toggles, keyboard bindings, ...),
+    /// leaving only the tab payload and active selection to the caller.
+    /// Shared by `with_launcher`, `with_primary_session`, and
+    /// `with_restored_workspace`, which otherwise differ only in how their
+    /// initial `tabs`/`active` are produced.
+    fn new_with_tabs(configuration: Configuration, tabs: Vec<Tab>, active: TabId) -> Self {
+        let settings = configuration.interface_settings().clone();
+        let (sftp_cleanup_sender, sftp_cleanup_receiver) = mpsc::sync_channel(8);
+        Self {
+            discovery: Default::default(),
+            resume_error: None,
+            pending_resume: None,
+            recording_auto_enrollment: None,
+            pending_native_termination: None,
+            #[cfg(feature = "experimental-dev-tunnels")]
+            tunnel_reconnects: Default::default(),
+            tabs,
+            pane_groups: Vec::new(),
+            pane_scale: 1.0,
+            pane_chip_ids: std::collections::HashMap::new(),
+            pane_zoom: None,
+            pane_revision: 0,
+            pane_error: None,
+            pane_available: egui::Vec2::ZERO,
+            pane_minimum: egui::vec2(520.0, 240.0),
+            active,
+            presentation_workspace: None,
+            activation_history: Vec::new(),
+            documents: DocumentRegistry::shared(),
+            configuration,
+            inspector_open: false,
+            input_ownership_epoch: 0,
+            chip_layout: chip_layout_from_preference(settings.chip_layout()),
+            status_bar_visible: settings.status_bar_visible(),
+            show_session_details: settings.show_session_details(),
+            show_pane_handles: settings.show_pane_handles(),
+            pane_high_contrast: settings.pane_high_contrast(),
+            confirm_session_close: settings.confirm_session_close(),
+            prefer_powershell: settings.prefer_powershell(),
+            customize_local_shell: settings.customize_local_shell(),
+            extend_dev_tunnel_lifetime: settings.extend_dev_tunnel_lifetime(),
+            show_running_dev_tunnels: settings.show_running_dev_tunnels(),
+            dev_tunnel_extension_days: settings.dev_tunnel_extension_days(),
+            restore_workspace: settings.restore_workspace(),
+            terminal_font: settings.terminal_font(),
+            terminal_ligatures: settings.terminal_ligatures(),
+            emoji_presentation: settings.emoji_presentation(),
+            scroll_speed: settings.scroll_speed(),
+            rectangle_copy_trim_trailing_spaces: settings.rectangle_copy_trim_trailing_spaces(),
+            scrollback_limit: settings.scrollback_limit(),
+            image_memory_budget: settings.image_memory_budget(),
+            editor: settings.editor(),
+            quick_switch_overlay: settings.quick_switch_overlay(),
+            compact_launcher_grid: settings.compact_launcher_grid(),
+            show_resumable_sessions: settings.show_resumable_sessions(),
+            show_durable_session_in_status_bar: settings.show_durable_session_in_status_bar(),
+            automatic_update_checks: settings.automatic_update_checks(),
+            mcp_enabled: settings.mcp_enabled(),
+            javascript_enabled: settings.javascript_enabled(),
+            keyboard_bindings: settings.keyboard_bindings().clone(),
+            #[cfg(test)]
+            interface_settings_snapshot_count: std::cell::Cell::new(0),
+            sftp_pane_order: settings.sftp_pane_order(),
+            default_sftp_local_directory: settings
+                .default_sftp_local_directory()
+                .map(Path::to_path_buf),
+            pending_profile_edit: None,
+            window_open_requested: false,
+            save_as_requested: false,
+            history_snapshot_refusal: None,
+            rectangle_copy_refusal: None,
+            open_refusal: None,
+            pending_open_refusal_notices: VecDeque::new(),
+            sftp_cleanup_sender,
+            sftp_cleanup_receiver,
+            pending_terminal_path_opens: Vec::new(),
+            pending_tab_move: None,
+            pending_profile_create: None,
+            pending_profile_usage: None,
+            workspace_dirty: false,
+            session_names_dirty: false,
+            pending_durable_aliases: Vec::new(),
+            session_name_persistence_unavailable: false,
+            session_name_capacity_exceeded: false,
+            session_name_validation_failure: None,
+        }
+    }
+
+    /// Starts in the singleton Launcher when there is no workspace to restore.
+    /// This is the ordinary product startup path; native-window smoke may
+    /// still request a deterministic primary session explicitly.
+    pub fn with_launcher(configuration: Configuration) -> Self {
+        let id = TabId::next();
+        Self::new_with_tabs(
+            configuration,
+            vec![Tab {
+                id,
+                durable_id: uuid::Uuid::new_v4().to_string(),
+                pane_id: uuid::Uuid::new_v4().to_string(),
+                content: TabContent::Launcher,
+            }],
+            id,
+        )
+    }
+
+    /// Starts with one primary local shell tab, matching the M5 completion
+    /// criterion that fesTerm opens a usable shell without extra steps. An
+    /// optional native-window-smoke profile override replaces the default
+    /// shell with the repository-owned deterministic test child (see
+    /// `native_smoke.rs`). Returns the state plus that tab's id, which the
+    /// caller retains for the native-window smoke driver.
+    pub fn with_primary_session(
+        context: &egui::Context,
+        smoke_profile: Option<LocalProfile>,
+        configuration: Configuration,
+    ) -> (Self, TabId) {
+        let settings = configuration.interface_settings().clone();
+        let session =
+            SessionTab::start_primary(context, smoke_profile, settings.prefer_powershell());
+        let id = TabId::next();
+        let mut state = Self::new_with_tabs(
+            configuration,
+            vec![Tab {
+                id,
+                durable_id: uuid::Uuid::new_v4().to_string(),
+                pane_id: uuid::Uuid::new_v4().to_string(),
+                content: TabContent::Session(Box::new(session)),
+            }],
+            id,
+        );
+        state.apply_scrollback_limit_to_sessions();
+        (state, id)
+    }
+
+    /// Restores only persisted workspace metadata. New process-local tab IDs
+    /// are assigned in saved display order; saved identifiers select focus
+    /// but are never treated as runtime `TabId` values.
+    pub fn with_restored_workspace(
+        context: &egui::Context,
+        configuration: Configuration,
+        workspace: &WorkspaceConfiguration,
+    ) -> Self {
+        let mut state = Self::with_restored_window(
+            context,
+            configuration,
+            workspace.tabs(),
+            workspace.focused_tab_id(),
+        );
+        state.restore_pane_groups(workspace.pane_groups());
+        state
+    }
+
+    /// Restores one window's saved tabs. The primary window's are the
+    /// workspace's own `tabs`; each additional window's come from a
+    /// `WorkspaceWindow` (ADR 0033).
+    pub fn with_restored_window(
+        context: &egui::Context,
+        configuration: Configuration,
+        workspace_tabs: &[WorkspaceTab],
+        focused_tab_id: Option<&str>,
+    ) -> Self {
+        let mut restored = Vec::with_capacity(workspace_tabs.len());
+        let mut focused = None;
+
+        for workspace_tab in workspace_tabs {
+            let id = TabId::next();
+            if focused_tab_id == Some(workspace_tab.identifier()) {
+                focused = Some(id);
+            }
+            let mut content = match workspace_tab {
+                WorkspaceTab::Launcher(_) => TabContent::Launcher,
+                WorkspaceTab::Settings(_) => TabContent::Settings,
+                WorkspaceTab::Profiles(_) => TabContent::Profiles,
+                WorkspaceTab::LocalSession(tab) => {
+                    let local = configuration
+                        .profile(tab.profile_id())
+                        .and_then(festerm_config::Profile::as_local)
+                        .expect("validated workspace local profile reference");
+                    TabContent::Session(Box::new(SessionTab::start_local_profile(
+                        local.to_local_profile(),
+                        local.identifier(),
+                        local.persistence(),
+                        context,
+                        None,
+                        configuration.interface_settings().scrollback_limit(),
+                    )))
+                }
+                WorkspaceTab::SshSession(tab) => {
+                    let ssh = configuration
+                        .profile(tab.profile_id())
+                        .and_then(festerm_config::Profile::as_ssh)
+                        .expect("validated workspace SSH profile reference");
+                    TabContent::SshAuthenticationRequired(SshAuthenticationRequiredTab {
+                        profile: ssh.clone(),
+                        alias: tab.alias().cloned(),
+                    })
+                }
+                WorkspaceTab::SftpSession(tab) => {
+                    let ssh = configuration
+                        .profile(tab.profile_id())
+                        .and_then(festerm_config::Profile::as_ssh)
+                        .expect("validated workspace SFTP profile reference");
+                    TabContent::SftpAuthenticationRequired(SftpAuthenticationRequiredTab {
+                        profile: ssh.clone(),
+                        alias: tab.alias().cloned(),
+                    })
+                }
+                WorkspaceTab::SftpFileManager(tab) => {
+                    let ssh = configuration
+                        .profile(tab.profile_id())
+                        .and_then(festerm_config::Profile::as_ssh)
+                        .expect("validated GUI SFTP workspace profile reference");
+                    TabContent::SftpFileManagerAuthenticationRequired(Box::new(
+                        SftpFileManagerAuthenticationRequiredTab::new(
+                            SftpFileManagerLaunchTarget {
+                                label: ssh.identifier().to_owned(),
+                                username: ssh.username().to_owned(),
+                                host: ssh.host().to_owned(),
+                                port: ssh.port(),
+                                profile_id: Some(ssh.identifier().to_owned()),
+                                stored_credential_kind: ssh
+                                    .credential_reference()
+                                    .is_some()
+                                    .then_some(ssh.credential_kind()),
+                                known_host_persisted: configuration
+                                    .known_host_fingerprint(ssh.host(), ssh.port())
+                                    .is_some(),
+                            },
+                            false,
+                        ),
+                    ))
+                }
+                WorkspaceTab::SerialSession(tab) => {
+                    let serial = configuration
+                        .profile(tab.profile_id())
+                        .and_then(festerm_config::Profile::as_serial)
+                        .expect("validated workspace serial profile reference");
+                    let settings = serial
+                        .to_line_settings()
+                        .expect("validated serial profile line settings");
+                    TabContent::Session(Box::new(SessionTab::start_serial(
+                        settings,
+                        Some(serial.identifier()),
+                        context,
+                        None,
+                    )))
+                }
+            };
+            if let TabContent::Session(session) = &mut content {
+                let saved = match workspace_tab {
+                    WorkspaceTab::LocalSession(tab) | WorkspaceTab::SerialSession(tab) => Some(tab),
+                    _ => None,
+                };
+                if let Some(saved) = saved {
+                    session.restore_alias(saved.alias());
+                }
+            }
+            restored.push(Tab {
+                id,
+                durable_id: workspace_tab.identifier().to_owned(),
+                pane_id: uuid::Uuid::new_v4().to_string(),
+                content,
+            });
+        }
+
+        let active = focused.unwrap_or_else(|| restored[0].id);
+        let mut state = Self::new_with_tabs(configuration, restored, active);
+        state.apply_scrollback_limit_to_sessions();
+        state
+    }
+
+    pub fn tabs(&self) -> &[Tab] {
+        &self.tabs
+    }
+
+    /// Exact counts of live local processes, SSH connections, and open
+    /// serial devices across every tab, for the aggregate application-quit
+    /// confirmation (`docs/gui-action-graph.md` `QUIT-01`). Uses the same
+    /// "still live" test as `SessionTab::close_requires_confirmation` so the
+    /// aggregate summary and the per-session dialog never disagree about
+    /// which sessions actually have something to lose by closing.
+    pub fn live_session_counts(&self) -> LiveSessionCounts {
+        let mut counts = LiveSessionCounts::default();
+        for tab in &self.tabs {
+            let TabContent::Session(session) = &tab.content else {
+                continue;
+            };
+            if !session.close_requires_confirmation() {
+                continue;
+            }
+            match session.inspector_transport {
+                InspectorTransport::Local { .. } => counts.local += 1,
+                InspectorTransport::Ssh { .. }
+                | InspectorTransport::Sftp { .. }
+                | InspectorTransport::DevTunnel { .. } => counts.ssh += 1,
+                InspectorTransport::Serial { .. } => counts.serial += 1,
+            }
+        }
+        counts
+    }
+
+    pub const fn active(&self) -> TabId {
+        self.active
+    }
+
+    /// Returns the immutable, explicitly supplied profile metadata available
+    /// to Launcher tabs. This method never performs configuration discovery
+    /// or filesystem reads.
+    pub const fn configuration(&self) -> &Configuration {
+        &self.configuration
+    }
+
+    /// Atomically replaces the immutable configuration used only by future
+    /// Launcher choices. Existing session tabs retain their live transports
+    /// and are never stopped or reconfigured.
+    pub fn replace_configuration(&mut self, configuration: Configuration) {
+        for tab in &mut self.tabs {
+            let TabContent::Session(session) = &mut tab.content else {
+                continue;
+            };
+            let Some(identifier) = &mut session.profile_identifier else {
+                continue;
+            };
+            if configuration.profile(identifier).is_some() {
+                continue;
+            }
+            let Some(previous) = self
+                .configuration
+                .profile(identifier)
+                .and_then(|profile| profile.as_local())
+                .and_then(|profile| profile.tunnel_hosting())
+            else {
+                continue;
+            };
+            if let Some(renamed) = configuration.profiles().iter().find(|profile| {
+                profile
+                    .as_local()
+                    .and_then(|profile| profile.tunnel_hosting())
+                    .is_some_and(|binding| binding.installation() == previous.installation())
+            }) {
+                *identifier = renamed.identifier().to_owned();
+            }
+        }
+        self.configuration = configuration;
+    }
+
+    /// Adopts a configuration another window committed (ADR 0032), refreshing
+    /// the interface preferences this state caches so a sibling's Settings,
+    /// profile, or keyboard-binding change takes effect on the next frame.
+    ///
+    /// Deliberately limited to the immutable document and its derived
+    /// preferences: tabs, the active-tab cursor, inspector visibility, the
+    /// input-ownership epoch, pending profile requests, and the
+    /// workspace-dirty flag are window-scoped and are never touched, so a
+    /// sibling's save cannot disturb this window's focus, scroll position, or
+    /// in-progress text entry.
+    pub fn adopt_configuration(&mut self, configuration: Configuration) {
+        let settings = configuration.interface_settings().clone();
+        self.chip_layout = chip_layout_from_preference(settings.chip_layout());
+        self.status_bar_visible = settings.status_bar_visible();
+        self.show_session_details = settings.show_session_details();
+        self.show_pane_handles = settings.show_pane_handles();
+        self.pane_high_contrast = settings.pane_high_contrast();
+        self.confirm_session_close = settings.confirm_session_close();
+        self.prefer_powershell = settings.prefer_powershell();
+        self.extend_dev_tunnel_lifetime = settings.extend_dev_tunnel_lifetime();
+        self.show_running_dev_tunnels = settings.show_running_dev_tunnels();
+        self.dev_tunnel_extension_days = settings.dev_tunnel_extension_days();
+        self.restore_workspace = settings.restore_workspace();
+        self.terminal_font = settings.terminal_font();
+        self.terminal_ligatures = settings.terminal_ligatures();
+        self.emoji_presentation = settings.emoji_presentation();
+        self.scroll_speed = settings.scroll_speed();
+        self.rectangle_copy_trim_trailing_spaces = settings.rectangle_copy_trim_trailing_spaces();
+        self.scrollback_limit = settings.scrollback_limit();
+        self.image_memory_budget = settings.image_memory_budget();
+        self.editor = settings.editor();
+        self.quick_switch_overlay = settings.quick_switch_overlay();
+        self.compact_launcher_grid = settings.compact_launcher_grid();
+        self.show_resumable_sessions = settings.show_resumable_sessions();
+        self.show_durable_session_in_status_bar = settings.show_durable_session_in_status_bar();
+        self.automatic_update_checks = settings.automatic_update_checks();
+        self.mcp_enabled = settings.mcp_enabled();
+        self.javascript_enabled = settings.javascript_enabled();
+        self.keyboard_bindings = settings.keyboard_bindings().clone();
+        self.sftp_pane_order = settings.sftp_pane_order();
+        self.default_sftp_local_directory = settings
+            .default_sftp_local_directory()
+            .map(Path::to_path_buf);
+        self.replace_configuration(configuration);
+    }
+
+    /// Captures only restorable workspace metadata in current display order.
+    ///
+    /// Runtime tab IDs, terminal state, active processes, and SSH transports
+    /// never leave this application state. A session is represented only when
+    /// it retained a configured local-profile identifier and that profile is
+    /// still present in the document being replaced.
+    /// Captures this one window's restorable tabs and focus.
+    ///
+    /// Durable identifiers are assigned once at view creation and move with
+    /// the view. Legacy restored identifiers are preserved; new UUIDs cannot
+    /// collide with their positional `tab-N` namespace. The caller's counter
+    /// remains a count of captured views across windows.
+    pub fn capture_window_workspace_tabs(
+        &self,
+        next_identifier: &mut usize,
+    ) -> Result<(Vec<WorkspaceTab>, Option<String>), ConfigError> {
+        let mut tabs = Vec::new();
+        let mut focused_tab_id = None;
+
+        for tab in &self.tabs {
+            let identifier = tab.durable_id.clone();
+            let workspace_tab = match &tab.content {
+                TabContent::Launcher => Some(WorkspaceTab::launcher(identifier.clone())?),
+                TabContent::Settings => Some(WorkspaceTab::settings(identifier.clone())?),
+                TabContent::Profiles => Some(WorkspaceTab::profiles(identifier.clone())?),
+                // ADR 0034 §12: an editor tab is not restored, because the
+                // buffer it was showing is not persisted anywhere.
+                TabContent::MarkdownViewer(_) | TabContent::TextEditor(_) => None,
+                TabContent::SshAuthenticationRequired(ssh) => Some(WorkspaceTab::ssh_session(
+                    identifier.clone(),
+                    ssh.profile.identifier(),
+                )?),
+                TabContent::SftpAuthenticationRequired(sftp) => Some(WorkspaceTab::sftp_session(
+                    identifier.clone(),
+                    sftp.profile.identifier(),
+                )?),
+                TabContent::SftpFileManagerAuthenticationRequired(tab) => tab
+                    .target
+                    .profile_id
+                    .as_deref()
+                    .map(|profile_id| {
+                        WorkspaceTab::sftp_file_manager(identifier.clone(), profile_id)
+                    })
+                    .transpose()?,
+                TabContent::SftpFileManager(tab) => tab
+                    .profile_identifier
+                    .as_deref()
+                    .map(|profile_id| {
+                        WorkspaceTab::sftp_file_manager(identifier.clone(), profile_id)
+                    })
+                    .transpose()?,
+                TabContent::Session(session) => session
+                    .profile_identifier
+                    .as_deref()
+                    .and_then(|profile_id| {
+                        let profile = self.configuration.profile(profile_id)?;
+                        if profile.as_local().is_some() {
+                            Some(WorkspaceTab::local_session(identifier.clone(), profile_id))
+                        } else if profile.as_ssh().is_some()
+                            && matches!(
+                                session.inspector_transport,
+                                InspectorTransport::Sftp { .. }
+                            )
+                        {
+                            Some(WorkspaceTab::sftp_session(identifier.clone(), profile_id))
+                        } else if profile.as_ssh().is_some() {
+                            Some(WorkspaceTab::ssh_session(identifier.clone(), profile_id))
+                        } else if profile.as_serial().is_some() {
+                            Some(WorkspaceTab::serial_session(identifier.clone(), profile_id))
+                        } else {
+                            None
+                        }
+                    })
+                    .transpose()?,
+            };
+            if let Some(mut workspace_tab) = workspace_tab {
+                match &tab.content {
+                    TabContent::Session(session) => {
+                        workspace_tab =
+                            workspace_tab.with_session_alias(session.explicit_alias.clone())?;
+                    }
+                    TabContent::SshAuthenticationRequired(tab) => {
+                        workspace_tab = workspace_tab.with_session_alias(tab.alias.clone())?;
+                    }
+                    TabContent::SftpAuthenticationRequired(tab) => {
+                        workspace_tab = workspace_tab.with_session_alias(tab.alias.clone())?;
+                    }
+                    _ => {}
+                }
+                if tab.id == self.active {
+                    focused_tab_id = Some(workspace_tab.identifier().to_owned());
+                }
+                *next_identifier += 1;
+                tabs.push(workspace_tab);
+            }
+        }
+
+        let focused_tab_id =
+            focused_tab_id.or_else(|| tabs.first().map(|tab| tab.identifier().to_owned()));
+        Ok((tabs, focused_tab_id))
+    }
+
+    /// Composes the whole workspace: this (primary) window's tabs, plus one
+    /// entry per additional window the Application captured (ADR 0033).
+    ///
+    /// A primary window with nothing restorable still saves a Launcher, so the
+    /// schema's "at least one tab" rule holds; an additional window with
+    /// nothing restorable is simply not saved, because inventing a Launcher
+    /// for it would resurrect an empty window on every restart.
+    pub fn capture_workspace_configuration(
+        &self,
+        additional_windows: Vec<festerm_config::WorkspaceWindow>,
+        next_identifier: &mut usize,
+        geometry: Option<festerm_config::WorkspaceWindowGeometry>,
+    ) -> Result<Configuration, ConfigError> {
+        let (mut tabs, mut focused_tab_id) = self.capture_window_workspace_tabs(next_identifier)?;
+        if tabs.is_empty() {
+            let identifier = uuid::Uuid::new_v4().to_string();
+            *next_identifier += 1;
+            tabs.push(WorkspaceTab::launcher(identifier.clone())?);
+            focused_tab_id = Some(identifier);
+        }
+        let pane_groups = self.saved_pane_groups(&tabs);
+        let workspace = WorkspaceConfiguration::with_windows_and_geometry(
+            tabs,
+            focused_tab_id,
+            additional_windows,
+            geometry,
+        )?
+        .with_pane_groups(pane_groups)?;
+        self.configuration.with_workspace(workspace)
+    }
+
+    pub const fn inspector_open(&self) -> bool {
+        self.inspector_open
+    }
+
+    pub const fn input_ownership_epoch(&self) -> u64 {
+        self.input_ownership_epoch
+    }
+
+    pub const fn chip_layout(&self) -> ChipLayout {
+        self.chip_layout
+    }
+
+    pub const fn status_bar_visible(&self) -> bool {
+        self.status_bar_visible
+    }
+
+    pub const fn show_session_details(&self) -> bool {
+        self.show_session_details
+    }
+
+    pub const fn show_pane_handles(&self) -> bool {
+        self.show_pane_handles
+    }
+
+    pub const fn pane_high_contrast(&self) -> bool {
+        self.pane_high_contrast
+    }
+
+    pub const fn confirm_session_close(&self) -> bool {
+        self.confirm_session_close
+    }
+
+    pub const fn restore_workspace(&self) -> bool {
+        self.restore_workspace
+    }
+
+    pub const fn terminal_font(&self) -> TerminalFontPreference {
+        self.terminal_font
+    }
+
+    pub const fn terminal_ligatures(&self) -> bool {
+        self.terminal_ligatures
+    }
+
+    pub const fn emoji_presentation(&self) -> EmojiPresentationPreference {
+        self.emoji_presentation
+    }
+
+    pub const fn scroll_speed(&self) -> ScrollSpeedPreference {
+        self.scroll_speed
+    }
+
+    pub const fn rectangle_copy_trim_trailing_spaces(&self) -> bool {
+        self.rectangle_copy_trim_trailing_spaces
+    }
+
+    pub fn take_rectangle_copy_refusal(&mut self) -> Option<festerm_ui_egui::RectangleCopyError> {
+        self.rectangle_copy_refusal.take()
+    }
+
+    pub const fn scrollback_limit(&self) -> ScrollbackLimitPreference {
+        self.scrollback_limit
+    }
+
+    pub const fn image_memory_budget(&self) -> ImageMemoryBudgetPreference {
+        self.image_memory_budget
+    }
+
+    pub const fn quick_switch_overlay(&self) -> bool {
+        self.quick_switch_overlay
+    }
+
+    pub const fn compact_launcher_grid(&self) -> bool {
+        self.compact_launcher_grid
+    }
+
+    pub const fn show_resumable_sessions(&self) -> bool {
+        self.show_resumable_sessions
+    }
+
+    pub const fn show_durable_session_in_status_bar(&self) -> bool {
+        self.show_durable_session_in_status_bar
+    }
+
+    pub const fn automatic_update_checks(&self) -> bool {
+        self.automatic_update_checks
+    }
+
+    pub const fn mcp_enabled(&self) -> bool {
+        self.mcp_enabled
+    }
+
+    pub const fn javascript_enabled(&self) -> bool {
+        self.javascript_enabled
+    }
+
+    pub(crate) fn set_automation_preferences(&mut self, mcp: bool, javascript: bool) {
+        self.mcp_enabled = mcp;
+        self.javascript_enabled = javascript;
+    }
+
+    pub const fn prefer_powershell(&self) -> bool {
+        self.prefer_powershell
+    }
+
+    pub const fn show_running_dev_tunnels(&self) -> bool {
+        self.show_running_dev_tunnels
+    }
+
+    pub const fn extend_dev_tunnel_lifetime(&self) -> bool {
+        self.extend_dev_tunnel_lifetime
+    }
+
+    pub const fn dev_tunnel_extension_days(&self) -> u32 {
+        self.dev_tunnel_extension_days
+    }
+
+    pub const fn customize_local_shell(&self) -> bool {
+        self.customize_local_shell
+    }
+
+    pub const fn sftp_pane_order(&self) -> SftpPaneOrderPreference {
+        self.sftp_pane_order
+    }
+
+    pub fn default_sftp_local_directory(&self) -> Option<&Path> {
+        self.default_sftp_local_directory.as_deref()
+    }
+
+    /// Borrows live bindings without constructing a persistable settings copy.
+    pub const fn keyboard_bindings(&self) -> &festerm_config::KeyboardBindings {
+        &self.keyboard_bindings
+    }
+
+    /// Returns the current chip-layout, status-bar, and session-detail
+    /// preferences as a persistable value, for the composition root to write
+    /// through after a toggle or reset.
+    pub fn interface_settings(&self) -> InterfaceSettings {
+        #[cfg(test)]
+        self.interface_settings_snapshot_count
+            .set(self.interface_settings_snapshot_count.get() + 1);
+        InterfaceSettings::new(
+            chip_layout_to_preference(self.chip_layout),
+            self.status_bar_visible,
+            self.show_session_details,
+            self.confirm_session_close,
+            self.restore_workspace,
+        )
+        .with_terminal_typography(self.terminal_font, self.terminal_ligatures)
+        .with_show_pane_handles(self.show_pane_handles)
+        .with_pane_high_contrast(self.pane_high_contrast)
+        .with_prefer_powershell(self.prefer_powershell)
+        .with_extend_dev_tunnel_lifetime(self.extend_dev_tunnel_lifetime)
+        .with_show_running_dev_tunnels(self.show_running_dev_tunnels)
+        .with_dev_tunnel_extension_days(self.dev_tunnel_extension_days)
+        .with_customize_local_shell(self.customize_local_shell)
+        .with_emoji_presentation(self.emoji_presentation)
+        .with_scroll_speed(self.scroll_speed)
+        .with_rectangle_copy_trim_trailing_spaces(self.rectangle_copy_trim_trailing_spaces)
+        .with_editor(self.editor)
+        .with_scrollback_limit(self.scrollback_limit)
+        .with_image_memory_budget(self.image_memory_budget)
+        .with_quick_switch_overlay(self.quick_switch_overlay)
+        .with_compact_launcher_grid(self.compact_launcher_grid)
+        .with_show_resumable_sessions(self.show_resumable_sessions)
+        .with_show_durable_session_in_status_bar(self.show_durable_session_in_status_bar)
+        .with_automatic_update_checks(self.automatic_update_checks)
+        .with_mcp_enabled(self.mcp_enabled)
+        .with_javascript_enabled(self.javascript_enabled)
+        .with_keyboard_bindings(self.keyboard_bindings.clone())
+        .with_sftp_pane_order(self.sftp_pane_order)
+        .with_default_sftp_local_directory(
+            self.default_sftp_local_directory
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+        )
+    }
+
+    pub fn active_tab_mut(&mut self) -> &mut Tab {
+        let active = self.active;
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.id == active)
+            .expect("active tab id always refers to a live tab")
+    }
+
+    pub fn active_tab(&self) -> &Tab {
+        let active = self.active;
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == active)
+            .expect("active tab id always refers to a live tab")
+    }
+
+    pub fn session_tab(&self, id: TabId) -> Option<&SessionTab> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| match &tab.content {
+                TabContent::Session(session) => Some(session.as_ref()),
+                TabContent::Launcher
+                | TabContent::Settings
+                | TabContent::Profiles
+                | TabContent::SshAuthenticationRequired(_)
+                | TabContent::SftpAuthenticationRequired(_)
+                | TabContent::SftpFileManagerAuthenticationRequired(_)
+                | TabContent::SftpFileManager(_)
+                | TabContent::MarkdownViewer(_)
+                | TabContent::TextEditor(_) => None,
+            })
+    }
+
+    pub fn session_tab_mut(&mut self, id: TabId) -> Option<&mut SessionTab> {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| match &mut tab.content {
+                TabContent::Session(session) => Some(session.as_mut()),
+                TabContent::Launcher
+                | TabContent::Settings
+                | TabContent::Profiles
+                | TabContent::MarkdownViewer(_)
+                | TabContent::TextEditor(_)
+                | TabContent::SshAuthenticationRequired(_)
+                | TabContent::SftpAuthenticationRequired(_)
+                | TabContent::SftpFileManagerAuthenticationRequired(_)
+                | TabContent::SftpFileManager(_) => None,
+            })
+    }
+
+    pub fn sftp_file_manager_tab_mut(&mut self, id: TabId) -> Option<&mut SftpFileManagerTab> {
+        self.tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| match &mut tab.content {
+                TabContent::SftpFileManager(session) => Some(session.as_mut()),
+                TabContent::Launcher
+                | TabContent::Settings
+                | TabContent::Profiles
+                | TabContent::MarkdownViewer(_)
+                | TabContent::TextEditor(_)
+                | TabContent::SshAuthenticationRequired(_)
+                | TabContent::SftpAuthenticationRequired(_)
+                | TabContent::SftpFileManagerAuthenticationRequired(_)
+                | TabContent::Session(_) => None,
+            })
+    }
+
+    pub fn apply_terminal_font_set(&mut self, font_set: festerm_ui_egui::TerminalFontSet) {
+        for tab in &mut self.tabs {
+            if let TabContent::Session(session) = &mut tab.content {
+                session.view.set_font_set(font_set);
+            }
+        }
+    }
+
+    /// The terminal grid size a brand-new tab should start at, so opening a
+    /// session in an already-resized window doesn't visibly snap back to the
+    /// application's baseline default and get corrected only on the next
+    /// resize. Prefers the active session tab's current dimensions (the one
+    /// most recently rendered against the real window size); falls back to
+    /// any other live session tab, then `None` (baseline default) if no
+    /// session tab exists yet, e.g. a fresh Launcher-only window.
+    fn current_session_dimensions(&self) -> Option<Dimensions> {
+        if let TabContent::Session(active) = &self.active_tab().content {
+            return Some(active.terminal.dimensions());
+        }
+        self.tabs.iter().find_map(|tab| match &tab.content {
+            TabContent::Session(session) => Some(session.terminal.dimensions()),
+            TabContent::Launcher
+            | TabContent::Settings
+            | TabContent::Profiles
+            | TabContent::MarkdownViewer(_)
+            | TabContent::TextEditor(_)
+            | TabContent::SshAuthenticationRequired(_)
+            | TabContent::SftpAuthenticationRequired(_)
+            | TabContent::SftpFileManagerAuthenticationRequired(_)
+            | TabContent::SftpFileManager(_) => None,
+        })
+    }
+
+    /// Every running session tab paired with its `TabId`, independent of
+    /// which is active. Used where a caller needs to compare each tab
+    /// against the currently active tab (feature request #68: only a
+    /// *non-active* tab's output should mark it as having new output).
+    pub fn session_tabs_with_id_mut(&mut self) -> impl Iterator<Item = (TabId, &mut SessionTab)> {
+        self.tabs
+            .iter_mut()
+            .filter_map(|tab| match &mut tab.content {
+                TabContent::Session(session) => Some((tab.id, session.as_mut())),
+                TabContent::Launcher
+                | TabContent::Settings
+                | TabContent::Profiles
+                | TabContent::MarkdownViewer(_)
+                | TabContent::TextEditor(_)
+                | TabContent::SshAuthenticationRequired(_)
+                | TabContent::SftpAuthenticationRequired(_)
+                | TabContent::SftpFileManagerAuthenticationRequired(_)
+                | TabContent::SftpFileManager(_) => None,
+            })
+    }
+
+    pub(crate) fn set_recording_auto_enrollment(
+        &mut self,
+        recording: Option<festerm_recording::SharedRecording>,
+    ) {
+        self.recording_auto_enrollment = recording;
+    }
+
+    /// Requests an on-demand SSH-level liveness probe (ADR 0018) on every
+    /// open SSH session tab. Intended for a wake/network-change signal:
+    /// each request is coalescing and nonblocking, so calling this
+    /// repeatedly (e.g. once per detected event) never queues more than one
+    /// pending probe per session. Errors are deliberately discarded — a
+    /// session that isn't running, or that already has a probe pending, is
+    /// an ordinary, expected outcome here, not a fault to surface.
+    pub fn request_liveness_check_on_all_sessions(&self) {
+        for tab in &self.tabs {
+            if let TabContent::Session(session) = &tab.content {
+                if let Some(session) = session.controller.session() {
+                    let _ = session.try_check_liveness();
+                }
+            }
+        }
+    }
+
+    /// Applies one `AppCommand`. This is the single command-handling path;
+    /// every invocation surface must converge here rather than implementing
+    /// independent tab/session policy.
+    pub fn dispatch(&mut self, command: AppCommand, context: &egui::Context) {
+        let previous_owner = (self.active, self.inspector_open);
+        if let Some(profile_id) = command.launched_profile_id() {
+            self.pending_profile_usage = Some(profile_id.to_owned());
+        }
+        match command {
+            command @ (AppCommand::CombinePanes { .. }
+            | AppCommand::FocusPaneDirection(..)
+            | AppCommand::ResizeFocusedPane { .. }
+            | AppCommand::ClosePaneGroup { .. }
+            | AppCommand::SetPanePreset { .. }
+            | AppCommand::SwapPanes { .. }
+            | AppCommand::SeparatePane(_)
+            | AppCommand::DetachPane { .. }
+            | AppCommand::SeparatePaneGroup(_)
+            | AppCommand::EqualizePanes(_)
+            | AppCommand::ZoomPane(_)
+            | AppCommand::FocusNextPane { .. }
+            | AppCommand::RenamePaneGroup { .. }
+            | AppCommand::ResizePaneSplit { .. }) => self.dispatch_pane_command(command),
+            #[cfg(feature = "experimental-dev-tunnels")]
+            AppCommand::ConnectDevTunnel(launch) => {
+                self.start_tunnel_launch(None, None, move || Ok(launch), context);
+            }
+            AppCommand::OpenLauncher => self.open_launcher(),
+            AppCommand::OpenWindow => self.window_open_requested = true,
+            AppCommand::MoveTabToWindow {
+                moved,
+                target,
+                before,
+                screen_position,
+            } => {
+                if self.pane_group(moved).is_some() {
+                    self.pane_error = Some("Separate the group into single-view tabs before moving it to another window.".into());
+                    return;
+                }
+                // ADR 0033: Launcher, Settings, and Profiles are per-window
+                // singletons every window opens for itself, so they never
+                // travel between windows. The chip row already refuses to
+                // start such a move; this is the state-level guard, so any
+                // other command source (keyboard, tests, a future menu
+                // item) cannot smuggle one through either.
+                if self
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.id == moved && tab.content.movable_across_windows())
+                {
+                    self.pending_tab_move = Some(TabMoveRequest {
+                        moved,
+                        target,
+                        before,
+                        screen_position,
+                    });
+                }
+            }
+            AppCommand::OpenSettings => self.open_settings(),
+            AppCommand::OpenRecording
+            | AppCommand::OpenRecordingSettings
+            | AppCommand::OpenRecordingLibrary => {}
+            AppCommand::OpenProfiles => self.open_profiles(),
+            AppCommand::CreateProfile { kind } => {
+                self.open_profiles();
+                self.pending_profile_create = Some(kind);
+            }
+            AppCommand::OpenDevTunnelHostSetup => {
+                self.open_profiles();
+                self.pending_profile_create = Some(NewProfileKind::HostSetup);
+            }
+            AppCommand::OpenHostSetupScript { platform } => self.open_host_setup_script(platform),
+            AppCommand::CreateSshProfileFromDraft { draft } => {
+                self.open_profiles();
+                self.pending_profile_create = Some(NewProfileKind::SshFromDraft(draft));
+            }
+            // Choosing the file is host I/O the composition root owns; if
+            // this command ever reaches here the picker was unavailable, so
+            // there is nothing to open.
+            AppCommand::OpenMarkdownWorkspace => {}
+            AppCommand::OpenLocalMarkdownFile { path, replacing } => {
+                self.open_local_markdown(path, replacing);
+            }
+            AppCommand::OpenRemoteMarkdownSnapshot {
+                source,
+                display_path,
+                content,
+            } => self.open_remote_markdown(source, display_path, content),
+            AppCommand::OpenRemoteTextSnapshot {
+                origin,
+                text,
+                read_only,
+            } => self.open_remote_text(origin, text, read_only),
+            AppCommand::OpenTerminalDetectedPath { tab_id } => {
+                self.open_detected_terminal_path(tab_id, context)
+            }
+            AppCommand::OpenTerminalHyperlink {
+                tab_id,
+                lifecycle_generation,
+                target,
+            } => self.open_terminal_hyperlink(
+                tab_id,
+                lifecycle_generation,
+                target.into_inner(),
+                context,
+            ),
+            AppCommand::OpenExternalLink { target } => {
+                if let Some(target) = festerm_core::normalize_external_web_url(&target.into_inner())
+                {
+                    context.open_url(egui::OpenUrl::new_tab(target));
+                }
+            }
+            AppCommand::OpenProfileEditor { identifier } => self.open_profile_editor(identifier),
+            AppCommand::StartLocalSession => self.start_local_session(context),
+            AppCommand::StartLocalSessionWithProfile { profile } => {
+                self.start_local_session_with_profile(profile, context)
+            }
+            AppCommand::StartConfiguredLocalProfile { profile_id } => {
+                self.start_configured_local_profile(&profile_id, context)
+            }
+
+            AppCommand::StartSshSession {
+                profile,
+                authentication,
+                options,
+            } => self.execute_ssh_session(profile, authentication, options, None, context),
+            AppCommand::StartSftpSession {
+                profile,
+                authentication,
+            } => self.execute_sftp_session(profile, authentication, None, context),
+            AppCommand::OpenSftpFileManager { target } => self.open_sftp_file_manager(target),
+            AppCommand::StartSftpFileManager {
+                target,
+                authentication,
+            } => self.start_sftp_file_manager(target, authentication, context),
+            AppCommand::RetrySftpFileManagerConnection { tab_id, target } => {
+                self.retry_sftp_file_manager_connection(tab_id, target)
+            }
+            AppCommand::RetryTerminalFontDownload
+            | AppCommand::StartStoredPasswordSshProfile { .. }
+            | AppCommand::StartStoredPasswordSftpProfile { .. }
+            | AppCommand::StartStoredSftpFileManagerProfile { .. }
+            | AppCommand::StoreSshPassword { .. }
+            | AppCommand::StoreSftpPassword { .. }
+            | AppCommand::StoreProfilePassword { .. }
+            | AppCommand::StoreDevTunnelConnectToken { .. }
+            | AppCommand::BrowseDevTunnels { .. }
+            | AppCommand::AddDevTunnelAccount
+            | AppCommand::RemoveDevTunnelAccount { .. }
+            | AppCommand::SaveAndConnectDevTunnel { .. }
+            | AppCommand::ConnectRunningDevTunnel { .. }
+            | AppCommand::ConnectDevTunnelForm { .. }
+            | AppCommand::StartConfiguredDevTunnelProfile { .. }
+            | AppCommand::StoreProfilePrivateKey { .. }
+            | AppCommand::StartConfiguredSshProfile { .. }
+            | AppCommand::StartConfiguredSftpProfile { .. } => {}
+            #[cfg(feature = "experimental-dev-tunnels")]
+            AppCommand::ImportPublicDevTunnelProfile { .. } => {}
+            AppCommand::OpenTextEditor { path } => {
+                if let Some(failure) = self.open_text_editor(&path) {
+                    self.open_refusal = Some((path, failure));
+                }
+            }
+            AppCommand::NewTextDocument => self.new_text_document(),
+            AppCommand::OpenTerminalHistoryInEditor => self.open_terminal_history_snapshot(false),
+            AppCommand::SaveTerminalHistoryAs => self.open_terminal_history_snapshot(true),
+            AppCommand::OpenAnotherEditorView => self.open_another_editor_view(),
+            AppCommand::SaveTextDocument => self.save_active_text_document(),
+            AppCommand::SaveTextDocumentAs => self.save_as_requested = true,
+            AppCommand::SaveTextDocumentTo { path, destination } => {
+                self.save_active_text_document_to(&path, &destination)
+            }
+            AppCommand::RefreshTextDocument => {
+                self.with_active_document(|registry, id| {
+                    registry.refresh(id);
+                });
+            }
+            AppCommand::ReloadTextDocument => {
+                self.with_active_document(|registry, id| {
+                    registry.reload_from_source(id);
+                });
+            }
+            AppCommand::KeepMyTextVersion => {
+                self.with_active_document(|registry, id| {
+                    if let Some(open) = registry.get_mut(id) {
+                        open.keep_my_version();
+                    }
+                });
+            }
+            AppCommand::ReloadMarkdown => {
+                self.with_active_markdown_viewer(|viewer| viewer.reload())
+            }
+            AppCommand::ToggleMarkdownPreviewSource => {
+                self.with_active_markdown_viewer(|viewer| viewer.toggle_mode())
+            }
+            AppCommand::ToggleMarkdownOutline => {
+                self.with_active_markdown_viewer(|viewer| viewer.toggle_outline())
+            }
+            AppCommand::OpenMarkdownFind => {
+                self.with_active_markdown_viewer(|viewer| viewer.open_find())
+            }
+            AppCommand::NavigateMarkdownFind { reverse } => {
+                self.with_active_markdown_viewer(|viewer| viewer.advance_find(reverse))
+            }
+            AppCommand::LoadMarkdownLocalImage { reference_index } => {
+                match &mut self.active_tab_mut().content {
+                    TabContent::MarkdownViewer(viewer) => {
+                        viewer.load_local_image(reference_index, context)
+                    }
+                    TabContent::TextEditor(editor) => {
+                        editor.load_local_image(reference_index, context)
+                    }
+                    _ => {}
+                }
+            }
+            AppCommand::OpenConfiguredSftpFileManagerProfile { profile_id } => {
+                self.open_configured_sftp_file_manager_profile(&profile_id)
+            }
+            AppCommand::StartSerialSession { settings } => {
+                self.start_serial_session(settings, context)
+            }
+            AppCommand::StartConfiguredSerialProfile { profile_id } => {
+                self.start_configured_serial_profile(&profile_id, context)
+            }
+            AppCommand::ResolveHostKeyTrust { tab, decision } => {
+                self.resolve_host_key_trust(tab, decision)
+            }
+            AppCommand::ResolveSshPassword { tab, password } => {
+                self.resolve_ssh_password(tab, password)
+            }
+            AppCommand::ReconnectSession(tab) => {
+                self.request_reconnect(tab);
+                context.request_repaint();
+            }
+            AppCommand::ActivateTab(id) => self.activate(id),
+            AppCommand::RedrawTerminal(id) => {
+                if let Some(session) = self.session_tab_mut(id) {
+                    session.view.request_full_redraw();
+                    context.request_repaint();
+                } else {
+                    tracing::warn!(target: "festerm::commands", "terminal redraw target is not a session");
+                }
+            }
+            AppCommand::BeginRectangleCopy(id) => {
+                if id != self.active {
+                    tracing::warn!(target: "festerm::commands", "rectangle copy target is not active");
+                    return;
+                }
+                let trim = self.rectangle_copy_trim_trailing_spaces;
+                let Some(session) = self.session_tab_mut(id) else {
+                    tracing::warn!(target: "festerm::commands", "rectangle copy target is not a session");
+                    return;
+                };
+                if !session.view.rectangle_copy_active() {
+                    let result = session.begin_rectangle_copy(trim);
+                    match result {
+                        Ok(()) => {
+                            self.input_ownership_epoch = self.input_ownership_epoch.wrapping_add(1);
+                            egui::Popup::close_all(context);
+                            context.request_repaint();
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "festerm::commands", %error, "rectangle copy refused");
+                            self.rectangle_copy_refusal = Some(error);
+                        }
+                    }
+                }
+            }
+            AppCommand::SmartSelect(id, scope) => {
+                if id != self.active {
+                    tracing::warn!(target: "festerm::commands", "smart selection target is not active");
+                    return;
+                }
+                if let Some(session) = self.session_tab_mut(id) {
+                    if !session.view.rectangle_copy_active() {
+                        session
+                            .view
+                            .smart_select_at_target(&session.terminal, scope);
+                        egui::Popup::close_all(context);
+                        context.request_repaint();
+                    }
+                } else {
+                    tracing::warn!(target: "festerm::commands", "smart selection target is not a session");
+                }
+            }
+            AppCommand::ActivateNextTab => self.activate_relative(1),
+            AppCommand::ActivatePreviousTab => self.activate_relative(-1),
+            AppCommand::CloseTab(id) | AppCommand::DiscardAndCloseTab(id) => self.close(id),
+            AppCommand::ReorderTab { moved, before } => self.reorder(moved, before),
+            AppCommand::MoveTabLeft(id) => self.move_tab(id, -1),
+            AppCommand::MoveTabRight(id) => self.move_tab(id, 1),
+            AppCommand::RenameTab(id, name) => self.rename(id, name),
+            AppCommand::UseDefaultSessionName(id) => self.use_default_session_name(id),
+            AppCommand::ToggleSessionInspector => {
+                if matches!(self.active_tab().content, TabContent::Session(_)) {
+                    self.inspector_open = !self.inspector_open;
+                }
+            }
+            AppCommand::ToggleChipLayout => {
+                self.chip_layout = match self.chip_layout {
+                    ChipLayout::Wrap => ChipLayout::SingleRowScroll,
+                    ChipLayout::SingleRowScroll => ChipLayout::Wrap,
+                };
+            }
+            AppCommand::ToggleStatusBar => {
+                self.status_bar_visible = !self.status_bar_visible;
+            }
+            AppCommand::ToggleShowSessionDetails => {
+                self.show_session_details = !self.show_session_details;
+            }
+            AppCommand::TogglePaneHandles => {
+                self.show_pane_handles = !self.show_pane_handles;
+            }
+            AppCommand::TogglePaneHighContrast => {
+                self.pane_high_contrast = !self.pane_high_contrast;
+            }
+            AppCommand::ToggleConfirmSessionClose => {
+                self.confirm_session_close = !self.confirm_session_close;
+            }
+            AppCommand::TogglePreferPowershell => {
+                self.prefer_powershell = !self.prefer_powershell;
+            }
+            AppCommand::ToggleShowRunningDevTunnels => {
+                self.show_running_dev_tunnels = !self.show_running_dev_tunnels;
+            }
+            AppCommand::ToggleExtendDevTunnelLifetime => {
+                self.extend_dev_tunnel_lifetime = !self.extend_dev_tunnel_lifetime;
+            }
+            AppCommand::SetDevTunnelExtensionDays(days) => {
+                self.dev_tunnel_extension_days = InterfaceSettings::DEFAULT
+                    .with_dev_tunnel_extension_days(days)
+                    .dev_tunnel_extension_days();
+            }
+            AppCommand::ToggleCustomizeLocalShell => {
+                self.customize_local_shell = !self.customize_local_shell;
+            }
+            AppCommand::ToggleRestoreWorkspace => {
+                self.restore_workspace = !self.restore_workspace;
+            }
+            AppCommand::SetTerminalFont(font) => {
+                self.terminal_font = font;
+            }
+            AppCommand::SetKeyboardBindings(bindings) => {
+                if bindings.validate(cfg!(target_os = "macos")).is_ok() {
+                    self.keyboard_bindings = bindings;
+                }
+            }
+            AppCommand::SetInputRecording { tab, enabled } => {
+                if let Some(session) = self.session_tab_mut(tab) {
+                    session
+                        .controller
+                        .input_recorder
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .set_recording(enabled);
+                }
+            }
+            AppCommand::ClearInputRecording(tab) => {
+                if let Some(session) = self.session_tab_mut(tab) {
+                    session
+                        .controller
+                        .input_recorder
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clear();
+                }
+            }
+            AppCommand::CopyInputRecording(tab) => {
+                if let Some(session) = self.session_tab_mut(tab) {
+                    context.copy_text(
+                        session
+                            .controller
+                            .input_recorder
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .report(),
+                    );
+                }
+            }
+            AppCommand::ToggleTerminalLigatures => {
+                self.terminal_ligatures = !self.terminal_ligatures;
+            }
+            AppCommand::SetEmojiPresentation(presentation) => {
+                self.emoji_presentation = presentation;
+            }
+            AppCommand::SetScrollSpeed(speed) => {
+                self.scroll_speed = speed;
+            }
+            AppCommand::ToggleRectangleCopyTrimTrailingSpaces => {
+                self.rectangle_copy_trim_trailing_spaces =
+                    !self.rectangle_copy_trim_trailing_spaces;
+            }
+            AppCommand::SetEditorSettings(editor) => {
+                self.editor = editor;
+            }
+            AppCommand::SetScrollbackLimit(limit) => {
+                self.scrollback_limit = limit;
+            }
+            AppCommand::SetImageMemoryBudget(budget) => {
+                self.image_memory_budget = budget;
+            }
+            AppCommand::ToggleQuickSwitchOverlay => {
+                self.quick_switch_overlay = !self.quick_switch_overlay;
+            }
+            AppCommand::ToggleCompactLauncherGrid => {
+                self.compact_launcher_grid = !self.compact_launcher_grid;
+            }
+            AppCommand::ToggleShowResumableSessions => {
+                self.show_resumable_sessions = !self.show_resumable_sessions;
+            }
+            AppCommand::ToggleDurableSessionInStatusBar => {
+                self.show_durable_session_in_status_bar = !self.show_durable_session_in_status_bar;
+            }
+            AppCommand::ToggleAutomaticUpdateChecks => {
+                self.automatic_update_checks = !self.automatic_update_checks;
+            }
+            AppCommand::ToggleMcpEnabled => {
+                self.mcp_enabled = !self.mcp_enabled;
+            }
+            AppCommand::ToggleJavascriptEnabled => {
+                self.javascript_enabled = !self.javascript_enabled;
+            }
+            AppCommand::RetryAutomationSettings => {}
+            AppCommand::OpenWorkflowPicker => {}
+            AppCommand::Automation(_) => {}
+            AppCommand::SetDefaultSftpLocalDirectory(path) => {
+                self.default_sftp_local_directory = path;
+            }
+            AppCommand::SetSftpPaneOrder(order) => {
+                self.sftp_pane_order = order;
+            }
+            AppCommand::RefreshRunningSessions => {
+                self.discovery.refresh();
+                self.resume_error = None;
+            }
+            AppCommand::TerminateUnattachedSession { session } => {
+                self.begin_native_termination(context, move || {
+                    let command = festerm_sessiond::terminate_unattached_session_command(&session)
+                        .map_err(|error| error.to_string())?;
+                    let output =
+                        crate::local_command::output(command, std::time::Duration::from_secs(8))?
+                            .ok_or("fesTerm session helper is unavailable")?;
+                    if output.status.success() {
+                        Ok(())
+                    } else {
+                        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+                    }
+                });
+            }
+            AppCommand::ResumeUnattachedSession { session } => {
+                let context = context.clone();
+                self.begin_resume(move || {
+                    Ok(SessionTab::start_resumed_session(&session, &context))
+                });
+            }
+            AppCommand::ResumeMultiplexerSession { provider, session } => {
+                let context = context.clone();
+                let dimensions = self.current_session_dimensions();
+                self.begin_resume(move || {
+                    let profile = crate::multiplexer_sessions::attach_profile(provider, &session)?;
+                    let persistence = PersistenceConfiguration::new(provider, &session.name);
+                    let mut tab = SessionTab::start_multiplexer_session(
+                        profile,
+                        &session.name,
+                        &persistence,
+                        &context,
+                        dimensions,
+                    );
+                    let (pid, terminal_device) = match tab.controller.session() {
+                        Some(ApplicationSession::Local(local)) => (
+                            local
+                                .process_id()
+                                .ok_or("Missing client process identity")?,
+                            local.terminal_device().map(std::path::Path::to_owned),
+                        ),
+                        _ => {
+                            return Err(tab
+                                .controller
+                                .start_error()
+                                .unwrap_or("Could not start attachment")
+                                .to_owned())
+                        }
+                    };
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    loop {
+                        tab.pump_session_events();
+                        if !matches!(
+                            tab.controller.session().map(Session::lifecycle),
+                            Some(SessionLifecycle::Starting | SessionLifecycle::Running)
+                        ) {
+                            return Err(format!(
+                                "{} attachment exited before connecting: {}",
+                                provider.label(),
+                                tab.terminal.row_text(0).unwrap_or_default()
+                            ));
+                        }
+                        if crate::multiplexer_sessions::client_attached(
+                            provider,
+                            &session,
+                            pid,
+                            terminal_device.as_deref(),
+                        )? {
+                            return Ok(tab);
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return Err(
+                                "Timed out waiting for the selected session to attach".into()
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                });
+            }
+            AppCommand::ResetInterfaceSettings => {
+                self.chip_layout =
+                    chip_layout_from_preference(InterfaceSettings::DEFAULT.chip_layout());
+                self.status_bar_visible = InterfaceSettings::DEFAULT.status_bar_visible();
+                self.show_session_details = InterfaceSettings::DEFAULT.show_session_details();
+                self.show_pane_handles = InterfaceSettings::DEFAULT.show_pane_handles();
+                self.pane_high_contrast = InterfaceSettings::DEFAULT.pane_high_contrast();
+                self.confirm_session_close = InterfaceSettings::DEFAULT.confirm_session_close();
+                self.prefer_powershell = InterfaceSettings::DEFAULT.prefer_powershell();
+                self.extend_dev_tunnel_lifetime =
+                    InterfaceSettings::DEFAULT.extend_dev_tunnel_lifetime();
+                self.show_running_dev_tunnels =
+                    InterfaceSettings::DEFAULT.show_running_dev_tunnels();
+                self.dev_tunnel_extension_days =
+                    InterfaceSettings::DEFAULT.dev_tunnel_extension_days();
+                self.customize_local_shell = InterfaceSettings::DEFAULT.customize_local_shell();
+                self.restore_workspace = InterfaceSettings::DEFAULT.restore_workspace();
+                self.terminal_font = InterfaceSettings::DEFAULT.terminal_font();
+                self.terminal_ligatures = InterfaceSettings::DEFAULT.terminal_ligatures();
+                self.emoji_presentation = InterfaceSettings::DEFAULT.emoji_presentation();
+                self.scroll_speed = InterfaceSettings::DEFAULT.scroll_speed();
+                self.rectangle_copy_trim_trailing_spaces =
+                    InterfaceSettings::DEFAULT.rectangle_copy_trim_trailing_spaces();
+                self.scrollback_limit = InterfaceSettings::DEFAULT.scrollback_limit();
+                self.image_memory_budget = InterfaceSettings::DEFAULT.image_memory_budget();
+                self.editor = InterfaceSettings::DEFAULT.editor();
+                self.quick_switch_overlay = InterfaceSettings::DEFAULT.quick_switch_overlay();
+                self.compact_launcher_grid = InterfaceSettings::DEFAULT.compact_launcher_grid();
+                self.show_resumable_sessions = InterfaceSettings::DEFAULT.show_resumable_sessions();
+                self.show_durable_session_in_status_bar =
+                    InterfaceSettings::DEFAULT.show_durable_session_in_status_bar();
+                self.automatic_update_checks = InterfaceSettings::DEFAULT.automatic_update_checks();
+                self.mcp_enabled = InterfaceSettings::DEFAULT.mcp_enabled();
+                self.javascript_enabled = InterfaceSettings::DEFAULT.javascript_enabled();
+                self.keyboard_bindings = Default::default();
+                self.sftp_pane_order = InterfaceSettings::DEFAULT.sftp_pane_order();
+                self.default_sftp_local_directory = None;
+            }
+            // The composition root fully intercepts these before dispatch to
+            // persist through the configuration reloader (mirroring
+            // `StoreSshPassword`); they never reach this match with real
+            // work to do here.
+            AppCommand::SaveProfile { .. }
+            | AppCommand::SaveLocalProfile { .. }
+            | AppCommand::SaveDevTunnelProfile { .. }
+            | AppCommand::SaveProfileWithCredential { .. }
+            | AppCommand::DeleteProfile { .. }
+            | AppCommand::ReorderProfiles { .. } => {}
+            #[cfg(feature = "experimental-dev-tunnels")]
+            AppCommand::LocalTunnelHost { .. } => {}
+            #[cfg(feature = "experimental-dev-tunnels")]
+            AppCommand::LocalTunnelCleanup { .. } => {}
+        }
+        // The Inspector follows session chips, but it is not a global panel
+        // for Launcher, Settings, or authentication forms.
+        if !matches!(self.active_tab().content, TabContent::Session(_)) {
+            self.inspector_open = false;
+        }
+        if previous_owner != (self.active, self.inspector_open) {
+            self.input_ownership_epoch = self.input_ownership_epoch.saturating_add(1);
+        }
+    }
+
+    fn with_active_markdown_viewer(&mut self, mut apply: impl FnMut(&mut MarkdownViewerTab)) {
+        let TabContent::MarkdownViewer(viewer) = &mut self.active_tab_mut().content else {
+            return;
+        };
+        apply(viewer);
+    }
+
+    fn open_launcher(&mut self) {
+        // Launcher is a singleton task surface and the window's stable empty
+        // state. Every invocation path focuses the existing chip rather than
+        // manufacturing duplicate launch surfaces.
+        if let Some(existing) = self
+            .tabs
+            .iter()
+            .find(|tab| matches!(tab.content, TabContent::Launcher))
+        {
+            self.set_active(existing.id);
+            self.workspace_dirty = true;
+            return;
+        }
+        let id = TabId::next();
+        self.tabs.push(Tab {
+            id,
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::Launcher,
+        });
+        self.set_active(id);
+        self.workspace_dirty = true;
+    }
+
+    fn open_settings(&mut self) {
+        // Settings is a singleton application surface with its own chip.
+        if let Some(existing) = self
+            .tabs
+            .iter()
+            .find(|tab| matches!(tab.content, TabContent::Settings))
+        {
+            self.set_active(existing.id);
+            self.workspace_dirty = true;
+            return;
+        }
+        let id = TabId::next();
+        self.tabs.push(Tab {
+            id,
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::Settings,
+        });
+        self.set_active(id);
+        self.workspace_dirty = true;
+    }
+
+    fn open_profiles(&mut self) {
+        // Profiles is a singleton application surface with its own chip,
+        // like Settings.
+        if let Some(existing) = self
+            .tabs
+            .iter()
+            .find(|tab| matches!(tab.content, TabContent::Profiles))
+        {
+            let existing_id = existing.id;
+            if matches!(
+                &self.active_tab().content,
+                TabContent::SftpFileManagerAuthenticationRequired(tab) if tab.return_to_profiles
+            ) {
+                self.close(self.active);
+            }
+            self.set_active(existing_id);
+            self.workspace_dirty = true;
+            return;
+        }
+        if matches!(
+            &self.active_tab().content,
+            TabContent::SftpFileManagerAuthenticationRequired(tab) if tab.return_to_profiles
+        ) {
+            self.active_tab_mut().content = TabContent::Profiles;
+            self.workspace_dirty = true;
+            return;
+        }
+        let id = TabId::next();
+        self.tabs.push(Tab {
+            id,
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::Profiles,
+        });
+        self.set_active(id);
+        self.workspace_dirty = true;
+    }
+
+    /// The application-scoped document registry this window was given.
+    pub(crate) fn documents(&self) -> &SharedDocuments {
+        &self.documents
+    }
+
+    /// Joins the registry a sibling window already owns, so the two windows
+    /// share one document per file (ADR 0034 §2).
+    pub(crate) fn adopt_documents(&mut self, documents: SharedDocuments) {
+        self.documents = documents;
+    }
+
+    /// The document the active tab is a view of, if it is an editor.
+    pub(crate) fn active_document(&self) -> Option<DocumentId> {
+        match &self.active_tab().content {
+            TabContent::TextEditor(editor) => Some(editor.document()),
+            _ => None,
+        }
+    }
+
+    /// What closing this tab would do to a document holding unsaved changes.
+    ///
+    /// Only the **final** view prompts: closing one of several views of a
+    /// dirty document takes nothing away, because the text and its undo
+    /// history live in the registry rather than in the tab (ADR 0034 §7).
+    pub(crate) fn document_close_consequence(&self, tab: TabId) -> Option<DirtyDocumentClose> {
+        let content = &self
+            .tabs
+            .iter()
+            .find(|candidate| candidate.id == tab)?
+            .content;
+        let document = view_document(content)?;
+        let registry = self.documents.borrow();
+        let open = registry.get(document)?;
+        (open.text().is_dirty() && open.views() <= 1).then(|| DirtyDocumentClose {
+            document,
+            title: open.origin().file_name().to_owned(),
+            origin: open.origin().qualified_label(),
+        })
+    }
+
+    /// Every tab in this window that is the final view of a dirty document, in
+    /// tab order, so a quit asks about each of them once.
+    pub(crate) fn dirty_document_closes(&self) -> Vec<(TabId, DirtyDocumentClose)> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| {
+                self.document_close_consequence(tab.id)
+                    .map(|consequence| (tab.id, consequence))
+            })
+            .collect()
+    }
+
+    /// A dirty document whose every remaining view belongs to this window.
+    ///
+    /// Window teardown drops all tabs as one batch, so two views in the same
+    /// window are collectively final even though neither tab is final alone.
+    pub(crate) fn dirty_document_lost_by_window_close(&self) -> Option<DirtyDocumentClose> {
+        let registry = self.documents.borrow();
+        let mut examined = Vec::new();
+        for tab in &self.tabs {
+            let Some(document) = view_document(&tab.content) else {
+                continue;
+            };
+            if examined.contains(&document) {
+                continue;
+            }
+            examined.push(document);
+            let Some(open) = registry.get(document) else {
+                continue;
+            };
+            let owned_views = self
+                .tabs
+                .iter()
+                .filter(|candidate| view_document(&candidate.content) == Some(document))
+                .count();
+            if open.text().is_dirty() && owned_views >= open.views() {
+                return Some(DirtyDocumentClose {
+                    document,
+                    title: open.origin().file_name().to_owned(),
+                    origin: open.origin().qualified_label(),
+                });
+            }
+        }
+        None
+    }
+
+    pub(crate) fn first_dirty_document(&self) -> Option<DirtyDocumentClose> {
+        self.documents
+            .borrow()
+            .first_dirty_document()
+            .map(|(document, title, origin)| DirtyDocumentClose {
+                document,
+                title,
+                origin,
+            })
+    }
+
+    /// Writes a document to its source, reporting what happened so a caller
+    /// that is closing the tab afterwards can decline to close on a failure.
+    pub(crate) fn save_document(&mut self, document: DocumentId) -> Option<SaveOutcome> {
+        let documents = Rc::clone(&self.documents);
+        let mut registry = documents.borrow_mut();
+        registry.save(document)
+    }
+
+    pub(crate) fn document_requires_save_as(&self, document: DocumentId) -> bool {
+        self.documents
+            .borrow()
+            .get(document)
+            .is_some_and(crate::documents::OpenDocument::requires_save_as)
+    }
+
+    fn with_active_document(&mut self, action: impl FnOnce(&mut DocumentRegistry, DocumentId)) {
+        let Some(id) = self.active_document() else {
+            return;
+        };
+        let documents = Rc::clone(&self.documents);
+        let mut registry = documents.borrow_mut();
+        action(&mut registry, id);
+    }
+
+    fn save_active_text_document(&mut self) {
+        let Some(document) = self.active_document() else {
+            return;
+        };
+        if self.document_requires_save_as(document) {
+            self.save_as_requested = true;
+            return;
+        }
+        self.documents.borrow_mut().save(document);
+    }
+
+    /// Writes the active editor's text to `path` and moves that view onto the
+    /// document the write produced.
+    ///
+    /// The original document is released by this view only; if another view
+    /// still holds it, it stays open on its own file, which is the whole
+    /// difference between Save As and a rename (ADR 0034 §3).
+    fn save_active_text_document_to(
+        &mut self,
+        path: &Path,
+        destination: &crate::document_store::ConfirmedDestination,
+    ) {
+        let Some(previous) = self.active_document() else {
+            return;
+        };
+        let saved = self
+            .documents
+            .borrow_mut()
+            .save_as(previous, path, destination);
+        let Some((_, Some(document))) = saved else {
+            return;
+        };
+        if document == previous {
+            return;
+        }
+        let documents = self.documents.clone();
+        if let TabContent::TextEditor(editor) = &mut self.active_tab_mut().content {
+            editor.rebind(document, &documents);
+        }
+        self.documents.borrow_mut().release(previous);
+        self.workspace_dirty = true;
+    }
+
+    /// Opens a file in the editor. A second view of a file that is already
+    /// open shares its document rather than reading the file again, and a tab
+    /// already showing that document is raised instead of duplicated.
+    pub(crate) fn local_document_tab(&mut self, path: &Path) -> Option<TabId> {
+        let document = self.documents.borrow_mut().find_current_local(path)?;
+        self.tabs.iter().find_map(|tab| match &tab.content {
+            TabContent::TextEditor(editor) if editor.document() == document => Some(tab.id),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn has_pending_open_refusal(&self) -> bool {
+        self.open_refusal.is_some()
+            || !self.pending_open_refusal_notices.is_empty()
+            || self.documents.borrow().has_recovery_notices()
+    }
+
+    pub(crate) fn has_recovery_notices(&self) -> bool {
+        self.documents.borrow().has_recovery_notices()
+    }
+
+    pub(crate) fn acknowledge_recovery_notice(&mut self, path: &Path) -> bool {
+        self.documents
+            .borrow_mut()
+            .acknowledge_recovery_notice(path)
+    }
+
+    pub(crate) fn open_text_editor(&mut self, path: &Path) -> Option<OpenFailure> {
+        if let Some(existing) = self.local_document_tab(path) {
+            self.set_active(existing);
+            self.workspace_dirty = true;
+            return None;
+        }
+
+        let opened = self.documents.borrow_mut().open_local(path);
+        self.finish_opening_text_editor(opened)
+    }
+
+    fn finish_opening_text_editor(
+        &mut self,
+        opened: Result<DocumentId, OpenFailure>,
+    ) -> Option<OpenFailure> {
+        match opened {
+            Ok(document) => {
+                if let Some(existing) = self.tabs.iter().find_map(|tab| match &tab.content {
+                    TabContent::TextEditor(editor) if editor.document() == document => Some(tab.id),
+                    _ => None,
+                }) {
+                    self.documents.borrow_mut().release(document);
+                    self.set_active(existing);
+                    self.workspace_dirty = true;
+                    return None;
+                }
+                self.open_text_document(document);
+                None
+            }
+            Err(failure) => Some(failure),
+        }
+    }
+
+    fn open_host_setup_script(&mut self, platform: festerm_host_setup::HostPlatform) {
+        let document = self.documents.borrow_mut().adopt_read_only_untitled(
+            &format!("dev-tunnel-host-setup-{}", platform.script_name()),
+            platform.script_name(),
+            "Dev Tunnel host installer (read-only)",
+            platform.script().as_bytes(),
+        );
+        if let Some(existing) = self.tabs.iter().find_map(|tab| match &tab.content {
+            TabContent::TextEditor(editor) if editor.document() == document => Some(tab.id),
+            _ => None,
+        }) {
+            self.documents.borrow_mut().release(document);
+            self.set_active(existing);
+            self.workspace_dirty = true;
+            return;
+        }
+        self.open_text_document(document);
+    }
+
+    fn new_text_document(&mut self) {
+        let document = self.documents.borrow_mut().create_untitled(
+            NEW_TEXT_DOCUMENT_NAME_PREFIX,
+            NEW_TEXT_DOCUMENT_LABEL,
+            b"",
+        );
+        self.open_text_document(document);
+    }
+
+    fn open_text_document(&mut self, document: DocumentId) {
+        let id = TabId::next();
+        let editor = TextEditorTab::with_options(
+            document,
+            &self.documents,
+            crate::text_editor::EditorViewOptions::from_settings(self.editor),
+        );
+        self.tabs.push(Tab {
+            id,
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::TextEditor(Box::new(editor)),
+        });
+        self.set_active(id);
+        self.workspace_dirty = true;
+    }
+
+    fn open_terminal_history_snapshot(&mut self, save_as: bool) {
+        let Some((snapshot, label)) = self.active_terminal_history_snapshot() else {
+            return;
+        };
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(refusal) => {
+                self.history_snapshot_refusal = Some(refusal);
+                return;
+            }
+        };
+        let document = self.documents.borrow_mut().create_untitled(
+            TERMINAL_HISTORY_SNAPSHOT_NAME_PREFIX,
+            &label,
+            snapshot.text().as_bytes(),
+        );
+        self.open_text_document(document);
+        if save_as {
+            self.save_as_requested = true;
+        }
+    }
+
+    /// Opens a second view of the document the active editor holds. One
+    /// document may have many views (ADR 0034 §1); this is the way to ask for
+    /// one, now that Markdown previews in the tab it belongs to rather than
+    /// in a tab of its own.
+    fn open_another_editor_view(&mut self) {
+        let Some(document) = self.active_document() else {
+            return;
+        };
+        self.documents.borrow_mut().retain(document);
+        self.open_text_document(document);
+    }
+
+    fn active_terminal_history_snapshot(
+        &self,
+    ) -> Option<(
+        Result<TerminalTextSnapshot, TerminalTextSnapshotRefusal>,
+        String,
+    )> {
+        let TabContent::Session(session) = &self.active_tab().content else {
+            return None;
+        };
+        let bounds = self.documents.borrow().bounds();
+        let screen = if session.terminal.modes().alternate_screen() {
+            TerminalTextSnapshotScreen::Alternate
+        } else {
+            TerminalTextSnapshotScreen::Primary
+        };
+        let snapshot = session.terminal.bounded_text_snapshot(
+            bounds.max_bytes(),
+            bounds.max_lines(),
+            bounds.max_line_bytes(),
+        );
+        let label = terminal_history_snapshot_label(
+            &session.label,
+            screen,
+            session.terminal.scrollback_stats().evicted_lines() > 0,
+        );
+        Some((snapshot, label))
+    }
+
+    /// Opens a local Markdown file. It goes to the editor like every other
+    /// text file: one document is one tab, and Preview is a mode that tab
+    /// starts in rather than a second tab saying the same thing (ADR 0034 §4).
+    fn open_local_markdown(&mut self, path: PathBuf, replacing: Option<TabId>) {
+        // `Ctrl+O` inside a viewer asked for *that* surface to change. A
+        // viewer of a remote snapshot is still a viewer, but there is nothing
+        // local left for it to become, so it gives way to the editor.
+        if let Some(target) = replacing {
+            if self
+                .tabs
+                .iter()
+                .any(|tab| tab.id == target && matches!(tab.content, TabContent::MarkdownViewer(_)))
+            {
+                self.close(target);
+            }
+        }
+        if let Some(failure) = self.open_text_editor(&path) {
+            self.open_refusal = Some((path, failure));
+        }
+    }
+
+    /// Opens a Markdown snapshot already fetched from a remote SFTP session
+    /// (issue #133). If a tab already shows the same remote file, its
+    /// content is replaced with the freshly fetched snapshot (refreshing
+    /// it) rather than opening a duplicate tab; otherwise a new tab is
+    /// pushed.
+    fn open_remote_markdown(
+        &mut self,
+        source: RemoteMarkdownSource,
+        display_path: String,
+        content: Vec<u8>,
+    ) {
+        if let Some(existing) = self.tabs.iter().find_map(|tab| match &tab.content {
+            TabContent::MarkdownViewer(viewer) if viewer.matches_remote_source(&source) => {
+                Some(tab.id)
+            }
+            _ => None,
+        }) {
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == existing) {
+                tab.content = TabContent::MarkdownViewer(Box::new(MarkdownViewerTab::open_remote(
+                    source,
+                    display_path,
+                    content,
+                )));
+            }
+            self.set_active(existing);
+            self.workspace_dirty = true;
+            return;
+        }
+        let id = TabId::next();
+        self.tabs.push(Tab {
+            id,
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::MarkdownViewer(Box::new(MarkdownViewerTab::open_remote(
+                source,
+                display_path,
+                content,
+            ))),
+        });
+        self.set_active(id);
+        self.workspace_dirty = true;
+    }
+
+    fn open_remote_text(&mut self, origin: RemoteOrigin, text: TextDocument, read_only: bool) {
+        let origin = festerm_document::DocumentOrigin::from(origin);
+        let document = self
+            .documents
+            .borrow_mut()
+            .adopt_remote_snapshot(origin, text, read_only);
+        if let Some(existing) = self.tabs.iter().find_map(|tab| match &tab.content {
+            TabContent::TextEditor(editor) if editor.document() == document => Some(tab.id),
+            _ => None,
+        }) {
+            self.set_active(existing);
+            self.workspace_dirty = true;
+            return;
+        }
+        self.open_text_document(document);
+    }
+
+    fn open_terminal_hyperlink(
+        &mut self,
+        tab_id: TabId,
+        lifecycle_generation: u64,
+        target: String,
+        context: &egui::Context,
+    ) {
+        let source = self
+            .session_tab(tab_id)
+            .filter(|session| session.controller.lifecycle_generation() == lifecycle_generation);
+        if source.is_some() {
+            if let Some(web) = festerm_core::normalize_external_web_url(&target) {
+                self.dispatch(
+                    AppCommand::OpenExternalLink {
+                        target: ExternalLinkTarget::new(web),
+                    },
+                    context,
+                );
+                return;
+            }
+        }
+        if let Some(TerminalFilesystemOrigin::Remote(origin)) =
+            source.and_then(SessionTab::terminal_filesystem_origin)
+        {
+            if let Some(request) =
+                crate::terminal_paths::explicit_remote_file_request(&target, &origin)
+            {
+                self.open_terminal_path_request(tab_id, request, context);
+            } else {
+                self.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                    title: None, acknowledgement_path: None, name: "Remote file link".into(), path: target,
+                    headline: "This remote file link cannot be opened".into(),
+                    detail: "The URI must address an unambiguous supported path on this source's verified live filesystem capability. No local or OS fallback is permitted.".into(),
+                });
+            }
+            return;
+        }
+        let path = source
+            .filter(|session| {
+                matches!(
+                    session.inspector_transport,
+                    InspectorTransport::Local { .. }
+                )
+            })
+            .and_then(|_| crate::terminal_paths::explicit_local_file_path(&target));
+        let Some(path) = path else {
+            self.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                title: None,
+                acknowledgement_path: None,
+                name: "File link".to_owned(),
+                path: festerm_core::local_file_hyperlink_path(&target).unwrap_or(target),
+                headline: "This file link cannot be opened".to_owned(),
+                detail: "Only an absolute local file URI from the same local session generation can open in fesTerm. Remote, serial, network and device targets are not supported.".to_owned(),
+            });
+            return;
+        };
+        let opened = self.documents.borrow_mut().open_terminal_link(&path);
+        if let Some(failure) = self.finish_opening_text_editor(opened) {
+            self.open_refusal = Some((path, failure));
+        }
+    }
+
+    fn open_detected_terminal_path(&mut self, tab_id: TabId, context: &egui::Context) {
+        let Some(request) = self
+            .session_tab(tab_id)
+            .and_then(SessionTab::terminal_path_open_request)
+        else {
+            return;
+        };
+        self.open_terminal_path_request(tab_id, request, context);
+    }
+
+    fn open_terminal_path_request(
+        &mut self,
+        tab_id: TabId,
+        request: TerminalPathOpenRequest,
+        context: &egui::Context,
+    ) {
+        match request {
+            TerminalPathOpenRequest::Local(request) => {
+                self.dispatch(open_local_command(&request), context);
+            }
+            TerminalPathOpenRequest::Web(target) => {
+                if let Some(target) = festerm_core::normalize_external_web_url(&target) {
+                    self.dispatch(
+                        AppCommand::OpenExternalLink {
+                            target: ExternalLinkTarget::new(target),
+                        },
+                        context,
+                    );
+                }
+            }
+            TerminalPathOpenRequest::Remote(request) => {
+                let Some(session) = self.session_tab(tab_id) else {
+                    return;
+                };
+                let origin = session.terminal_filesystem_origin();
+                let source_generation = session.controller.lifecycle_generation();
+                let generation = session.live_remote_file_requestor().map_or_else(
+                    || session.controller.lifecycle_generation(),
+                    |requestor| requestor.transport_generation(),
+                );
+                if generation != request.lifecycle_generation
+                    || !matches!(&origin, Some(TerminalFilesystemOrigin::Remote(origin)) if request.matches_origin(origin))
+                {
+                    self.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                        title: None,
+                        acknowledgement_path: None,
+                        name: Path::new(&request.remote_path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| request.remote_path.clone()),
+                        path: request.display_path.clone(),
+                        headline: "This remote path could not be opened".to_owned(),
+                        detail: "The source SSH/SFTP session has reconnected since this menu opened, so fesTerm will not retarget the path to a different transport generation.".to_owned(),
+                    });
+                    return;
+                }
+                let Some(requestor) = session.live_remote_file_requestor() else {
+                    self.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                        title: None,
+                        acknowledgement_path: None,
+                        name: Path::new(&request.remote_path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| request.remote_path.clone()),
+                        path: request.display_path.clone(),
+                        headline: "This remote path could not be opened".to_owned(),
+                        detail: "The source SSH/SFTP session is no longer connected, so fesTerm cannot reuse its live transport to read files.".to_owned(),
+                    });
+                    return;
+                };
+                let request = match bind_live_remote_request(requestor, request) {
+                    Ok(request) => request,
+                    Err(notice) => {
+                        self.queue_open_refusal_notice(notice);
+                        return;
+                    }
+                };
+                let display_path = request.request.display_path.clone();
+                if self.pending_terminal_path_opens.len() >= 4 {
+                    self.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                        title: None,
+                        acknowledgement_path: None,
+                        name: "remote path".to_owned(),
+                        path: display_path,
+                        headline: "Too many remote files are opening".to_owned(),
+                        detail:
+                            "Wait for an existing file request to finish before opening another."
+                                .to_owned(),
+                    });
+                    return;
+                }
+                let (sender, receiver) = mpsc::sync_channel(1);
+                let repaint = context.clone();
+                match std::thread::Builder::new()
+                    .name("terminal-path-open".into())
+                    .spawn(move || {
+                        let result = open_remote_request(request);
+                        let _ = sender.send(result);
+                        repaint.request_repaint();
+                    }) {
+                    Ok(handle) => self
+                        .pending_terminal_path_opens
+                        .push(PendingTerminalPathOpen {
+                            source_generation,
+                            source: tab_id,
+                            origin,
+                            receiver,
+                            handle: Some(handle),
+                        }),
+                    Err(error) => {
+                        self.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                            title: None,
+                            acknowledgement_path: None,
+                            name: Path::new(&display_path)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| display_path.clone()),
+                            path: display_path,
+                            headline: "This remote path could not be opened".to_owned(),
+                            detail: format!("The background SFTP worker could not start: {error}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn update_pending_terminal_path_opens(&mut self, context: &egui::Context) {
+        let mut index = 0usize;
+        while index < self.pending_terminal_path_opens.len() {
+            match self.pending_terminal_path_opens[index].receiver.try_recv() {
+                Ok(TerminalPathWorkerResult::Command(command)) => {
+                    let mut pending = self.pending_terminal_path_opens.remove(index);
+                    if let Some(handle) = pending.handle.take() {
+                        let _ = handle.join();
+                    }
+                    if self.session_tab(pending.source).is_some_and(|session| {
+                        session.controller.lifecycle_generation() == pending.source_generation
+                    }) && self
+                        .session_tab(pending.source)
+                        .and_then(SessionTab::terminal_filesystem_origin)
+                        == pending.origin
+                        && self
+                            .session_tab(pending.source)
+                            .and_then(SessionTab::live_remote_file_requestor)
+                            .is_some_and(|files| files.verified_endpoint_identity().is_some())
+                    {
+                        self.dispatch(*command, context);
+                    } else {
+                        self.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                            title: None, acknowledgement_path: None, name: "Remote snapshot".into(), path: "remote path".into(),
+                            headline: "The source binding changed".into(),
+                            detail: "The file result was discarded because its originating profile, verified endpoint, or live session generation no longer matches.".into(),
+                        });
+                    }
+                }
+                Ok(TerminalPathWorkerResult::OpenRefusal(notice)) => {
+                    let mut pending = self.pending_terminal_path_opens.remove(index);
+                    if let Some(handle) = pending.handle.take() {
+                        let _ = handle.join();
+                    }
+                    self.queue_open_refusal_notice(notice);
+                }
+                Err(TryRecvError::Empty) => {
+                    index += 1;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    let mut pending = self.pending_terminal_path_opens.remove(index);
+                    if let Some(handle) = pending.handle.take() {
+                        let _ = handle.join();
+                    }
+                    self.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                        title: None,
+                        acknowledgement_path: None,
+                        name: "remote path".to_owned(),
+                        path: "remote path".to_owned(),
+                        headline: "This remote path could not be opened".to_owned(),
+                        detail: "The remote filesystem worker stopped before returning a result."
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Opens (or focuses) the Profiles surface and marks `identifier` to be
+    /// consumed by `take_pending_profile_edit`, so the surface renders
+    /// straight into that profile's editor instead of the list.
+    fn open_profile_editor(&mut self, identifier: String) {
+        self.open_profiles();
+        self.pending_profile_edit = Some(identifier);
+    }
+
+    /// One-shot consumption of a pending profile-editor request set by
+    /// `open_profile_editor`. `FesTermApp::screen_command` calls this each
+    /// frame it renders the Profiles surface; the Profiles screen itself
+    /// cannot read `AppState` directly.
+    pub fn take_pending_profile_edit(&mut self) -> Option<String> {
+        self.pending_profile_edit.take()
+    }
+
+    /// One-shot consumption of a pending "open another window" request (ADR
+    /// 0032). Only the composition root may act on it, because only the
+    /// composition root owns the window list.
+    /// How the active text editor view is set up, for tests that check a new
+    /// view starts out the way the reader left the last one.
+    #[cfg(test)]
+    pub(crate) fn active_editor_options(&self) -> Option<crate::text_editor::EditorViewOptions> {
+        match &self.tabs.iter().find(|tab| tab.id == self.active)?.content {
+            TabContent::TextEditor(editor) => Some(editor.options_for_test()),
+            _ => None,
+        }
+    }
+
+    /// One-shot consumption of a file that could not be opened, so the
+    /// composition root can say why.
+    pub fn take_open_refusal(&mut self) -> Option<(PathBuf, OpenFailure)> {
+        self.open_refusal.take()
+    }
+
+    fn queue_open_refusal_notice(&mut self, notice: crate::overlay_state::OpenRefusalNotice) {
+        if self.pending_open_refusal_notices.len() == MAX_PENDING_OPEN_REFUSAL_NOTICES {
+            self.pending_open_refusal_notices.pop_front();
+        }
+        self.pending_open_refusal_notices.push_back(notice);
+    }
+
+    pub fn take_open_refusal_notice(&mut self) -> Option<crate::overlay_state::OpenRefusalNotice> {
+        self.pending_open_refusal_notices.pop_front().or_else(|| {
+            self.documents
+                .borrow_mut()
+                .take_recovery_notice()
+                .map(|(path, error)| crate::overlay_state::OpenRefusalNotice {
+                    title: Some("Saving needs manual recovery".into()),
+                    acknowledgement_path: Some(Box::new(path.clone())),
+                    name: "Save recovery retained".to_owned(),
+                    path: path.display().to_string(),
+                    headline: error.headline().to_owned(),
+                    detail: error.detail().to_owned(),
+                })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_recovery_notice_for_test(
+        &mut self,
+        path: PathBuf,
+        error: festerm_document::SaveError,
+    ) {
+        self.documents
+            .borrow_mut()
+            .queue_recovery_notice(path, error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn induce_recovery_notice_for_test(&mut self, path: &Path) -> PathBuf {
+        let id = self.documents.borrow_mut().open_local(path).unwrap();
+        {
+            let mut documents = self.documents.borrow_mut();
+            let document = documents.get_mut(id).unwrap();
+            let end = document.text().text().len();
+            document.text_mut().replace(end..end, "recovery\n").unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            let target = path.to_path_buf();
+            let replacement = path.with_extension("replacement");
+            crate::document_store::set_after_save_replacement_hook(move || {
+                std::fs::write(&replacement, "later\n").unwrap();
+                std::fs::rename(&replacement, &target).unwrap();
+            });
+        }
+        #[cfg(windows)]
+        {
+            let target = path.to_path_buf();
+            crate::document_store::set_after_save_replacement_hook(move || {
+                let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&target, permissions).unwrap();
+            });
+        }
+        assert!(matches!(
+            self.documents.borrow_mut().save(id),
+            Some(SaveOutcome::Failed(_))
+        ));
+        let recovery = self
+            .documents
+            .borrow()
+            .get(id)
+            .unwrap()
+            .recovery_path()
+            .map(Path::to_path_buf)
+            .expect("real save retained a recovery directory");
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+        assert!(self.documents.borrow_mut().release(id));
+        recovery
+    }
+
+    pub(crate) fn take_sftp_cleanup_notice(
+        &mut self,
+    ) -> Option<crate::overlay_state::OpenRefusalNotice> {
+        self.sftp_cleanup_receiver.try_recv().ok()
+    }
+
+    /// Whether a Save As destination has been asked for since the last frame.
+    pub fn take_save_as_request(&mut self) -> bool {
+        std::mem::take(&mut self.save_as_requested)
+    }
+
+    pub fn take_history_snapshot_refusal(&mut self) -> Option<TerminalTextSnapshotRefusal> {
+        self.history_snapshot_refusal.take()
+    }
+
+    pub fn take_window_open_request(&mut self) -> bool {
+        std::mem::take(&mut self.window_open_requested)
+    }
+
+    /// One-shot consumption of a pending "move this tab to another window"
+    /// request (ADR 0033), for the same reason as
+    /// [`Self::take_window_open_request`]: it mutates two windows.
+    pub fn take_tab_move_request(&mut self) -> Option<TabMoveRequest> {
+        self.pending_tab_move.take()
+    }
+
+    /// Removes a tab and hands it to the caller with its live session intact.
+    ///
+    /// Unlike [`Self::close`] this never shuts the session down and never
+    /// replaces an emptied tab list with a Launcher: the tab is moving to
+    /// another window, and what an emptied window does about it is
+    /// Application policy (ADR 0033).
+    pub fn detach_tab(&mut self, id: TabId) -> Option<Tab> {
+        if self.pane_group(id).is_some() {
+            self.pane_error =
+                Some("Separate the group before moving a view to another window.".into());
+            return None;
+        }
+        let index = self.tabs.iter().position(|tab| tab.id == id)?;
+        let tab = self.tabs.remove(index);
+        self.workspace_dirty = true;
+        self.activation_history.retain(|open| *open != id);
+        if self.active == id {
+            let next = self.last_used_tab().or_else(|| {
+                let fallback = index
+                    .checked_sub(1)
+                    .or_else(|| self.tabs.len().checked_sub(1))?;
+                self.tabs.get(fallback).map(|tab| tab.id)
+            });
+            if let Some(next) = next {
+                self.set_active(next);
+            }
+        }
+        Some(tab)
+    }
+
+    /// Takes ownership of a tab detached from another window, placing it
+    /// before `before` (or at the end) and focusing it, because a tab arrives
+    /// here as the direct result of the user dropping it here.
+    pub fn adopt_tab(&mut self, tab: Tab, before: Option<TabId>) {
+        if let TabContent::SftpFileManager(sftp) = &tab.content {
+            sftp.set_cleanup_reporter(self.sftp_cleanup_sender.clone());
+        }
+        let id = tab.id;
+        let insert_at = before
+            .and_then(|before| self.tabs.iter().position(|tab| tab.id == before))
+            .unwrap_or(self.tabs.len());
+        self.tabs.insert(insert_at, tab);
+        self.set_active(id);
+        // The arriving tab's terminal must not inherit keystrokes aimed at
+        // whatever this window was showing a moment ago.
+        self.input_ownership_epoch = self.input_ownership_epoch.wrapping_add(1);
+        self.workspace_dirty = true;
+    }
+
+    /// Replaces a brand-new window's placeholder Launcher with the tab that
+    /// was dragged out to create it (ADR 0033).
+    ///
+    /// Only ever called on a window created moments earlier, whose only tab
+    /// is the Launcher it started on, so nothing with a live session is
+    /// discarded here.
+    pub fn adopt_detached_tab(&mut self, tab: Tab) {
+        debug_assert!(
+            !self
+                .tabs
+                .iter()
+                .any(|tab| matches!(tab.content, TabContent::Session(_))),
+            "a detached tab may only replace a new window's placeholder Launcher",
+        );
+        self.tabs.clear();
+        self.activation_history.clear();
+        self.adopt_tab(tab, None);
+    }
+
+    /// Whether this window has any tabs left, which only happens between a
+    /// [`Self::detach_tab`] and the Application deciding what the emptied
+    /// window does (ADR 0033).
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    /// Restores the "root state is never empty" invariant
+    /// (`docs/gui-design.md` "Root Application States") for a window that
+    /// cannot close, by returning it to the Launcher.
+    pub fn open_launcher_if_empty(&mut self, context: &egui::Context) {
+        if self.tabs.is_empty() {
+            self.dispatch(AppCommand::OpenLauncher, context);
+        }
+    }
+
+    /// One-shot consumption of a pending new-profile request set by
+    /// `AppCommand::CreateProfile`, consumed exactly like
+    /// `take_pending_profile_edit`.
+    pub fn take_pending_profile_create(&mut self) -> Option<NewProfileKind> {
+        self.pending_profile_create.take()
+    }
+
+    /// One-shot consumption of the saved profile launched this frame, for
+    /// the composition root to stamp into the configuration's usage record.
+    pub fn take_pending_profile_usage(&mut self) -> Option<String> {
+        self.pending_profile_usage.take()
+    }
+
+    /// One-shot consumption of the workspace-dirty flag set by any
+    /// tab-list mutation, so the composition root can autosave the
+    /// workspace exactly once per frame that actually changed it, instead
+    /// of on every frame or requiring a manual Save action.
+    pub fn take_workspace_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.workspace_dirty)
+    }
+
+    fn start_local_session(&mut self, context: &egui::Context) {
+        let dimensions = self.current_session_dimensions();
+        self.place_user_session(SessionTab::start_default(
+            context,
+            dimensions,
+            self.prefer_powershell,
+        ));
+    }
+
+    fn start_local_session_with_profile(&mut self, profile: LocalProfile, context: &egui::Context) {
+        let dimensions = self.current_session_dimensions();
+        let profile = crate::environment::with_corrected_local_path(profile);
+        let launch_secondary = local_profile_secondary(&profile);
+        let dimensions =
+            dimensions.unwrap_or_else(|| Dimensions::new(80, 24).expect("valid default size"));
+        let size = terminal_size(dimensions).expect("terminal dimensions fit PTY limits");
+        let result = LocalPtySession::start_with_notifier(profile, size, make_notifier(context))
+            .map(ApplicationSession::Local)
+            .map_err(|error| error.to_string());
+        self.place_user_session(SessionTab::from_local_session_result(
+            result,
+            dimensions,
+            "Local Shell",
+            launch_secondary,
+            None,
+            None,
+        ));
+    }
+
+    fn begin_resume(
+        &mut self,
+        start: impl FnOnce() -> Result<SessionTab, String> + Send + 'static,
+    ) {
+        self.begin_attach(start, true, None);
+    }
+
+    fn begin_attach(
+        &mut self,
+        start: impl FnOnce() -> Result<SessionTab, String> + Send + 'static,
+        require_running_sessions: bool,
+        recording_auto_enrollment: Option<festerm_recording::RecordingId>,
+    ) {
+        if self.pending_resume.is_some()
+            || self.pending_native_termination.is_some()
+            || (require_running_sessions && !self.show_resumable_sessions)
+        {
+            return;
+        }
+        self.resume_error = None;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let handle = std::thread::Builder::new()
+            .name("running-session-reattach".into())
+            .spawn(move || {
+                let result = start().and_then(|session| {
+                    if let Some(error) = session.controller.start_error() {
+                        Err(error.to_string())
+                    } else {
+                        Ok(session)
+                    }
+                });
+                let _ = sender.send(result);
+            });
+        match handle {
+            Ok(handle) => {
+                self.pending_resume = Some(PendingResume {
+                    requires_running_sessions: require_running_sessions,
+                    recording_auto_enrollment,
+                    target: self.active,
+                    receiver,
+                    handle: Some(handle),
+                })
+            }
+            Err(error) => {
+                self.resume_error = Some(format!(
+                    "Could not start Reattach: {error}. Refresh to retry."
+                ));
+                self.discovery.refresh();
+            }
+        }
+    }
+    #[cfg(feature = "experimental-dev-tunnels")]
+    pub(crate) fn start_configured_tunnel_profile(
+        &mut self,
+        profile_id: String,
+        store: Arc<dyn SecretStore>,
+        context: &egui::Context,
+    ) {
+        let Some(profile) = self
+            .configuration
+            .profile(&profile_id)
+            .filter(|profile| profile.as_dev_tunnel().is_some())
+            .cloned()
+        else {
+            return;
+        };
+        // Capture the exact profile/reference before scheduling secret lookup.
+        // Rotation always creates a fresh reference, never mutates this binding.
+        let tunnel = tunnel_reconnect::TunnelTab::new(tunnel_reconnect::TunnelOrigin::Profile(
+            profile_id.clone(),
+        ));
+        self.start_tunnel_launch(
+            Some(profile_id),
+            Some(tunnel),
+            move || crate::tunnel_activation::Launch::from_profile(&profile, store.as_ref()),
+            context,
+        );
+    }
+
+    #[cfg(feature = "experimental-dev-tunnels")]
+    pub(crate) fn start_tunnel_launch(
+        &mut self,
+        profile_id: Option<String>,
+        tunnel: Option<tunnel_reconnect::TunnelTab>,
+        load: impl FnOnce() -> std::io::Result<crate::tunnel_activation::Launch> + Send + 'static,
+        context: &egui::Context,
+    ) {
+        if self.pending_resume.is_some() || self.pending_native_termination.is_some() {
+            self.resume_error = Some(
+                "Another attach is in progress. Wait before connecting another profile.".into(),
+            );
+            return;
+        }
+        self.pending_profile_usage = profile_id.clone();
+        let context = context.clone();
+        self.open_launcher();
+        self.begin_attach(move || {
+                let launch = load().map_err(|_| "Dev Tunnel destination or connect credential unavailable. Check this profile's trusted metadata and native credential.".to_owned())?;
+                let started = tunnel_reconnect::start_tunnel(launch, &context);
+                let mut tab = SessionTab::from_session_result(started.result, Dimensions::new(80,24).expect("default dimensions"), SessionResultMeta {
+                    label: &started.name, launch_secondary: Some("Experimental Dev Tunnel · attach only".into()),
+                    profile_identifier: profile_id, session_name: "Dev Tunnel",
+                    inspector_transport: started.transport, ssh_password_retry: None,
+                });
+                tab.remote_files = started.files;
+                tab.tunnel = tunnel;
+                Ok(tab)
+            }, false, self.recording_auto_enrollment.as_ref().map(festerm_recording::SharedRecording::id));
+    }
+
+    pub fn native_termination_pending(&self) -> bool {
+        self.pending_native_termination.is_some()
+    }
+
+    fn begin_native_termination(
+        &mut self,
+        context: &egui::Context,
+        terminate: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) {
+        if !self.show_resumable_sessions || self.pending_native_termination.is_some() {
+            return;
+        }
+        if self.pending_resume.is_some() {
+            self.resume_error =
+                Some("Reattach is still in progress. Try again when it finishes.".into());
+            return;
+        }
+        self.resume_error = None;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let context = context.clone();
+        match std::thread::Builder::new()
+            .name("native-session-terminate".into())
+            .spawn(move || {
+                let _ = sender.send(terminate());
+                context.request_repaint();
+            }) {
+            Ok(handle) => {
+                self.pending_native_termination =
+                    Some(PendingNativeTermination { receiver, handle });
+            }
+            Err(error) => {
+                self.resume_error = Some(format!(
+                    "Could not start Terminate: {error}. Refresh to retry."
+                ));
+                self.discovery.refresh();
+            }
+        }
+    }
+
+    pub fn update_running_sessions(&mut self, context: &egui::Context) {
+        // Only the Launcher shows Running Sessions, and discovery costs a
+        // `tmux`/`screen`/daemon probe every couple of seconds. Now that the
+        // preference is on by default, polling while the user is looking at a
+        // terminal would spend that on nobody's behalf; switching back to the
+        // Launcher clears the stale inventory and rediscovers at once.
+        let launcher_visible = matches!(self.active_tab().content, TabContent::Launcher);
+        self.discovery
+            .update(self.show_resumable_sessions && launcher_visible, context);
+        if self.pending_resume.as_ref().is_some_and(|pending| {
+            pending
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+        }) {
+            let mut pending = self.pending_resume.take().unwrap();
+            let _ = pending.handle.take().unwrap().join();
+            let still_requested = (!pending.requires_running_sessions
+                || self.show_resumable_sessions)
+                && self.active == pending.target
+                && matches!(self.active_tab().content, TabContent::Launcher);
+            match pending.receiver.try_recv().unwrap_or_else(|_| Err("Reattach worker failed".into())) {
+                Ok(session) if still_requested => {
+                    let recording = self.recording_auto_enrollment.as_ref().filter(|recording| {
+                        Some(recording.id()) == pending.recording_auto_enrollment
+                    }).cloned();
+                    self.place_session_with_recording(session, recording.as_ref());
+                }
+                Err(error) if still_requested => self.resume_error = Some(format!("Could not reattach: {error} No replacement shell was started. Refresh Running Sessions and try again.")),
+                _ => {},
+            }
+            self.discovery.refresh();
+        }
+        if self
+            .pending_native_termination
+            .as_ref()
+            .is_some_and(|pending| pending.handle.is_finished())
+        {
+            let pending = self.pending_native_termination.take().unwrap();
+            let _ = pending.handle.join();
+            if let Err(error) = pending
+                .receiver
+                .try_recv()
+                .unwrap_or_else(|_| Err("Termination worker failed".into()))
+            {
+                self.resume_error = Some(format!("Could not terminate: {error} Refresh Running Sessions and try again. No saved profile was removed."));
+            }
+            self.discovery.refresh();
+        }
+        if self.pending_resume.is_some() || self.pending_native_termination.is_some() {
+            context.request_repaint_after(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn start_configured_local_profile(&mut self, profile_id: &str, context: &egui::Context) {
+        let Some(profile) = self.configuration.profile(profile_id) else {
+            return;
+        };
+        let Some(local) = profile.as_local() else {
+            return;
+        };
+        let dimensions = self.current_session_dimensions();
+        self.place_user_session(SessionTab::start_local_profile(
+            local.to_local_profile(),
+            local.identifier(),
+            local.persistence(),
+            context,
+            dimensions,
+            self.scrollback_limit,
+        ));
+    }
+
+    fn start_serial_session(&mut self, settings: LineSettings, context: &egui::Context) {
+        let dimensions = self.current_session_dimensions();
+        self.place_user_session(SessionTab::start_serial(
+            settings, None, context, dimensions,
+        ));
+    }
+
+    fn start_configured_serial_profile(&mut self, profile_id: &str, context: &egui::Context) {
+        let Some(profile) = self
+            .configuration
+            .profile(profile_id)
+            .and_then(festerm_config::Profile::as_serial)
+        else {
+            return;
+        };
+        let Ok(settings) = profile.to_line_settings() else {
+            return;
+        };
+        let dimensions = self.current_session_dimensions();
+        self.place_user_session(SessionTab::start_serial(
+            settings,
+            Some(profile_id),
+            context,
+            dimensions,
+        ));
+    }
+
+    /// Starts a saved SSH profile that has no stored native-secret
+    /// credential, using the same openssh-style in-terminal interactive
+    /// prompt flow as Quick Connect. Unlike a stored-password profile (which
+    /// needs the composition root's secret store), this is fully handled
+    /// here. The launch inherits the current window's terminal size rather
+    /// than the profile's own stored initial size, matching how a local
+    /// session or Quick Connect starts already sized to the open window.
+    pub fn start_configured_ssh_profile_interactive(
+        &mut self,
+        profile_id: &str,
+        context: &egui::Context,
+    ) -> Result<(), ConfiguredSshProfileLaunchError> {
+        let profile = self
+            .configuration
+            .profile(profile_id)
+            .and_then(festerm_config::Profile::as_ssh)
+            .ok_or(ConfiguredSshProfileLaunchError::MissingProfile)?;
+        let size = self
+            .current_session_dimensions()
+            .and_then(|dimensions| terminal_size(dimensions).ok());
+        let connection_profile =
+            size.and_then(|size| profile.to_connection_profile_with_size(size).ok());
+        let connection_profile = connection_profile
+            .or_else(|| profile.to_connection_profile().ok())
+            .ok_or(ConfiguredSshProfileLaunchError::InvalidConnectionProfile)?;
+        let strategy = profile
+            .session_strategy()
+            .unwrap_or(festerm_ssh::SessionStrategy::PlainShell);
+        let options =
+            Self::with_profile_port_forwards(SshSessionOptions::manual_recovery(strategy), profile)
+                .map_err(ConfiguredSshProfileLaunchError::PortForwards)?;
+        self.execute_ssh_session(
+            connection_profile,
+            SshAuthentication::interactive(),
+            options,
+            Some(profile_id),
+            context,
+        );
+        Ok(())
+    }
+
+    /// Starts a saved SSH profile as a text-mode SFTP session, using the
+    /// same host-key-first interactive password flow as Quick Connect when
+    /// no stored credential is present.
+    pub fn start_configured_sftp_profile_interactive(
+        &mut self,
+        profile_id: &str,
+        context: &egui::Context,
+    ) -> bool {
+        let Some(profile) = self
+            .configuration
+            .profile(profile_id)
+            .and_then(festerm_config::Profile::as_ssh)
+        else {
+            return false;
+        };
+        let size = self
+            .current_session_dimensions()
+            .and_then(|dimensions| terminal_size(dimensions).ok());
+        let connection_profile =
+            size.and_then(|size| profile.to_connection_profile_with_size(size).ok());
+        let Some(connection_profile) =
+            connection_profile.or_else(|| profile.to_connection_profile().ok())
+        else {
+            return false;
+        };
+        self.execute_sftp_session(
+            connection_profile,
+            SshAuthentication::interactive(),
+            Some(profile_id),
+            context,
+        );
+        true
+    }
+
+    fn execute_ssh_session(
+        &mut self,
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        options: SshSessionOptions,
+        profile_id: Option<&str>,
+        context: &egui::Context,
+    ) {
+        // Consulted here rather than in the SSH backend so every launch path
+        // (Quick Connect, Advanced form, a configured profile, or a stored-
+        // password profile) benefits uniformly from a persisted trust
+        // record (ADR 0020), including ad-hoc Quick Connect destinations
+        // that have no saved profile at all.
+        let options = match self
+            .configuration
+            .known_host_fingerprint(profile.identity().host(), profile.identity().port())
+        {
+            Some(fingerprint) => options.with_known_host_fingerprint(fingerprint),
+            None => options,
+        };
+        // A brand-new `StartSshSession` command (Quick Connect, Advanced
+        // form, or a configured profile) always begins a fresh retry
+        // episode. The bounded reprompt loop for an in-connection password
+        // rejection (see `reprompt_rejected_ssh_passwords`) restarts the
+        // session directly rather than routing back through this dispatch
+        // path, so it can carry its own running attempt count forward.
+        self.place_user_session(SessionTab::start_ssh(
+            profile,
+            authentication,
+            options,
+            profile_id,
+            0,
+            context,
+        ));
+    }
+
+    fn execute_sftp_session(
+        &mut self,
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        profile_id: Option<&str>,
+        context: &egui::Context,
+    ) {
+        let known_host_fingerprint = self
+            .configuration
+            .known_host_fingerprint(profile.identity().host(), profile.identity().port())
+            .map(str::to_owned);
+        self.place_user_session(SessionTab::start_sftp(
+            profile,
+            authentication,
+            self.default_sftp_local_directory.clone(),
+            known_host_fingerprint,
+            profile_id,
+            context,
+        ));
+    }
+
+    /// Sends the given tab back to the pre-connect authentication surface
+    /// with the same (possibly about-to-be-edited) destination, replacing
+    /// its content in place regardless of what it currently holds -- unlike
+    /// `open_sftp_file_manager`, which only replaces a launch surface and
+    /// otherwise opens a brand new one, this always targets one specific
+    /// existing tab (the failed connection the user is looking at) so
+    /// retrying never leaves behind an orphaned duplicate tab.
+    fn retry_sftp_file_manager_connection(
+        &mut self,
+        tab_id: TabId,
+        mut target: SftpFileManagerLaunchTarget,
+    ) {
+        target.known_host_persisted = self
+            .configuration
+            .known_host_fingerprint(&target.host, target.port)
+            .is_some();
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.content = TabContent::SftpFileManagerAuthenticationRequired(Box::new(
+                SftpFileManagerAuthenticationRequiredTab::new(target, false),
+            ));
+            self.workspace_dirty = true;
+        }
+    }
+
+    fn open_sftp_file_manager(&mut self, mut target: SftpFileManagerLaunchTarget) {
+        target.known_host_persisted = self
+            .configuration
+            .known_host_fingerprint(&target.host, target.port)
+            .is_some();
+        self.workspace_dirty = true;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == self.active) {
+            if matches!(tab.content, TabContent::Launcher)
+                || (target.profile_id.is_some() && matches!(tab.content, TabContent::Profiles))
+            {
+                tab.content = TabContent::SftpFileManagerAuthenticationRequired(Box::new(
+                    SftpFileManagerAuthenticationRequiredTab::new(
+                        target,
+                        matches!(tab.content, TabContent::Profiles),
+                    ),
+                ));
+                return;
+            }
+        }
+        let id = TabId::next();
+        self.tabs.push(Tab {
+            id,
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::SftpFileManagerAuthenticationRequired(Box::new(
+                SftpFileManagerAuthenticationRequiredTab::new(target, false),
+            )),
+        });
+        self.set_active(id);
+    }
+
+    fn open_configured_sftp_file_manager_profile(&mut self, profile_id: &str) {
+        if let Some(target) = self.sftp_file_manager_target_for_profile(profile_id) {
+            self.open_sftp_file_manager(target);
+        }
+    }
+
+    fn start_sftp_file_manager(
+        &mut self,
+        target: SftpFileManagerLaunchTarget,
+        authentication: SftpFileManagerAuthentication,
+        context: &egui::Context,
+    ) {
+        let known_host_fingerprint = self
+            .configuration
+            .known_host_fingerprint(&target.host, target.port)
+            .map(str::to_owned);
+        let local_directory = self
+            .default_sftp_local_directory
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let tab = SftpFileManagerTab::new(
+            target,
+            authentication,
+            known_host_fingerprint,
+            local_directory,
+            self.sftp_pane_order,
+            context,
+        );
+        self.place_sftp_file_manager(tab);
+    }
+
+    fn sftp_file_manager_target_for_profile(
+        &self,
+        profile_id: &str,
+    ) -> Option<SftpFileManagerLaunchTarget> {
+        let ssh = self
+            .configuration
+            .profile(profile_id)
+            .and_then(festerm_config::Profile::as_ssh)?;
+        Some(SftpFileManagerLaunchTarget {
+            label: ssh.identifier().to_owned(),
+            username: ssh.username().to_owned(),
+            host: ssh.host().to_owned(),
+            port: ssh.port(),
+            profile_id: Some(ssh.identifier().to_owned()),
+            stored_credential_kind: ssh
+                .credential_reference()
+                .is_some()
+                .then_some(ssh.credential_kind()),
+            known_host_persisted: self
+                .configuration
+                .known_host_fingerprint(ssh.host(), ssh.port())
+                .is_some(),
+        })
+    }
+
+    pub(crate) fn start_stored_sftp_file_manager_profile(
+        &mut self,
+        profile_id: &str,
+        store: Arc<dyn festerm_secret_store::SecretStore>,
+        context: &egui::Context,
+    ) -> bool {
+        let Some(profile) = self
+            .configuration
+            .profile(profile_id)
+            .and_then(festerm_config::Profile::as_ssh)
+        else {
+            return false;
+        };
+        let Some(reference) = profile.credential_reference() else {
+            return false;
+        };
+        let authentication = Self::stored_sftp_file_manager_authentication(
+            profile.credential_kind(),
+            reference,
+            store,
+        );
+        let Some(target) = self.sftp_file_manager_target_for_profile(profile_id) else {
+            return false;
+        };
+        self.start_sftp_file_manager(target, authentication, context);
+        true
+    }
+
+    fn stored_sftp_file_manager_authentication(
+        credential_kind: festerm_config::CredentialKind,
+        reference: &festerm_secret_store::SecretReference,
+        store: Arc<dyn festerm_secret_store::SecretStore>,
+    ) -> SftpFileManagerAuthentication {
+        match credential_kind {
+            festerm_config::CredentialKind::Password => {
+                SftpFileManagerAuthentication::StoredPassword {
+                    store,
+                    reference: Arc::new(reference.duplicate_for_transport()),
+                }
+            }
+            festerm_config::CredentialKind::PrivateKey => {
+                SftpFileManagerAuthentication::StoredPrivateKey {
+                    store,
+                    reference: Arc::new(reference.duplicate_for_transport()),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn sftp_file_manager_target_for_tab(
+        &self,
+        tab_id: TabId,
+    ) -> Option<SftpFileManagerLaunchTarget> {
+        let session = self.session_tab(tab_id)?;
+        let InspectorTransport::Ssh {
+            ref username,
+            ref host,
+            port,
+            ..
+        } = session.inspector_transport
+        else {
+            return None;
+        };
+        let (profile_id, stored_credential_kind) = session
+            .profile_identifier
+            .as_deref()
+            .and_then(|profile_id| {
+                self.configuration
+                    .profile(profile_id)
+                    .and_then(festerm_config::Profile::as_ssh)
+                    .map(|ssh| {
+                        (
+                            Some(ssh.identifier().to_owned()),
+                            ssh.credential_reference()
+                                .is_some()
+                                .then_some(ssh.credential_kind()),
+                        )
+                    })
+            })
+            .unwrap_or((None, None));
+        Some(SftpFileManagerLaunchTarget {
+            label: session
+                .profile_identifier
+                .clone()
+                .unwrap_or_else(|| format!("{username}@{host}")),
+            username: username.clone(),
+            host: host.clone(),
+            port,
+            profile_id,
+            stored_credential_kind,
+            known_host_persisted: self
+                .configuration
+                .known_host_fingerprint(host, port)
+                .is_some(),
+        })
+    }
+
+    fn with_profile_port_forwards(
+        options: SshSessionOptions,
+        profile: &SshProfileConfiguration,
+    ) -> Result<SshSessionOptions, festerm_ssh::SshPortForwardConfigurationError> {
+        options.with_profile_port_forwards(profile.port_forwards().iter())
+    }
+
+    /// Resolves only profile metadata on the application path and hands the
+    /// opaque credential source to `festerm-ssh`; secret retrieval remains
+    /// in that transport's worker immediately before authentication. Uses
+    /// password or public-key authentication depending on the profile's
+    /// stored `credential_kind`.
+    pub fn start_stored_password_ssh_profile(
+        &mut self,
+        profile_id: &str,
+        store: Arc<dyn SecretStore>,
+        options: SshSessionOptions,
+        context: &egui::Context,
+    ) -> bool {
+        let Some(profile) = self
+            .configuration
+            .profile(profile_id)
+            .and_then(festerm_config::Profile::as_ssh)
+        else {
+            return false;
+        };
+        let Some(reference) = profile.credential_reference() else {
+            return false;
+        };
+        let Ok(connection_profile) = profile.to_connection_profile() else {
+            return false;
+        };
+        let authentication = match profile.credential_kind() {
+            festerm_config::CredentialKind::Password => {
+                SshAuthentication::stored_password(store, reference)
+            }
+            festerm_config::CredentialKind::PrivateKey => {
+                SshAuthentication::stored_private_key(store, reference)
+            }
+        };
+        self.execute_ssh_session(
+            connection_profile,
+            authentication,
+            options,
+            Some(profile_id),
+            context,
+        );
+        true
+    }
+
+    /// Resolves only profile metadata on the application path and hands the
+    /// opaque credential source to the SFTP worker; secret retrieval remains
+    /// in that worker immediately before authentication.
+    pub fn start_stored_password_sftp_profile(
+        &mut self,
+        profile_id: &str,
+        store: Arc<dyn SecretStore>,
+        context: &egui::Context,
+    ) -> bool {
+        let Some(profile) = self
+            .configuration
+            .profile(profile_id)
+            .and_then(festerm_config::Profile::as_ssh)
+        else {
+            return false;
+        };
+        let Some(reference) = profile.credential_reference() else {
+            return false;
+        };
+        let Ok(connection_profile) = profile.to_connection_profile() else {
+            return false;
+        };
+        let authentication = match profile.credential_kind() {
+            festerm_config::CredentialKind::Password => {
+                SshAuthentication::stored_password(store, reference)
+            }
+            festerm_config::CredentialKind::PrivateKey => {
+                SshAuthentication::stored_private_key(store, reference)
+            }
+        };
+        self.execute_sftp_session(
+            connection_profile,
+            authentication,
+            Some(profile_id),
+            context,
+        );
+        true
+    }
+
+    fn resolve_host_key_trust(&mut self, tab: TabId, decision: HostKeyTrustDecision) {
+        if let Some(session) = self.session_tab_mut(tab) {
+            if let Err(error) = session.resolve_host_key_trust(decision) {
+                session.controller.record_host_key_resolution_error(error);
+            }
+            // The "Reject"/"Accept Once" buttons steal keyboard focus from the
+            // terminal for however long the prompt is on screen. Unlike the
+            // close/paste/rename overlays, nothing else claims focus afterwards,
+            // so without this the terminal is left silently unfocused - typing
+            // does nothing until the user clicks into it.
+            session.view.request_focus_on_next_frame();
+            return;
+        }
+        let Some(tab) = self.sftp_file_manager_tab_mut(tab) else {
+            return;
+        };
+        let _ = tab.resolve_host_key_trust(decision);
+    }
+
+    fn request_reconnect(&mut self, tab: TabId) {
+        let Some(session) = self.session_tab_mut(tab) else {
+            return;
+        };
+        #[cfg(feature = "experimental-dev-tunnels")]
+        if session.tunnel.is_some() {
+            if session.reconnect_available() {
+                self.queue_tunnel_reconnect(tab);
+            }
+            return;
+        }
+        if let Err(error) = session.request_reconnect() {
+            session
+                .controller
+                .record_operation_error("reconnect request", error);
+        }
+    }
+
+    fn place_user_session(&mut self, session: SessionTab) {
+        let is_replacement = matches!(
+            self.active_tab().content,
+            TabContent::SshAuthenticationRequired(_)
+                | TabContent::SftpAuthenticationRequired(_)
+                | TabContent::SftpFileManagerAuthenticationRequired(_)
+        );
+        let recording = if is_replacement {
+            None
+        } else {
+            self.recording_auto_enrollment.clone()
+        };
+        self.place_session_with_recording(session, recording.as_ref());
+    }
+
+    #[cfg(test)]
+    fn place_session(&mut self, session: SessionTab) {
+        self.place_session_with_recording(session, None);
+    }
+
+    fn place_session_with_recording(
+        &mut self,
+        mut session: SessionTab,
+        recording: Option<&festerm_recording::SharedRecording>,
+    ) {
+        session.apply_frontend_terminal_configuration(self.scrollback_limit);
+        if let Some(recording) = recording {
+            session.start_recording_auto_enrollment(recording, self.scrollback_limit);
+        }
+        self.workspace_dirty = true;
+        // Starting a configured profile also consumes the active Profiles
+        // surface, but a synchronous startup failure leaves it available.
+        // Starting a session from the active Launcher or restored
+        // authentication-required tab replaces that surface in place (same
+        // position, same identity) rather than leaving it behind alongside
+        // a new session tab.
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == self.active) {
+            if (session.profile_identifier.is_some()
+                && session.controller.start_error().is_none()
+                && matches!(tab.content, TabContent::Profiles))
+                || matches!(
+                    tab.content,
+                    TabContent::Launcher
+                        | TabContent::SshAuthenticationRequired(_)
+                        | TabContent::SftpAuthenticationRequired(_)
+                        | TabContent::SftpFileManagerAuthenticationRequired(_)
+                )
+            {
+                match &tab.content {
+                    TabContent::SshAuthenticationRequired(saved)
+                        if session.profile_identifier.as_deref()
+                            == Some(saved.profile.identifier()) =>
+                    {
+                        session.set_alias(saved.alias.clone());
+                    }
+                    TabContent::SftpAuthenticationRequired(saved)
+                        if session.profile_identifier.as_deref()
+                            == Some(saved.profile.identifier()) =>
+                    {
+                        session.set_alias(saved.alias.clone());
+                    }
+                    _ => {}
+                }
+                if matches!(tab.content, TabContent::Launcher | TabContent::Profiles) {
+                    session.seed_native_alias(&self.configuration);
+                }
+                tab.content = TabContent::Session(Box::new(session));
+                return;
+            }
+        }
+        session.seed_native_alias(&self.configuration);
+        let id = TabId::next();
+        self.tabs.push(Tab {
+            id,
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::Session(Box::new(session)),
+        });
+        self.set_active(id);
+    }
+
+    fn place_sftp_file_manager(&mut self, tab_content: SftpFileManagerTab) {
+        tab_content.set_cleanup_reporter(self.sftp_cleanup_sender.clone());
+        self.workspace_dirty = true;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == self.active) {
+            if (tab_content.profile_identifier.is_some()
+                && matches!(tab.content, TabContent::Profiles))
+                || matches!(
+                    tab.content,
+                    TabContent::Launcher | TabContent::SftpFileManagerAuthenticationRequired(_)
+                )
+            {
+                tab.content = TabContent::SftpFileManager(Box::new(tab_content));
+                return;
+            }
+        }
+        let id = TabId::next();
+        self.tabs.push(Tab {
+            id,
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::SftpFileManager(Box::new(tab_content)),
+        });
+        self.set_active(id);
+    }
+
+    fn apply_scrollback_limit_to_sessions(&mut self) {
+        for tab in &mut self.tabs {
+            if let TabContent::Session(session) = &mut tab.content {
+                session.apply_frontend_terminal_configuration(self.scrollback_limit);
+            }
+        }
+    }
+
+    fn resolve_ssh_password(&mut self, tab: TabId, password: String) {
+        let Some(session) = self.session_tab_mut(tab) else {
+            return;
+        };
+        if let Err(error) = session.resolve_ssh_password(password) {
+            session.controller.record_operation_error("password", error);
+        }
+        // Mirrors `resolve_host_key_trust`: submitting the password steals
+        // keyboard focus for however long the prompt was on screen, and
+        // nothing else claims it afterwards.
+        session.view.request_focus_on_next_frame();
+    }
+
+    /// Restarts any session tab whose most recent connection attempt was
+    /// rejected on a plain, up-front password (`SessionErrorKind::
+    /// Authentication`), up to `MAX_SSH_PASSWORD_PROMPT_ATTEMPTS`, mimicking
+    /// `ssh`'s own "Permission denied, please try again." retry loop. The
+    /// fresh attempt authenticates interactively (host-key-first, then an
+    /// in-terminal password prompt on the new connection) rather than
+    /// asking for another password blind before reconnecting. Runs across
+    /// every open tab, independent of which is active, matching
+    /// `session_tabs_mut`'s "keep making progress in the background" policy.
+    pub fn reprompt_rejected_ssh_passwords(&mut self, context: &egui::Context) {
+        self.reprompt_rejected_ssh_passwords_with_start(context, SessionTab::start_ssh);
+    }
+
+    fn reprompt_rejected_ssh_passwords_with_start(
+        &mut self,
+        context: &egui::Context,
+        mut start: impl FnMut(
+            SshConnectionProfile,
+            SshAuthentication,
+            SshSessionOptions,
+            Option<&str>,
+            u8,
+            &egui::Context,
+        ) -> SessionTab,
+    ) {
+        let mut restarts = Vec::new();
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let TabContent::Session(session) = &tab.content else {
+                continue;
+            };
+            let Some(retry) = &session.ssh_password_retry else {
+                continue;
+            };
+            if retry.attempts >= MAX_SSH_PASSWORD_PROMPT_ATTEMPTS {
+                continue;
+            }
+            let Some(SessionLifecycle::Failed(error)) = session.controller.lifecycle() else {
+                continue;
+            };
+            if error.kind() != SessionErrorKind::Authentication {
+                continue;
+            }
+            restarts.push((
+                index,
+                retry.profile.clone(),
+                retry.profile_identifier.clone(),
+                retry.options.clone(),
+            ));
+        }
+        for (index, profile, profile_identifier, options) in restarts {
+            let mut restarted = start(
+                profile,
+                SshAuthentication::interactive(),
+                options,
+                profile_identifier.as_deref(),
+                0,
+                context,
+            );
+            restarted.apply_frontend_terminal_configuration(self.scrollback_limit);
+            if let Some(tab) = self.tabs.get_mut(index) {
+                if let TabContent::Session(previous) = &tab.content {
+                    restarted.default_label = previous.default_label.clone();
+                    restarted.set_alias(previous.explicit_alias.clone());
+                    restarted.alias_identity = previous.alias_identity.clone();
+                    restarted.name_save_pending = previous.name_save_pending;
+                    restarted.name_edit_revision = previous.name_edit_revision;
+                }
+                tab.content = TabContent::Session(Box::new(restarted));
+            }
+        }
+    }
+
+    fn activate(&mut self, id: TabId) {
+        if self.tabs.iter().any(|tab| tab.id == id) {
+            self.set_active(id);
+            self.workspace_dirty = true;
+        }
+    }
+
+    /// Moves the active cursor by `delta` positions in stable list order,
+    /// wrapping around. `delta` is `1` for next, `-1` for previous. Order
+    /// follows the tab list (also the drag-reorder order), independent of
+    /// how chips currently wrap onto visual rows.
+    fn activate_relative(&mut self, delta: i64) {
+        let visible = self.presentation_tabs();
+        let current = self
+            .pane_group(self.active)
+            .map_or(self.active, |group| group.tree.views()[0]);
+        let Some(index) = visible.iter().position(|id| *id == current) else {
+            return;
+        };
+        let len = visible.len() as i64;
+        if len == 0 {
+            return;
+        }
+        let next = (index as i64 + delta).rem_euclid(len) as usize;
+        let next = visible[next];
+        let focused = self.pane_group(next).map_or(next, |group| group.focused);
+        self.set_active(focused);
+        self.workspace_dirty = true;
+    }
+
+    /// Switches the active tab and, if the newly active tab is a session,
+    /// clears its "new output since last active" flag (feature request
+    /// #68): once the user is looking at it again there is nothing left to
+    /// notify them about.
+    fn set_active(&mut self, id: TabId) {
+        self.focus_pane(id);
+        if self.active != id {
+            if let Some(revision) = &self.presentation_workspace {
+                revision.changed();
+            }
+            if let Some(session) = self.session_tab_mut(self.active) {
+                session.view.cancel_rectangle_copy();
+            }
+            self.remember_departing_tab();
+        }
+        self.active = id;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            if let TabContent::Session(session) = &mut tab.content {
+                session.has_new_output_since_active = false;
+            }
+        }
+    }
+
+    pub(crate) fn set_presentation_workspace(
+        &mut self,
+        revision: &crate::automation::WorkspaceRevision,
+    ) {
+        self.presentation_workspace = Some(revision.clone());
+    }
+
+    /// Records the tab being left as the most recent place to return to.
+    ///
+    /// A tab that is no longer in the list is not recorded: it has just been
+    /// closed or detached, and neither is somewhere to go back to. Re-visiting
+    /// a tab moves it to the end rather than adding a second entry, so the
+    /// history holds each tab once, in the order it was last left.
+    fn remember_departing_tab(&mut self) {
+        let departing = self.active;
+        let remembered = self
+            .tabs
+            .iter()
+            .any(|tab| tab.id == departing && tab.content.remembered_as_last_used());
+        if !remembered {
+            return;
+        }
+        self.activation_history.retain(|id| *id != departing);
+        self.activation_history.push(departing);
+        if self.activation_history.len() > ACTIVATION_HISTORY_LIMIT {
+            self.activation_history.remove(0);
+        }
+    }
+
+    /// The most recently left tab that is still open, discarding entries for
+    /// tabs that have since gone.
+    fn last_used_tab(&mut self) -> Option<TabId> {
+        while let Some(candidate) = self.activation_history.pop() {
+            if self.tabs.iter().any(|tab| tab.id == candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Relocates `moved` to sit immediately before `before` (or at the end of
+    /// the list if `None`), preserving the moved tab's own identity/content
+    /// and leaving the active cursor pointed at whichever tab it already
+    /// referenced (`docs/gui-design.md` "Drag-and-drop reorders independent
+    /// session objects and should preserve their identity and state.").
+    fn reorder(&mut self, moved: TabId, before: Option<TabId>) {
+        let members = self.pane_members(moved);
+        if before.is_some_and(|id| members.contains(&id)) {
+            return;
+        }
+        if !self.tabs.iter().any(|tab| tab.id == moved) {
+            return;
+        }
+        let before = before.map(|id| {
+            self.pane_group(id).map_or(id, |group| {
+                let members = group.tree.views();
+                self.tabs
+                    .iter()
+                    .find(|tab| members.contains(&tab.id))
+                    .map_or(id, |tab| tab.id)
+            })
+        });
+        let mut tabs = Vec::new();
+        for member in members {
+            if let Some(from) = self.tabs.iter().position(|tab| tab.id == member) {
+                tabs.push(self.tabs.remove(from));
+            }
+        }
+        let insert_at = match before {
+            Some(before_id) => self
+                .tabs
+                .iter()
+                .position(|tab| tab.id == before_id)
+                .unwrap_or(self.tabs.len()),
+            None => self.tabs.len(),
+        };
+        self.tabs.splice(insert_at..insert_at, tabs);
+        self.workspace_dirty = true;
+    }
+
+    /// Moves a tab one place without changing which tab is active. Invalid ids
+    /// and attempts to move beyond an edge are no-ops.
+    fn move_tab(&mut self, id: TabId, delta: i64) {
+        let visible = self.presentation_tabs();
+        let id = self
+            .pane_group(id)
+            .map_or(id, |group| group.tree.views()[0]);
+        let Some(from) = visible.iter().position(|tab| *tab == id) else {
+            return;
+        };
+        let to = from as i64 + delta;
+        if !(0..visible.len() as i64).contains(&to) {
+            return;
+        }
+        let before = if delta < 0 {
+            visible.get(to as usize)
+        } else {
+            visible.get(to as usize + 1)
+        }
+        .copied();
+        self.reorder(id, before);
+    }
+
+    /// Renames the session tab's stable primary identity (label). A no-op
+    /// for Launcher/Settings tabs (their names are fixed chrome, not session
+    /// state) and for an empty trimmed name, matching the chrome-side
+    /// rename-commit rule that empty names are discarded.
+    fn rename(&mut self, id: TabId, name: String) {
+        if self.session_tab(id).is_none() {
+            return;
+        }
+        match SessionAlias::from_user_input(&name) {
+            Ok(Some(alias)) => self.change_session_alias(id, Some(alias)),
+            Ok(None) => {}
+            Err(error) => self.session_name_validation_failure = Some(error),
+        }
+    }
+
+    fn use_default_session_name(&mut self, id: TabId) {
+        self.change_session_alias(id, None);
+    }
+
+    fn change_session_alias(&mut self, id: TabId, alias: Option<SessionAlias>) {
+        let Some(session) = self.session_tab(id) else {
+            return;
+        };
+        if alias.is_none() && session.explicit_alias.is_none() && !session.name_save_pending {
+            return;
+        }
+        let identity = if alias.is_none() {
+            session
+                .alias_identity
+                .clone()
+                .or_else(|| session.durable_identity())
+        } else {
+            session.durable_identity()
+        };
+        let workspace_available = self.restore_workspace
+            && session
+                .profile_identifier
+                .as_deref()
+                .is_some_and(|profile| self.configuration.profile(profile).is_some());
+        let unavailable = !workspace_available && identity.is_none();
+        static NEXT_NAME_EDIT_REVISION: AtomicU64 = AtomicU64::new(1);
+        let revision = NEXT_NAME_EDIT_REVISION.fetch_add(1, Ordering::Relaxed);
+        let session = self.session_tab_mut(id).expect("session was checked");
+        if identity.is_some() {
+            session.alias_identity = identity.clone();
+        }
+        session.set_alias(alias.clone());
+        session.name_save_pending = workspace_available || identity.is_some();
+        session.name_edit_revision = revision;
+        if let Some(identity) = identity {
+            self.pending_durable_aliases
+                .retain(|(existing, _, _)| *existing != identity);
+            if self.pending_durable_aliases.len() < festerm_config::MAX_DURABLE_SESSION_ALIASES {
+                self.pending_durable_aliases
+                    .push((identity, alias, revision));
+            } else {
+                self.session_name_capacity_exceeded = true;
+            }
+        }
+        self.session_names_dirty = true;
+        self.workspace_dirty = true;
+        self.session_name_persistence_unavailable |= unavailable;
+    }
+
+    pub(crate) fn take_session_name_changes(&mut self) -> SessionNameChanges {
+        let mut changes = SessionNameChanges {
+            changed: std::mem::take(&mut self.session_names_dirty),
+            durable_aliases: std::mem::take(&mut self.pending_durable_aliases),
+            persistence_unavailable: std::mem::take(&mut self.session_name_persistence_unavailable),
+            capacity_exceeded: std::mem::take(&mut self.session_name_capacity_exceeded),
+            validation_failure: self.session_name_validation_failure.take(),
+        };
+        // A failed write is not retried every frame, but the next naming
+        // transaction must include other still-live unsaved native edits.
+        for (_, session) in self.session_tabs_with_id_mut() {
+            if !session.name_save_pending {
+                continue;
+            }
+            let Some(identity) = session.alias_identity.clone() else {
+                continue;
+            };
+            if let Some(previous) = changes
+                .durable_aliases
+                .iter_mut()
+                .find(|(key, _, _)| key == &identity)
+            {
+                if previous.2 < session.name_edit_revision {
+                    previous.1 = session.explicit_alias.clone();
+                    previous.2 = session.name_edit_revision;
+                }
+            } else if changes.durable_aliases.len() < festerm_config::MAX_DURABLE_SESSION_ALIASES {
+                changes.durable_aliases.push((
+                    identity,
+                    session.explicit_alias.clone(),
+                    session.name_edit_revision,
+                ));
+            } else {
+                changes.capacity_exceeded = true;
+            }
+        }
+        changes
+    }
+
+    pub(crate) fn settle_session_name_save(&mut self, saved: bool, configuration: &Configuration) {
+        for (_, session) in self.session_tabs_with_id_mut() {
+            if saved
+                && (session.alias_identity.is_some()
+                    || (configuration.interface_settings().restore_workspace()
+                        && session
+                            .profile_identifier
+                            .as_deref()
+                            .is_some_and(|profile| configuration.profile(profile).is_some())))
+            {
+                session.name_save_pending = false;
+                if session.explicit_alias.is_none() {
+                    session.alias_identity = None;
+                }
+            }
+        }
+    }
+
+    fn close(&mut self, id: TabId) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let next_pane = self.pane_members(id).into_iter().find(|view| *view != id);
+        self.remove_pane(id);
+        let removed = self.tabs.remove(index);
+        self.workspace_dirty = true;
+        // A view going is what makes the document's reference count fall, and
+        // the last one going is what forgets the document (ADR 0034 §2). The
+        // dirty-close policy is settled before this point: the registry does
+        // not second-guess a decision the user has already been asked to make.
+        if let Some(document) = view_document(&removed.content) {
+            self.documents.borrow_mut().release(document);
+        }
+        if let TabContent::Session(session) = removed.content {
+            session.controller.shutdown();
+        }
+        if self.tabs.is_empty() {
+            // Root state must never go empty (`docs/gui-design.md` "Root
+            // Application States"): return to the launcher rather than an
+            // undefined window.
+            self.open_launcher();
+            return;
+        }
+        if self.active == id {
+            self.activation_history.retain(|open| *open != id);
+            // Where the reader just was, if that tab is still open; otherwise
+            // the neighbour to the left, and the rightmost tab when the
+            // leftmost one is what closed.
+            let next = next_pane
+                .or_else(|| self.last_used_tab())
+                .unwrap_or_else(|| {
+                    let fallback = index.checked_sub(1).unwrap_or(self.tabs.len() - 1);
+                    self.tabs[fallback].id
+                });
+            self.set_active(next);
+        }
+    }
+}
+
+#[cfg(test)]
+impl SessionTab {
+    pub(crate) fn set_test_durable_identity(&mut self, identity: DurableSessionIdentity) {
+        let DurableSessionIdentity::FestermSessiond { name, .. } = &identity;
+        self.inspector_transport = InspectorTransport::Local {
+            persistence: Some(InspectorPersistence {
+                provider_label: PersistenceProviderKind::FestermSessiond.label(),
+                session_name: name.clone(),
+            }),
+        };
+        self.test_durable_identity = Some(identity);
+    }
+
+    fn for_test_ssh(
+        session: crate::session_controller::fake::FakeSshSession,
+        username: &str,
+        host: &str,
+        port: u16,
+    ) -> Self {
+        let dimensions = Dimensions::new(80, 24).expect("test dimensions are valid");
+        let mut controller =
+            SessionController::for_test(ApplicationSession::TestSsh(session.clone()));
+        controller.set_lifecycle_for_test(SessionLifecycle::Running);
+        Self {
+            remote_files: None,
+            terminal: Terminal::new(dimensions).expect("terminal allocation"),
+            controller,
+            recording_auto_enrollment: None,
+            view: TerminalView::default(),
+            label: format!("{username}@{host}"),
+            default_label: format!("{username}@{host}"),
+            explicit_alias: None,
+            alias_identity: None,
+            name_save_pending: false,
+            name_edit_revision: 0,
+            test_durable_identity: None,
+            launch_secondary: Some(format!("SSH · {host}:{port}")),
+            profile_identifier: None,
+            inspector_transport: InspectorTransport::Ssh {
+                username: username.to_owned(),
+                host: host.to_owned(),
+                port,
+                persistence: None,
+            },
+            eviction_notice_shown: false,
+            ssh_password_retry: None,
+            has_new_output_since_active: false,
+            output_ingest_deferred: false,
+            search: crate::search::TerminalSearchState::default(),
+            terminal_path: TerminalPathState::default(),
+            #[cfg(feature = "experimental-dev-tunnels")]
+            tunnel: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    pub(crate) fn interface_settings_snapshot_count(&self) -> usize {
+        self.interface_settings_snapshot_count.get()
+    }
+
+    /// Test-only constructor that starts with a Launcher tab instead of
+    /// spawning a real local shell, so dispatch/tab-lifecycle tests do not
+    /// need a live PTY. `pub(crate)` so `app.rs`'s headless UI tests can also
+    /// build a `FesTermApp` without a live PTY session.
+    pub(crate) fn for_test() -> Self {
+        Self::for_test_with_configuration(Configuration::empty())
+    }
+
+    pub(crate) fn for_test_with_configuration(configuration: Configuration) -> Self {
+        Self::with_launcher(configuration)
+    }
+
+    pub(crate) fn replace_active_with_test_ssh_session(
+        &mut self,
+        session: crate::session_controller::fake::FakeSshSession,
+        username: &str,
+        host: &str,
+        port: u16,
+    ) -> TabId {
+        let tab = self.active;
+        let replacement = SessionTab::for_test_ssh(session, username, host, port);
+        self.active_tab_mut().content = TabContent::Session(Box::new(replacement));
+        tab
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    struct RecordingFixture {
+        _storage: crate::recording_storage::RecordingStorage,
+        _streams: Vec<festerm_recording::RecordingStream>,
+        recording: festerm_recording::SharedRecording,
+        ready: std::sync::mpsc::Receiver<()>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl RecordingFixture {
+        fn new(streams: usize) -> Self {
+            let directory = crate::recording_storage::test_private_parent();
+            let path =
+                crate::recording_storage::test_directory_path(directory.path()).join("recordings");
+            let (storage, _) =
+                crate::recording_storage::RecordingStorage::open_for_test(&path).unwrap();
+            let terminal = Terminal::new(Dimensions::new(20, 2).unwrap()).unwrap();
+            let terminals = vec![&terminal; streams];
+            let (wake, ready) = std::sync::mpsc::channel();
+            let (recording, streams) =
+                festerm_recording::SharedRecording::start(storage.path(), &terminals, move || {
+                    let _ = wake.send(());
+                })
+                .unwrap();
+            Self {
+                _storage: storage,
+                _streams: streams,
+                recording,
+                ready,
+                _directory: directory,
+            }
+        }
+
+        fn completion(&self) -> festerm_recording::Completion {
+            loop {
+                self.ready.recv_timeout(Duration::from_secs(10)).unwrap();
+                if let Some(completion) = self.recording.poll_completion().unwrap() {
+                    return completion;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recording_auto_enrollment_only_follows_new_user_sessions_and_the_same_generation() {
+        let fixture = RecordingFixture::new(1);
+        let mut state = AppState::for_test();
+        let recording = &fixture.recording;
+        let make_session = || {
+            SessionTab::for_test_ssh(
+                crate::session_controller::fake::FakeSshSession::new([]),
+                "user",
+                "example.test",
+                22,
+            )
+        };
+        state.set_recording_auto_enrollment(Some(recording.clone()));
+        state.place_user_session(make_session());
+        let user_tab = state.active();
+        assert_eq!(
+            state
+                .session_tab(user_tab)
+                .unwrap()
+                .controller
+                .recording_id(),
+            Some(recording.id())
+        );
+
+        state.place_session(make_session());
+        assert!(state
+            .session_tab(state.active())
+            .unwrap()
+            .controller
+            .recording_id()
+            .is_none());
+
+        state.place_user_session(make_session());
+        let session = state.session_tab_mut(state.active()).unwrap();
+        assert_eq!(session.controller.recording_id(), Some(recording.id()));
+        session.controller.advance_lifecycle_generation();
+        assert!(session.controller.recording_id().is_none());
+
+        state.set_recording_auto_enrollment(None);
+        state.place_user_session(make_session());
+        assert!(state
+            .session_tab(state.active())
+            .unwrap()
+            .controller
+            .recording_id()
+            .is_none());
+        recording
+            .stop(festerm_recording::FinishReason::User)
+            .unwrap();
+        assert!(matches!(
+            fixture.completion(),
+            festerm_recording::Completion::Complete { .. }
+        ));
+    }
+
+    #[test]
+    fn recording_auto_enrollment_does_not_miss_a_fast_session() {
+        use festerm_recording::{ArtifactEvent, ArtifactReader, Completion, FinishReason};
+
+        let fixture = RecordingFixture::new(1);
+        let mut state = AppState::for_test();
+        let session = SessionTab::for_test_ssh(
+            crate::session_controller::fake::FakeSshSession::new([
+                SessionEvent::Lifecycle(SessionLifecycle::Running),
+                SessionEvent::Output(b"short-lived output".to_vec()),
+                SessionEvent::Lifecycle(SessionLifecycle::Exited(
+                    festerm_session::SessionExit::with_exit_code(0),
+                )),
+            ]),
+            "user",
+            "example.test",
+            22,
+        );
+        state.set_recording_auto_enrollment(Some(fixture.recording.clone()));
+        state.place_user_session(session);
+        let tab = state.active();
+        assert_eq!(
+            state.session_tab(tab).unwrap().controller.recording_id(),
+            Some(fixture.recording.id())
+        );
+        state
+            .session_tab_mut(tab)
+            .unwrap()
+            .pump_session_events_with_slice();
+        fixture.recording.stop(FinishReason::User).unwrap();
+        let Completion::Complete { path, .. } = fixture.completion() else {
+            panic!("a clean short-lived session should finish normally");
+        };
+        let mut reader = ArtifactReader::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut started = 0;
+        let mut recorded_output = false;
+        while let Some(event) = reader.next_event().unwrap() {
+            match event {
+                ArtifactEvent::Started { .. } => started += 1,
+                ArtifactEvent::Output { bytes, .. } => {
+                    recorded_output |= bytes == b"short-lived output"
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(started, 2);
+        assert!(recorded_output);
+    }
+
+    #[test]
+    fn recording_auto_enrollment_waits_for_a_sanitized_recovery_screen() {
+        use festerm_recording::{ArtifactEvent, ArtifactReader, Completion, FinishReason};
+
+        let fixture = RecordingFixture::new(1);
+        let fake = crate::session_controller::fake::FakeSshSession::new([]);
+        fake.enable_authoritative_recovery();
+        let mut state = AppState::for_test();
+        state.set_recording_auto_enrollment(Some(fixture.recording.clone()));
+        state.place_user_session(SessionTab::for_test_ssh(
+            fake.clone(),
+            "user",
+            "example.test",
+            22,
+        ));
+        let tab = state.active();
+        assert!(state
+            .session_tab(tab)
+            .unwrap()
+            .recording_auto_enrollment
+            .is_some());
+        assert!(state
+            .session_tab(tab)
+            .unwrap()
+            .controller
+            .recording_id()
+            .is_none());
+
+        let mut recovered = Terminal::new(Dimensions::new(20, 2).unwrap()).unwrap();
+        recovered.ingest(b"old hidden history\r\nsecond line\r\nvisible recovery");
+        fake.set_recovered_terminal(recovered);
+        let preference = state.scrollback_limit();
+        let session = state.session_tab_mut(tab).unwrap();
+        assert!(session.adopt_recovered_terminal());
+        session.apply_frontend_terminal_configuration(preference);
+        session.complete_recording_auto_enrollment();
+        assert_eq!(
+            session.controller.recording_id(),
+            Some(fixture.recording.id())
+        );
+        fake.push_event(SessionEvent::Output(b" live".to_vec()));
+        session.pump_session_events_with_slice();
+        fixture.recording.stop(FinishReason::User).unwrap();
+
+        let Completion::Complete { path, .. } = fixture.completion() else {
+            panic!("a recovered session should finish normally");
+        };
+        let mut reader = ArtifactReader::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut found_recovery = false;
+        let mut found_live = false;
+        while let Some(event) = reader.next_event().unwrap() {
+            match event {
+                ArtifactEvent::Started { terminal, .. } => {
+                    let rows = (0..terminal.dimensions().rows())
+                        .map(|row| terminal.row_text(row).unwrap())
+                        .collect::<String>();
+                    assert!(!rows.contains("old hidden history"));
+                    found_recovery |= rows.contains("visible recovery");
+                }
+                ArtifactEvent::Output { bytes, .. } => {
+                    assert!(!bytes
+                        .windows(b"old hidden history".len())
+                        .any(|w| w == b"old hidden history"));
+                    found_live |= bytes == b" live";
+                }
+                _ => {}
+            }
+        }
+        assert!(found_recovery && found_live);
+    }
+
+    #[test]
+    fn recording_auto_enrollment_fails_if_a_pending_session_is_replaced() {
+        let fixture = RecordingFixture::new(1);
+        let fake = crate::session_controller::fake::FakeSshSession::new([]);
+        fake.enable_authoritative_recovery();
+        let mut state = AppState::for_test();
+        state.set_recording_auto_enrollment(Some(fixture.recording.clone()));
+        state.place_user_session(SessionTab::for_test_ssh(fake, "user", "example.test", 22));
+        let session = state.session_tab_mut(state.active()).unwrap();
+        session.controller.advance_lifecycle_generation();
+        session.pump_session_events_with_slice();
+        assert!(!fixture.recording.is_recording().unwrap());
+        assert!(matches!(
+            fixture.completion(),
+            festerm_recording::Completion::Incomplete {
+                reason: festerm_recording::FinishReason::IntegrityFailure,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recording_auto_enrollment_failure_stops_the_recording() {
+        let fixture = RecordingFixture::new(festerm_recording::MAX_STREAMS);
+        let mut state = AppState::for_test();
+        state.set_recording_auto_enrollment(Some(fixture.recording.clone()));
+        state.place_user_session(SessionTab::for_test_ssh(
+            crate::session_controller::fake::FakeSshSession::new([]),
+            "user",
+            "example.test",
+            22,
+        ));
+        assert!(!fixture.recording.is_recording().unwrap());
+        assert!(fixture.recording.take_failure().unwrap().is_some());
+        assert!(matches!(
+            fixture.completion(),
+            festerm_recording::Completion::Incomplete { .. }
+        ));
+    }
+
+    fn alias_test_configuration() -> Configuration {
+        let directory = std::env::current_dir().unwrap();
+        let child = directory.join(".festerm-alias-owned-missing-child.exe");
+        let device = directory.join(".festerm-alias-owned-missing-device");
+        assert!(!child.exists());
+        assert!(!device.exists());
+        Configuration::new(vec![
+            festerm_config::Profile::local(
+                "local",
+                child.to_string_lossy().into_owned(),
+                Vec::new(),
+                None,
+            )
+            .unwrap(),
+            festerm_config::Profile::ssh(
+                "remote",
+                "ssh.example.test",
+                22,
+                "deploy",
+                "xterm-256color",
+                80,
+                24,
+            )
+            .unwrap(),
+            festerm_config::Profile::serial_with_defaults(
+                "serial",
+                device.to_string_lossy().into_owned(),
+            )
+            .unwrap(),
+        ])
+        .unwrap()
+    }
+
+    fn alias_test_native_identity(generation: u128) -> DurableSessionIdentity {
+        DurableSessionIdentity::native(
+            "build",
+            42,
+            generation,
+            format!("owned-native-42-{generation}"),
+        )
+        .unwrap()
+    }
+
+    fn alias_test_session(
+        profile: Option<&str>,
+    ) -> (SessionTab, crate::session_controller::fake::FakeSshSession) {
+        let fake = crate::session_controller::fake::FakeSshSession::new([]);
+        let mut tab = SessionTab::for_test_ssh(fake.clone(), "deploy", "ssh.example.test", 22);
+        tab.profile_identifier = profile.map(str::to_owned);
+        (tab, fake)
+    }
+
+    #[test]
+    fn dev_tunnel_origin_never_grants_local_filesystem_or_implicit_reconnect_authority() {
+        let (mut tab, _) = alias_test_session(None);
+        tab.inspector_transport = InspectorTransport::DevTunnel {
+            host: "test-tunnel".into(),
+            port: 47461,
+            account: None,
+        };
+        let Some(TerminalFilesystemOrigin::Remote(origin)) = tab.terminal_filesystem_origin()
+        else {
+            panic!("tunnel must remain remote, never Local");
+        };
+        assert!(!origin.live_transport_available);
+        assert!(origin.trusted_working_directory.is_none());
+        assert!(origin.verified_host_key_fingerprint.is_none());
+        assert!(tab.live_remote_file_requestor().is_none());
+        assert!(!tab.close_requires_confirmation());
+        assert_eq!(tab.system_label(), "Remote · Experimental Dev Tunnel");
+    }
+
+    #[test]
+    fn hosted_profile_rename_updates_live_and_sibling_workspace_metadata_only() {
+        let binding = festerm_config::LocalTunnelHosting::new(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            true,
+        )
+        .unwrap();
+        let profile = |name| {
+            festerm_config::Profile::local(name, "shell", Vec::new(), None)
+                .unwrap()
+                .with_persistence(PersistenceProviderKind::FestermSessiond, "stable-shell")
+                .unwrap()
+                .with_local_tunnel_hosting(Some(binding.clone()))
+                .unwrap()
+        };
+        for sibling in [false, true] {
+            let before = Configuration::new(vec![profile("original")]).unwrap();
+            let after = before
+                .with_edited_profile(Some("original"), profile("renamed"))
+                .unwrap();
+            let mut state = AppState::for_test();
+            state.replace_configuration(before);
+            let (session, _) = alias_test_session(Some("original"));
+            let label = session.label.clone();
+            state.place_session(session);
+            let source = state.active();
+            let dirty = state.workspace_dirty;
+            if sibling {
+                state.adopt_configuration(after);
+            } else {
+                state.replace_configuration(after);
+            }
+            let session = state.session_tab(source).unwrap();
+            assert_eq!(session.profile_identifier.as_deref(), Some("renamed"));
+            assert_eq!(session.label, label);
+            assert_eq!(state.active(), source);
+            assert_eq!(state.workspace_dirty, dirty);
+            let mut identifier = 0;
+            let (tabs, _) = state
+                .capture_window_workspace_tabs(&mut identifier)
+                .unwrap();
+            assert!(tabs.iter().any(|tab| tab.profile_id() == Some("renamed")));
+            assert!(!tabs.iter().any(|tab| tab.profile_id() == Some("original")));
+        }
+    }
+
+    fn remote_file_fixture(
+        provider: crate::remote_files::RemoteFileProvider,
+        gate: Option<Arc<std::sync::Barrier>>,
+    ) -> (SessionTab, Arc<crate::remote_files::TestFiles>) {
+        let (mut tab, _) = alias_test_session(Some("bound-profile"));
+        let files = Arc::new(crate::remote_files::TestFiles {
+            provider,
+            generation: 7,
+            endpoint: "verified-owned-endpoint".into(),
+            connected: std::sync::atomic::AtomicBool::new(true),
+            paths: std::sync::Mutex::new(Vec::new()),
+            bytes: b"bounded remote snapshot\n".to_vec(),
+            gate,
+        });
+        if provider != crate::remote_files::RemoteFileProvider::Sftp {
+            tab.inspector_transport = InspectorTransport::DevTunnel {
+                host: "owned-tunnel".into(),
+                port: 47461,
+                account: None,
+            };
+        }
+        tab.remote_files = Some(crate::remote_files::RemoteFileCapability::Test(
+            files.clone(),
+        ));
+        (tab, files)
+    }
+
+    #[test]
+    fn native_auth_live_account_and_file_binding_remain_pinned_after_profile_account_change() {
+        let profile = |id: u64| {
+            let (configuration, key) = Configuration::new(Vec::new())
+                .unwrap()
+                .with_account(
+                    festerm_config::DevTunnelAccount::new(
+                        format!("github-{id}"),
+                        festerm_config::AccountProvider::Github,
+                        id,
+                        format!("account-{id}"),
+                        festerm_secret_store::SecretReference::generate(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let profile = festerm_config::Profile::named_dev_tunnel("bound-profile", "owned.usw3")
+                .unwrap()
+                .with_tunnel_account(
+                    key,
+                    festerm_secret_store::SecretReference::generate(),
+                    festerm_config::DevTunnelHost {
+                        tunnel_id: "owned".into(),
+                        cluster: "usw3".into(),
+                        host_id: "host".into(),
+                        public_key: "pin".into(),
+                        port: 47461,
+                    },
+                )
+                .unwrap();
+            configuration.with_profile(profile).unwrap()
+        };
+        let mut state = AppState::for_test();
+        state.replace_configuration(profile(42));
+        let (mut tab, _) = remote_file_fixture(
+            crate::remote_files::RemoteFileProvider::DevTunnelPosix,
+            None,
+        );
+        tab.inspector_transport = InspectorTransport::DevTunnel {
+            host: "owned".into(),
+            port: 47461,
+            account: Some((42, "account-42".into())),
+        };
+        state.place_session(tab);
+        let source = state.active;
+        let Some(TerminalFilesystemOrigin::Remote(before)) = state
+            .session_tab(source)
+            .unwrap()
+            .terminal_filesystem_origin()
+        else {
+            panic!("remote source")
+        };
+        state.replace_configuration(profile(99));
+        let live = state.session_tab(source).unwrap();
+        assert!(matches!(&live.inspector_transport,
+            InspectorTransport::DevTunnel {account:Some((42,login)),..} if login == "account-42"));
+        let Some(TerminalFilesystemOrigin::Remote(after)) = live.terminal_filesystem_origin()
+        else {
+            panic!("remote source")
+        };
+        assert_eq!(before.session_binding, after.session_binding);
+        assert_eq!(before.profile_identifier, after.profile_identifier);
+        assert!(after.live_transport_available);
+        assert_eq!(after.username, "remote OS user");
+    }
+
+    fn finish_remote_file_open(state: &mut AppState, context: &egui::Context) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.pending_terminal_path_opens.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "bounded remote open did not finish"
+            );
+            state.update_pending_terminal_path_opens(context);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn detected_and_osc8_paths_share_bound_ssh_and_dev_tunnel_document_routing() {
+        use crate::remote_files::RemoteFileProvider;
+        let context = egui::Context::default();
+        for provider in [
+            RemoteFileProvider::Sftp,
+            RemoteFileProvider::DevTunnelPosix,
+            RemoteFileProvider::DevTunnelWindows,
+        ] {
+            for explicit in [false, true] {
+                for extension in ["txt", "md"] {
+                    let mut state = AppState::for_test();
+                    let (tab, files) = remote_file_fixture(provider, None);
+                    state.place_session(tab);
+                    let source = state.active;
+                    let session = state.session_tab_mut(source).unwrap();
+                    let path = if provider == RemoteFileProvider::DevTunnelWindows {
+                        format!("C:/owned/report.{extension}")
+                    } else {
+                        format!("/srv/report.{extension}")
+                    };
+                    if explicit {
+                        let uri_path = if path.starts_with('/') {
+                            path.clone()
+                        } else {
+                            format!("/{path}")
+                        };
+                        session.terminal.ingest(format!("\x1b]8;;file://localhost{uri_path}\x07misleading-local-name.txt\x1b]8;;\x07").as_bytes());
+                        let target = session
+                            .terminal
+                            .cell(0, 0)
+                            .unwrap()
+                            .hyperlink()
+                            .unwrap()
+                            .to_owned();
+                        let generation = session.controller.lifecycle_generation();
+                        state.dispatch(
+                            AppCommand::OpenTerminalHyperlink {
+                                tab_id: source,
+                                lifecycle_generation: generation,
+                                target: ExternalLinkTarget::new(target),
+                            },
+                            &context,
+                        );
+                    } else {
+                        session.terminal.ingest(path.as_bytes());
+                        let origin = session.terminal_filesystem_origin();
+                        session.terminal_path.menu = resolve_context_menu_action(
+                            &session.terminal,
+                            festerm_ui_egui::TerminalContextTarget {
+                                content_position: festerm_core::ContentPosition {
+                                    column: 3,
+                                    absolute_row: 0,
+                                },
+                                generation: 1,
+                            },
+                            origin.as_ref(),
+                        );
+                        state.dispatch(
+                            AppCommand::OpenTerminalDetectedPath { tab_id: source },
+                            &context,
+                        );
+                    }
+                    finish_remote_file_open(&mut state, &context);
+                    assert_eq!(
+                        files.paths.lock().unwrap().as_slice(),
+                        std::slice::from_ref(&path)
+                    );
+                    if extension == "md" {
+                        let TabContent::MarkdownViewer(viewer) = &state.active_tab().content else {
+                            panic!("remote Markdown snapshot expected");
+                        };
+                        assert!(viewer.local_path().is_none());
+                        assert_eq!(viewer.chip_secondary(), "Markdown · Remote");
+                        continue;
+                    }
+                    let TabContent::TextEditor(editor) = &state.active_tab().content else {
+                        panic!("remote text snapshot expected");
+                    };
+                    let registry = state.documents.borrow();
+                    let document = registry.get(editor.document()).unwrap();
+                    let festerm_document::DocumentOrigin::Remote(origin) = document.origin() else {
+                        panic!("remote bytes must never acquire local identity");
+                    };
+                    assert_eq!(origin.path(), path);
+                    assert_eq!(origin.is_dev_tunnel(), provider != RemoteFileProvider::Sftp);
+                    assert!(document.origin().key().to_string().starts_with(
+                        if provider == RemoteFileProvider::Sftp {
+                            "sftp:"
+                        } else {
+                            "dev-tunnel:"
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remote_file_non_text_snapshots_are_refused_without_creating_local_documents() {
+        use crate::remote_files::{RemoteFileCapability, RemoteFileProvider};
+        let context = egui::Context::default();
+        for provider in [RemoteFileProvider::Sftp, RemoteFileProvider::DevTunnelPosix] {
+            let mut state = AppState::for_test();
+            let (mut tab, files) = remote_file_fixture(provider, None);
+            tab.remote_files = None;
+            let mut files = Arc::try_unwrap(files).unwrap();
+            files.bytes = vec![0, 0xff, 0xfe];
+            tab.remote_files = Some(RemoteFileCapability::Test(Arc::new(files)));
+            state.place_session(tab);
+            let source = state.active;
+            let generation = state
+                .session_tab(source)
+                .unwrap()
+                .controller
+                .lifecycle_generation();
+            state.dispatch(
+                AppCommand::OpenTerminalHyperlink {
+                    tab_id: source,
+                    lifecycle_generation: generation,
+                    target: ExternalLinkTarget::new("file:///srv/report.txt".into()),
+                },
+                &context,
+            );
+            finish_remote_file_open(&mut state, &context);
+            assert!(matches!(state.active_tab().content, TabContent::Session(_)));
+            assert!(state.take_open_refusal_notice().is_some());
+        }
+    }
+
+    #[test]
+    fn remote_file_results_are_discarded_after_source_profile_or_generation_changes() {
+        use crate::remote_files::RemoteFileProvider;
+        let context = egui::Context::default();
+        for change_profile in [false, true] {
+            let mut state = AppState::for_test();
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let (tab, files) =
+                remote_file_fixture(RemoteFileProvider::DevTunnelPosix, Some(gate.clone()));
+            state.place_session(tab);
+            let source = state.active;
+            let generation = state
+                .session_tab(source)
+                .unwrap()
+                .controller
+                .lifecycle_generation();
+            state.dispatch(
+                AppCommand::OpenTerminalHyperlink {
+                    tab_id: source,
+                    lifecycle_generation: generation,
+                    target: ExternalLinkTarget::new("file:///srv/report.txt".into()),
+                },
+                &context,
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while files.paths.lock().unwrap().is_empty() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if change_profile {
+                state.session_tab_mut(source).unwrap().profile_identifier =
+                    Some("different-profile".into());
+            } else {
+                state
+                    .session_tab_mut(source)
+                    .unwrap()
+                    .controller
+                    .advance_lifecycle_generation();
+            }
+            gate.wait();
+            finish_remote_file_open(&mut state, &context);
+            assert!(matches!(state.active_tab().content, TabContent::Session(_)));
+            assert_eq!(
+                state.take_open_refusal_notice().unwrap().headline,
+                "The source binding changed"
+            );
+        }
+    }
+
+    #[test]
+    fn session_alias_rename_is_instance_only_and_terminal_titles_never_become_aliases() {
+        let context = egui::Context::default();
+        let configuration = alias_test_configuration();
+        let mut state = AppState::for_test_with_configuration(configuration.clone());
+        let (first, first_transport) = alias_test_session(Some("remote"));
+        state.place_session(first);
+        let first_id = state.active();
+        let (second, second_transport) = alias_test_session(Some("remote"));
+        state.place_session(second);
+        let second_id = state.active();
+        state
+            .session_tab_mut(first_id)
+            .unwrap()
+            .terminal
+            .ingest(b"\x1b]2;untrusted title\x07");
+        let grid = state
+            .session_tab(first_id)
+            .unwrap()
+            .terminal
+            .row_text(0)
+            .unwrap();
+        state.dispatch(
+            AppCommand::RenameTab(first_id, " \nBuild\u{202e} bench\t ".into()),
+            &context,
+        );
+        assert_eq!(
+            state.active(),
+            second_id,
+            "inactive rename must not activate its target"
+        );
+        assert_eq!(state.session_tab(first_id).unwrap().label, "Build bench");
+        assert_eq!(state.session_tab(second_id).unwrap().explicit_alias(), None);
+        assert_eq!(state.configuration(), &configuration);
+        assert_eq!(
+            state.session_tab(first_id).unwrap().terminal.title(),
+            "untrusted title"
+        );
+        assert_eq!(
+            state
+                .session_tab(first_id)
+                .unwrap()
+                .terminal
+                .row_text(0)
+                .unwrap(),
+            grid
+        );
+        assert!(first_transport.sent().is_empty());
+        assert!(first_transport.operations().is_empty());
+        assert!(second_transport.sent().is_empty());
+        assert!(state.take_workspace_dirty());
+        let captured = state
+            .capture_workspace_configuration(Vec::new(), &mut 1, None)
+            .unwrap();
+        let text = captured.to_toml().unwrap();
+        assert!(text.contains("Build bench"));
+        assert!(!text.contains("untrusted title"));
+        let WorkspaceTab::SshSession(first) = &captured.workspace().unwrap().tabs()[0] else {
+            panic!("SSH tab")
+        };
+        let WorkspaceTab::SshSession(second) = &captured.workspace().unwrap().tabs()[1] else {
+            panic!("SSH tab")
+        };
+        assert_eq!(first.alias().unwrap().as_str(), "Build bench");
+        assert!(second.alias().is_none());
+    }
+
+    #[test]
+    fn session_alias_reset_clears_override_and_empty_commit_keeps_previous_name() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let (session, transport) = alias_test_session(None);
+        state.place_session(session);
+        let tab = state.active();
+        let default = state.session_tab(tab).unwrap().label.clone();
+        state.dispatch(AppCommand::RenameTab(tab, "Custom".into()), &context);
+        state.dispatch(AppCommand::RenameTab(tab, " \r\n ".into()), &context);
+        assert_eq!(state.session_tab(tab).unwrap().label, "Custom");
+        state.dispatch(AppCommand::UseDefaultSessionName(tab), &context);
+        assert_eq!(state.session_tab(tab).unwrap().label, default);
+        assert!(state.session_tab(tab).unwrap().explicit_alias().is_none());
+        state.dispatch(AppCommand::RenameTab(tab, default.clone()), &context);
+        assert!(
+            state.session_tab(tab).unwrap().explicit_alias().is_some(),
+            "an explicit equal-to-default name is still an override"
+        );
+        state.dispatch(AppCommand::UseDefaultSessionName(tab), &context);
+        assert!(state.session_tab(tab).unwrap().explicit_alias().is_none());
+        assert!(transport.sent().is_empty());
+    }
+
+    #[test]
+    fn session_alias_pending_edits_are_bounded_and_live_failed_edits_join_the_next_transaction() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test_with_configuration(Configuration::empty());
+        let (mut first, _) = alias_test_session(None);
+        first.set_test_durable_identity(alias_test_native_identity(100));
+        state.place_session(first);
+        let first_tab = state.active();
+        state.dispatch(AppCommand::RenameTab(first_tab, "First".into()), &context);
+        assert!(state.take_session_name_changes().changed);
+        state.settle_session_name_save(false, &Configuration::empty());
+        let (mut second, _) = alias_test_session(None);
+        second.set_test_durable_identity(alias_test_native_identity(101));
+        state.place_session(second);
+        let second_tab = state.active();
+        state.dispatch(AppCommand::RenameTab(second_tab, "Second".into()), &context);
+        let changes = state.take_session_name_changes();
+        assert_eq!(changes.durable_aliases.len(), 2);
+        let committed = changes
+            .durable_aliases
+            .into_iter()
+            .try_fold(
+                Configuration::empty(),
+                |configuration, (identity, alias, _)| {
+                    configuration.with_durable_session_alias(identity, alias)
+                },
+            )
+            .unwrap();
+        state.settle_session_name_save(true, &committed);
+        assert!(!state.session_tab(first_tab).unwrap().name_save_pending);
+        assert!(!state.session_tab(second_tab).unwrap().name_save_pending);
+        assert_eq!(
+            committed
+                .durable_session_alias(&alias_test_native_identity(100))
+                .unwrap()
+                .as_str(),
+            "First"
+        );
+        state.pending_durable_aliases = (1..=festerm_config::MAX_DURABLE_SESSION_ALIASES)
+            .map(|generation| {
+                (
+                    alias_test_native_identity(generation as u128),
+                    Some(SessionAlias::new("Retained").unwrap()),
+                    0,
+                )
+            })
+            .collect();
+        state
+            .session_tab_mut(second_tab)
+            .unwrap()
+            .set_test_durable_identity(alias_test_native_identity(2000));
+        state.dispatch(AppCommand::RenameTab(second_tab, "Extra".into()), &context);
+        let overflow = state.take_session_name_changes();
+        assert!(overflow.capacity_exceeded);
+        assert_eq!(
+            overflow.durable_aliases.len(),
+            festerm_config::MAX_DURABLE_SESSION_ALIASES
+        );
+        assert!(overflow
+            .durable_aliases
+            .iter()
+            .all(|(identity, _, _)| identity != &alias_test_native_identity(2000)));
+        assert_eq!(state.session_tab(second_tab).unwrap().label, "Extra");
+        assert_eq!(state.configuration(), &Configuration::empty());
+    }
+
+    #[test]
+    fn session_alias_workspace_round_trip_restores_local_serial_and_authentication_surfaces() {
+        let context = egui::Context::default();
+        let alias = SessionAlias::new("One instance").unwrap();
+        let workspace = WorkspaceConfiguration::new(
+            vec![
+                WorkspaceTab::local_session("local-one", "local")
+                    .unwrap()
+                    .with_session_alias(Some(alias.clone()))
+                    .unwrap(),
+                WorkspaceTab::local_session("local-two", "local").unwrap(),
+                WorkspaceTab::ssh_session("ssh", "remote")
+                    .unwrap()
+                    .with_session_alias(Some(alias.clone()))
+                    .unwrap(),
+                WorkspaceTab::sftp_session("sftp", "remote")
+                    .unwrap()
+                    .with_session_alias(Some(alias.clone()))
+                    .unwrap(),
+                WorkspaceTab::serial_session("serial", "serial")
+                    .unwrap()
+                    .with_session_alias(Some(alias))
+                    .unwrap(),
+            ],
+            Some("ssh".into()),
+        )
+        .unwrap();
+        let original = alias_test_configuration();
+        let saved = original.with_workspace(workspace).unwrap();
+        let restarted = Configuration::parse(&saved.to_toml().unwrap()).unwrap();
+        assert_eq!(restarted.profiles(), original.profiles());
+        let state = AppState::with_restored_workspace(
+            &context,
+            restarted.clone(),
+            restarted.workspace().unwrap(),
+        );
+        for index in [0, 4] {
+            let TabContent::Session(session) = &state.tabs()[index].content else {
+                panic!("session")
+            };
+            assert_eq!(session.label, "One instance");
+            assert!(
+                session.controller.start_error().is_some(),
+                "only owned nonexistent launch targets are used"
+            );
+        }
+        let TabContent::Session(other) = &state.tabs()[1].content else {
+            panic!("session")
+        };
+        assert_eq!(other.label, "local");
+        assert!(other.explicit_alias().is_none());
+        let TabContent::SshAuthenticationRequired(ssh) = &state.tabs()[2].content else {
+            panic!("SSH authentication")
+        };
+        assert_eq!(ssh.alias.as_ref().unwrap().as_str(), "One instance");
+        let TabContent::SftpAuthenticationRequired(sftp) = &state.tabs()[3].content else {
+            panic!("SFTP authentication")
+        };
+        assert_eq!(sftp.alias.as_ref().unwrap().as_str(), "One instance");
+        assert_eq!(
+            state
+                .capture_workspace_configuration(Vec::new(), &mut 1, None)
+                .unwrap()
+                .profiles(),
+            original.profiles()
+        );
+    }
+
+    #[test]
+    fn session_alias_authentication_completion_and_password_retry_preserve_only_same_instance() {
+        let context = egui::Context::default();
+        for (sftp, provider) in [
+            (false, None),
+            (true, None),
+            (false, Some(PersistenceProviderKind::Tmux)),
+            (false, Some(PersistenceProviderKind::Screen)),
+            (true, Some(PersistenceProviderKind::Tmux)),
+            (true, Some(PersistenceProviderKind::Screen)),
+        ] {
+            let mut configuration = alias_test_configuration();
+            if let Some(provider) = provider {
+                let profile = configuration
+                    .profile("remote")
+                    .unwrap()
+                    .clone()
+                    .with_persistence(provider, "build")
+                    .unwrap();
+                configuration = configuration.with_profile(profile).unwrap();
+            }
+            let mut state = AppState::for_test_with_configuration(configuration);
+            let profile = state
+                .configuration()
+                .profile("remote")
+                .unwrap()
+                .as_ssh()
+                .unwrap()
+                .clone();
+            let alias = Some(SessionAlias::new("My remote").unwrap());
+            state.active_tab_mut().content = if sftp {
+                TabContent::SftpAuthenticationRequired(SftpAuthenticationRequiredTab {
+                    profile,
+                    alias,
+                })
+            } else {
+                TabContent::SshAuthenticationRequired(SshAuthenticationRequiredTab {
+                    profile,
+                    alias,
+                })
+            };
+            let tab_id = state.active();
+            let (mut session, transport) = alias_test_session(Some("remote"));
+            if sftp {
+                session.inspector_transport = InspectorTransport::Sftp {
+                    username: "deploy".into(),
+                    host: "ssh.example.test".into(),
+                    port: 22,
+                };
+            } else if let Some(provider) = provider {
+                if let InspectorTransport::Ssh { persistence, .. } =
+                    &mut session.inspector_transport
+                {
+                    *persistence = Some(InspectorPersistence {
+                        provider_label: provider.label(),
+                        session_name: "build".into(),
+                    });
+                }
+            }
+            state.place_session(session);
+            assert_eq!(state.active(), tab_id);
+            assert_eq!(state.session_tab(tab_id).unwrap().label, "My remote");
+            state.dispatch(AppCommand::ReconnectSession(tab_id), &context);
+            assert_eq!(state.session_tab(tab_id).unwrap().label, "My remote");
+            let session = state.session_tab_mut(tab_id).unwrap();
+            session.ssh_password_retry = Some(SshPasswordRetryState {
+                profile: ssh_profile(),
+                profile_identifier: Some("remote".into()),
+                options: SshSessionOptions::new(),
+                attempts: 0,
+            });
+            session
+                .controller
+                .set_lifecycle_for_test(SessionLifecycle::Failed(
+                    festerm_session::SessionError::new(
+                        SessionErrorKind::Authentication,
+                        "owned rejection",
+                    ),
+                ));
+            state.reprompt_rejected_ssh_passwords_with_start(&context, |_, _, _, profile, _, _| {
+                alias_test_session(profile).0
+            });
+            assert_eq!(state.session_tab(tab_id).unwrap().label, "My remote");
+            assert_eq!(
+                state
+                    .session_tab(tab_id)
+                    .unwrap()
+                    .explicit_alias()
+                    .unwrap()
+                    .as_str(),
+                "My remote"
+            );
+            assert!(transport.sent().is_empty());
+        }
+    }
+
+    #[test]
+    fn session_alias_running_sessions_completion_uses_exact_native_generation_without_workspace() {
+        let context = egui::Context::default();
+        let identity = alias_test_native_identity(100);
+        let alias = SessionAlias::new("Build bench").unwrap();
+        let saved = Configuration::empty()
+            .with_durable_session_alias(identity.clone(), Some(alias))
+            .unwrap();
+        let restarted = Configuration::parse(&saved.to_toml().unwrap()).unwrap();
+        assert!(restarted.workspace().is_none());
+        let mut state = AppState::for_test_with_configuration(restarted);
+        let (mut resumed, transport) = alias_test_session(None);
+        resumed.default_label = "build".into();
+        resumed.set_alias(None);
+        resumed.set_test_durable_identity(identity.clone());
+        state.place_session(resumed);
+        let tab = state.active();
+        assert_eq!(state.session_tab(tab).unwrap().label, "Build bench");
+        assert!(state.session_tab(tab).unwrap().profile_identifier.is_none());
+        assert_eq!(
+            state
+                .session_tab(tab)
+                .unwrap()
+                .durable_session_label()
+                .unwrap(),
+            format!(
+                "{} · build",
+                PersistenceProviderKind::FestermSessiond.label()
+            )
+        );
+        state.dispatch(AppCommand::UseDefaultSessionName(tab), &context);
+        assert_eq!(state.session_tab(tab).unwrap().label, "build");
+        let changes = state.take_session_name_changes();
+        assert_eq!(changes.durable_aliases.len(), 1);
+        assert_eq!(changes.durable_aliases[0].0, identity);
+        assert!(changes.durable_aliases[0].1.is_none());
+        state.dispatch(AppCommand::OpenLauncher, &context);
+        let (mut replacement, _) = alias_test_session(None);
+        replacement.set_test_durable_identity(alias_test_native_identity(101));
+        state.place_session(replacement);
+        assert!(state
+            .session_tab(state.active())
+            .unwrap()
+            .explicit_alias()
+            .is_none());
+        assert!(transport.sent().is_empty());
+        assert!(transport.operations().is_empty());
+    }
+
+    #[test]
+    fn session_alias_workspace_owns_name_independently_of_native_seed_and_replacement() {
+        let identity = alias_test_native_identity(100);
+        let old_alias = SessionAlias::new("Old workspace name").unwrap();
+        let workspace = WorkspaceConfiguration::new(
+            vec![WorkspaceTab::local_session("native", "local")
+                .unwrap()
+                .with_session_alias(Some(old_alias))
+                .unwrap()],
+            Some("native".into()),
+        )
+        .unwrap();
+        let configuration = alias_test_configuration()
+            .with_workspace(workspace)
+            .unwrap()
+            .with_durable_session_alias(
+                identity.clone(),
+                Some(SessionAlias::new("Latest name").unwrap()),
+            )
+            .unwrap();
+        for reset in [false, true] {
+            let document = if reset {
+                configuration
+                    .with_durable_session_alias(identity.clone(), None)
+                    .unwrap()
+            } else {
+                configuration.clone()
+            };
+            let restarted = Configuration::parse(&document.to_toml().unwrap()).unwrap();
+            let WorkspaceTab::LocalSession(saved) = &restarted.workspace().unwrap().tabs()[0]
+            else {
+                panic!("native workspace descriptor")
+            };
+            assert_eq!(saved.alias().unwrap().as_str(), "Old workspace name");
+            let (mut session, transport) = alias_test_session(Some("local"));
+            session.set_test_durable_identity(identity.clone());
+            session.restore_alias(saved.alias());
+            session.seed_native_alias(&restarted);
+            assert_eq!(session.label, "Old workspace name");
+            session.set_test_durable_identity(alias_test_native_identity(101));
+            session.seed_native_alias(&restarted);
+            assert_eq!(session.label, "Old workspace name");
+            assert_eq!(session.explicit_alias().unwrap(), saved.alias().unwrap());
+            assert!(session.alias_identity.is_none());
+            assert!(transport.sent().is_empty());
+            assert!(transport.operations().is_empty());
+        }
+    }
+
+    #[test]
+    fn session_alias_reconnect_keeps_view_name_without_seeding_a_replacement_generation() {
+        let first = alias_test_native_identity(100);
+        let second = alias_test_native_identity(101);
+        let configuration = Configuration::empty()
+            .with_durable_session_alias(first.clone(), Some(SessionAlias::new("Old").unwrap()))
+            .unwrap()
+            .with_durable_session_alias(
+                second.clone(),
+                Some(SessionAlias::new("Own saved name").unwrap()),
+            )
+            .unwrap();
+        let mut state = AppState::for_test_with_configuration(configuration.clone());
+        let (mut session, transport) = alias_test_session(None);
+        session.set_test_durable_identity(first);
+        state.place_session(session);
+        let tab = state.active();
+        assert_eq!(state.session_tab(tab).unwrap().label, "Old");
+        state
+            .session_tab_mut(tab)
+            .unwrap()
+            .set_test_durable_identity(second.clone());
+        state.adopt_configuration(configuration.clone());
+        assert_eq!(state.session_tab(tab).unwrap().label, "Old");
+        let without_seeds = configuration
+            .with_durable_session_alias(alias_test_native_identity(100), None)
+            .unwrap()
+            .with_durable_session_alias(second.clone(), None)
+            .unwrap();
+        state.adopt_configuration(without_seeds);
+        assert_eq!(state.session_tab(tab).unwrap().label, "Old");
+        state.adopt_configuration(configuration.clone());
+        assert_eq!(state.session_tab(tab).unwrap().label, "Old");
+        assert_eq!(
+            state.session_tab(tab).unwrap().alias_identity.as_ref(),
+            Some(&alias_test_native_identity(100))
+        );
+        let (mut fresh, _) = alias_test_session(None);
+        fresh.set_test_durable_identity(second.clone());
+        state.place_session(fresh);
+        assert_eq!(
+            state.session_tab(state.active()).unwrap().label,
+            "Own saved name"
+        );
+        state.use_default_session_name(tab);
+        let reset = state.take_session_name_changes();
+        assert_eq!(reset.durable_aliases.len(), 1);
+        assert_eq!(reset.durable_aliases[0].0, alias_test_native_identity(100));
+        assert!(reset.durable_aliases[0].1.is_none());
+        assert_eq!(state.configuration(), &configuration);
+        assert!(transport.sent().is_empty());
+        assert!(transport.operations().is_empty());
+    }
+
+    #[test]
+    fn session_alias_fresh_native_attachment_refuses_an_old_generation_seed() {
+        let first = alias_test_native_identity(100);
+        let replacement = alias_test_native_identity(101);
+        let configuration = Configuration::empty()
+            .with_durable_session_alias(
+                first.clone(),
+                Some(SessionAlias::new("Old generation seed").unwrap()),
+            )
+            .unwrap();
+        let configuration = Configuration::parse(&configuration.to_toml().unwrap()).unwrap();
+        assert!(configuration.workspace().is_none());
+        let mut state = AppState::for_test_with_configuration(configuration.clone());
+        let (mut fresh, transport) = alias_test_session(None);
+        fresh.set_test_durable_identity(replacement.clone());
+        let default = fresh.label.clone();
+        state.place_session(fresh);
+        let fresh = state.session_tab(state.active()).unwrap();
+        assert_eq!(fresh.durable_identity(), Some(replacement));
+        assert_eq!(fresh.label, default);
+        assert!(fresh.explicit_alias().is_none());
+        assert!(fresh.alias_identity.is_none());
+        assert_eq!(
+            state
+                .configuration()
+                .durable_session_alias(&first)
+                .unwrap()
+                .as_str(),
+            "Old generation seed"
+        );
+        assert_eq!(state.configuration(), &configuration);
+        assert!(transport.sent().is_empty());
+        assert!(transport.operations().is_empty());
+    }
+
+    #[test]
+    fn session_alias_native_seed_updates_never_rename_other_current_views() {
+        let identity = alias_test_native_identity(100);
+        let configuration = alias_test_configuration()
+            .with_durable_session_alias(
+                identity.clone(),
+                Some(SessionAlias::new("Initial seed").unwrap()),
+            )
+            .unwrap();
+        let mut state = AppState::for_test_with_configuration(configuration);
+        let (mut first, first_transport) = alias_test_session(Some("local"));
+        first.set_test_durable_identity(identity.clone());
+        state.place_session(first);
+        let first = state.active();
+        let (mut second, second_transport) = alias_test_session(Some("local"));
+        second.set_test_durable_identity(identity.clone());
+        state.place_session(second);
+        let second = state.active();
+        state.rename(second, "Second view".into());
+        state.rename(first, "First view".into());
+        let changes = state.take_session_name_changes();
+        assert_eq!(changes.durable_aliases.len(), 1);
+        assert_eq!(
+            changes.durable_aliases[0].1.as_ref().unwrap().as_str(),
+            "First view"
+        );
+        let saved = state
+            .configuration()
+            .with_durable_session_alias(identity.clone(), changes.durable_aliases[0].1.clone())
+            .unwrap();
+        state.settle_session_name_save(true, &saved);
+        state.adopt_configuration(saved);
+        assert_eq!(state.session_tab(first).unwrap().label, "First view");
+        assert_eq!(state.session_tab(second).unwrap().label, "Second view");
+        assert!(!state.session_tab(second).unwrap().name_save_pending);
+        let workspace = state
+            .capture_workspace_configuration(Vec::new(), &mut 1, None)
+            .unwrap();
+        let names: Vec<_> = workspace
+            .workspace()
+            .unwrap()
+            .tabs()
+            .iter()
+            .map(|tab| {
+                let WorkspaceTab::LocalSession(tab) = tab else {
+                    panic!("local view");
+                };
+                tab.alias().unwrap().as_str()
+            })
+            .collect();
+        assert_eq!(names, ["First view", "Second view"]);
+        state.use_default_session_name(first);
+        let reset = state.take_session_name_changes();
+        let reset = state
+            .configuration()
+            .with_durable_session_alias(reset.durable_aliases[0].0.clone(), None)
+            .unwrap();
+        state.settle_session_name_save(true, &reset);
+        state.adopt_configuration(reset);
+        assert!(state.session_tab(first).unwrap().explicit_alias().is_none());
+        assert_eq!(state.session_tab(second).unwrap().label, "Second view");
+        state.open_launcher();
+        let (mut fresh, _) = alias_test_session(Some("local"));
+        fresh.set_test_durable_identity(identity);
+        state.place_session(fresh);
+        assert!(state
+            .session_tab(state.active())
+            .unwrap()
+            .explicit_alias()
+            .is_none());
+        assert_eq!(state.session_tab(second).unwrap().label, "Second view");
+        assert!(first_transport.sent().is_empty());
+        assert!(first_transport.operations().is_empty());
+        assert!(second_transport.sent().is_empty());
+        assert!(second_transport.operations().is_empty());
+    }
+
+    #[test]
+    fn session_alias_mux_workspace_names_are_per_view_not_backend_lookup() {
+        let context = egui::Context::default();
+        for provider in [
+            PersistenceProviderKind::Tmux,
+            PersistenceProviderKind::Screen,
+        ] {
+            for local in [false, true] {
+                let profile_id = if local { "local" } else { "remote" };
+                let configuration = alias_test_configuration();
+                let profile = configuration
+                    .profile(profile_id)
+                    .unwrap()
+                    .clone()
+                    .with_persistence(provider, "build")
+                    .unwrap();
+                let configuration = configuration.with_profile(profile).unwrap();
+                let mut state = AppState::for_test_with_configuration(configuration.clone());
+                let (mut session, transport) = alias_test_session(Some(profile_id));
+                let persistence = Some(InspectorPersistence {
+                    provider_label: provider.label(),
+                    session_name: "build".into(),
+                });
+                if local {
+                    session.inspector_transport = InspectorTransport::Local { persistence };
+                } else if let InspectorTransport::Ssh {
+                    persistence: target,
+                    ..
+                } = &mut session.inspector_transport
+                {
+                    *target = persistence;
+                }
+                state.place_session(session);
+                let tab = state.active();
+                state.dispatch(AppCommand::RenameTab(tab, "My alias".into()), &context);
+                let changes = state.take_session_name_changes();
+                assert!(!changes.persistence_unavailable);
+                assert!(changes.durable_aliases.is_empty());
+                let saved = state
+                    .capture_workspace_configuration(Vec::new(), &mut 1, None)
+                    .unwrap();
+                let restarted = Configuration::parse(&saved.to_toml().unwrap()).unwrap();
+                assert_eq!(restarted.profiles(), configuration.profiles());
+                assert_eq!(
+                    state
+                        .session_tab(tab)
+                        .unwrap()
+                        .durable_session_label()
+                        .unwrap(),
+                    format!("{} · build", provider.label())
+                );
+                let descriptor = match &restarted.workspace().unwrap().tabs()[0] {
+                    WorkspaceTab::LocalSession(tab) | WorkspaceTab::SshSession(tab) => tab,
+                    _ => panic!("mux workspace tab"),
+                };
+                assert_eq!(descriptor.alias().unwrap().as_str(), "My alias");
+                if local {
+                    let (mut recreated, _) = alias_test_session(Some(profile_id));
+                    recreated.inspector_transport = InspectorTransport::Local {
+                        persistence: Some(InspectorPersistence {
+                            provider_label: provider.label(),
+                            session_name: "build".into(),
+                        }),
+                    };
+                    recreated.restore_alias(descriptor.alias());
+                    assert_eq!(recreated.label, "My alias");
+                } else {
+                    let mut restored = AppState::with_restored_workspace(
+                        &context,
+                        restarted.clone(),
+                        restarted.workspace().unwrap(),
+                    );
+                    let TabContent::SshAuthenticationRequired(auth) =
+                        &restored.active_tab().content
+                    else {
+                        panic!("restored mux authentication");
+                    };
+                    assert_eq!(auth.alias.as_ref().unwrap().as_str(), "My alias");
+                    let (mut authenticated, _) = alias_test_session(Some(profile_id));
+                    if let InspectorTransport::Ssh { persistence, .. } =
+                        &mut authenticated.inspector_transport
+                    {
+                        *persistence = Some(InspectorPersistence {
+                            provider_label: provider.label(),
+                            session_name: "build".into(),
+                        });
+                    }
+                    restored.place_session(authenticated);
+                    assert_eq!(
+                        restored.session_tab(restored.active()).unwrap().label,
+                        "My alias"
+                    );
+                }
+                state.open_launcher();
+                let (mut fresh, _) = alias_test_session(Some(profile_id));
+                fresh.inspector_transport = if local {
+                    InspectorTransport::Local {
+                        persistence: Some(InspectorPersistence {
+                            provider_label: provider.label(),
+                            session_name: "build".into(),
+                        }),
+                    }
+                } else {
+                    InspectorTransport::Ssh {
+                        username: "deploy".into(),
+                        host: "ssh.example.test".into(),
+                        port: 22,
+                        persistence: Some(InspectorPersistence {
+                            provider_label: provider.label(),
+                            session_name: "build".into(),
+                        }),
+                    }
+                };
+                state.place_session(fresh);
+                assert!(state
+                    .session_tab(state.active())
+                    .unwrap()
+                    .explicit_alias()
+                    .is_none());
+                assert_eq!(state.session_tab(tab).unwrap().label, "My alias");
+                state.dispatch(AppCommand::UseDefaultSessionName(tab), &context);
+                assert!(state.session_tab(tab).unwrap().explicit_alias().is_none());
+                assert!(transport.sent().is_empty());
+                assert!(transport.operations().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn session_notifier_wakes_one_frame_without_a_settling_repaint() {
+        let context = egui::Context::default();
+        for _ in 0..4 {
+            let mut output = context.run_ui(Default::default(), |_| {});
+            output.textures_delta.clear();
+        }
+        let wakes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = wakes.clone();
+        context.set_request_repaint_callback(move |info| {
+            observed.lock().unwrap().push(info.delay);
+        });
+        let notifier = make_notifier(&context);
+        notifier.notify();
+        assert_eq!(*wakes.lock().unwrap(), [std::time::Duration::ZERO]);
+        let mut output = context.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .repaint_delay
+            .is_zero());
+        assert_eq!(wakes.lock().unwrap().len(), 1);
+
+        let mut output = context.run_ui(Default::default(), |_| notifier.notify());
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .repaint_delay
+                .is_zero(),
+            "output arriving during a frame must still wake a following frame"
+        );
+        let mut output = context.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .repaint_delay
+            .is_zero());
+    }
+
+    fn launcher_ids(state: &AppState) -> Vec<TabId> {
+        state
+            .tabs()
+            .iter()
+            .filter(|tab| matches!(tab.content, TabContent::Launcher))
+            .map(|tab| tab.id)
+            .collect()
+    }
+
+    #[test]
+    fn external_link_policy_accepts_only_normalized_http_and_https_urls() {
+        assert_eq!(
+            festerm_core::normalize_external_web_url("HTTPS://Example.COM/path"),
+            Some("https://example.com/path".to_owned())
+        );
+        for target in [
+            "https://",
+            "https://a b",
+            "https://example.com/\u{202e}spoof",
+            "https://github.com@evil.example/login",
+            "mailto:user@example.com",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+        ] {
+            assert_eq!(
+                festerm_core::normalize_external_web_url(target),
+                None,
+                "{target:?} must not reach the OS opener"
+            );
+        }
+
+        let command = AppCommand::OpenExternalLink {
+            target: ExternalLinkTarget::new("https://example.com/private-query".to_owned()),
+        };
+        assert!(!format!("{command:?}").contains("private-query"));
+    }
+
+    #[test]
+    fn local_profile_secondary_uses_the_launch_executable_name() {
+        let profile = LocalProfile::new("C:/Windows/System32/cmd.exe");
+
+        assert_eq!(
+            local_profile_secondary(&profile).as_deref(),
+            Some("cmd.exe")
+        );
+    }
+
+    #[test]
+    fn transient_local_profile_command_replaces_launcher_without_saved_profile_identity() {
+        let context = egui::Context::default();
+        let working_directory = std::env::current_dir().expect("test working directory is valid");
+        let mut state = AppState::for_test();
+        let launcher_id = state.active();
+
+        state.dispatch(
+            AppCommand::StartLocalSessionWithProfile {
+                profile: LocalProfile::new("festerm-transient-command-that-does-not-exist")
+                    .with_working_directory(working_directory),
+            },
+            &context,
+        );
+
+        assert_eq!(state.active(), launcher_id);
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("transient local launch must replace the active launcher");
+        };
+        assert_eq!(session.label, "Local Shell");
+        assert_eq!(session.profile_identifier, None);
+    }
+
+    #[test]
+    fn configured_local_profile_command_uses_metadata_and_stable_profile_id() {
+        let context = egui::Context::default();
+        let configuration = Configuration::new(vec![festerm_config::Profile::local(
+            "development",
+            "festerm-profile-test-command-that-does-not-exist",
+            vec!["--interactive".to_owned()],
+            None,
+        )
+        .expect("test local profile is valid")])
+        .expect("test configuration is valid");
+        let mut state = AppState::for_test_with_configuration(configuration);
+        let launcher_id = state.active();
+
+        state.dispatch(
+            AppCommand::StartConfiguredLocalProfile {
+                profile_id: "development".to_owned(),
+            },
+            &context,
+        );
+
+        assert_eq!(state.tabs().len(), 1);
+        assert_eq!(state.active(), launcher_id);
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("configured local profile must replace the active launcher");
+        };
+        assert_eq!(session.label, "development");
+        assert_eq!(
+            session.launch_secondary.as_deref(),
+            Some("festerm-profile-test-command-that-does-not-exist")
+        );
+        assert_eq!(session.profile_identifier.as_deref(), Some("development"));
+        assert!(
+            session.controller.start_error().is_some(),
+            "the nonexistent executable proves the configured launch path attempted its metadata"
+        );
+    }
+
+    #[test]
+    fn configured_local_profile_command_ignores_an_ssh_profile() {
+        let context = egui::Context::default();
+        let configuration = Configuration::new(vec![festerm_config::Profile::ssh(
+            "production",
+            "ssh.example.test",
+            22,
+            "deploy",
+            "xterm-256color",
+            80,
+            24,
+        )
+        .expect("test SSH profile is valid")])
+        .expect("test configuration is valid");
+        let mut state = AppState::for_test_with_configuration(configuration);
+        let launcher_id = state.active();
+
+        state.dispatch(
+            AppCommand::StartConfiguredLocalProfile {
+                profile_id: "production".to_owned(),
+            },
+            &context,
+        );
+
+        assert_eq!(state.active(), launcher_id);
+        assert!(matches!(state.active_tab().content, TabContent::Launcher));
+    }
+
+    #[test]
+    fn profile_session_placement_reuses_profiles_position_identity_and_workspace() {
+        let context = egui::Context::default();
+        for profile_id in ["local", "ssh", "sftp", "serial"] {
+            let mut state = AppState::for_test();
+            let launcher = state.active();
+            state.dispatch(AppCommand::OpenProfiles, &context);
+            let profiles = state.active();
+            state.dispatch(AppCommand::OpenSettings, &context);
+            let settings = state.active();
+            state.dispatch(AppCommand::ActivateTab(profiles), &context);
+            state.take_workspace_dirty();
+            let mut session = SessionTab::for_test_ssh(
+                crate::session_controller::fake::FakeSshSession::new([]),
+                "user",
+                "example.test",
+                22,
+            );
+            session.profile_identifier = Some(profile_id.to_owned());
+
+            state.place_session(session);
+
+            assert_eq!(state.active(), profiles);
+            assert_eq!(
+                state.tabs().iter().map(|tab| tab.id).collect::<Vec<_>>(),
+                [launcher, profiles, settings]
+            );
+            assert!(matches!(state.tabs()[0].content, TabContent::Launcher));
+            assert!(matches!(state.tabs()[2].content, TabContent::Settings));
+            assert_eq!(
+                state
+                    .session_tab(profiles)
+                    .unwrap()
+                    .profile_identifier
+                    .as_deref(),
+                Some(profile_id)
+            );
+            assert!(state.take_workspace_dirty());
+            state.dispatch(AppCommand::OpenProfiles, &context);
+            assert_ne!(state.active(), profiles, "Profiles can be reopened");
+            assert_eq!(state.tabs().len(), 4);
+        }
+    }
+
+    #[test]
+    fn ad_hoc_session_does_not_consume_profiles_and_other_surfaces_are_preserved() {
+        let context = egui::Context::default();
+        for configured in [false, true] {
+            let mut state = AppState::for_test();
+            state.dispatch(AppCommand::OpenProfiles, &context);
+            let profiles = state.active();
+            if configured {
+                state.dispatch(AppCommand::OpenSettings, &context);
+            }
+            let prior = state.active();
+            let count = state.tabs().len();
+            let mut session = SessionTab::for_test_ssh(
+                crate::session_controller::fake::FakeSshSession::new([]),
+                "user",
+                "example.test",
+                22,
+            );
+            session.profile_identifier = configured.then(|| "saved".to_owned());
+
+            state.place_session(session);
+
+            assert_eq!(state.tabs().len(), count + 1);
+            assert_ne!(state.active(), prior);
+            assert!(matches!(
+                state
+                    .tabs()
+                    .iter()
+                    .find(|tab| tab.id == profiles)
+                    .unwrap()
+                    .content,
+                TabContent::Profiles
+            ));
+            if configured {
+                assert!(matches!(
+                    state
+                        .tabs()
+                        .iter()
+                        .find(|tab| tab.id == prior)
+                        .unwrap()
+                        .content,
+                    TabContent::Settings
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_or_missing_profile_launch_keeps_profiles_available() {
+        let context = egui::Context::default();
+        let configuration = Configuration::new(vec![
+            festerm_config::Profile::local(
+                "missing-shell",
+                "festerm-profile-connect-command-that-does-not-exist",
+                Vec::new(),
+                None,
+            )
+            .unwrap(),
+            festerm_config::Profile::serial_with_defaults(
+                "missing-device",
+                "festerm-profile-connect-device-that-does-not-exist",
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        for command in [
+            AppCommand::StartConfiguredLocalProfile {
+                profile_id: "missing-shell".to_owned(),
+            },
+            AppCommand::StartConfiguredSerialProfile {
+                profile_id: "missing-device".to_owned(),
+            },
+        ] {
+            let mut state = AppState::for_test_with_configuration(configuration.clone());
+            state.dispatch(AppCommand::OpenProfiles, &context);
+            let profiles = state.active();
+            state.dispatch(
+                AppCommand::StartConfiguredLocalProfile {
+                    profile_id: "unknown".to_owned(),
+                },
+                &context,
+            );
+            assert_eq!(state.active(), profiles);
+            assert_eq!(state.tabs().len(), 2);
+            state.dispatch(command, &context);
+            assert_eq!(state.tabs().len(), 3);
+            assert!(state
+                .session_tab(state.active())
+                .unwrap()
+                .controller
+                .start_error()
+                .is_some());
+            state.dispatch(AppCommand::OpenProfiles, &context);
+            assert_eq!(state.active(), profiles);
+            assert_eq!(state.tabs().len(), 3);
+        }
+    }
+
+    #[test]
+    fn configured_interactive_ssh_connect_consumes_profiles_in_place() {
+        let context = egui::Context::default();
+        let configuration = Configuration::new(vec![festerm_config::Profile::ssh(
+            "remote",
+            "192.0.2.1",
+            22,
+            "user",
+            "xterm-256color",
+            80,
+            24,
+        )
+        .unwrap()])
+        .unwrap();
+        for sftp in [false, true] {
+            let mut state = AppState::for_test_with_configuration(configuration.clone());
+            state.dispatch(AppCommand::OpenProfiles, &context);
+            let profiles = state.active();
+            if sftp {
+                assert!(state.start_configured_sftp_profile_interactive("remote", &context));
+            } else {
+                state
+                    .start_configured_ssh_profile_interactive("remote", &context)
+                    .unwrap();
+            }
+            assert_eq!(state.active(), profiles);
+            assert_eq!(state.tabs().len(), 2);
+            assert_eq!(
+                state
+                    .session_tab(profiles)
+                    .unwrap()
+                    .profile_identifier
+                    .as_deref(),
+                Some("remote")
+            );
+            state.dispatch(AppCommand::CloseTab(profiles), &context);
+        }
+    }
+
+    #[test]
+    fn gui_sftp_profile_connect_replaces_profiles_and_can_cancel_in_place() {
+        let context = egui::Context::default();
+        let configuration = Configuration::new(vec![festerm_config::Profile::ssh(
+            "files",
+            "192.0.2.1",
+            22,
+            "user",
+            "xterm-256color",
+            80,
+            24,
+        )
+        .unwrap()])
+        .unwrap();
+        let mut state = AppState::for_test_with_configuration(configuration);
+        state.dispatch(AppCommand::OpenProfiles, &context);
+        let profiles = state.active();
+        state.dispatch(
+            AppCommand::OpenConfiguredSftpFileManagerProfile {
+                profile_id: "files".to_owned(),
+            },
+            &context,
+        );
+        assert_eq!(state.active(), profiles);
+        assert_eq!(state.tabs().len(), 2);
+        assert!(matches!(
+            &state.active_tab().content,
+            TabContent::SftpFileManagerAuthenticationRequired(tab) if tab.return_to_profiles
+        ));
+        state.dispatch(AppCommand::OpenProfiles, &context);
+        assert_eq!(state.active(), profiles);
+        assert_eq!(state.tabs().len(), 2);
+        assert!(matches!(state.active_tab().content, TabContent::Profiles));
+
+        state.dispatch(
+            AppCommand::OpenConfiguredSftpFileManagerProfile {
+                profile_id: "files".to_owned(),
+            },
+            &context,
+        );
+        let target = state.sftp_file_manager_target_for_profile("files").unwrap();
+        state.dispatch(
+            AppCommand::StartSftpFileManager {
+                target,
+                authentication: SftpFileManagerAuthentication::Password("test-only".to_owned()),
+            },
+            &context,
+        );
+        assert_eq!(state.active(), profiles);
+        assert_eq!(state.tabs().len(), 2);
+        assert!(matches!(
+            state.active_tab().content,
+            TabContent::SftpFileManager(_)
+        ));
+        state.dispatch(AppCommand::CloseTab(profiles), &context);
+    }
+
+    #[test]
+    fn stored_credential_profile_connect_reuses_profiles_for_ssh_and_sftp() {
+        let context = egui::Context::default();
+        let profile = festerm_config::Profile::ssh(
+            "stored",
+            "192.0.2.1",
+            22,
+            "user",
+            "xterm-256color",
+            80,
+            24,
+        )
+        .unwrap()
+        .with_credential_reference(festerm_secret_store::SecretReference::generate())
+        .unwrap();
+        let configuration = Configuration::new(vec![profile]).unwrap();
+        for transport in 0..3 {
+            let mut state = AppState::for_test_with_configuration(configuration.clone());
+            state.dispatch(AppCommand::OpenProfiles, &context);
+            let profiles = state.active();
+            let store: Arc<dyn SecretStore> =
+                Arc::new(festerm_secret_store::MemorySecretStore::new());
+            assert!(match transport {
+                0 => state.start_stored_password_ssh_profile(
+                    "stored",
+                    store,
+                    SshSessionOptions::new(),
+                    &context,
+                ),
+                1 => state.start_stored_password_sftp_profile("stored", store, &context),
+                _ => state.start_stored_sftp_file_manager_profile("stored", store, &context),
+            });
+            assert_eq!(state.active(), profiles);
+            assert_eq!(state.tabs().len(), 2);
+            assert!(matches!(
+                state.active_tab().content,
+                TabContent::Session(_) | TabContent::SftpFileManager(_)
+            ));
+            state.dispatch(AppCommand::CloseTab(profiles), &context);
+        }
+    }
+
+    #[test]
+    fn configured_interactive_ssh_profile_records_its_profile_identifier() {
+        let context = egui::Context::default();
+        let configuration = Configuration::new(vec![festerm_config::Profile::ssh(
+            "production",
+            "ssh.example.test",
+            22,
+            "deploy",
+            "xterm-256color",
+            80,
+            24,
+        )
+        .expect("test SSH profile is valid")])
+        .expect("test configuration is valid");
+        let mut state = AppState::for_test_with_configuration(configuration);
+
+        assert!(state
+            .start_configured_ssh_profile_interactive("production", &context)
+            .is_ok());
+
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("configured SSH profile must place a session tab");
+        };
+        assert_eq!(session.profile_identifier.as_deref(), Some("production"));
+        let target = state
+            .sftp_file_manager_target_for_tab(state.active())
+            .expect("SSH session should offer GUI SFTP");
+        assert_eq!(target.profile_id.as_deref(), Some("production"));
+        assert_eq!(target.stored_credential_kind, None);
+    }
+
+    #[test]
+    fn stored_credential_ssh_profile_exposes_its_saved_credential_to_gui_sftp() {
+        let context = egui::Context::default();
+        let profile = festerm_config::Profile::ssh(
+            "production",
+            "ssh.example.test",
+            22,
+            "deploy",
+            "xterm-256color",
+            80,
+            24,
+        )
+        .expect("test SSH profile is valid")
+        .with_credential_reference(festerm_secret_store::SecretReference::generate())
+        .expect("SSH profile accepts an opaque reference");
+        let configuration = Configuration::new(vec![profile]).expect("test configuration is valid");
+        let mut state = AppState::for_test_with_configuration(configuration);
+        let store: Arc<dyn festerm_secret_store::SecretStore> =
+            Arc::new(festerm_secret_store::MemorySecretStore::new());
+
+        assert!(state.start_stored_password_ssh_profile(
+            "production",
+            store,
+            SshSessionOptions::new(),
+            &context,
+        ));
+
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("stored-credential SSH profile must place a session tab");
+        };
+        assert_eq!(session.profile_identifier.as_deref(), Some("production"));
+        let target = state
+            .sftp_file_manager_target_for_tab(state.active())
+            .expect("SSH session should offer GUI SFTP");
+        assert_eq!(target.profile_id.as_deref(), Some("production"));
+        assert_eq!(
+            target.stored_credential_kind,
+            Some(festerm_config::CredentialKind::Password)
+        );
+    }
+
+    #[test]
+    fn replacing_configuration_changes_only_future_launcher_choices() {
+        let context = egui::Context::default();
+        let original = Configuration::new(vec![festerm_config::Profile::local(
+            "original",
+            "festerm-profile-test-command-that-does-not-exist",
+            Vec::new(),
+            None,
+        )
+        .expect("original local profile is valid")])
+        .expect("original configuration is valid");
+        let replacement = Configuration::new(vec![festerm_config::Profile::local(
+            "replacement",
+            "festerm-replacement-test-command-that-does-not-exist",
+            Vec::new(),
+            None,
+        )
+        .expect("replacement local profile is valid")])
+        .expect("replacement configuration is valid");
+        let mut state = AppState::for_test_with_configuration(original);
+
+        state.dispatch(
+            AppCommand::StartConfiguredLocalProfile {
+                profile_id: "original".to_owned(),
+            },
+            &context,
+        );
+        let active = state.active();
+        state.replace_configuration(replacement);
+
+        assert_eq!(state.active(), active);
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("the already running configured session must remain a session");
+        };
+        assert_eq!(session.label, "original");
+        assert!(state.configuration().profile("original").is_none());
+        assert!(state.configuration().profile("replacement").is_some());
+    }
+
+    fn restored_workspace_configuration(
+        focused_tab_id: Option<&str>,
+    ) -> (Configuration, WorkspaceConfiguration) {
+        let workspace = WorkspaceConfiguration::new(
+            vec![
+                WorkspaceTab::launcher("launcher").expect("launcher tab is valid"),
+                WorkspaceTab::local_session("local", "development").expect("local tab is valid"),
+                WorkspaceTab::ssh_session("remote", "production").expect("SSH tab is valid"),
+                WorkspaceTab::settings("settings").expect("settings tab is valid"),
+            ],
+            focused_tab_id.map(str::to_owned),
+        )
+        .expect("workspace is valid");
+        let configuration = Configuration::new_with_workspace(
+            vec![
+                festerm_config::Profile::local(
+                    "development",
+                    "festerm-workspace-local-profile-that-does-not-exist",
+                    Vec::new(),
+                    None,
+                )
+                .expect("local profile is valid"),
+                festerm_config::Profile::ssh(
+                    "production",
+                    "ssh.example.test",
+                    2200,
+                    "deploy",
+                    "xterm-256color",
+                    100,
+                    40,
+                )
+                .expect("SSH profile is valid"),
+            ],
+            workspace.clone(),
+        )
+        .expect("configuration is valid");
+        (configuration, workspace)
+    }
+
+    #[test]
+    fn workspace_restoration_recreates_ordered_fresh_local_tabs_and_focus() {
+        let context = egui::Context::default();
+        let (configuration, workspace) = restored_workspace_configuration(Some("local"));
+
+        let state = AppState::with_restored_workspace(&context, configuration, &workspace);
+
+        assert_eq!(state.tabs().len(), 4, "no default session is added");
+        assert!(matches!(state.tabs()[0].content, TabContent::Launcher));
+        let TabContent::Session(local) = &state.tabs()[1].content else {
+            panic!("the saved local tab starts a fresh local session");
+        };
+        assert_eq!(local.label, "development");
+        assert_eq!(
+            local.launch_secondary.as_deref(),
+            Some("festerm-workspace-local-profile-that-does-not-exist")
+        );
+        assert!(
+            local.controller.start_error().is_some(),
+            "the nonexistent executable proves startup used fresh profile metadata"
+        );
+        assert!(matches!(
+            state.tabs()[2].content,
+            TabContent::SshAuthenticationRequired(_)
+        ));
+        assert!(matches!(state.tabs()[3].content, TabContent::Settings));
+        assert_eq!(state.active(), state.tabs()[1].id);
+    }
+
+    #[test]
+    fn workspace_restoration_without_focus_selects_the_first_saved_tab() {
+        let context = egui::Context::default();
+        let (configuration, workspace) = restored_workspace_configuration(None);
+
+        let state = AppState::with_restored_workspace(&context, configuration, &workspace);
+
+        assert_eq!(state.active(), state.tabs()[0].id);
+        assert!(matches!(state.active_tab().content, TabContent::Launcher));
+    }
+
+    #[test]
+    fn restored_ssh_tab_requires_fresh_authentication_without_starting_a_session() {
+        let context = egui::Context::default();
+        let (configuration, workspace) = restored_workspace_configuration(Some("remote"));
+
+        let mut state = AppState::with_restored_workspace(&context, configuration, &workspace);
+
+        assert_eq!(state.active(), state.tabs()[2].id);
+        let TabContent::SshAuthenticationRequired(tab) = &state.active_tab().content else {
+            panic!("saved SSH metadata must restore an authentication-required surface");
+        };
+        assert_eq!(tab.profile.identifier(), "production");
+        assert_eq!(tab.profile.host(), "ssh.example.test");
+        assert_eq!(tab.profile.port(), 2200);
+        assert_eq!(tab.profile.username(), "deploy");
+        assert!(
+            state.session_tabs_with_id_mut().next().is_some(),
+            "only the separately restored local profile started a session"
+        );
+        assert_eq!(
+            state.session_tabs_with_id_mut().count(),
+            1,
+            "the SSH restoration starts no network transport"
+        );
+    }
+
+    #[test]
+    fn restored_sftp_tab_requires_fresh_authentication_without_starting_a_session() {
+        let context = egui::Context::default();
+        let workspace = WorkspaceConfiguration::new(
+            vec![WorkspaceTab::sftp_session("remote", "production").expect("SFTP tab is valid")],
+            Some("remote".to_owned()),
+        )
+        .expect("workspace is valid");
+        let configuration = Configuration::new_with_workspace(
+            vec![festerm_config::Profile::ssh(
+                "production",
+                "ssh.example.test",
+                2200,
+                "deploy",
+                "xterm-256color",
+                80,
+                24,
+            )
+            .expect("SSH profile is valid")],
+            workspace.clone(),
+        )
+        .expect("configuration is valid");
+
+        let mut state = AppState::with_restored_workspace(&context, configuration, &workspace);
+
+        let TabContent::SftpAuthenticationRequired(tab) = &state.active_tab().content else {
+            panic!("saved SFTP metadata must restore an authentication-required surface");
+        };
+        assert_eq!(tab.profile.identifier(), "production");
+        assert_eq!(tab.profile.host(), "ssh.example.test");
+        assert_eq!(tab.profile.port(), 2200);
+        assert_eq!(tab.profile.username(), "deploy");
+        assert_eq!(
+            state.session_tabs_with_id_mut().count(),
+            0,
+            "the SFTP restoration starts no network transport"
+        );
+    }
+
+    #[test]
+    fn gui_sftp_workspace_restore_requires_fresh_authentication() {
+        let context = egui::Context::default();
+        let workspace = WorkspaceConfiguration::new(
+            vec![
+                WorkspaceTab::sftp_file_manager("remote-files", "production")
+                    .expect("GUI SFTP tab is valid"),
+            ],
+            Some("remote-files".to_owned()),
+        )
+        .expect("workspace is valid");
+        let configuration = Configuration::new_with_workspace(
+            vec![festerm_config::Profile::ssh(
+                "production",
+                "ssh.example.test",
+                2200,
+                "deploy",
+                "xterm-256color",
+                80,
+                24,
+            )
+            .expect("SSH profile is valid")],
+            workspace.clone(),
+        )
+        .expect("configuration is valid");
+
+        let mut state = AppState::with_restored_workspace(&context, configuration, &workspace);
+
+        let TabContent::SftpFileManagerAuthenticationRequired(tab) = &state.active_tab().content
+        else {
+            panic!("saved GUI SFTP metadata must restore an authentication-required surface");
+        };
+        assert_eq!(tab.target.profile_id.as_deref(), Some("production"));
+        assert_eq!(tab.target.host, "ssh.example.test");
+        assert_eq!(tab.target.port, 2200);
+        assert_eq!(tab.target.username, "deploy");
+        assert_eq!(
+            state.session_tabs_with_id_mut().count(),
+            0,
+            "the restored GUI SFTP surface starts no live network transport"
+        );
+    }
+
+    #[test]
+    fn configured_ssh_profiles_can_open_gui_sftp_authentication_surfaces() {
+        let context = egui::Context::default();
+        let configuration = Configuration::new(vec![festerm_config::Profile::ssh(
+            "production",
+            "ssh.example.test",
+            2200,
+            "deploy",
+            "xterm-256color",
+            80,
+            24,
+        )
+        .expect("SSH profile is valid")])
+        .expect("configuration is valid");
+        let mut state = AppState::for_test_with_configuration(configuration);
+
+        state.dispatch(
+            AppCommand::OpenConfiguredSftpFileManagerProfile {
+                profile_id: "production".to_owned(),
+            },
+            &context,
+        );
+
+        let TabContent::SftpFileManagerAuthenticationRequired(tab) = &state.active_tab().content
+        else {
+            panic!("opening GUI SFTP should produce an authentication-required surface");
+        };
+        assert_eq!(tab.target.profile_id.as_deref(), Some("production"));
+        assert_eq!(tab.target.label, "production");
+        assert_eq!(tab.target.host, "ssh.example.test");
+        assert_eq!(tab.target.port, 2200);
+        assert_eq!(tab.target.username, "deploy");
+    }
+
+    #[test]
+    fn gui_sftp_builds_stored_password_and_private_key_authentication_without_loading_secrets() {
+        let store: Arc<dyn festerm_secret_store::SecretStore> =
+            Arc::new(festerm_secret_store::MemorySecretStore::new());
+        let reference = festerm_secret_store::SecretReference::generate();
+
+        let password = AppState::stored_sftp_file_manager_authentication(
+            festerm_config::CredentialKind::Password,
+            &reference,
+            Arc::clone(&store),
+        );
+        let private_key = AppState::stored_sftp_file_manager_authentication(
+            festerm_config::CredentialKind::PrivateKey,
+            &reference,
+            store,
+        );
+
+        assert!(matches!(
+            password,
+            SftpFileManagerAuthentication::StoredPassword { .. }
+        ));
+        assert!(matches!(
+            private_key,
+            SftpFileManagerAuthentication::StoredPrivateKey { .. }
+        ));
+        assert!(!format!("{password:?}").contains(reference.to_persisted_string().as_str()));
+        assert!(!format!("{private_key:?}").contains(reference.to_persisted_string().as_str()));
+    }
+
+    #[test]
+    fn pane_workspace_capture_keeps_legacy_and_new_view_ids_unique_across_windows() {
+        let context = egui::Context::default();
+        let workspace = WorkspaceConfiguration::new(
+            vec![
+                WorkspaceTab::launcher("tab-1").unwrap(),
+                WorkspaceTab::settings("tab-2").unwrap(),
+            ],
+            Some("tab-2".into()),
+        )
+        .unwrap();
+        let mut state =
+            AppState::with_restored_workspace(&context, Configuration::empty(), &workspace);
+        state.dispatch(AppCommand::CloseTab(state.tabs[0].id), &context);
+        state.dispatch(AppCommand::OpenLauncher, &context);
+        let mut next = 1;
+        let (tabs, focus) = state.capture_window_workspace_tabs(&mut next).unwrap();
+        assert_eq!(tabs[0].identifier(), "tab-2");
+        assert!(uuid::Uuid::parse_str(tabs[1].identifier()).is_ok());
+        assert_ne!(tabs[0].identifier(), tabs[1].identifier());
+        let additional = festerm_config::WorkspaceWindow::new(
+            vec![WorkspaceTab::launcher("tab-3").unwrap()],
+            Some("tab-3".into()),
+            None,
+        );
+        WorkspaceConfiguration::with_windows(tabs, focus, vec![additional]).unwrap();
+    }
+
+    #[test]
+    fn workspace_capture_preserves_order_focus_and_omits_nonrestorable_sessions() {
+        let context = egui::Context::default();
+        let configuration = Configuration::new(vec![
+            festerm_config::Profile::local(
+                "development",
+                "festerm-workspace-capture-command-that-does-not-exist",
+                Vec::new(),
+                None,
+            )
+            .unwrap(),
+            festerm_config::Profile::ssh(
+                "production",
+                "ssh.example.test",
+                22,
+                "deploy",
+                "xterm-256color",
+                80,
+                24,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let mut state = AppState::for_test_with_configuration(configuration);
+        state.dispatch(
+            AppCommand::StartConfiguredLocalProfile {
+                profile_id: "development".to_owned(),
+            },
+            &context,
+        );
+        state.dispatch(AppCommand::OpenSettings, &context);
+        let settings = state.active();
+        state.dispatch(AppCommand::OpenLauncher, &context);
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let TabContent::Session(ad_hoc) = &mut state.active_tab_mut().content else {
+            panic!("default launch creates a session");
+        };
+        assert_eq!(ad_hoc.profile_identifier, None);
+        let ssh = state
+            .configuration()
+            .profile("production")
+            .and_then(festerm_config::Profile::as_ssh)
+            .unwrap()
+            .clone();
+        state.tabs.push(Tab {
+            id: TabId::next(),
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::SshAuthenticationRequired(SshAuthenticationRequiredTab {
+                profile: ssh,
+                alias: None,
+            }),
+        });
+        let sftp = state
+            .configuration()
+            .profile("production")
+            .and_then(festerm_config::Profile::as_ssh)
+            .unwrap()
+            .clone();
+        state.tabs.push(Tab {
+            id: TabId::next(),
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::SftpAuthenticationRequired(SftpAuthenticationRequiredTab {
+                profile: sftp,
+                alias: None,
+            }),
+        });
+        state.active = settings;
+
+        let captured = state
+            .capture_workspace_configuration(Vec::new(), &mut 1, None)
+            .unwrap();
+        let workspace = captured.workspace().unwrap();
+
+        let identifiers: std::collections::HashSet<_> = workspace
+            .tabs()
+            .iter()
+            .map(WorkspaceTab::identifier)
+            .collect();
+        assert_eq!(identifiers.len(), 4);
+        assert!(identifiers
+            .iter()
+            .all(|id| uuid::Uuid::parse_str(id).is_ok()));
+        assert_eq!(
+            state
+                .capture_workspace_configuration(Vec::new(), &mut 1, None)
+                .unwrap(),
+            captured,
+            "capture preserves assigned view identities"
+        );
+        assert!(matches!(workspace.tabs()[0], WorkspaceTab::LocalSession(_)));
+        assert!(matches!(workspace.tabs()[1], WorkspaceTab::Settings(_)));
+        assert!(matches!(workspace.tabs()[2], WorkspaceTab::SshSession(_)));
+        assert!(matches!(workspace.tabs()[3], WorkspaceTab::SftpSession(_)));
+        assert_eq!(
+            workspace.focused_tab_id(),
+            state
+                .tabs
+                .iter()
+                .find(|tab| tab.id == settings)
+                .map(|tab| tab.durable_id.as_str())
+        );
+        assert_eq!(captured.profiles(), state.configuration().profiles());
+    }
+
+    #[test]
+    fn workspace_capture_uses_a_launcher_when_every_tab_is_omitted() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+
+        let captured = state
+            .capture_workspace_configuration(Vec::new(), &mut 1, None)
+            .unwrap();
+        let workspace = captured.workspace().unwrap();
+
+        assert!(matches!(workspace.tabs(), [WorkspaceTab::Launcher(_)]));
+        assert_eq!(
+            workspace.focused_tab_id(),
+            Some(workspace.tabs()[0].identifier())
+        );
+        state.dispatch(AppCommand::CloseTab(state.active()), &context);
+    }
+
+    #[test]
+    fn a_markdown_file_opens_in_the_editor_showing_its_preview_and_only_once() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let directory = std::env::temp_dir().join(format!(
+            "festerm-markdown-in-editor-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("NOTES.md");
+        std::fs::write(&path, "# Saved heading\n").unwrap();
+
+        state.dispatch(
+            AppCommand::OpenLocalMarkdownFile {
+                path: path.clone(),
+                replacing: None,
+            },
+            &context,
+        );
+
+        let editors = state
+            .tabs
+            .iter()
+            .filter(|tab| matches!(tab.content, TabContent::TextEditor(_)))
+            .count();
+        assert_eq!(
+            editors, 1,
+            "a Markdown file is a document, not a viewer tab"
+        );
+        assert!(
+            !state
+                .tabs
+                .iter()
+                .any(|tab| matches!(tab.content, TabContent::MarkdownViewer(_))),
+            "and no second tab is opened to say the same thing"
+        );
+        assert!(
+            state.active_editor_options().is_some(),
+            "the active tab is the editor"
+        );
+        let mode = state.tabs.iter().find_map(|tab| match &tab.content {
+            TabContent::TextEditor(editor) => Some(editor.mode()),
+            _ => None,
+        });
+        assert_eq!(
+            mode,
+            Some(crate::text_editor::EditorMode::Preview),
+            "Markdown is opened to be read first"
+        );
+
+        // Asking again focuses what is open rather than opening a second tab.
+        let before = state.tabs.len();
+        state.dispatch(
+            AppCommand::OpenLocalMarkdownFile {
+                path,
+                replacing: None,
+            },
+            &context,
+        );
+        assert_eq!(state.tabs.len(), before);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn workspace_capture_omits_runtime_markdown_viewer_tabs() {
+        let mut state = AppState::for_test();
+        state.tabs.push(Tab {
+            id: TabId::next(),
+            durable_id: uuid::Uuid::new_v4().to_string(),
+            pane_id: uuid::Uuid::new_v4().to_string(),
+            content: TabContent::MarkdownViewer(Box::new(MarkdownViewerTab::open_local(
+                PathBuf::from("/docs/readme.md"),
+            ))),
+        });
+        state.active = state.tabs[1].id;
+
+        let captured = state
+            .capture_workspace_configuration(Vec::new(), &mut 1, None)
+            .unwrap();
+        let workspace = captured.workspace().unwrap();
+
+        assert!(matches!(workspace.tabs(), [WorkspaceTab::Launcher(_)]));
+        assert_eq!(
+            workspace.focused_tab_id(),
+            Some(workspace.tabs()[0].identifier())
+        );
+    }
+
+    fn test_remote_markdown_source(remote_path: &str) -> RemoteMarkdownSource {
+        RemoteMarkdownSource::new(
+            "sftp.example.test",
+            22,
+            festerm_markdown::RemoteSourceOwner::username("deploy").unwrap(),
+            "SHA256:abc123",
+            remote_path,
+            1,
+        )
+        .expect("valid remote source fields")
+    }
+
+    fn test_remote_text_origin(remote_path: &str) -> RemoteOrigin {
+        RemoteOrigin::new(
+            "sftp.example.test",
+            22,
+            festerm_document::RemoteOwner::username("deploy").unwrap(),
+            "SHA256:abc123",
+            remote_path,
+            1,
+        )
+        .expect("valid remote origin fields")
+    }
+
+    #[test]
+    fn open_remote_markdown_snapshot_opens_a_new_tab() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let tabs_before = state.tabs().len();
+
+        state.dispatch(
+            AppCommand::OpenRemoteMarkdownSnapshot {
+                source: test_remote_markdown_source("/srv/docs/guide.md"),
+                display_path: "/srv/docs/guide.md".to_owned(),
+                content: b"# Guide\n".to_vec(),
+            },
+            &context,
+        );
+
+        assert_eq!(state.tabs().len(), tabs_before + 1);
+        let TabContent::MarkdownViewer(viewer) = &state.active_tab_mut().content else {
+            panic!("expected the new tab to be the Markdown viewer");
+        };
+        assert_eq!(viewer.display_path(), "/srv/docs/guide.md");
+    }
+
+    #[test]
+    fn open_remote_text_snapshot_opens_a_new_editor_tab() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let tabs_before = state.tabs().len();
+        let text = TextDocument::from_bytes(b"alpha\n", festerm_document::DocumentBounds::DEFAULT)
+            .unwrap();
+
+        state.dispatch(
+            AppCommand::OpenRemoteTextSnapshot {
+                origin: test_remote_text_origin("/srv/docs/notes.txt"),
+                text,
+                read_only: true,
+            },
+            &context,
+        );
+
+        assert_eq!(state.tabs().len(), tabs_before + 1);
+        let TabContent::TextEditor(editor) = &state.active_tab_mut().content else {
+            panic!("expected the new tab to be a text editor");
+        };
+        assert_eq!(editor.title(), "notes.txt");
+    }
+
+    #[test]
+    fn reopening_the_same_remote_markdown_file_refreshes_the_existing_tab_instead_of_duplicating() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(
+            AppCommand::OpenRemoteMarkdownSnapshot {
+                source: test_remote_markdown_source("/srv/docs/guide.md"),
+                display_path: "/srv/docs/guide.md".to_owned(),
+                content: b"# Guide v1\n".to_vec(),
+            },
+            &context,
+        );
+        let tabs_after_first_open = state.tabs().len();
+        let tab_id = state.active();
+
+        state.dispatch(
+            AppCommand::OpenRemoteMarkdownSnapshot {
+                source: test_remote_markdown_source("/srv/docs/guide.md"),
+                display_path: "/srv/docs/guide.md".to_owned(),
+                content: b"# Guide v2\n".to_vec(),
+            },
+            &context,
+        );
+
+        assert_eq!(state.tabs().len(), tabs_after_first_open);
+        assert_eq!(state.active(), tab_id);
+        let TabContent::MarkdownViewer(viewer) = &state.active_tab_mut().content else {
+            panic!("expected the refreshed tab to still be the Markdown viewer");
+        };
+        assert!(viewer.matches_remote_source(&test_remote_markdown_source("/srv/docs/guide.md")));
+    }
+
+    #[test]
+    fn remote_markdown_snapshots_with_different_identity_open_new_tabs() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(
+            AppCommand::OpenRemoteMarkdownSnapshot {
+                source: test_remote_markdown_source("/srv/docs/guide.md"),
+                display_path: "/srv/docs/guide.md".to_owned(),
+                content: b"# Guide v1\n".to_vec(),
+            },
+            &context,
+        );
+        let tabs_after_first_open = state.tabs().len();
+
+        let different_identity = RemoteMarkdownSource::new(
+            "sftp.example.test",
+            22,
+            festerm_markdown::RemoteSourceOwner::profile_identifier("other-profile").unwrap(),
+            "SHA256:different",
+            "/srv/docs/guide.md",
+            2,
+        )
+        .unwrap();
+        state.dispatch(
+            AppCommand::OpenRemoteMarkdownSnapshot {
+                source: different_identity,
+                display_path: "/srv/docs/guide.md".to_owned(),
+                content: b"# Guide v2\n".to_vec(),
+            },
+            &context,
+        );
+
+        assert_eq!(state.tabs().len(), tabs_after_first_open + 1);
+    }
+
+    #[test]
+    fn reopening_the_same_remote_text_snapshot_refreshes_the_existing_editor_tab() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(
+            AppCommand::OpenRemoteTextSnapshot {
+                origin: test_remote_text_origin("/srv/docs/notes.txt"),
+                text: TextDocument::from_bytes(
+                    b"alpha\n",
+                    festerm_document::DocumentBounds::DEFAULT,
+                )
+                .unwrap(),
+                read_only: true,
+            },
+            &context,
+        );
+        let tab_id = state.active();
+        let tabs_after_first_open = state.tabs().len();
+
+        state.dispatch(
+            AppCommand::OpenRemoteTextSnapshot {
+                origin: test_remote_text_origin("/srv/docs/notes.txt"),
+                text: TextDocument::from_bytes(
+                    b"beta\n",
+                    festerm_document::DocumentBounds::DEFAULT,
+                )
+                .unwrap(),
+                read_only: true,
+            },
+            &context,
+        );
+
+        assert_eq!(state.tabs().len(), tabs_after_first_open);
+        assert_eq!(state.active(), tab_id);
+    }
+
+    #[test]
+    fn rectangle_frozen_context_menu_resolves_cropped_url_after_live_overwrite() {
+        use egui_kittest::{kittest::Queryable, Harness};
+
+        let mut state = AppState::for_test();
+        let tab_id = state.replace_active_with_test_ssh_session(
+            crate::session_controller::fake::FakeSshSession::new([]),
+            "deploy",
+            "ssh.example.test",
+            22,
+        );
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, state: &mut AppState| {
+                    let session = state.session_tab_mut(tab_id).unwrap();
+                    let action = session.terminal_context_menu_action();
+                    session.view.show_with_options(
+                        ui,
+                        &mut session.terminal,
+                        &mut session.controller,
+                        festerm_ui_egui::TerminalViewOptions {
+                            context_menu_action: action,
+                            ..Default::default()
+                        },
+                    );
+                    session.update_terminal_context_menu(ui.ctx());
+                },
+                state,
+            );
+        harness.run();
+        {
+            let session = harness.state_mut().session_tab_mut(tab_id).unwrap();
+            session.terminal = Terminal::new(Dimensions::new(24, 3).unwrap()).unwrap();
+            session
+                .terminal
+                .ingest(b"left https://examp zz\r\nleft le.com/a     zz");
+            session.begin_rectangle_copy(true).unwrap();
+            session
+                .terminal
+                .ingest(b"\x1b[2J\x1b[Hhttps://wrong.example/live");
+        }
+        harness.run();
+        let grid = harness
+            .state()
+            .session_tab(tab_id)
+            .unwrap()
+            .view
+            .diagnostics()
+            .grid_rect
+            .unwrap();
+        let point = |column: f32, row: f32| {
+            grid.min
+                + egui::vec2(
+                    (column + 0.5) * grid.width() / 24.0,
+                    (row + 0.5) * grid.height() / 3.0,
+                )
+        };
+        for (column, row, button) in [
+            (5.0, 0.0, egui::PointerButton::Primary),
+            (17.0, 1.0, egui::PointerButton::Primary),
+            (7.0, 1.0, egui::PointerButton::Secondary),
+        ] {
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: point(column, row),
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.step();
+            }
+        }
+        harness.run();
+        let session = harness.state().session_tab(tab_id).unwrap();
+        assert!(matches!(session.terminal_path_open_request(),
+            Some(TerminalPathOpenRequest::Web(ref target)) if target == "https://example.com/a"));
+        assert!(harness.query_by_label("Go").is_some());
+        assert!(harness.query_by_label("Copy URL").is_some());
+        harness.get_by_label("Copy URL").click();
+        harness.run();
+        assert!(harness
+            .state()
+            .session_tab(tab_id)
+            .unwrap()
+            .view
+            .rectangle_copy_active());
+        assert!(!harness
+            .state_mut()
+            .session_tab_mut(tab_id)
+            .unwrap()
+            .view
+            .take_context_action_request());
+    }
+
+    #[test]
+    fn terminal_path_open_refuses_a_reconnected_remote_generation() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let session = crate::session_controller::fake::FakeSshSession::new([]);
+        let tab_id =
+            state.replace_active_with_test_ssh_session(session, "deploy", "ssh.example.test", 22);
+        let TabContent::Session(session) = &mut state.active_tab_mut().content else {
+            panic!("expected test SSH session");
+        };
+        session.terminal.ingest(b"/srv/docs/guide.md\n");
+        session.controller.advance_lifecycle_generation();
+        session.terminal_path.menu = resolve_context_menu_action(
+            &session.terminal,
+            festerm_ui_egui::TerminalContextTarget {
+                content_position: festerm_core::ContentPosition {
+                    column: 2,
+                    absolute_row: 0,
+                },
+                generation: 7,
+            },
+            &TerminalFilesystemOrigin::Remote(RemoteTerminalOrigin {
+                session_binding: "test-source".into(),
+                provider: crate::remote_files::RemoteFileProvider::Sftp,
+                host: "ssh.example.test".to_owned(),
+                port: 22,
+                username: "deploy".to_owned(),
+                profile_identifier: None,
+                lifecycle_generation: 0,
+                verified_host_key_fingerprint: Some("SHA256:abc123".to_owned()),
+                live_transport_available: true,
+                trusted_working_directory: None,
+            }),
+        );
+
+        state.dispatch(AppCommand::OpenTerminalDetectedPath { tab_id }, &context);
+
+        let notice = state
+            .take_open_refusal_notice()
+            .expect("generation mismatch should refuse");
+        assert!(notice.detail.contains("different transport generation"));
+    }
+
+    #[test]
+    fn terminal_file_links_open_local_documents_and_preserve_unsaved_edits() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let tab_id = state.replace_active_with_test_ssh_session(
+            crate::session_controller::fake::FakeSshSession::new([]),
+            "fixture",
+            "fixture.invalid",
+            22,
+        );
+        state.session_tab_mut(tab_id).unwrap().inspector_transport =
+            InspectorTransport::Local { persistence: None };
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("report one.md");
+        std::fs::write(&path, "# Original\n").unwrap();
+        let target = crate::terminal_paths::file_uri_for_test(&path);
+        let generation = state
+            .session_tab(tab_id)
+            .unwrap()
+            .controller
+            .lifecycle_generation();
+        let command = || AppCommand::OpenTerminalHyperlink {
+            tab_id,
+            lifecycle_generation: generation,
+            target: ExternalLinkTarget::new(target.clone()),
+        };
+        state.dispatch(command(), &context);
+        assert!(state.open_refusal.is_none(), "{:?}", state.open_refusal);
+        let editor_tab = state.active();
+        let document = state.active_document().expect("internal document");
+        assert_eq!(
+            state
+                .documents
+                .borrow()
+                .get(document)
+                .unwrap()
+                .text()
+                .text(),
+            "# Original\n"
+        );
+        state
+            .documents
+            .borrow_mut()
+            .get_mut(document)
+            .unwrap()
+            .text_mut()
+            .replace(0..0, "Unsaved\n")
+            .unwrap();
+        state.dispatch(command(), &context);
+        assert_eq!(state.active(), editor_tab);
+        assert_eq!(state.documents.borrow().len(), 1);
+        assert_eq!(
+            state
+                .documents
+                .borrow()
+                .get(document)
+                .unwrap()
+                .text()
+                .text(),
+            "Unsaved\n# Original\n"
+        );
+        assert!(context.output(|output| !output
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::OutputCommand::OpenUrl(_)))));
+    }
+
+    #[test]
+    fn terminal_file_links_refuse_remote_serial_stale_closed_and_unsafe_targets() {
+        for mode in [
+            "ssh", "sftp", "serial", "stale", "closed", "network", "device",
+        ] {
+            let context = egui::Context::default();
+            let mut state = AppState::for_test();
+            let tab_id = state.replace_active_with_test_ssh_session(
+                crate::session_controller::fake::FakeSshSession::new([]),
+                "fixture",
+                "fixture.invalid",
+                22,
+            );
+            let session = state.session_tab_mut(tab_id).unwrap();
+            let generation = session.controller.lifecycle_generation();
+            session.inspector_transport = match mode {
+                "ssh" => InspectorTransport::Ssh {
+                    username: "fixture".into(),
+                    host: "fixture.invalid".into(),
+                    port: 22,
+                    persistence: None,
+                },
+                "sftp" => InspectorTransport::Sftp {
+                    username: "fixture".into(),
+                    host: "fixture.invalid".into(),
+                    port: 22,
+                },
+                "serial" => InspectorTransport::Serial {
+                    device: "fixture".into(),
+                    baud_rate: 9600,
+                    data_bits: festerm_config::SerialDataBits::Eight,
+                    parity: festerm_config::SerialParity::None,
+                    stop_bits: festerm_config::SerialStopBits::One,
+                    flow_control: festerm_config::SerialFlowControl::None,
+                },
+                _ => InspectorTransport::Local { persistence: None },
+            };
+            if mode == "stale" {
+                session.controller.advance_lifecycle_generation();
+            }
+            if mode == "closed" {
+                state.close(tab_id);
+            }
+            let target = match mode {
+                "network" => "file:///%2Fattacker.invalid/share/report.md",
+                "device" => "file:///C:/NUL.md",
+                _ => "file:///C:/fixture/report.md",
+            };
+            state.dispatch(
+                AppCommand::OpenTerminalHyperlink {
+                    tab_id,
+                    lifecycle_generation: generation,
+                    target: ExternalLinkTarget::new(target.into()),
+                },
+                &context,
+            );
+            assert!(state.documents.borrow().is_empty(), "{mode}");
+            assert!(state.take_open_refusal_notice().is_some(), "{mode}");
+            assert!(
+                context.output(|output| !output
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::OutputCommand::OpenUrl(_)))),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn queued_recovery_notices_are_delivered_in_order_with_recovery_titles() {
+        let mut state = AppState::for_test();
+        let first = PathBuf::from("/tmp/.festerm-save-first.stage");
+        let second = PathBuf::from("/tmp/.festerm-save-second.stage");
+        {
+            let mut documents = state.documents.borrow_mut();
+            documents.queue_recovery_notice(
+                first.clone(),
+                festerm_document::SaveError::new("First recovery", "first detail"),
+            );
+            documents.queue_recovery_notice(
+                second.clone(),
+                festerm_document::SaveError::new("Second recovery", "second detail"),
+            );
+        }
+
+        let first_notice = state.take_open_refusal_notice().expect("first notice");
+        assert_eq!(
+            first_notice.title.as_deref(),
+            Some("Saving needs manual recovery")
+        );
+        assert_eq!(first_notice.path, first.display().to_string());
+        assert!(state.take_open_refusal_notice().is_none());
+        assert!(state.has_recovery_notices());
+        assert!(state.acknowledge_recovery_notice(&first));
+        let second_notice = state.take_open_refusal_notice().expect("second notice");
+        assert_eq!(second_notice.path, second.display().to_string());
+        assert!(state.acknowledge_recovery_notice(&second));
+        assert!(state.take_open_refusal_notice().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_acknowledgement_preserves_non_utf8_path_identity() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut state = AppState::for_test();
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/.festerm-save-\xff.stage".to_vec(),
+        ));
+        state.queue_recovery_notice_for_test(
+            path.clone(),
+            festerm_document::SaveError::new("Recovery", "Recover retained bytes."),
+        );
+
+        let notice = state.take_open_refusal_notice().expect("recovery notice");
+
+        assert_eq!(notice.acknowledgement_path.as_deref(), Some(&path));
+        assert!(state.acknowledge_recovery_notice(
+            notice
+                .acknowledgement_path
+                .as_deref()
+                .expect("exact acknowledgement path")
+        ));
+        assert!(!state.has_recovery_notices());
+    }
+
+    #[test]
+    fn recovery_notice_overflow_preserves_oldest_paths_and_surfaces_a_count() {
+        let mut state = AppState::for_test();
+        let exact_capacity = crate::documents::MAX_PENDING_RECOVERY_NOTICES
+            + crate::documents::MAX_OVERFLOW_RECOVERY_NOTICES;
+        for index in 0..(exact_capacity + 2) {
+            state.queue_recovery_notice_for_test(
+                PathBuf::from(format!("/tmp/.festerm-save-{index}.stage")),
+                festerm_document::SaveError::new(
+                    format!("Recovery {index}"),
+                    format!("detail {index}"),
+                ),
+            );
+        }
+
+        for index in 0..exact_capacity {
+            let notice = state.take_open_refusal_notice().expect("retained notice");
+            assert_eq!(notice.path, format!("/tmp/.festerm-save-{index}.stage"));
+            assert!(state.acknowledge_recovery_notice(Path::new(&notice.path)));
+        }
+        let overflow = state.take_open_refusal_notice().expect("overflow summary");
+        assert_eq!(
+            overflow.path,
+            format!("/tmp/.festerm-save-{}.stage", exact_capacity + 1)
+        );
+        assert!(overflow.detail.contains("2 additional recovery notice(s)"));
+        assert!(state.acknowledge_recovery_notice(Path::new(&overflow.path)));
+        assert!(state.take_open_refusal_notice().is_none());
+    }
+
+    #[test]
+    fn queued_remote_refusals_are_delivered_without_overwriting_each_other() {
+        let mut state = AppState::for_test();
+        for index in 1..=3 {
+            state.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                title: None,
+                acknowledgement_path: None,
+                name: format!("remote-{index}.md"),
+                path: format!("host:/remote-{index}.md"),
+                headline: format!("Refusal {index}"),
+                detail: format!("detail {index}"),
+            });
+        }
+
+        for index in 1..=3 {
+            let notice = state.take_open_refusal_notice().expect("queued refusal");
+            assert_eq!(notice.headline, format!("Refusal {index}"));
+        }
+        assert!(state.take_open_refusal_notice().is_none());
+    }
+
+    #[test]
+    fn asynchronous_remote_refusals_are_collected_without_loss() {
+        let mut state = AppState::for_test();
+        for index in 1..=3 {
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(TerminalPathWorkerResult::OpenRefusal(
+                    crate::overlay_state::OpenRefusalNotice {
+                        title: None,
+                        acknowledgement_path: None,
+                        name: format!("remote-{index}.md"),
+                        path: format!("host:/remote-{index}.md"),
+                        headline: format!("Refusal {index}"),
+                        detail: format!("detail {index}"),
+                    },
+                ))
+                .unwrap();
+            state
+                .pending_terminal_path_opens
+                .push(PendingTerminalPathOpen {
+                    source_generation: 0,
+                    source: state.active,
+                    origin: None,
+                    receiver,
+                    handle: None,
+                });
+        }
+
+        state.update_pending_terminal_path_opens(&egui::Context::default());
+
+        for index in 1..=3 {
+            let notice = state.take_open_refusal_notice().expect("worker refusal");
+            assert_eq!(notice.headline, format!("Refusal {index}"));
+        }
+        assert!(state.take_open_refusal_notice().is_none());
+    }
+
+    #[test]
+    fn remote_refusal_queue_is_bounded_and_keeps_the_newest_in_order() {
+        let mut state = AppState::for_test();
+        for index in 0..=MAX_PENDING_OPEN_REFUSAL_NOTICES {
+            state.queue_open_refusal_notice(crate::overlay_state::OpenRefusalNotice {
+                title: None,
+                acknowledgement_path: None,
+                name: format!("remote-{index}.md"),
+                path: format!("host:/remote-{index}.md"),
+                headline: format!("Refusal {index}"),
+                detail: format!("detail {index}"),
+            });
+        }
+
+        for index in 1..=MAX_PENDING_OPEN_REFUSAL_NOTICES {
+            let notice = state.take_open_refusal_notice().expect("bounded refusal");
+            assert_eq!(notice.headline, format!("Refusal {index}"));
+        }
+        assert!(state.take_open_refusal_notice().is_none());
+    }
+
+    /// A scratch directory with two Markdown files in it, for the routes that
+    /// open a local document.
+    fn two_markdown_files() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::Builder::new()
+            .prefix("festerm-open-markdown-")
+            .tempdir()
+            .unwrap();
+        let first = directory.path().join("first.md");
+        let second = directory.path().join("second.md");
+        std::fs::write(&first, "# First\n").unwrap();
+        std::fs::write(&second, "# Second\n").unwrap();
+        (directory, first, second)
+    }
+
+    #[test]
+    fn markdown_file_fixtures_have_independent_owned_cleanup() {
+        let (directory, first, second) = two_markdown_files();
+        let (other_directory, other_first, other_second) = two_markdown_files();
+        let directory_path = std::fs::canonicalize(directory.path()).unwrap();
+        let other_directory_path = std::fs::canonicalize(other_directory.path()).unwrap();
+        assert_ne!(directory_path, other_directory_path);
+        for path in [&directory_path, &other_directory_path] {
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("festerm-open-markdown-"));
+        }
+        for (path, expected) in [
+            (&first, "# First\n"),
+            (&second, "# Second\n"),
+            (&other_first, "# First\n"),
+            (&other_second, "# Second\n"),
+        ] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+        }
+
+        directory.close().expect("Markdown fixture cleanup failed");
+        assert!(!directory_path.exists());
+        assert!(other_directory_path.is_dir());
+        assert_eq!(std::fs::read_to_string(&other_first).unwrap(), "# First\n");
+        assert_eq!(
+            std::fs::read_to_string(&other_second).unwrap(),
+            "# Second\n"
+        );
+        other_directory
+            .close()
+            .expect("Markdown fixture cleanup failed");
+        assert!(!other_directory_path.exists());
+    }
+
+    #[test]
+    fn opening_a_hard_link_alias_raises_the_existing_text_editor_tab() {
+        let (directory, first, _) = two_markdown_files();
+        let alias = directory.path().join("alias.md");
+        std::fs::hard_link(&first, &alias).unwrap();
+        let mut state = AppState::for_test();
+
+        assert!(state.open_text_editor(&first).is_none());
+        let document = state.active_document().unwrap();
+        assert!(state.open_text_editor(&alias).is_none());
+
+        let text_editor_tabs = state
+            .tabs
+            .iter()
+            .filter(|tab| matches!(tab.content, TabContent::TextEditor(_)))
+            .count();
+        assert_eq!(text_editor_tabs, 1);
+        assert_eq!(state.active_document(), Some(document));
+        assert_eq!(state.documents.borrow().get(document).unwrap().views(), 1);
+    }
+
+    #[test]
+    fn hard_link_save_as_rebinds_only_the_active_text_editor_view() {
+        let (directory, source, _) = two_markdown_files();
+        let destination = directory.path().join("destination.md");
+        std::fs::hard_link(&source, &destination).unwrap();
+        let mut state = AppState::for_test();
+        assert!(state.open_text_editor(&source).is_none());
+        let source_document = state.active_document().unwrap();
+        state.documents.borrow_mut().retain(source_document);
+        state.open_text_document(source_document);
+        let saving_tab = state.active();
+        let confirmed = crate::document_store::observe_destination(&destination).unwrap();
+
+        state.save_active_text_document_to(&destination, &confirmed);
+
+        let destination_document = state.active_document().unwrap();
+        assert_ne!(destination_document, source_document);
+        assert_eq!(state.active(), saving_tab);
+        assert_eq!(
+            state
+                .tabs
+                .iter()
+                .filter_map(|tab| match &tab.content {
+                    TabContent::TextEditor(editor) => Some(editor.document()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![source_document, destination_document]
+        );
+    }
+
+    #[test]
+    fn ctrl_o_inside_a_viewer_gives_the_tab_over_to_the_editor() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let (directory, _first, second) = two_markdown_files();
+        state.dispatch(
+            AppCommand::OpenRemoteMarkdownSnapshot {
+                source: test_remote_markdown_source("/srv/docs/guide.md"),
+                display_path: "/srv/docs/guide.md".to_owned(),
+                content: b"# Guide\n".to_vec(),
+            },
+            &context,
+        );
+        let viewer_tab = state.active();
+        let tabs_with_the_viewer = state.tabs().len();
+
+        state.dispatch(
+            AppCommand::OpenLocalMarkdownFile {
+                path: second.clone(),
+                replacing: Some(viewer_tab),
+            },
+            &context,
+        );
+        if let Some((path, failure)) = state.take_open_refusal() {
+            panic!("could not open {}: {}", path.display(), failure.detail());
+        }
+
+        // The reader asked for the surface in front of them to change, so the
+        // viewer goes and the editor takes its place rather than both being
+        // left open.
+        assert_eq!(state.tabs().len(), tabs_with_the_viewer);
+        assert!(
+            !state
+                .tabs()
+                .iter()
+                .any(|tab| matches!(tab.content, TabContent::MarkdownViewer(_))),
+            "the viewer the reader was in has given way"
+        );
+        let TabContent::TextEditor(editor) = &state.active_tab_mut().content else {
+            panic!("expected the retargeted tab to be the editor");
+        };
+        assert_eq!(editor.title(), "second.md");
+        directory.close().expect("Markdown fixture cleanup failed");
+    }
+
+    #[test]
+    fn opening_a_second_markdown_file_opens_a_second_editor_tab() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let (directory, first, second) = two_markdown_files();
+        state.dispatch(
+            AppCommand::OpenLocalMarkdownFile {
+                path: first,
+                replacing: None,
+            },
+            &context,
+        );
+        if let Some((path, failure)) = state.take_open_refusal() {
+            panic!("could not open {}: {}", path.display(), failure.detail());
+        }
+        let first_tab = state.active();
+        let tabs_after_first_open = state.tabs().len();
+
+        state.dispatch(
+            AppCommand::OpenLocalMarkdownFile {
+                path: second,
+                replacing: None,
+            },
+            &context,
+        );
+        if let Some((path, failure)) = state.take_open_refusal() {
+            panic!("could not open {}: {}", path.display(), failure.detail());
+        }
+
+        assert_eq!(state.tabs().len(), tabs_after_first_open + 1);
+        assert_ne!(state.active(), first_tab);
+        directory.close().expect("Markdown fixture cleanup failed");
+    }
+
+    /// A stale replacement target (its tab was closed while the picker was
+    /// open) must not silently swallow the open.
+    #[test]
+    fn opening_a_markdown_file_still_opens_it_when_the_replacement_target_is_gone() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let (directory, first, second) = two_markdown_files();
+        state.dispatch(
+            AppCommand::OpenLocalMarkdownFile {
+                path: first,
+                replacing: None,
+            },
+            &context,
+        );
+        if let Some((path, failure)) = state.take_open_refusal() {
+            panic!("could not open {}: {}", path.display(), failure.detail());
+        }
+        let stale = state.active();
+        state.dispatch(AppCommand::CloseTab(stale), &context);
+        let tabs_before = state.tabs().len();
+
+        state.dispatch(
+            AppCommand::OpenLocalMarkdownFile {
+                path: second,
+                replacing: Some(stale),
+            },
+            &context,
+        );
+        if let Some((path, failure)) = state.take_open_refusal() {
+            panic!("could not open {}: {}", path.display(), failure.detail());
+        }
+
+        assert_eq!(state.tabs().len(), tabs_before + 1);
+        let TabContent::TextEditor(editor) = &state.active_tab_mut().content else {
+            panic!("expected a new editor tab");
+        };
+        assert_eq!(editor.title(), "second.md");
+        directory.close().expect("Markdown fixture cleanup failed");
+    }
+
+    #[test]
+    fn closing_the_final_restored_ssh_surface_returns_to_the_launcher() {
+        let context = egui::Context::default();
+        let workspace = WorkspaceConfiguration::new(
+            vec![WorkspaceTab::ssh_session("remote", "production").expect("SSH tab is valid")],
+            Some("remote".to_owned()),
+        )
+        .expect("workspace is valid");
+        let configuration = Configuration::new_with_workspace(
+            vec![festerm_config::Profile::ssh(
+                "production",
+                "ssh.example.test",
+                2200,
+                "deploy",
+                "xterm-256color",
+                80,
+                24,
+            )
+            .expect("SSH profile is valid")],
+            workspace.clone(),
+        )
+        .expect("configuration is valid");
+        let mut state = AppState::with_restored_workspace(&context, configuration, &workspace);
+        let restored_tab = state.active();
+
+        state.dispatch(AppCommand::CloseTab(restored_tab), &context);
+
+        assert_eq!(state.tabs().len(), 1);
+        assert!(matches!(state.active_tab().content, TabContent::Launcher));
+    }
+
+    fn ssh_profile() -> SshConnectionProfile {
+        SshConnectionProfile::new(
+            festerm_ssh::HostIdentity::new("192.0.2.1", 22).expect("test host is valid"),
+            "test-user",
+            SshConnectionProfile::DEFAULT_TERMINAL_TYPE,
+            TerminalSize::new(80, 24).expect("test size is valid"),
+        )
+        .expect("test profile is valid")
+    }
+
+    #[test]
+    fn host_key_trust_decisions_map_onto_the_ssh_transport_decisions_including_persistence() {
+        assert_eq!(
+            HostTrustDecision::from(HostKeyTrustDecision::Reject),
+            HostTrustDecision::Reject
+        );
+        assert_eq!(
+            HostTrustDecision::from(HostKeyTrustDecision::AcceptOnce),
+            HostTrustDecision::AcceptOnce
+        );
+        // ADR 0020: the durable trust-record write is a composition-root
+        // concern intercepted in `FesTermApp::screen_command`, but the
+        // SSH-transport-level decision this maps onto is identical to
+        // `AcceptOnce` for the current connection either way.
+        assert_eq!(
+            HostTrustDecision::from(HostKeyTrustDecision::AcceptAndPersist),
+            HostTrustDecision::AcceptAndPersist
+        );
+    }
+
+    #[test]
+    fn ssh_startup_failure_uses_the_existing_no_session_fallback() {
+        let dimensions = Dimensions::new(80, 24).expect("test dimensions are valid");
+        let session = SessionTab::from_ssh_session_result(
+            Err(SshSessionStartError),
+            dimensions,
+            "test-user@example.invalid",
+            Some("SSH · example.invalid:22".to_owned()),
+            None,
+            InspectorTransport::Ssh {
+                username: "test-user".to_owned(),
+                host: "example.invalid".to_owned(),
+                port: 22,
+                persistence: None,
+            },
+            None,
+        );
+
+        assert_eq!(
+            session.controller.start_error(),
+            Some("could not start SSH worker thread")
+        );
+        assert!(
+            session
+                .controller
+                .status_line()
+                .starts_with("SSH session unavailable:"),
+            "SSH failures use the controller's ordinary startup-error state"
+        );
+        assert!(session
+            .terminal
+            .row_text(0)
+            .is_some_and(|row| row.starts_with("SSH session could not start.")));
+    }
+
+    #[test]
+    fn ssh_command_replaces_the_active_launcher_without_a_live_server() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let launcher_id = state.active();
+        let secret = "transient-test-password";
+        let command = AppCommand::StartSshSession {
+            profile: ssh_profile(),
+            authentication: SshAuthentication::password(secret),
+            options: SshSessionOptions::new(),
+        };
+
+        assert!(
+            !format!("{command:?}").contains(secret),
+            "transient authentication must stay redacted in command debug output"
+        );
+        state.dispatch(command, &context);
+
+        assert_eq!(state.tabs().len(), 1);
+        assert_eq!(state.active(), launcher_id);
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("SSH command must place a session tab");
+        };
+        assert_eq!(session.label, "test-user@192.0.2.1");
+        assert_eq!(session.system_label(), "Remote");
+        assert!(matches!(
+            session.controller.session(),
+            Some(ApplicationSession::Ssh(_))
+        ));
+
+        state.dispatch(AppCommand::CloseTab(launcher_id), &context);
+    }
+
+    #[test]
+    fn interactive_ssh_command_replaces_the_active_launcher_in_place() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let launcher_id = state.active();
+
+        state.dispatch(
+            AppCommand::StartSshSession {
+                profile: ssh_profile(),
+                authentication: SshAuthentication::interactive(),
+                options: SshSessionOptions::new(),
+            },
+            &context,
+        );
+
+        assert_eq!(
+            state.tabs().len(),
+            1,
+            "Quick Connect with no upfront credential must reuse the existing Launcher tab, \
+             not open a second tab"
+        );
+        assert_eq!(state.active(), launcher_id);
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!(
+                "an interactive (host-key-first) SSH command must place a session tab, not a \
+                 pre-connection prompt"
+            );
+        };
+        assert_eq!(session.label, "test-user@192.0.2.1");
+        assert!(matches!(
+            session.controller.session(),
+            Some(ApplicationSession::Ssh(_))
+        ));
+        // Interactive sessions authenticate on the live connection itself
+        // (host key first, then an in-terminal password prompt), so they
+        // never populate the full-reconnect retry state that a plain typed
+        // password does.
+        assert!(session.ssh_password_retry.is_none());
+
+        state.dispatch(AppCommand::CloseTab(launcher_id), &context);
+    }
+
+    #[test]
+    fn a_plain_typed_password_session_retains_full_reconnect_retry_state() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let launcher_id = state.active();
+
+        state.dispatch(
+            AppCommand::StartSshSession {
+                profile: ssh_profile(),
+                authentication: SshAuthentication::password("transient-test-password"),
+                options: SshSessionOptions::new(),
+            },
+            &context,
+        );
+
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("SSH command must place a session tab");
+        };
+        let retry = session
+            .ssh_password_retry
+            .as_ref()
+            .expect("a plain typed password must retain full-reconnect retry state");
+        assert_eq!(
+            retry.attempts, 0,
+            "a first attempt must start the retry episode at zero"
+        );
+
+        state.dispatch(AppCommand::CloseTab(launcher_id), &context);
+    }
+
+    #[test]
+    fn reconnect_command_ignores_a_non_ssh_tab() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let launcher = state.active();
+
+        state.dispatch(AppCommand::ReconnectSession(launcher), &context);
+
+        assert_eq!(state.active(), launcher);
+        assert_eq!(state.tabs().len(), 1);
+        assert!(matches!(state.active_tab().content, TabContent::Launcher));
+    }
+
+    #[test]
+    fn new_launcher_command_reactivates_the_singleton() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let initial = state.active();
+
+        state.dispatch(AppCommand::OpenLauncher, &context);
+
+        assert_eq!(state.tabs().len(), 1);
+        assert_eq!(state.active(), initial);
+        assert_eq!(launcher_ids(&state), vec![initial]);
+    }
+
+    #[test]
+    fn open_settings_is_a_singleton_and_reactivates_the_existing_tab() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+
+        state.dispatch(AppCommand::OpenSettings, &context);
+        assert_eq!(state.tabs().len(), 2);
+        let settings_id = state.active();
+        assert!(matches!(state.active_tab().content, TabContent::Settings));
+
+        // Switch away, then request Settings again: it must reactivate the
+        // same tab rather than creating a second one.
+        let launcher_id = launcher_ids(&state)[0];
+        state.dispatch(AppCommand::ActivateTab(launcher_id), &context);
+        assert_eq!(state.active(), launcher_id);
+
+        state.dispatch(AppCommand::OpenSettings, &context);
+        assert_eq!(state.tabs().len(), 2, "Settings is a singleton chip");
+        assert_eq!(state.active(), settings_id);
+    }
+
+    #[test]
+    fn open_profiles_is_a_singleton_and_reactivates_the_existing_tab() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+
+        state.dispatch(AppCommand::OpenProfiles, &context);
+        assert_eq!(state.tabs().len(), 2);
+        let profiles_id = state.active();
+        assert!(matches!(state.active_tab().content, TabContent::Profiles));
+
+        // Switch away, then request Profiles again: it must reactivate the
+        // same tab rather than creating a second one.
+        let launcher_id = launcher_ids(&state)[0];
+        state.dispatch(AppCommand::ActivateTab(launcher_id), &context);
+        assert_eq!(state.active(), launcher_id);
+
+        state.dispatch(AppCommand::OpenProfiles, &context);
+        assert_eq!(state.tabs().len(), 2, "Profiles is a singleton chip");
+        assert_eq!(state.active(), profiles_id);
+    }
+
+    #[test]
+    fn activate_ignores_an_unknown_tab_id() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let initial = state.active();
+
+        state.dispatch(AppCommand::OpenSettings, &context);
+        let unknown = TabId::next();
+        state.dispatch(AppCommand::ActivateTab(unknown), &context);
+
+        assert_ne!(state.active(), initial);
+        assert_ne!(state.active(), unknown);
+    }
+
+    #[test]
+    fn starting_a_local_session_from_the_active_launcher_replaces_it_in_place() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let launcher_id = state.active();
+        assert!(matches!(state.active_tab().content, TabContent::Launcher));
+
+        state.dispatch(AppCommand::StartLocalSession, &context);
+
+        assert_eq!(
+            state.tabs().len(),
+            1,
+            "the launcher tab is replaced, not left behind alongside a new session tab"
+        );
+        assert_eq!(
+            state.active(),
+            launcher_id,
+            "the session tab keeps the launcher's identity/position"
+        );
+        assert!(matches!(state.active_tab().content, TabContent::Session(_)));
+    }
+
+    #[test]
+    fn starting_a_local_session_from_a_non_launcher_active_tab_opens_a_new_tab() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(AppCommand::OpenSettings, &context);
+        assert!(matches!(state.active_tab().content, TabContent::Settings));
+
+        state.dispatch(AppCommand::StartLocalSession, &context);
+
+        assert_eq!(
+            state.tabs().len(),
+            3,
+            "Settings and Launcher tabs are left untouched; the new session tab is added"
+        );
+        assert!(matches!(state.active_tab().content, TabContent::Session(_)));
+    }
+
+    #[test]
+    fn a_new_local_session_inherits_the_current_windows_terminal_dimensions() {
+        // Regression test: opening a new local session while another one is
+        // already running in an already-resized window must start the new
+        // session at that window's size, not visibly snap back to the
+        // application's baseline default until the next resize corrects it.
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let TabContent::Session(first) = &mut state.active_tab_mut().content else {
+            panic!("expected a session tab");
+        };
+        let resized = Dimensions::new(140, 45).expect("valid dimensions");
+        assert_ne!(first.terminal.dimensions(), resized);
+        first
+            .terminal
+            .resize(resized)
+            .expect("terminal resize succeeds");
+
+        // Opening a second session from the same (non-launcher) active tab
+        // opens a new tab rather than replacing the first.
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        assert_eq!(state.tabs().len(), 2);
+        let TabContent::Session(second) = &state.active_tab().content else {
+            panic!("expected a session tab");
+        };
+        assert_eq!(
+            second.terminal.dimensions(),
+            resized,
+            "new session must start at the current window's terminal size"
+        );
+    }
+
+    #[test]
+    fn toggle_chip_layout_flips_between_wrap_and_single_row_scroll() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert_eq!(state.chip_layout(), ChipLayout::SingleRowScroll);
+
+        state.dispatch(AppCommand::ToggleChipLayout, &context);
+        assert_eq!(state.chip_layout(), ChipLayout::Wrap);
+
+        state.dispatch(AppCommand::ToggleChipLayout, &context);
+        assert_eq!(state.chip_layout(), ChipLayout::SingleRowScroll);
+    }
+
+    #[test]
+    fn toggle_status_bar_flips_visibility_and_defaults_to_shown() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(state.status_bar_visible());
+
+        state.dispatch(AppCommand::ToggleStatusBar, &context);
+        assert!(!state.status_bar_visible());
+
+        state.dispatch(AppCommand::ToggleStatusBar, &context);
+        assert!(state.status_bar_visible());
+    }
+
+    #[test]
+    fn pane_handles_preference_snapshot_adopt_and_reset() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(!state.show_pane_handles());
+        state.dispatch(AppCommand::TogglePaneHandles, &context);
+        assert!(state.show_pane_handles());
+        let snapshot = state.interface_settings();
+        assert!(snapshot.show_pane_handles());
+        let configuration = Configuration::empty()
+            .with_interface_settings(snapshot)
+            .unwrap();
+        assert!(AppState::for_test_with_configuration(configuration.clone()).show_pane_handles());
+        state.dispatch(AppCommand::TogglePaneHandles, &context);
+        assert!(!state.show_pane_handles());
+        state.adopt_configuration(configuration);
+        assert!(state.show_pane_handles());
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(!state.show_pane_handles());
+        assert!(!state.interface_settings().show_pane_handles());
+    }
+
+    #[test]
+    fn pane_high_contrast_preference_snapshot_adopt_and_reset() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(!state.pane_high_contrast());
+        state.dispatch(AppCommand::TogglePaneHighContrast, &context);
+        assert!(state.pane_high_contrast());
+        let snapshot = state.interface_settings();
+        assert!(snapshot.pane_high_contrast());
+        let configuration = Configuration::empty()
+            .with_interface_settings(snapshot)
+            .unwrap();
+        assert!(AppState::for_test_with_configuration(configuration.clone()).pane_high_contrast());
+        state.dispatch(AppCommand::TogglePaneHighContrast, &context);
+        assert!(!state.pane_high_contrast());
+        state.adopt_configuration(configuration);
+        assert!(state.pane_high_contrast());
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(!state.pane_high_contrast());
+        assert!(!state.interface_settings().pane_high_contrast());
+    }
+
+    #[test]
+    fn toggle_show_session_details_flips_visibility_and_defaults_to_hidden() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(!state.show_session_details());
+
+        state.dispatch(AppCommand::ToggleShowSessionDetails, &context);
+        assert!(state.show_session_details());
+
+        state.dispatch(AppCommand::ToggleShowSessionDetails, &context);
+        assert!(!state.show_session_details());
+    }
+
+    #[test]
+    fn reset_interface_settings_also_restores_show_session_details() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(AppCommand::ToggleShowSessionDetails, &context);
+        assert!(state.show_session_details());
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(!state.show_session_details());
+    }
+
+    #[test]
+    fn toggle_restore_workspace_flips_state_and_resets_to_on() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(state.restore_workspace(), "on by default");
+
+        state.dispatch(AppCommand::ToggleRestoreWorkspace, &context);
+        assert!(!state.restore_workspace());
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(state.restore_workspace());
+    }
+
+    #[test]
+    fn toggle_close_confirmation_flips_state_and_resets_to_off() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(!state.confirm_session_close(), "off by default");
+
+        state.dispatch(AppCommand::ToggleConfirmSessionClose, &context);
+        assert!(state.confirm_session_close());
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(!state.confirm_session_close());
+    }
+
+    #[test]
+    fn toggle_powershell_preference_flips_state_and_resets_to_on() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(state.prefer_powershell(), "on by default");
+
+        state.dispatch(AppCommand::TogglePreferPowershell, &context);
+        assert!(!state.prefer_powershell());
+        assert!(!state.interface_settings().prefer_powershell());
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(state.prefer_powershell());
+    }
+
+    #[test]
+    fn toggle_customize_local_shell_flips_state_and_resets_to_off() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(!state.customize_local_shell(), "off by default");
+
+        state.dispatch(AppCommand::ToggleCustomizeLocalShell, &context);
+        assert!(state.customize_local_shell());
+        assert!(state.interface_settings().customize_local_shell());
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(!state.customize_local_shell());
+    }
+
+    #[test]
+    fn default_local_session_profile_starts_in_the_users_home_directory() {
+        // Computed independently of the helper the implementation calls, so
+        // the assertion still fails if home resolution degrades to the
+        // process's own directory or the filesystem root.
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+            .expect("a test host provides a home directory");
+
+        let profile = SessionTab::default_local_profile_for_session(true)
+            .expect("this platform provides a default local shell");
+
+        assert_eq!(profile.working_directory(), Some(home.as_path()));
+        assert_ne!(
+            profile.working_directory(),
+            std::env::current_dir().ok().as_deref(),
+            "a shell must start in the user's home directory, not wherever \
+             fesTerm happened to be launched from"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disabled_powershell_preference_labels_the_comspec_session() {
+        let context = egui::Context::default();
+        let session = SessionTab::start_default(&context, None, false);
+        let expected = default_local_profile_with_powershell_preference(false)
+            .ok()
+            .and_then(|profile| local_profile_secondary(&profile));
+
+        assert_eq!(session.launch_secondary, expected);
+    }
+
+    #[test]
+    fn automation_preferences_reset_and_replace_without_implicit_enablement() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(!state.mcp_enabled());
+        assert!(!state.javascript_enabled());
+        state.dispatch(AppCommand::ToggleMcpEnabled, &context);
+        assert!(state.mcp_enabled());
+        assert!(!state.javascript_enabled());
+        state.dispatch(AppCommand::ToggleJavascriptEnabled, &context);
+        let enabled = state.interface_settings();
+        assert!(enabled.mcp_enabled());
+        assert!(enabled.javascript_enabled());
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(!state.mcp_enabled());
+        assert!(!state.javascript_enabled());
+        let replacement = Configuration::empty()
+            .with_interface_settings(enabled)
+            .unwrap();
+        state.adopt_configuration(replacement);
+        assert!(state.mcp_enabled());
+        assert!(state.javascript_enabled());
+    }
+
+    #[test]
+    fn terminal_typography_changes_and_resets_independently() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert_eq!(state.terminal_font(), TerminalFontPreference::JetBrainsMono);
+        assert!(state.terminal_ligatures());
+        assert_eq!(
+            state.emoji_presentation(),
+            EmojiPresentationPreference::Color
+        );
+
+        state.dispatch(
+            AppCommand::SetTerminalFont(TerminalFontPreference::JuliaMono),
+            &context,
+        );
+        state.dispatch(AppCommand::ToggleTerminalLigatures, &context);
+        state.dispatch(
+            AppCommand::SetEmojiPresentation(EmojiPresentationPreference::Monochrome),
+            &context,
+        );
+
+        assert_eq!(state.terminal_font(), TerminalFontPreference::JuliaMono);
+        assert!(!state.terminal_ligatures());
+        assert_eq!(
+            state.interface_settings().terminal_font(),
+            TerminalFontPreference::JuliaMono
+        );
+        assert!(!state.interface_settings().terminal_ligatures());
+        assert_eq!(
+            state.interface_settings().emoji_presentation(),
+            EmojiPresentationPreference::Monochrome
+        );
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert_eq!(state.terminal_font(), TerminalFontPreference::JetBrainsMono);
+        assert!(state.terminal_ligatures());
+        assert_eq!(
+            state.emoji_presentation(),
+            EmojiPresentationPreference::Color
+        );
+    }
+
+    #[test]
+    fn terminal_font_policy_applies_to_every_existing_session_view() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        assert_eq!(state.tabs().len(), 2);
+
+        state.apply_terminal_font_set(
+            festerm_ui_egui::TerminalFontSet::default().with_color_emoji(false),
+        );
+
+        for tab in state.tabs() {
+            let TabContent::Session(session) = &tab.content else {
+                panic!("expected only session tabs");
+            };
+            assert!(!session.view.color_emoji_enabled());
+        }
+    }
+
+    #[test]
+    fn scroll_speed_changes_and_resets_to_normal() {
+        // Feature request #67: scroll speed is a Settings clickstop, not a
+        // toggle, so it needs its own coverage distinct from the boolean
+        // preferences above.
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert_eq!(state.scroll_speed(), ScrollSpeedPreference::Normal);
+
+        state.dispatch(
+            AppCommand::SetScrollSpeed(ScrollSpeedPreference::VerySlow),
+            &context,
+        );
+        assert_eq!(state.scroll_speed(), ScrollSpeedPreference::VerySlow);
+        assert_eq!(
+            state.interface_settings().scroll_speed(),
+            ScrollSpeedPreference::VerySlow
+        );
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert_eq!(state.scroll_speed(), ScrollSpeedPreference::Normal);
+    }
+
+    #[test]
+    fn scrollback_limit_changes_apply_only_to_subsequent_sessions() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let TabContent::Session(first) = &state.active_tab().content else {
+            panic!("expected a session tab");
+        };
+        assert_eq!(
+            first.terminal.scrollback_stats().limit_bytes(),
+            ScrollbackLimitPreference::MiB64.bytes()
+        );
+
+        state.dispatch(
+            AppCommand::SetScrollbackLimit(ScrollbackLimitPreference::Disabled),
+            &context,
+        );
+        assert_eq!(
+            state.interface_settings().scrollback_limit(),
+            ScrollbackLimitPreference::Disabled
+        );
+        let TabContent::Session(first) = &state.tabs()[0].content else {
+            panic!("expected a session tab");
+        };
+        assert_eq!(
+            first.terminal.scrollback_stats().limit_bytes(),
+            ScrollbackLimitPreference::MiB64.bytes(),
+            "changing the preference must not mutate an existing session"
+        );
+
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let TabContent::Session(second) = &state.active_tab().content else {
+            panic!("expected a session tab");
+        };
+        assert_eq!(second.terminal.scrollback_stats().limit_bytes(), 0);
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert_eq!(state.scrollback_limit(), ScrollbackLimitPreference::MiB64);
+    }
+
+    #[test]
+    fn durable_session_label_names_every_provider_and_omits_ordinary_sessions() {
+        // Feature request #168's acceptance list: local festerm-sessiond,
+        // local tmux, local GNU screen, and persistent SSH through either
+        // multiplexer, with nothing at all for sessions that have no durable
+        // identity to report.
+        for (provider, expected) in [
+            (PersistenceProviderKind::Tmux, "tmux · deploy-watch"),
+            (PersistenceProviderKind::Screen, "GNU Screen · deploy-watch"),
+            (
+                PersistenceProviderKind::FestermSessiond,
+                "fesTerm session daemon · deploy-watch",
+            ),
+        ] {
+            let persistence = || {
+                Some(InspectorPersistence {
+                    provider_label: provider.label(),
+                    session_name: "deploy-watch".to_owned(),
+                })
+            };
+            assert_eq!(
+                durable_session_label_for(&InspectorTransport::Local {
+                    persistence: persistence(),
+                })
+                .as_deref(),
+                Some(expected),
+                "a local {} session must name itself in the status bar",
+                provider.label()
+            );
+            assert_eq!(
+                durable_session_label_for(&InspectorTransport::Ssh {
+                    username: "deploy".to_owned(),
+                    host: "web-1.example.test".to_owned(),
+                    port: 22,
+                    persistence: persistence(),
+                })
+                .as_deref(),
+                Some(expected),
+                "a persistent SSH {} session reports the same identity",
+                provider.label()
+            );
+        }
+
+        for ordinary in [
+            InspectorTransport::Local { persistence: None },
+            InspectorTransport::Ssh {
+                username: "deploy".to_owned(),
+                host: "web-1.example.test".to_owned(),
+                port: 22,
+                persistence: None,
+            },
+            InspectorTransport::Sftp {
+                username: "builder".to_owned(),
+                host: "artifacts.example.test".to_owned(),
+                port: 22,
+            },
+        ] {
+            assert_eq!(
+                durable_session_label_for(&ordinary),
+                None,
+                "a session with no durable identity must render no placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_durable_session_in_status_bar_flips_state_and_resets_to_off() {
+        // Feature request #168.
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(!state.show_durable_session_in_status_bar());
+
+        state.dispatch(AppCommand::ToggleDurableSessionInStatusBar, &context);
+        assert!(state.show_durable_session_in_status_bar());
+        assert!(state
+            .interface_settings()
+            .show_durable_session_in_status_bar());
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(!state.show_durable_session_in_status_bar());
+    }
+
+    #[test]
+    fn toggle_show_resumable_sessions_flips_state_and_resets_to_on() {
+        // Feature request #70.
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(state.show_resumable_sessions());
+
+        state.dispatch(AppCommand::ToggleShowResumableSessions, &context);
+        assert!(!state.show_resumable_sessions());
+        assert!(!state.interface_settings().show_resumable_sessions());
+
+        state.dispatch(AppCommand::ResetInterfaceSettings, &context);
+        assert!(state.show_resumable_sessions());
+    }
+
+    #[test]
+    fn activating_a_tab_clears_its_new_output_flag() {
+        // Feature request #68: switching back to a tab that had unseen
+        // background output must clear the flag, since the user is now
+        // looking at it and there is nothing left to notify them of.
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let first = state.active();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let second = state.active();
+
+        let TabContent::Session(session) = &mut state.active_tab_mut().content else {
+            panic!("expected a session tab");
+        };
+        session.has_new_output_since_active = true;
+
+        // Switching away and back to the flagged tab clears it.
+        state.dispatch(AppCommand::ActivateTab(first), &context);
+        state.dispatch(AppCommand::ActivateTab(second), &context);
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("expected a session tab");
+        };
+        assert!(!session.has_new_output_since_active);
+    }
+
+    #[test]
+    fn toggle_inspector_flips_state() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(!state.inspector_open());
+
+        state.dispatch(AppCommand::ToggleSessionInspector, &context);
+        assert!(!state.inspector_open(), "Launcher has no session inspector");
+
+        state.dispatch(AppCommand::StartLocalSession, &context);
+
+        state.dispatch(AppCommand::ToggleSessionInspector, &context);
+        assert!(state.inspector_open());
+
+        state.dispatch(AppCommand::OpenSettings, &context);
+        assert!(matches!(state.active_tab().content, TabContent::Settings));
+        assert!(!state.inspector_open());
+
+        state.dispatch(AppCommand::ActivatePreviousTab, &context);
+        assert!(!state.inspector_open(), "the inspector must not resurrect");
+
+        state.dispatch(AppCommand::ToggleSessionInspector, &context);
+        assert!(state.inspector_open());
+    }
+
+    #[test]
+    fn closing_a_tab_returns_to_the_one_it_was_opened_from() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let first = state.active();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let third = state.active();
+
+        state.dispatch(AppCommand::ActivateTab(first), &context);
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let opened = state.active();
+        assert_ne!(opened, third);
+
+        state.dispatch(AppCommand::CloseTab(opened), &context);
+        assert_eq!(
+            state.active(),
+            first,
+            "a close returns to where the closed tab was opened from, not to its neighbour",
+        );
+    }
+
+    #[test]
+    fn a_singleton_tab_is_never_where_a_close_returns_to() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let session = state.active();
+
+        state.dispatch(AppCommand::OpenSettings, &context);
+        assert!(matches!(state.active_tab().content, TabContent::Settings));
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let opened = state.active();
+
+        state.dispatch(AppCommand::CloseTab(opened), &context);
+        assert_eq!(
+            state.active(),
+            session,
+            "Settings is passed through, not returned to",
+        );
+    }
+
+    #[test]
+    fn without_a_history_a_close_falls_back_to_the_tab_on_the_left() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let left = state.active();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let closing = state.active();
+        state.activation_history.clear();
+
+        state.dispatch(AppCommand::CloseTab(closing), &context);
+        assert_eq!(state.active(), left);
+    }
+
+    #[test]
+    fn closing_the_leftmost_tab_without_a_history_falls_back_to_the_rightmost() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let leftmost = state.active();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let rightmost = state.active();
+
+        state.dispatch(AppCommand::ActivateTab(leftmost), &context);
+        state.activation_history.clear();
+        state.dispatch(AppCommand::CloseTab(leftmost), &context);
+        assert_eq!(state.active(), rightmost);
+    }
+
+    #[test]
+    fn a_revisited_tab_is_remembered_once_and_most_recently() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let first = state.active();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let second = state.active();
+
+        state.dispatch(AppCommand::ActivateTab(first), &context);
+        state.dispatch(AppCommand::ActivateTab(second), &context);
+        assert_eq!(state.activation_history, vec![second, first]);
+
+        state.dispatch(AppCommand::CloseTab(second), &context);
+        assert_eq!(state.active(), first);
+    }
+
+    #[test]
+    fn a_closed_tab_is_not_returned_to_later() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let first = state.active();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let second = state.active();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let third = state.active();
+        assert_eq!(state.activation_history, vec![first, second]);
+
+        state.dispatch(AppCommand::CloseTab(second), &context);
+        assert_eq!(
+            state.active(),
+            third,
+            "closing an inactive tab moves nobody"
+        );
+
+        state.dispatch(AppCommand::CloseTab(third), &context);
+        assert_eq!(
+            state.active(),
+            first,
+            "a tab that has itself been closed is skipped over, not returned to",
+        );
+    }
+
+    #[test]
+    fn closing_the_active_tab_reactivates_a_neighbor() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let first = state.active();
+
+        state.dispatch(AppCommand::OpenSettings, &context);
+        let second = state.active();
+        assert_ne!(first, second);
+
+        state.dispatch(AppCommand::CloseTab(second), &context);
+        assert_eq!(state.tabs().len(), 1);
+        assert_eq!(state.active(), first);
+    }
+
+    #[test]
+    fn activate_next_and_previous_wrap_around_in_stable_list_order() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let first = state.active();
+        state.dispatch(AppCommand::OpenSettings, &context);
+        let second = state.active();
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        let third = state.active();
+
+        state.dispatch(AppCommand::ActivateTab(first), &context);
+        state.dispatch(AppCommand::ActivateNextTab, &context);
+        assert_eq!(state.active(), second);
+        state.dispatch(AppCommand::ActivateNextTab, &context);
+        assert_eq!(state.active(), third);
+        state.dispatch(AppCommand::ActivateNextTab, &context);
+        assert_eq!(state.active(), first, "next wraps back to the start");
+
+        state.dispatch(AppCommand::ActivatePreviousTab, &context);
+        assert_eq!(state.active(), third, "previous wraps back to the end");
+    }
+
+    #[test]
+    fn reorder_moves_a_tab_before_a_target_without_changing_active_tab() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let first = state.active();
+        state.dispatch(AppCommand::OpenSettings, &context);
+        let second = state.active();
+        state.dispatch(AppCommand::ActivateTab(first), &context);
+
+        // Order is [first, second]; move second before first.
+        state.dispatch(
+            AppCommand::ReorderTab {
+                moved: second,
+                before: Some(first),
+            },
+            &context,
+        );
+
+        let order: Vec<TabId> = state.tabs().iter().map(|tab| tab.id).collect();
+        assert_eq!(order, vec![second, first]);
+        assert_eq!(
+            state.active(),
+            first,
+            "reordering must not change which tab is active"
+        );
+    }
+
+    #[test]
+    fn reorder_to_the_end_when_before_is_none() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let first = state.active();
+        state.dispatch(AppCommand::OpenSettings, &context);
+        let second = state.active();
+
+        state.dispatch(
+            AppCommand::ReorderTab {
+                moved: first,
+                before: None,
+            },
+            &context,
+        );
+
+        let order: Vec<TabId> = state.tabs().iter().map(|tab| tab.id).collect();
+        assert_eq!(order, vec![second, first]);
+    }
+
+    #[test]
+    fn reorder_ignores_an_unknown_moved_id_or_moving_before_itself() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let only = state.active();
+        let unknown = TabId::next();
+
+        state.dispatch(
+            AppCommand::ReorderTab {
+                moved: unknown,
+                before: Some(only),
+            },
+            &context,
+        );
+        assert_eq!(state.tabs().len(), 1);
+
+        state.dispatch(
+            AppCommand::ReorderTab {
+                moved: only,
+                before: Some(only),
+            },
+            &context,
+        );
+        assert_eq!(state.tabs()[0].id, only);
+    }
+
+    #[test]
+    fn move_tab_commands_move_one_place_without_changing_active_identity() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let launcher = state.active();
+        state.dispatch(AppCommand::OpenSettings, &context);
+        let settings = state.active();
+
+        state.dispatch(AppCommand::MoveTabLeft(settings), &context);
+        assert_eq!(state.active(), settings);
+        assert_eq!(state.tabs()[0].id, settings);
+        assert_eq!(state.tabs()[1].id, launcher);
+
+        state.dispatch(AppCommand::MoveTabLeft(launcher), &context);
+        assert_eq!(state.active(), settings);
+        assert_eq!(state.tabs()[0].id, launcher);
+        assert_eq!(state.tabs()[1].id, settings);
+    }
+
+    #[test]
+    fn closing_the_last_tab_returns_to_the_launcher_rather_than_going_empty() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let only = state.active();
+
+        state.dispatch(AppCommand::CloseTab(only), &context);
+
+        assert_eq!(state.tabs().len(), 1, "root state is never empty");
+        assert!(matches!(state.active_tab().content, TabContent::Launcher));
+    }
+
+    #[test]
+    fn serial_startup_failure_surfaces_a_concise_error() {
+        let context = egui::Context::default();
+        let dimensions = Dimensions::new(80, 24).expect("test dimensions are valid");
+        let settings = LineSettings::with_defaults("/dev/festerm-test-nonexistent-000")
+            .expect("test line settings are valid");
+        let inspector_transport = inspector_transport_from_settings(&settings);
+        let result = SerialSession::open_with_notifier(settings, make_notifier(&context))
+            .map(ApplicationSession::Serial);
+        let session = SessionTab::from_serial_session_result(
+            result,
+            dimensions,
+            "nonexistent-device",
+            Some("Serial · 115200 baud".to_owned()),
+            None,
+            inspector_transport,
+        );
+
+        assert!(
+            session.controller.start_error().is_some(),
+            "a nonexistent serial device must surface a startup error"
+        );
+        assert!(
+            session
+                .controller
+                .status_line()
+                .starts_with("Serial session unavailable:"),
+            "serial failures use the controller's ordinary startup-error state"
+        );
+        assert!(session
+            .terminal
+            .row_text(0)
+            .is_some_and(|row| row.starts_with("Serial session could not start.")));
+    }
+
+    #[test]
+    fn resuming_a_missing_session_surfaces_a_concise_error() {
+        // Feature request #70: attempting to resume a session that has
+        // vanished by the time the user clicks it (e.g. it exited) must
+        // surface an ordinary startup error, not panic.
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.show_resumable_sessions = true;
+        let original = state.active();
+        state.dispatch(
+            AppCommand::ResumeUnattachedSession {
+                session: festerm_sessiond::UnattachedSession {
+                    name: "nonexistent-resumable-session".to_owned(),
+                    shell: String::new(),
+                    arguments: Vec::new(),
+                    working_directory: None,
+                    created_at_unix_ms: 0,
+                    pid: 0,
+                    endpoint: String::new(),
+                },
+            },
+            &context,
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while state.pending_resume.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            state.update_running_sessions(&context);
+            std::thread::yield_now();
+        }
+        assert_eq!(state.active(), original);
+        assert!(matches!(state.active_tab().content, TabContent::Launcher));
+        assert!(state
+            .resume_error
+            .as_ref()
+            .unwrap()
+            .contains("No replacement shell"));
+    }
+
+    /// Discovery runs `tmux ls`, `screen -ls`, and a daemon probe every two
+    /// seconds. With the preference on by default that would otherwise be
+    /// spent on every user forever, including while they are looking at a
+    /// terminal and could not see a Running Sessions panel if one existed.
+    #[test]
+    fn running_session_discovery_polls_only_while_the_launcher_is_on_screen() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        assert!(state.show_resumable_sessions, "on by default");
+        assert!(matches!(state.active_tab().content, TabContent::Launcher));
+
+        state.update_running_sessions(&context);
+        assert!(
+            state.discovery.is_enabled(),
+            "the Launcher is what shows Running Sessions"
+        );
+
+        state.dispatch(AppCommand::StartLocalSession, &context);
+        state.update_running_sessions(&context);
+        assert!(
+            !state.discovery.is_enabled(),
+            "a session tab cannot show Running Sessions, so nothing should be probed for it"
+        );
+
+        state.dispatch(AppCommand::OpenLauncher, &context);
+        state.update_running_sessions(&context);
+        assert!(
+            state.discovery.is_enabled(),
+            "returning to the Launcher must start looking again"
+        );
+    }
+
+    #[test]
+    fn duplicate_resume_requests_are_bounded_and_disabled_discovery_does_not_launch() {
+        let mut state = AppState::for_test();
+        state.show_resumable_sessions = false;
+        state.begin_resume(|| panic!("disabled resume must not launch"));
+        assert!(state.pending_resume.is_none());
+        state.show_resumable_sessions = true;
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        state.begin_resume(move || {
+            wait.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            Err("controlled stale entry".into())
+        });
+        for _ in 0..1000 {
+            state.begin_resume(|| panic!("duplicate resume must be coalesced"));
+        }
+        state.show_resumable_sessions = false;
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while state.pending_resume.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            state.update_running_sessions(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        assert_eq!(state.tabs().len(), 1);
+        assert!(matches!(state.active_tab().content, TabContent::Launcher));
+    }
+
+    #[test]
+    fn native_termination_is_bounded_refreshes_inventory_and_surfaces_failures() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        state.show_resumable_sessions = false;
+        state.begin_native_termination(&context, || panic!("disabled action must not launch"));
+        assert!(!state.native_termination_pending());
+        state.show_resumable_sessions = true;
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        state.begin_native_termination(&context, move || {
+            wait.recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            Err("selected generation is now attached".into())
+        });
+        for _ in 0..1000 {
+            state.begin_native_termination(&context, || {
+                panic!("duplicate termination must not launch")
+            });
+            state.begin_resume(|| panic!("reattach must not race termination"));
+        }
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while state.native_termination_pending() {
+            assert!(std::time::Instant::now() < deadline);
+            state.update_running_sessions(&context);
+            std::thread::yield_now();
+        }
+        assert!(state
+            .resume_error
+            .as_deref()
+            .unwrap()
+            .contains("now attached"));
+        assert_eq!(state.tabs().len(), 1);
+        state.begin_native_termination(&context, || Ok(()));
+        while state.native_termination_pending() {
+            assert!(std::time::Instant::now() < deadline);
+            state.update_running_sessions(&context);
+            std::thread::yield_now();
+        }
+        assert!(state.resume_error.is_none());
+        assert_eq!(state.tabs().len(), 1);
+    }
+
+    #[test]
+    fn serial_command_replaces_the_active_launcher_in_place() {
+        let context = egui::Context::default();
+        let mut state = AppState::for_test();
+        let launcher_id = state.active();
+
+        let settings = LineSettings::with_defaults("/dev/festerm-test-nonexistent-000")
+            .expect("test line settings are valid");
+        state.dispatch(AppCommand::StartSerialSession { settings }, &context);
+
+        assert_eq!(state.tabs().len(), 1);
+        assert_eq!(state.active(), launcher_id);
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("serial command must place a session tab");
+        };
+        assert_eq!(session.label, "/dev/festerm-test-nonexistent-000");
+        assert_eq!(session.system_label(), "Serial");
+        assert_eq!(session.status_bar_label(), "Failed");
+        assert!(
+            session.controller.start_error().is_some(),
+            "the nonexistent device proves the serial launch path was exercised"
+        );
+        assert!(matches!(
+            session.inspector_transport,
+            InspectorTransport::Serial { .. }
+        ));
+
+        state.dispatch(AppCommand::CloseTab(launcher_id), &context);
+    }
+
+    #[test]
+    fn configured_serial_profile_command_starts_a_serial_session() {
+        let context = egui::Context::default();
+        let configuration =
+            Configuration::new(vec![festerm_config::Profile::serial_with_defaults(
+                "my-device",
+                "/dev/festerm-test-nonexistent-serial-profile",
+            )
+            .expect("test serial profile is valid")])
+            .expect("test configuration is valid");
+        let mut state = AppState::for_test_with_configuration(configuration);
+        let launcher_id = state.active();
+
+        state.dispatch(
+            AppCommand::StartConfiguredSerialProfile {
+                profile_id: "my-device".to_owned(),
+            },
+            &context,
+        );
+
+        assert_eq!(state.tabs().len(), 1);
+        assert_eq!(state.active(), launcher_id);
+        let TabContent::Session(session) = &state.active_tab().content else {
+            panic!("configured serial profile must replace the active launcher");
+        };
+        assert_eq!(session.label, "my-device");
+        assert_eq!(session.profile_identifier.as_deref(), Some("my-device"));
+        assert!(
+            session.controller.start_error().is_some(),
+            "the nonexistent device proves the configured launch path attempted its metadata"
+        );
+    }
+}

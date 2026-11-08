@@ -1,0 +1,25 @@
+name = "festerm"
+version = "0.15.0"
+product-name = "fesTerm"
+identifier = "dev.fes.festerm"
+description = "An AI-friendly local, SSH, and serial terminal."
+homepage = "https://github.com/fes/fesTerm"
+authors = ["fes"]
+out-dir = "../target/release"
+formats = ["dmg"]
+icons = [
+  "../assets/app-icon/app-icon-16.png",
+  "../assets/app-icon/app-icon-32.png",
+  "../assets/app-icon/app-icon-128.png",
+  "../assets/app-icon/app-icon-256.png",
+  "../assets/app-icon/app-icon-512.png",
+]
+binaries = [
+  { path = "festerm", main = true },
+  { path = "festerm-sessiond", main = false },
+  { path = "festerm-tunnel-setup", main = false },
+  { path = "festerm-tunnel-bridge", main = false },
+]
+
+[macos]
+info-plist-path = "../packaging/macos-info.plist"

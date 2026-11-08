@@ -1,0 +1,1109 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, OnceLock,
+};
+use std::time::{Duration, Instant};
+
+use eframe::egui;
+use festerm_config::{AccountProvider, DevTunnelAccount, DevTunnelHost, Profile};
+use festerm_secret_store::{SecretBytes, SecretReference, SecretStore};
+use festerm_tunnel_bridge::{
+    protocol::ClientId,
+    relay::{self, Destination},
+    transport,
+};
+use festerm_tunnel_client::{
+    identity::{self, Account, DevicePrompt, Identity},
+    service, Error, Https,
+};
+use festerm_ui_egui::{
+    controls::{action_button_monospace, ActionButtonRole},
+    theme,
+};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+
+use super::{ConfigurationStartupStatus, FesTermApp};
+use crate::{
+    tabs::{
+        tunnel_reconnect::{TunnelOrigin, TunnelReconnectRequest, TunnelTab},
+        TabId, TunnelConnectToken,
+    },
+    tunnel_activation::Launch,
+};
+
+/// How long an automatic reconnect may run before it gives up quietly.
+const AUTOMATIC_RECONNECT_LIMIT: Duration = Duration::from_secs(60);
+
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+#[path = "tunnel_workflow_tests.rs"]
+mod tests;
+
+struct WorkerSlot {
+    identity_lease: OnceLock<std::fs::File>,
+}
+
+fn acquire_identity_lease(
+    root: &std::path::Path,
+    reference: &SecretReference,
+) -> Result<std::fs::File, Error> {
+    std::fs::create_dir_all(root).map_err(|_| Error::Store)?;
+    let metadata = std::fs::symlink_metadata(root).map_err(|_| Error::Store)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::Store);
+    }
+    let path = root.join(format!("{}.lock", reference.to_persisted_string()));
+    if std::fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        return Err(Error::Store);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|_| Error::Store)?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+        if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+            Error::Busy
+        } else {
+            Error::Store
+        }
+    })?;
+    Ok(file)
+}
+
+pub(super) fn account_lease(
+    account: Option<&DevTunnelAccount>,
+) -> Result<Option<std::fs::File>, Error> {
+    profile_identity_lease(account, true)
+}
+
+fn profile_identity_lease(
+    account: Option<&DevTunnelAccount>,
+    remember: bool,
+) -> Result<Option<std::fs::File>, Error> {
+    let identity = account;
+    if !remember || identity.is_none() {
+        return Ok(None);
+    }
+    let root = directories::ProjectDirs::from("com", "fes", "fesTerm")
+        .ok_or(Error::Store)?
+        .cache_dir()
+        .join("native-tunnel-identity-locks");
+    acquire_identity_lease(&root, identity.ok_or(Error::Store)?.credential_reference()).map(Some)
+}
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+struct Stored {
+    store: Arc<dyn SecretStore>,
+    references: Vec<SecretReference>,
+    cleanup_reporter: CleanupReporter,
+}
+
+#[derive(Clone)]
+struct CleanupReporter {
+    failed: Arc<std::sync::atomic::AtomicU16>,
+    context: egui::Context,
+}
+
+impl CleanupReporter {
+    fn report(&self) {
+        self.failed.fetch_or(
+            crate::configuration_startup::SecretCleanupNotice::Tunnel.bit(),
+            Ordering::Release,
+        );
+        self.context.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+impl Stored {
+    fn cleanup(&mut self) -> bool {
+        let mut failed = false;
+        for reference in self.references.drain(..) {
+            failed |= self.store.delete(&reference).is_err();
+        }
+        if failed {
+            self.cleanup_reporter.report();
+        }
+        !failed
+    }
+}
+impl Drop for Stored {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// What a successful, remembered sign-in adds to the profile once the user
+/// approves the host.
+struct Binding {
+    /// A freshly signed-in account to add or re-authenticate; `None` when the
+    /// profile's existing account was reused.
+    account: Option<DevTunnelAccount>,
+    connect: SecretReference,
+    host: DevTunnelHost,
+}
+
+struct Prepared {
+    binding: Option<Binding>,
+    launch: Launch,
+    /// The host lets a client reclaim its own stale attachment, so it
+    /// understands a client id.
+    reclaim: bool,
+    stored: Stored,
+}
+
+/// The connection to start: a client id goes only to a host that advertised
+/// reclaim, because older hosts reject an unknown hello field.
+fn connection_launch(launch: Launch, takeover: bool, reclaim: bool, client: &ClientId) -> Launch {
+    let launch = launch.with_takeover(takeover);
+    if reclaim {
+        launch.with_client(client.clone())
+    } else {
+        launch
+    }
+}
+
+enum Event {
+    Device(DevicePrompt),
+    Refresh {
+        bytes: zeroize::Zeroizing<Vec<u8>>,
+        published: oneshot::Sender<Result<(), Error>>,
+    },
+    Host {
+        account: Account,
+        host: DevTunnelHost,
+        approval: oneshot::Sender<()>,
+    },
+    Complete(Result<Box<Prepared>, Error>),
+}
+enum Stage {
+    Working,
+    Device(DevicePrompt),
+    Host {
+        account: Account,
+        host: DevTunnelHost,
+        approval: Option<oneshot::Sender<()>>,
+    },
+    Error(Error),
+}
+
+pub(super) struct Workflow {
+    expected: Profile,
+    account: Option<DevTunnelAccount>,
+    cancel: CancellationToken,
+    receiver: mpsc::Receiver<Event>,
+    stage: Stage,
+    connect: bool,
+    remember: bool,
+    /// An ephemeral workflow's profile exists only in memory: nothing is
+    /// saved, and the connection is not attributed to a saved profile.
+    ephemeral: bool,
+    takeover: bool,
+    focus_cancel: bool,
+    ready: Option<Box<Prepared>>,
+    /// Reconnects this tab in place, presenting its client id.
+    reconnect: Option<(TabId, ClientId)>,
+    /// Started by itself: it never prompts and never reports failure; it is
+    /// dropped instead, leaving the tab's manual Reconnect.
+    automatic: Option<Instant>,
+    _slot: Option<Arc<WorkerSlot>>,
+}
+impl Drop for Workflow {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+fn host_metadata(binding: &service::HostBinding) -> DevTunnelHost {
+    DevTunnelHost {
+        tunnel_id: binding.tunnel_id.clone(),
+        cluster: binding.cluster.clone(),
+        host_id: binding.host_id.clone(),
+        public_key: binding.public_key.clone(),
+        port: binding.port,
+    }
+}
+
+impl Workflow {
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        expected: Profile,
+        account: Option<DevTunnelAccount>,
+        store: Arc<dyn SecretStore>,
+        sign_in: bool,
+        remember: bool,
+        connect: bool,
+        ephemeral: bool,
+        takeover: bool,
+        extend_days: Option<u32>,
+        cleanup_reporter: CleanupReporter,
+        context: &egui::Context,
+    ) -> Self {
+        let cancel = CancellationToken::new();
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let mut workflow = Self {
+            expected: expected.clone(),
+            account: account.clone(),
+            cancel: cancel.clone(),
+            receiver,
+            stage: Stage::Working,
+            connect,
+            remember,
+            ephemeral,
+            takeover,
+            focus_cancel: true,
+            ready: None,
+            reconnect: None,
+            automatic: None,
+            _slot: None,
+        };
+        let Some(client_id) = identity::registered_client_id() else {
+            workflow.stage = Stage::Error(Error::Registration);
+            return workflow;
+        };
+        if ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            workflow.stage = Stage::Error(Error::Busy);
+            return workflow;
+        }
+        let slot = Arc::new(WorkerSlot {
+            identity_lease: OnceLock::new(),
+        });
+        workflow._slot = Some(Arc::clone(&slot));
+        let context = context.clone();
+        let spawned = std::thread::Builder::new().name("native-tunnel-sign-in".into())
+            .spawn(move || {
+                let _slot = slot;
+                let notify = |event| {
+                    let sent = sender.try_send(event).is_ok();
+                    context.request_repaint();
+                    sent
+                };
+                let result = profile_identity_lease(account.as_ref(), remember || ephemeral).and_then(|lease| {
+                    if let Some(lease) = lease {
+                        _slot.identity_lease.set(lease).map_err(|_| Error::Busy)?;
+                    }
+                    tokio::runtime::Builder::new_current_thread().enable_all().build()
+                        .map_err(|_| Error::Network)
+                })
+                    .and_then(|runtime| runtime.block_on(async {
+                        tokio::select! {
+                            _ = cancel.cancelled() => Err(Error::Cancelled),
+                            _ = tokio::time::sleep(Duration::from_secs(1800)) => Err(Error::Expired),
+                            value = prepare(expected, account, store, client_id, sign_in, remember, ephemeral, extend_days, &cancel, &notify, cleanup_reporter) => value.map(Box::new),
+                        }
+                    }));
+                notify(Event::Complete(result));
+            });
+        if spawned.is_err() {
+            workflow._slot = None;
+            workflow.stage = Stage::Error(Error::Network);
+        }
+        workflow
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare(
+    expected: Profile,
+    account: Option<DevTunnelAccount>,
+    store: Arc<dyn SecretStore>,
+    client_id: &str,
+    force_sign_in: bool,
+    remember: bool,
+    reuse_account: bool,
+    extend_days: Option<u32>,
+    cancel: &CancellationToken,
+    notify: &impl Fn(Event) -> bool,
+    cleanup_reporter: CleanupReporter,
+) -> Result<Prepared, Error> {
+    let profile = expected.as_dev_tunnel().ok_or(Error::Tunnel)?;
+    let name = profile.tunnel_name().ok_or(Error::Tunnel)?;
+    let http = Https::new()?;
+    let new_account = force_sign_in || account.is_none() || !(remember || reuse_account);
+    let identity = if new_account {
+        identity::sign_in(&http, client_id, None, cancel, |prompt| {
+            if !notify(Event::Device(prompt)) {
+                cancel.cancel();
+            }
+        })
+        .await?
+    } else {
+        let binding = account.as_ref().ok_or(Error::AccountChanged)?;
+        let secret = store
+            .get(binding.credential_reference())
+            .map_err(|_| Error::Store)?;
+        let identity = secret
+            .with_bytes(|bytes| Identity::decode_private(bytes, binding.account_id(), client_id))?;
+        if identity.needs_sign_in() {
+            let refreshed = identity.refresh(&http, client_id, cancel).await?;
+            let (published, publication) = oneshot::channel();
+            if !notify(Event::Refresh {
+                bytes: refreshed.encode_private()?,
+                published,
+            }) {
+                return Err(Error::Cancelled);
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(Error::Cancelled),
+                result = publication => result.map_err(|_| Error::Cancelled)??,
+            };
+            refreshed
+        } else {
+            identity
+        }
+    };
+    let resolved = service::resolve(&identity, name, cancel)
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(stage = "tunnel-lookup", error = ?error, "Native Dev Tunnel setup failed");
+        })?;
+    if let Some(days) = extend_days {
+        // Best effort: only the owner may extend, and the connection must not
+        // depend on it.
+        if let Err(error) = service::extend_lifetime(&identity, name, days, cancel).await {
+            if matches!(error, Error::Cancelled) {
+                return Err(error);
+            }
+            tracing::info!(stage = "tunnel-extend", error = ?error, "Dev Tunnel lifetime not extended");
+        }
+    }
+    let host = host_metadata(&resolved.binding);
+    relay::host_fingerprint(&host.public_key).map_err(|_| Error::Tunnel)?;
+    if new_account || profile.trusted_host() != Some(&host) {
+        let (approval, approved) = oneshot::channel();
+        if !notify(Event::Host {
+            account: identity.account.clone(),
+            host: host.clone(),
+            approval,
+        }) {
+            return Err(Error::Cancelled);
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(Error::Cancelled),
+            _ = tokio::time::sleep(Duration::from_secs(300)) => return Err(Error::Expired),
+            result = approved => result.map_err(|_| Error::Cancelled)?,
+        };
+    }
+    let description = tokio::time::timeout(
+        Duration::from_secs(30),
+        transport::discover(
+            &resolved.endpoint,
+            resolved.binding.port,
+            &resolved.connect_token,
+        ),
+    )
+    .await
+    .map_err(|_| Error::Network)?
+    .map_err(|_| Error::Tunnel)?;
+    let destination = Destination {
+        version: 1,
+        tunnel_id: resolved.binding.tunnel_id,
+        cluster: resolved.binding.cluster,
+        port: resolved.binding.port,
+        target: description.target,
+        endpoint: resolved.endpoint,
+        file_read: description.files.read,
+        path_style: if description.files.windows_paths {
+            festerm_tunnel_bridge::files::PathStyle::Windows
+        } else {
+            festerm_tunnel_bridge::files::PathStyle::Posix
+        },
+    };
+    let mut stored = Stored {
+        store,
+        references: Vec::new(),
+        cleanup_reporter,
+    };
+    let updated = if remember {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let new_record = if new_account {
+            let encoded = identity.encode_private()?;
+            let reference = stored
+                .store
+                .put(&SecretBytes::copy_from_slice(&encoded))
+                .map_err(|_| Error::Store)?;
+            stored.references.push(reference.duplicate_for_transport());
+            Some(
+                DevTunnelAccount::new(
+                    format!("github-{}", identity.account.login.to_ascii_lowercase()),
+                    AccountProvider::Github,
+                    identity.account.id,
+                    identity.account.login.clone(),
+                    reference,
+                )
+                .map_err(|_| Error::Response)?,
+            )
+        } else {
+            None
+        };
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let token =
+            TunnelConnectToken::new(resolved.connect_token.to_string()).into_stored_secret();
+        let connect_ref = stored.store.put(&token).map_err(|_| Error::Store)?;
+        stored
+            .references
+            .push(connect_ref.duplicate_for_transport());
+        Some(Binding {
+            account: new_record,
+            connect: connect_ref,
+            host,
+        })
+    } else {
+        None
+    };
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    Ok(Prepared {
+        binding: updated,
+        launch: Launch::from_destination(destination, resolved.connect_token)
+            .with_account(identity.account.clone()),
+        reclaim: description.reclaim,
+        stored,
+    })
+}
+
+impl FesTermApp {
+    fn cancel_native_tunnel(&mut self) {
+        self.native_tunnel = None;
+        self.overlays.native_tunnel = false;
+    }
+
+    /// Commits a remembered sign-in: the account (new or re-authenticated) and
+    /// the profile bound to it are written in one configuration replacement.
+    fn save_tunnel_binding(
+        &mut self,
+        expected: &Profile,
+        existing: Option<&DevTunnelAccount>,
+        binding: Binding,
+    ) -> bool {
+        let Binding {
+            account,
+            connect,
+            host,
+        } = binding;
+        let Some(existing_key) = existing
+            .map(|account| account.identifier().to_owned())
+            .or_else(|| account.as_ref().map(|_| String::new()))
+        else {
+            self.configuration_status = ConfigurationStartupStatus::ProfileSaveFailure(
+                crate::configuration_startup::ConfigurationLoadFailure::Invalid,
+            );
+            return false;
+        };
+        let configuration = self.state.configuration().clone();
+        let previous_account_credential = account.as_ref().and_then(|account| {
+            configuration
+                .accounts()
+                .iter()
+                .find(|known| {
+                    known.provider() == account.provider()
+                        && known.account_id() == account.account_id()
+                })
+                .map(|known| known.credential_reference().duplicate_for_transport())
+        });
+        let previous_profile = configuration.profile(expected.identifier()).cloned();
+        let replacement = (|| {
+            let (configuration, key) = match account {
+                Some(account) => configuration.with_account(account)?,
+                None => (configuration, existing_key.clone()),
+            };
+            let profile = expected.clone().with_tunnel_account(key, connect, host)?;
+            configuration.with_profile(profile)
+        })();
+        let new_credential = replacement.as_ref().ok().and_then(|configuration| {
+            let key = configuration
+                .profile(expected.identifier())?
+                .as_dev_tunnel()?
+                .account()?;
+            Some(
+                configuration
+                    .account(key)?
+                    .credential_reference()
+                    .duplicate_for_transport(),
+            )
+        });
+        let saved = self.apply_configuration_save(
+            replacement,
+            ConfigurationStartupStatus::ProfileSaveFailure,
+            crate::configuration_startup::ConfigurationReloader::save_profile,
+        );
+        if saved {
+            if let (Some(old), Some(new), Ok(store)) = (
+                previous_account_credential,
+                new_credential,
+                &self.secret_store,
+            ) {
+                if old != new {
+                    let _ = store.delete(&old);
+                }
+            }
+            self.retire_native_tunnel_credentials(previous_profile.as_ref());
+        }
+        saved
+    }
+
+    pub(super) fn retire_native_tunnel_credentials(&self, previous: Option<&Profile>) {
+        let Some(previous) = previous else { return };
+        let Some(old) = previous
+            .as_dev_tunnel()
+            .filter(|profile| profile.tunnel_name().is_some())
+        else {
+            return;
+        };
+        let Ok(store) = &self.secret_store else {
+            return;
+        };
+        let current = self
+            .state
+            .configuration()
+            .profile(previous.identifier())
+            .and_then(Profile::as_dev_tunnel);
+        if let Some(reference) = old.credential_reference() {
+            if current.is_none_or(|profile| profile.credential_reference() != Some(reference)) {
+                let _ = store.delete(reference);
+            }
+        }
+    }
+
+    pub(super) fn begin_native_tunnel(
+        &mut self,
+        profile_id: String,
+        sign_in: bool,
+        remember: bool,
+        connect: bool,
+        context: &egui::Context,
+    ) {
+        if self.native_tunnel.is_some() {
+            return;
+        }
+        let Some(profile) = self
+            .state
+            .configuration()
+            .profile(&profile_id)
+            .filter(|profile| {
+                profile
+                    .as_dev_tunnel()
+                    .is_some_and(|profile| profile.tunnel_name().is_some())
+            })
+            .cloned()
+        else {
+            return;
+        };
+        // Without secure storage, still connect the saved profile, but keep
+        // its sign-in in memory only for this connection.
+        let (store, remember): (Arc<dyn SecretStore>, bool) = match &self.secret_store {
+            Ok(store) => (Arc::clone(store), remember),
+            Err(_) => {
+                if remember {
+                    self.secure_storage_feedback =
+                        Some("Secure storage unavailable. Connecting without keeping the sign-in.");
+                }
+                (
+                    Arc::new(festerm_secret_store::MemorySecretStore::new()),
+                    false,
+                )
+            }
+        };
+        self.start_native_workflow(
+            profile, store, sign_in, remember, connect, false, true, context,
+        );
+    }
+
+    /// Connects to `tunnel` once without saving a profile or any credential.
+    /// With a signed-in `account` its stored sign-in is reused; otherwise the
+    /// device-code sign-in runs and is discarded afterwards.
+    pub(super) fn connect_dev_tunnel_once(
+        &mut self,
+        tunnel: &str,
+        account: Option<String>,
+        takeover: bool,
+        context: &egui::Context,
+    ) {
+        if self.native_tunnel.is_some() {
+            return;
+        }
+        let account = account.filter(|key| self.state.configuration().account(key).is_some());
+        let Ok(profile) = Profile::named_dev_tunnel("Dev Tunnel (not saved)", tunnel.trim())
+            .and_then(|profile| profile.with_tunnel_account_selection(account.clone()))
+        else {
+            self.secure_storage_feedback = Some("Enter a valid Dev Tunnel name or id.");
+            return;
+        };
+        let store = match (&self.secret_store, account.is_some()) {
+            (Ok(store), _) => Arc::clone(store),
+            (Err(_), false) => Arc::new(festerm_secret_store::MemorySecretStore::new()),
+            (Err(_), true) => {
+                self.secure_storage_feedback =
+                    Some("Secure storage unavailable. Sign-in could not be reused.");
+                return;
+            }
+        };
+        self.start_native_workflow(profile, store, false, false, true, true, takeover, context);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_native_workflow(
+        &mut self,
+        profile: Profile,
+        store: Arc<dyn SecretStore>,
+        sign_in: bool,
+        remember: bool,
+        connect: bool,
+        ephemeral: bool,
+        takeover: bool,
+        context: &egui::Context,
+    ) {
+        let account = profile
+            .as_dev_tunnel()
+            .and_then(|profile| profile.account())
+            .and_then(|key| self.state.configuration().account(key))
+            .cloned();
+        let extend_days = self
+            .state
+            .extend_dev_tunnel_lifetime()
+            .then(|| self.state.dev_tunnel_extension_days());
+        self.native_tunnel = Some(Workflow::start(
+            profile,
+            account,
+            store,
+            sign_in,
+            remember,
+            connect,
+            ephemeral,
+            takeover,
+            extend_days,
+            CleanupReporter {
+                failed: self.configuration_reloader.secret_cleanup_failure(),
+                context: context.clone(),
+            },
+            context,
+        ));
+        self.overlays.native_tunnel = true;
+        context.request_repaint();
+    }
+
+    /// Connects a just-saved profile with the form's takeover choice.
+    pub(super) fn begin_native_tunnel_with_takeover(
+        &mut self,
+        profile_id: String,
+        takeover: bool,
+        context: &egui::Context,
+    ) {
+        self.begin_native_tunnel(profile_id, false, true, true, context);
+        if let Some(workflow) = self.native_tunnel.as_mut() {
+            workflow.takeover = takeover;
+        }
+    }
+
+    /// Re-arms and drains Dev Tunnel tab reconnects, both the user's and the
+    /// automatic ones for a lost tab brought to the front.
+    pub(super) fn drive_tunnel_reconnects(&mut self, context: &egui::Context) {
+        let focused = context.input(|input| input.viewport().focused.unwrap_or(true));
+        self.state.poll_tunnel_reconnects(focused, context);
+        for request in self.state.take_tunnel_reconnect_requests() {
+            self.reconnect_tunnel_tab(request, context);
+        }
+    }
+
+    /// Connects a Dev Tunnel tab again in place with the tab's client id. A
+    /// manual reconnect may take over; an automatic one may only reclaim the
+    /// tab's own stale attachment and never prompts.
+    pub(super) fn reconnect_tunnel_tab(
+        &mut self,
+        request: TunnelReconnectRequest,
+        context: &egui::Context,
+    ) {
+        let TunnelReconnectRequest { tab, automatic } = request;
+        let Some(tunnel) = self.state.tunnel_tab(tab) else {
+            return;
+        };
+        let client = tunnel.client.clone();
+        let (profile, ephemeral) = match &tunnel.origin {
+            TunnelOrigin::Profile(id) => match self.state.configuration().profile(id).cloned() {
+                Some(profile) => (profile, false),
+                None => {
+                    if !automatic {
+                        self.secure_storage_feedback =
+                            Some("This Dev Tunnel profile no longer exists.");
+                    }
+                    return;
+                }
+            },
+            TunnelOrigin::Ephemeral(profile) => ((**profile).clone(), true),
+        };
+        let Some(tunnel_profile) = profile.as_dev_tunnel() else {
+            return;
+        };
+        let takeover = !automatic;
+        if tunnel_profile.tunnel_name().is_none() {
+            let Ok(store) = self.secret_store.as_ref().map(Arc::clone) else {
+                if !automatic {
+                    self.secure_storage_feedback = Some("Secure storage unavailable.");
+                }
+                return;
+            };
+            self.state.start_tunnel_reconnect(
+                tab,
+                move || {
+                    Launch::from_profile(&profile, store.as_ref())
+                        .map(|launch| launch.with_takeover(takeover))
+                },
+                context,
+            );
+            return;
+        }
+        if self.native_tunnel.is_some() {
+            return;
+        }
+        let store = match (
+            &self.secret_store,
+            ephemeral && tunnel_profile.account().is_none(),
+        ) {
+            (Ok(store), _) => Arc::clone(store),
+            (Err(_), true) => Arc::new(festerm_secret_store::MemorySecretStore::new()),
+            (Err(_), false) => {
+                if !automatic {
+                    self.secure_storage_feedback =
+                        Some("Secure storage unavailable. Sign-in could not be reused.");
+                }
+                return;
+            }
+        };
+        self.start_native_workflow(
+            profile, store, false, !ephemeral, true, ephemeral, takeover, context,
+        );
+        if let Some(workflow) = self.native_tunnel.as_mut() {
+            workflow.reconnect = Some((tab, client));
+            if automatic {
+                workflow.automatic = Some(Instant::now() + AUTOMATIC_RECONNECT_LIMIT);
+                self.overlays.native_tunnel = false;
+            }
+        }
+    }
+
+    pub(super) fn poll_native_tunnel(&mut self, context: &egui::Context) {
+        let Some(mut workflow) = self.native_tunnel.take() else {
+            return;
+        };
+        if !workflow.ephemeral
+            && self
+                .state
+                .configuration()
+                .profile(workflow.expected.identifier())
+                != Some(&workflow.expected)
+        {
+            let cleanup_failed = workflow
+                .ready
+                .as_mut()
+                .is_some_and(|ready| !ready.stored.cleanup());
+            if cleanup_failed {
+                self.report_configuration_notice("Profile changed, and a new native credential could not be removed. Reconcile secure storage manually.");
+            } else if workflow.automatic.is_none() {
+                self.secure_storage_feedback = Some("Profile changed. Sign-in cancelled.");
+            }
+            self.overlays.native_tunnel = false;
+            return;
+        }
+        loop {
+            let event = match workflow.receiver.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if workflow.ready.is_none() && !matches!(workflow.stage, Stage::Error(_)) {
+                        workflow.stage = Stage::Error(Error::Network);
+                    }
+                    break;
+                }
+            };
+            match event {
+                Event::Device(prompt) => workflow.stage = Stage::Device(prompt),
+                Event::Refresh { bytes, published } => {
+                    let result = workflow
+                        .account
+                        .as_ref()
+                        .ok_or(Error::AccountChanged)
+                        .and_then(|identity| {
+                            self.secret_store
+                                .as_ref()
+                                .map_err(|_| Error::Store)?
+                                .update(
+                                    identity.credential_reference(),
+                                    &SecretBytes::copy_from_slice(&bytes),
+                                )
+                                .map_err(|_| Error::Store)
+                        });
+                    let _ = published.send(result);
+                }
+                Event::Host {
+                    account,
+                    host,
+                    approval,
+                } => {
+                    workflow.focus_cancel = true;
+                    workflow.stage = Stage::Host {
+                        account,
+                        host,
+                        approval: Some(approval),
+                    };
+                }
+                Event::Complete(Ok(ready)) => workflow.ready = Some(ready),
+                Event::Complete(Err(error)) => workflow.stage = Stage::Error(error),
+            }
+        }
+        if let Some(deadline) = workflow.automatic {
+            // A prompt, a failure or a stall ends an automatic attempt
+            // quietly; dropping the workflow cancels it.
+            if matches!(
+                workflow.stage,
+                Stage::Device(_) | Stage::Host { .. } | Stage::Error(_)
+            ) || Instant::now() >= deadline
+            {
+                return;
+            }
+            let ready = workflow.ready.is_some();
+            self.native_tunnel = Some(workflow);
+            if ready {
+                self.finish_native_tunnel(context);
+            } else {
+                context.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+            }
+            return;
+        }
+        self.native_tunnel = Some(workflow);
+    }
+
+    fn finish_native_tunnel(&mut self, context: &egui::Context) {
+        let Some(mut workflow) = self.native_tunnel.take() else {
+            return;
+        };
+        if !workflow.ephemeral
+            && self
+                .state
+                .configuration()
+                .profile(workflow.expected.identifier())
+                != Some(&workflow.expected)
+        {
+            let cleanup_failed = workflow
+                .ready
+                .as_mut()
+                .is_some_and(|ready| !ready.stored.cleanup());
+            if cleanup_failed {
+                self.report_configuration_notice("Profile changed, and a new native credential could not be removed. Reconcile secure storage manually.");
+            } else if workflow.automatic.is_none() {
+                self.secure_storage_feedback = Some("Profile changed. Sign-in cancelled.");
+            }
+            self.overlays.native_tunnel = false;
+            return;
+        }
+        if let Some(mut ready) = workflow.ready.take() {
+            if let Some(binding) = ready.binding.take() {
+                // Once saving begins, unwinding must retain the candidate secrets:
+                // the replacement may already have been installed.
+                let new_references = std::mem::take(&mut ready.stored.references);
+                if !self.save_tunnel_binding(&workflow.expected, workflow.account.as_ref(), binding)
+                {
+                    if self.configuration_status.save_outcome_unknown() {
+                        self.report_unknown_configuration_save(true);
+                        self.overlays.native_tunnel = false;
+                        return;
+                    }
+                    if self.configuration_status.save_reconciliation_required() {
+                        self.publish_shared_notice(
+                            crate::configuration_startup::SecretCleanupNotice::TunnelRetained,
+                        );
+                        self.overlays.native_tunnel = false;
+                        return;
+                    }
+                    if self.configuration_status
+                        == ConfigurationStartupStatus::ProfileSaveFailure(
+                            crate::configuration_startup::ConfigurationLoadFailure::SaveBusy,
+                        )
+                    {
+                        self.publish_shared_notice(
+                            crate::configuration_startup::SecretCleanupNotice::TunnelRetained,
+                        );
+                        self.overlays.native_tunnel = false;
+                        return;
+                    }
+                    ready.stored.references = new_references;
+                    let cleaned = ready.stored.cleanup();
+                    if !cleaned {
+                        self.report_configuration_notice("Account could not be saved, and a new native credential could not be removed. Reconcile secure storage manually.");
+                    } else if workflow.automatic.is_none() {
+                        self.secure_storage_feedback =
+                            Some("Account could not be saved. Sign in again.");
+                    }
+                    self.overlays.native_tunnel = false;
+                    return;
+                }
+            }
+            if workflow.connect {
+                let ready = *ready;
+                match workflow.reconnect.take() {
+                    Some((tab, client)) => {
+                        let launch = connection_launch(
+                            ready.launch,
+                            workflow.takeover,
+                            ready.reclaim,
+                            &client,
+                        );
+                        self.state
+                            .start_tunnel_reconnect(tab, move || Ok(launch), context);
+                    }
+                    None => {
+                        let profile_id = (!workflow.ephemeral)
+                            .then(|| workflow.expected.identifier().to_owned());
+                        let tunnel = TunnelTab::new(match &profile_id {
+                            Some(id) => TunnelOrigin::Profile(id.clone()),
+                            None => TunnelOrigin::Ephemeral(Box::new(workflow.expected.clone())),
+                        });
+                        let launch = connection_launch(
+                            ready.launch,
+                            workflow.takeover,
+                            ready.reclaim,
+                            &tunnel.client,
+                        );
+                        self.state.start_tunnel_launch(
+                            profile_id,
+                            Some(tunnel),
+                            move || Ok(launch),
+                            context,
+                        );
+                    }
+                }
+            }
+            self.overlays.native_tunnel = false;
+            return;
+        }
+        self.native_tunnel = Some(workflow);
+    }
+
+    pub(super) fn show_native_tunnel(&mut self, context: &egui::Context, escape: bool) {
+        let Some(workflow) = self
+            .native_tunnel
+            .as_mut()
+            .filter(|workflow| workflow.automatic.is_none())
+        else {
+            return;
+        };
+        let mut dismiss = escape;
+        egui::Modal::new(egui::Id::new("native_dev_tunnel")).show(context, |ui| {
+            super::confirmations::prepare_confirmation(ui, context, 520.0);
+            ui.heading("Dev Tunnel");
+            let mut approve_label = None;
+            super::confirmations::confirmation_body(ui, |ui| match &workflow.stage {
+                Stage::Working => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Connecting…");
+                    });
+                }
+                Stage::Device(prompt) => {
+                    ui.label("Sign in to Microsoft Dev Tunnels");
+                    ui.label("Enter this code on GitHub:");
+                    ui.add_space(6.0);
+                    if action_button_monospace(ui, ActionButtonRole::Accent, &prompt.user_code)
+                        .on_hover_text("Copy code and open GitHub")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(prompt.user_code.clone());
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(identity::VERIFICATION_URI));
+                    }
+                    ui.add_space(6.0);
+                    ui.label("Waiting for sign-in…");
+                }
+                Stage::Host { account, host, .. } => {
+                    ui.label(format!("GitHub · {}", account.login));
+                    ui.label(format!(
+                        "{}.{} · {}",
+                        host.tunnel_id, host.cluster, host.port
+                    ));
+                    if let Some(previous) = workflow
+                        .expected
+                        .as_dev_tunnel()
+                        .and_then(|profile| profile.trusted_host())
+                    {
+                        if previous != host {
+                            ui.add_space(6.0);
+                            ui.colored_label(theme::STATUS_ERROR, "Host identity changed.");
+                            if let Ok(fingerprint) = relay::host_fingerprint(&previous.public_key) {
+                                ui.label(format!("Previous: {fingerprint}"));
+                            }
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.label("Trust this host?");
+                    if let Ok(fingerprint) = relay::host_fingerprint(&host.public_key) {
+                        ui.monospace(fingerprint);
+                    }
+                    if workflow.remember {
+                        ui.label("Uses native secure storage.");
+                    }
+                    approve_label = Some(if workflow.connect {
+                        "Connect"
+                    } else {
+                        "Save account"
+                    });
+                }
+                Stage::Error(error) => {
+                    ui.label(error.to_string());
+                }
+            });
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                let cancel = super::confirmations::dialog_action(
+                    ui,
+                    ActionButtonRole::Secondary,
+                    if matches!(workflow.stage, Stage::Error(_)) {
+                        "Close"
+                    } else {
+                        "Cancel"
+                    },
+                );
+                if workflow.focus_cancel {
+                    cancel.request_focus();
+                    workflow.focus_cancel = false;
+                }
+                dismiss |= cancel.clicked();
+                if let Some(label) = approve_label {
+                    if super::confirmations::dialog_action(ui, ActionButtonRole::Accent, label)
+                        .clicked()
+                    {
+                        if let Stage::Host { approval, .. } = &mut workflow.stage {
+                            if let Some(approval) = approval.take() {
+                                let _ = approval.send(());
+                            }
+                        }
+                        workflow.stage = Stage::Working;
+                    }
+                }
+            });
+        });
+        if dismiss {
+            self.cancel_native_tunnel();
+        } else if self
+            .native_tunnel
+            .as_ref()
+            .is_some_and(|workflow| workflow.ready.is_some())
+        {
+            self.finish_native_tunnel(context);
+        }
+    }
+}

@@ -1,0 +1,4000 @@
+//! GUI-independent ANSI/VT terminal state primitives.
+//!
+//! The parser accepts C0 controls plus 7-bit ESC/CSI syntax. The terminal
+//! incrementally decodes printable UTF-8 while the parser is in ground state.
+//! Raw C1 bytes are deliberately not controls: treating them as such would
+//! make UTF-8 continuation bytes ambiguous.
+
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
+mod cell;
+mod colors;
+mod history;
+mod hyperlink;
+mod input;
+mod modes;
+mod parser;
+mod replies;
+mod screen;
+mod terminal;
+mod unicode;
+
+pub use hyperlink::{local_file_hyperlink_path, normalize_terminal_hyperlink};
+
+/// The largest screen that the core will allocate.
+pub const MAX_CELL_COUNT: usize = 4 * 1024 * 1024;
+/// The maximum number of CSI parameters retained by the parser.
+pub const MAX_CSI_PARAMETERS: usize = 32;
+/// The maximum number of CSI intermediate bytes retained by the parser.
+pub const MAX_CSI_INTERMEDIATES: usize = 2;
+/// The maximum unsupported string-protocol payload discarded before recovery.
+pub const MAX_STRING_BYTES: usize = 4096;
+/// The maximum number of bytes retained by either session transport queue.
+///
+/// A queued write is accepted atomically: if the entire write does not fit,
+/// none of its bytes are retained and the caller receives an overflow result.
+pub const TRANSPORT_QUEUE_HIGH_WATERMARK: usize = 64 * 1024;
+pub use history::{LogicalLine, ScrollbackStats, DEFAULT_SCROLLBACK_LIMIT_BYTES};
+
+/// Parses and normalizes an untrusted external web target.
+///
+/// Only absolute ASCII HTTP/HTTPS URLs with a host are eligible for OS
+/// activation. Callers must still require an explicit user gesture.
+pub fn normalize_external_web_url(target: &str) -> Option<String> {
+    if target.len() > 2_048
+        || !target.is_ascii()
+        || target.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(target).ok()?;
+    (matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none())
+    .then(|| parsed.to_string())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Dimensions {
+    columns: usize,
+    rows: usize,
+    cell_count: usize,
+}
+
+impl Dimensions {
+    pub fn new(columns: usize, rows: usize) -> Result<Self, DimensionsError> {
+        if columns < 2 {
+            return Err(DimensionsError::TooFewColumns { columns });
+        }
+        if rows == 0 {
+            return Err(DimensionsError::ZeroRows);
+        }
+
+        let cell_count = columns
+            .checked_mul(rows)
+            .ok_or(DimensionsError::CellCountOverflow { columns, rows })?;
+        if cell_count > MAX_CELL_COUNT {
+            return Err(DimensionsError::TooManyCells {
+                cell_count,
+                maximum: MAX_CELL_COUNT,
+            });
+        }
+
+        Ok(Self {
+            columns,
+            rows,
+            cell_count,
+        })
+    }
+
+    pub const fn columns(self) -> usize {
+        self.columns
+    }
+
+    pub const fn rows(self) -> usize {
+        self.rows
+    }
+
+    pub const fn cell_count(self) -> usize {
+        self.cell_count
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DimensionsError {
+    TooFewColumns { columns: usize },
+    ZeroRows,
+    CellCountOverflow { columns: usize, rows: usize },
+    TooManyCells { cell_count: usize, maximum: usize },
+}
+
+impl fmt::Display for DimensionsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooFewColumns { columns } => {
+                write!(
+                    formatter,
+                    "terminal requires at least 2 columns, received {columns}"
+                )
+            }
+            Self::ZeroRows => formatter.write_str("terminal requires at least 1 row, received 0"),
+            Self::CellCountOverflow { columns, rows } => write!(
+                formatter,
+                "terminal dimensions {columns} columns by {rows} rows overflow the cell count"
+            ),
+            Self::TooManyCells {
+                cell_count,
+                maximum,
+            } => write!(
+                formatter,
+                "terminal dimensions require {cell_count} cells, exceeding the maximum of {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DimensionsError {}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Cursor {
+    column: usize,
+    row: usize,
+}
+
+impl Cursor {
+    pub const fn column(self) -> usize {
+        self.column
+    }
+
+    pub const fn row(self) -> usize {
+        self.row
+    }
+}
+
+pub use cell::{Attributes, Cell, CellWidth, Color, FAINT_OPACITY};
+pub use colors::{ColorScheme, Rgb};
+pub use input::{
+    FocusEvent, InputEvent, InputEventOutcome, InputPreparationError, Key, KeypadKey, Modifiers,
+    MouseButton, MouseEvent, MouseEventKind, MouseWheel, PreparedInput, MAX_PREPARED_INPUT_EVENTS,
+};
+pub use modes::{CursorStyle, MouseTrackingMode, TerminalModes};
+pub use parser::{CsiParameters, ParameterSeparator, Parser, TerminalOp};
+pub use replies::QueuePushResult;
+pub use screen::Screen;
+pub use terminal::{
+    ContentPosition, RecordingCheckpoint, Terminal, TerminalError, TerminalSemantics,
+    TerminalTextSnapshot, TerminalTextSnapshotRefusal, TerminalTextSnapshotScreen,
+    MAX_RECORDING_CHECKPOINT_BYTES, MAX_RECORDING_SCROLLBACK_BYTES,
+};
+
+#[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Attributes, CellWidth, Color, ColorScheme, ContentPosition, Dimensions, FocusEvent,
+        InputEvent, InputEventOutcome, Key, KeypadKey, Modifiers, MouseButton, MouseEvent,
+        MouseEventKind, MouseTrackingMode, MouseWheel, Parser, QueuePushResult, Rgb, Terminal,
+        TerminalOp, TerminalTextSnapshotRefusal, TerminalTextSnapshotScreen, MAX_CELL_COUNT,
+        MAX_CSI_PARAMETERS, MAX_RECORDING_CHECKPOINT_BYTES, MAX_STRING_BYTES,
+        TRANSPORT_QUEUE_HIGH_WATERMARK,
+    };
+    use std::sync::Arc;
+
+    fn terminal(columns: usize, rows: usize) -> Terminal {
+        Terminal::new(Dimensions::new(columns, rows).unwrap()).unwrap()
+    }
+
+    fn unicode_emoji_15_1_fully_qualified() -> Vec<String> {
+        include_str!("../tests/fixtures/unicode/emoji-15.1/emoji-test.txt")
+            .lines()
+            .filter_map(|line| {
+                let (code_points, remainder) = line.split_once(';')?;
+                remainder
+                    .trim_start()
+                    .starts_with("fully-qualified")
+                    .then(|| {
+                        code_points
+                            .split_whitespace()
+                            .map(|code_point| {
+                                char::from_u32(
+                                    u32::from_str_radix(code_point, 16)
+                                        .expect("emoji data uses hexadecimal code points"),
+                                )
+                                .expect("emoji data contains valid scalar values")
+                            })
+                            .collect()
+                    })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn backspace_at_the_left_edge_stays_put_until_reverse_wraparound_is_on() {
+        let mut terminal = terminal(10, 5);
+        terminal.ingest(b"0123456789abc");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (3, 1)
+        );
+        terminal.ingest(b"\x08\x08\x08\x08");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 1),
+            "without DECSET 45 backspace must stop at the left edge"
+        );
+
+        terminal.ingest(b"\x1b[?45h\x08");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (9, 0),
+            "reverse wraparound climbs to the last column of the wrapped row"
+        );
+    }
+
+    #[test]
+    fn reverse_wraparound_stops_at_the_start_of_the_logical_line() {
+        let mut terminal = terminal(10, 5);
+        terminal.ingest(b"\x1b[?45h");
+        terminal.ingest(b"0123456789abc");
+        terminal.ingest(b"\x1b[100D");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 0),
+            "an oversized CUB unwinds the wrap but not past the line it began"
+        );
+    }
+
+    #[test]
+    fn reverse_wraparound_refuses_to_cross_a_row_that_did_not_wrap() {
+        let mut terminal = terminal(10, 5);
+        terminal.ingest(b"\x1b[?45h");
+        terminal.ingest(b"abc\r\ndef");
+        terminal.ingest(b"\x1b[100D");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 1),
+            "a line feed ended the row above, so there is nothing to climb into"
+        );
+    }
+
+    #[test]
+    fn reverse_wraparound_will_not_climb_out_of_the_scrolling_region() {
+        let mut terminal = terminal(10, 6);
+        terminal.ingest(b"\x1b[?45h");
+        terminal.ingest(b"0123456789abc");
+        terminal.ingest(b"\x1b[2;4r\x1b[2;1H");
+        terminal.ingest(b"\x1b[100D");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 1),
+            "row 1 is the top of the region even though row 0 wrapped into it"
+        );
+    }
+
+    #[test]
+    fn a_line_feed_clears_a_stale_wrap_mark_so_the_cursor_cannot_climb() {
+        let mut terminal = terminal(10, 5);
+        terminal.ingest(b"\x1b[?45h");
+        terminal.ingest(b"0123456789abc");
+        // Return to the row that wrapped and end it explicitly. The row below
+        // is no longer a continuation of it.
+        terminal.ingest(b"\x1b[1;5H\n");
+        terminal.ingest(b"\x1b[2;1H\x1b[100D");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 1),
+            "the line feed retired the wrap mark left behind by the earlier wrap"
+        );
+    }
+
+    #[test]
+    fn decrqm_reports_reverse_wraparound() {
+        let mut terminal = terminal(10, 5);
+        terminal.ingest(b"\x1b[?45$p");
+        assert_eq!(terminal.drain_replies(), b"\x1b[?45;2$y".to_vec());
+        terminal.ingest(b"\x1b[?45h\x1b[?45$p");
+        assert_eq!(terminal.drain_replies(), b"\x1b[?45;1$y".to_vec());
+    }
+
+    #[test]
+    #[ignore = "manual throughput probe, not a regression test"]
+    fn manual_ingest_throughput_probe() {
+        let mut term = terminal(120, 40);
+        let pattern = b"C:\\Windows\\System32\\some\\deep\\path\\to\\a\\file.txt\r\n";
+        let mut workload = Vec::new();
+        while workload.len() < 4 * 1024 * 1024 {
+            workload.extend_from_slice(pattern);
+        }
+        let start = std::time::Instant::now();
+        term.ingest(&workload);
+        let elapsed = start.elapsed();
+        eprintln!(
+            "ingest {} bytes took {:?} ({:.2} MB/s)",
+            workload.len(),
+            elapsed,
+            workload.len() as f64 / elapsed.as_secs_f64() / 1_048_576.0
+        );
+    }
+
+    #[test]
+    fn validates_dimensions_before_allocating() {
+        assert!(Dimensions::new(0, 1).is_err());
+        assert!(Dimensions::new(1, 1).is_err());
+        assert!(Dimensions::new(2, 0).is_err());
+        assert!(Dimensions::new(usize::MAX, 2).is_err());
+        assert!(Dimensions::new(2, (MAX_CELL_COUNT / 2) + 1).is_err());
+        assert!(Terminal::new(Dimensions::new(2, 1).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn parser_emits_typed_operations_and_ignores_raw_c1() {
+        let mut parser = Parser::new();
+        assert_eq!(parser.advance(b'A'), TerminalOp::Print('A'));
+        assert_eq!(parser.advance(b'\r'), TerminalOp::CarriageReturn);
+        assert_eq!(parser.advance(0x9b), TerminalOp::Ignored);
+        assert_eq!(parser.advance(0x1b), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'['), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'2'), TerminalOp::Ignored);
+        assert_eq!(
+            parser.advance(b'J'),
+            TerminalOp::EraseDisplay({
+                let mut parameters = super::CsiParameters::default();
+                assert!(parameters.append_digit(2));
+                parameters
+            })
+        );
+    }
+
+    /// tmux (and ncurses' `smacs`/`rmacs`) draws every window border and
+    /// status-bar divider by designating DEC Special Graphics into G1 with
+    /// `ESC ) 0`, then toggling it on with SO (0x0E) and off with SI
+    /// (0x0F) around each run of line-drawing bytes. Without this, those
+    /// bytes print as raw ASCII (`q`, `x`, `l`, `k`, `m`, ...) instead of
+    /// the box-drawing glyphs they represent.
+    #[test]
+    fn shift_out_translates_g1_dec_special_graphics_until_shift_in() {
+        let mut parser = Parser::new();
+        // ESC ) 0 designates DEC Special Graphics into G1.
+        assert_eq!(parser.advance(0x1b), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b')'), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'0'), TerminalOp::Ignored);
+
+        // Before SO, G0 (still ASCII) is active: bytes print unchanged.
+        assert_eq!(parser.advance(b'q'), TerminalOp::Print('q'));
+
+        // SO shifts to G1 (DEC Special Graphics).
+        assert_eq!(parser.advance(0x0e), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'q'), TerminalOp::Print('\u{2500}')); // ─
+        assert_eq!(parser.advance(b'x'), TerminalOp::Print('\u{2502}')); // │
+        assert_eq!(parser.advance(b'l'), TerminalOp::Print('\u{250c}')); // ┌
+        assert_eq!(parser.advance(b'k'), TerminalOp::Print('\u{2510}')); // ┐
+        assert_eq!(parser.advance(b'm'), TerminalOp::Print('\u{2514}')); // └
+        assert_eq!(parser.advance(b'j'), TerminalOp::Print('\u{2518}')); // ┘
+
+        // SI shifts back to G0 (ASCII): bytes print unchanged again.
+        assert_eq!(parser.advance(0x0f), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'q'), TerminalOp::Print('q'));
+    }
+
+    #[test]
+    fn designating_dec_special_graphics_into_g0_translates_without_shift_out() {
+        let mut parser = Parser::new();
+        // ESC ( 0 designates DEC Special Graphics directly into G0, the
+        // default active slot (no SO required); some programs use this
+        // form instead of the G1 + SO/SI convention.
+        assert_eq!(parser.advance(0x1b), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'('), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'0'), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'q'), TerminalOp::Print('\u{2500}'));
+
+        // ESC ( B restores G0 to ASCII (US-ASCII designation).
+        assert_eq!(parser.advance(0x1b), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'('), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'B'), TerminalOp::Ignored);
+        assert_eq!(parser.advance(b'q'), TerminalOp::Print('q'));
+    }
+
+    /// End-to-end version of the parser-level SO/SI tests above, through
+    /// `Terminal::ingest`: this is the same byte sequence tmux emits to
+    /// draw a one-cell-tall horizontal rule (e.g. a pane divider).
+    #[test]
+    fn terminal_renders_tmux_style_line_drawing_through_shift_out_and_in() {
+        let mut terminal = terminal(4, 1);
+        terminal.ingest(b"\x1b)0\x0eqqqq\x0f");
+        assert_eq!(
+            terminal.row_text(0).as_deref(),
+            Some("\u{2500}\u{2500}\u{2500}\u{2500}")
+        );
+    }
+
+    #[test]
+    fn malformed_and_over_limit_sequences_recover_without_printing_payload() {
+        let mut terminal = terminal(8, 1);
+        let oversized_parameters = format!("\x1b[{}mOK", "1;".repeat(MAX_CSI_PARAMETERS + 1));
+        terminal.ingest(oversized_parameters.as_bytes());
+        terminal.ingest(b"\x1b[123456mX");
+        terminal.ingest(b"\x1b[!\"#AB");
+        terminal.ingest(&[0x1b, b']']);
+        terminal.ingest(&vec![b'x'; MAX_STRING_BYTES]);
+        terminal.ingest(b"Y");
+
+        assert_eq!(terminal.row_text(0).as_deref(), Some("OKXBY   "));
+        assert_eq!(terminal.attributes(), Attributes::NONE);
+    }
+
+    #[test]
+    fn preserves_right_margin_until_the_next_printable_byte() {
+        let mut terminal = terminal(3, 2);
+        terminal.ingest(b"abcdef");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abc"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("def"));
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (2, 1)
+        );
+
+        terminal.ingest(b"\x1b[31mg");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("def"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("g  "));
+        assert_eq!(terminal.cell(0, 1).unwrap().foreground(), Color::Indexed(1));
+    }
+
+    #[test]
+    fn applies_movement_erasure_and_editing_within_the_active_region() {
+        let mut terminal = terminal(5, 4);
+        terminal.ingest(b"11111\r\n22222\r\n33333\r\n44444");
+        terminal.ingest(b"\x1b[2;4r\x1b[2;1H\x1b[2L\x1b[1M");
+        terminal.ingest(b"\x1b[2;2H\x1b[2@A\x1b[1P\x1b[2X");
+
+        assert_eq!(terminal.row_text(0).as_deref(), Some("11111"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some(" A   "));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("22222"));
+        assert_eq!(terminal.row_text(3).as_deref(), Some("     "));
+    }
+
+    /// Erasing to the end of the screen after enough output to rotate the
+    /// ring buffer spans rows that are no longer contiguous in the cell
+    /// array. Mapping the whole span through the ring once ran off the end of
+    /// that array and panicked, taking the process with it.
+    #[test]
+    fn erasing_to_the_end_of_a_scrolled_screen_clears_every_row_without_panicking() {
+        let mut terminal = terminal(5, 4);
+        for line in 0..12 {
+            terminal.ingest(format!("row{line}\r\n").as_bytes());
+        }
+
+        // Home the cursor, then erase from there to the end of the screen.
+        terminal.ingest(b"\x1b[H\x1b[J");
+
+        for row in 0..4 {
+            assert_eq!(
+                terminal.row_text(row).as_deref(),
+                Some("     "),
+                "row {row} should be blank after erase-to-end-of-screen"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_mode_and_scroll_region_bound_cursor_addressing_and_scrolling() {
+        let mut terminal = terminal(4, 4);
+        terminal.ingest(b"top \r\none \r\ntwo \r\nbot ");
+        terminal.ingest(b"\x1b[2;3r\x1b[?6h\x1b[1;1HABCDZWXYQ");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("top "));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("ZWXY"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("Q   "));
+        assert_eq!(terminal.row_text(3).as_deref(), Some("bot "));
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (1, 2)
+        );
+    }
+
+    #[test]
+    fn saves_and_restores_dec_and_ansi_state() {
+        let mut terminal = terminal(6, 2);
+        terminal.ingest(b"\x1b[31;1mAB\x1b7\x1b[2;6H\x1b[0mZ\x1b8C");
+        assert_eq!(terminal.cell(2, 0).unwrap().foreground(), Color::Indexed(1));
+        assert!(terminal
+            .cell(2, 0)
+            .unwrap()
+            .attributes()
+            .contains(Attributes::BOLD));
+        terminal.ingest(b"\x1b[s\x1b[2;1H\x1b[uD");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (4, 0)
+        );
+    }
+
+    #[test]
+    fn alternate_modes_preserve_primary_and_1049_restores_saved_cursor() {
+        let mut terminal = terminal(5, 2);
+        terminal.ingest(b"main\x1b[?47halt\x1b[?47l");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("main "));
+        terminal.ingest(b"\x1b[?1049halt\x1b[?1049lX");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("mainX"));
+        assert!(!terminal.modes().alternate_screen());
+    }
+
+    #[test]
+    fn screen_generation_tracks_buffer_transitions_and_full_reset() {
+        let mut terminal = terminal(5, 2);
+        let primary = terminal.screen_generation();
+
+        terminal.ingest(b"\x1b[?47h");
+        let alternate = terminal.screen_generation();
+        assert!(alternate > primary);
+
+        terminal.ingest(b"\x1b[?47h");
+        assert_eq!(
+            terminal.screen_generation(),
+            alternate,
+            "an already-active buffer is not a new lifetime"
+        );
+
+        terminal.ingest(b"\x1b[?47l");
+        let returned_primary = terminal.screen_generation();
+        assert!(returned_primary > alternate);
+
+        terminal.ingest(b"\x1b[?47h\x1b[?47l");
+        assert!(
+            terminal.screen_generation() > returned_primary,
+            "hidden enter/exit transitions still advance identity"
+        );
+
+        let before_reset = terminal.screen_generation();
+        terminal.reset_to_initial_state();
+        assert!(terminal.screen_generation() > before_reset);
+    }
+
+    #[test]
+    fn dec_restore_clamps_an_origin_cursor_to_current_margins_before_cpr() {
+        let mut terminal = terminal(5, 4);
+        terminal.ingest(b"\x1b[2;3r\x1b[?6h\x1b7\x1b[?6l\x1b[3;4r\x1b8\x1b[6n");
+
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 2)
+        );
+        assert!(terminal.modes().origin_mode());
+        assert_eq!(terminal.drain_replies(), b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn dec_and_ansi_saved_cursors_are_scoped_to_the_active_screen() {
+        let mut terminal = terminal(5, 2);
+        terminal.ingest(
+            b"\x1b[1;2H\x1b7\x1b[s\x1b[?47h\
+              \x1b[2;3H\x1b7\x1b[s\x1b[1;1H\x1b8A\
+              \x1b[?47l\x1b8P",
+        );
+
+        assert_eq!(
+            terminal.primary_screen().row_text(0).as_deref(),
+            Some(" P   ")
+        );
+        assert_eq!(
+            terminal.alternate_screen().unwrap().row_text(1).as_deref(),
+            Some("  A  ")
+        );
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (2, 0)
+        );
+
+        terminal.ingest(b"\x1b[?47h\x1b8");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (2, 1)
+        );
+        terminal.ingest(b"\x1b[u");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (2, 1)
+        );
+    }
+
+    #[test]
+    fn applies_standard_indexed_and_true_color_sgr() {
+        let mut terminal = terminal(5, 1);
+        terminal.ingest(b"\x1b[1;4;31;48;5;200mA\x1b[38;2;1;2;3;49mB\x1b[0mC");
+        let first = terminal.cell(0, 0).unwrap();
+        assert_eq!(first.foreground(), Color::Indexed(1));
+        assert_eq!(first.background(), Color::Indexed(200));
+        assert!(first.attributes().contains(Attributes::BOLD));
+        assert!(first.attributes().contains(Attributes::UNDERLINE));
+        assert_eq!(
+            terminal.cell(1, 0).unwrap().foreground(),
+            Color::Rgb {
+                red: 1,
+                green: 2,
+                blue: 3
+            }
+        );
+        assert_eq!(terminal.cell(2, 0).unwrap().foreground(), Color::Default);
+    }
+
+    #[test]
+    fn applies_compact_colon_true_color_sgr_to_spaces() {
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b[38:2:80:160:240;48:2:40:50:60m code \x1b[0m.");
+
+        for column in 0..6 {
+            let cell = terminal.cell(column, 0).unwrap();
+            assert_eq!(
+                cell.foreground(),
+                Color::Rgb {
+                    red: 80,
+                    green: 160,
+                    blue: 240
+                }
+            );
+            assert_eq!(
+                cell.background(),
+                Color::Rgb {
+                    red: 40,
+                    green: 50,
+                    blue: 60
+                }
+            );
+        }
+        assert_eq!(terminal.cell(6, 0).unwrap().background(), Color::Default);
+    }
+
+    #[test]
+    fn reports_device_status_and_conservative_primary_identity() {
+        let mut terminal = terminal(5, 3);
+        terminal.ingest(b"\x1b[2;3H\x1b[5n\x1b[6n\x1b[c\x1b[>c");
+        assert_eq!(
+            terminal.drain_replies(),
+            b"\x1b[0n\x1b[2;3R\x1b[?6c\x1b[>0;0;0c"
+        );
+    }
+
+    /// Everything the terminal has queued to send back, as a string.
+    fn drain(terminal: &mut Terminal) -> String {
+        String::from_utf8(terminal.drain_replies().to_vec()).expect("replies are utf-8")
+    }
+
+    /// Asks DECRQSS for one setting and returns the whole reply.
+    fn status_report(terminal: &mut Terminal, selector: &[u8]) -> String {
+        let mut query = b"\x1bP$q".to_vec();
+        query.extend_from_slice(selector);
+        query.extend_from_slice(b"\x1b\\");
+        terminal.ingest(&query);
+        drain(terminal)
+    }
+
+    /// Turns on DECLRMM and sets left/right margins, one-based inclusive.
+    fn with_margins(terminal: &mut Terminal, left: usize, right: usize) {
+        terminal.ingest(b"\x1b[?69h");
+        terminal.ingest(format!("\x1b[{left};{right}s").as_bytes());
+    }
+
+    #[test]
+    fn repeat_repeats_the_last_printed_character_not_the_last_byte() {
+        // REP is defined against the last *graphic* character, so an
+        // intervening control sequence leaves it repeatable, and a combining
+        // mark that only extended an existing grapheme does not become it.
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"a\x1b[1m\x1b[3b");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("aaaa    "));
+
+        // With nothing yet printed there is nothing to repeat.
+        let mut fresh = crate::tests::terminal(8, 1);
+        fresh.ingest(b"\x1b[3b");
+        assert_eq!(fresh.row_text(0).as_deref(), Some("        "));
+    }
+
+    #[test]
+    fn repeat_wraps_and_is_bounded_by_the_margins() {
+        // The repeats go through the ordinary print path, so they wrap at the
+        // right margin exactly as the character that seeded them would have.
+        let mut terminal = terminal(8, 2);
+        with_margins(&mut terminal, 2, 4);
+        terminal.ingest(b"\x1b[1;2Ha\x1b[3b");
+        assert_eq!(terminal.row_text(0).as_deref(), Some(" aaa    "));
+        assert_eq!(terminal.row_text(1).as_deref(), Some(" a      "));
+    }
+
+    #[test]
+    fn the_alignment_pattern_fills_the_page_and_drops_the_margins() {
+        // DECALN is a test pattern, so it deliberately leaves none of the
+        // previous state in the way: both margin sets go, not just the
+        // contents of the screen.
+        let mut terminal = terminal(4, 3);
+        with_margins(&mut terminal, 2, 3);
+        terminal.ingest(b"\x1b[2;2r");
+        terminal.ingest(b"\x1b[2;2H\x1b#8");
+        for row in 0..3 {
+            assert_eq!(terminal.row_text(row).as_deref(), Some("EEEE"));
+        }
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 0)
+        );
+        // The cursor can now reach a corner that the margins had fenced off.
+        terminal.ingest(b"\x1b[3;4H");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (3, 2)
+        );
+    }
+
+    #[test]
+    fn setting_reports_answer_for_settings_we_hold_and_decline_the_rest() {
+        // DECRQSS replies `1$r<params><selector>` for a setting it keeps and
+        // `0$r` for one it does not. Declining is the honest answer: a
+        // plausible default for a setting we ignore would be a lie the
+        // caller cannot detect.
+        let mut terminal = terminal(10, 6);
+        terminal.ingest(b"\x1b[3;5r");
+        assert_eq!(status_report(&mut terminal, b"r"), "\x1bP1$r3;5r\x1b\\");
+
+        terminal.ingest(b"\x1b[4 q");
+        assert_eq!(status_report(&mut terminal, b" q"), "\x1bP1$r4 q\x1b\\");
+
+        terminal.ingest(b"\x1b[1\"q");
+        assert_eq!(status_report(&mut terminal, b"\"q"), "\x1bP1$r1\"q\x1b\\");
+
+        // DECSCL is a setting we do not keep, so we say so.
+        assert_eq!(status_report(&mut terminal, b"\"p"), "\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn device_status_reports_admit_the_devices_are_absent() {
+        // Every DECDSR report is about a device we do not have. The values
+        // chosen all mean "no such thing" rather than "ready": a program
+        // that believes a printer is attached will send a job into a void.
+        let mut terminal = terminal(10, 6);
+        for (query, reply) in [
+            (&b"\x1b[?15n"[..], "\x1b[?13n"),
+            (b"\x1b[?25n", "\x1b[?21n"),
+            (b"\x1b[?55n", "\x1b[?50n"),
+            (b"\x1b[?75n", "\x1b[?70n"),
+            (b"\x1b[?85n", "\x1b[?83n"),
+        ] {
+            terminal.ingest(query);
+            assert_eq!(drain(&mut terminal), reply);
+        }
+
+        // DECXCPR reports the cursor, and reports it without a page, because
+        // the page is a VT400 claim and our identity deliberately claims
+        // less than that.
+        terminal.ingest(b"\x1b[6;5H\x1b[?6n");
+        assert_eq!(drain(&mut terminal), "\x1b[?6;5R");
+    }
+
+    #[test]
+    fn a_copied_rectangle_survives_overlapping_itself() {
+        // DECCRA is defined for rectangles that overlap, so the source has to
+        // be read out before any of it is written back. A cell-by-cell copy
+        // would smear the leading edge across the rest of the block.
+        let mut terminal = terminal(8, 4);
+        terminal.ingest(b"abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345");
+        // Copy rows 2-4, columns 2-4 up and left onto rows 3-5, columns 3-5.
+        terminal.ingest(b"\x1b[2;2;4;4;1;3;3;1$v");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abcdefgh"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("ijklmnop"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("qrjklvwx"));
+        assert_eq!(terminal.row_text(3).as_deref(), Some("yzrst345"));
+    }
+
+    #[test]
+    fn rectangle_operations_ignore_the_margins() {
+        // Almost everything else in the terminal is bounded by DECSTBM and
+        // DECSLRM. The rectangle family is the exception: it addresses the
+        // page, so setting margins must not move or clip it.
+        let mut terminal = terminal(8, 4);
+        terminal.ingest(b"abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345");
+        with_margins(&mut terminal, 3, 6);
+        terminal.ingest(b"\x1b[2;6h");
+        terminal.ingest(b"\x1b[65;1;1;2;8$x");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("AAAAAAAA"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("AAAAAAAA"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("qrstuvwx"));
+    }
+
+    #[test]
+    fn an_inverted_rectangle_is_not_a_rectangle() {
+        // A bottom above the top, or a right left of the left, describes no
+        // cells at all. The sequence is discarded rather than normalised:
+        // swapping the edges would erase a region the caller never named.
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"abcdefgh\r\nijklmnop");
+        terminal.ingest(b"\x1b[2;2;1;1$z");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abcdefgh"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("ijklmnop"));
+    }
+
+    #[test]
+    fn a_selective_rectangle_erase_spares_dec_protection_but_not_iso() {
+        // DECSED and DECSEL honour an ISO guarded area; DECSERA does not.
+        // The rectangle form is a later, purely DEC addition and spares only
+        // what DECSCA protected.
+        let mut dec = terminal(4, 1);
+        dec.ingest(b"\x1b[1\"qab\x1b[0\"qcd");
+        dec.ingest(b"\x1b[1;1;1;4${");
+        assert_eq!(dec.row_text(0).as_deref(), Some("ab  "));
+
+        let mut iso = terminal(4, 1);
+        iso.ingest(b"\x1bVab\x1bWcd");
+        iso.ingest(b"\x1b[1;1;1;4${");
+        assert_eq!(iso.row_text(0).as_deref(), Some("    "));
+    }
+
+    #[test]
+    fn inserting_a_column_shifts_every_row_of_the_region() {
+        // DECIC is not ICH repeated at the cursor: it opens a column down the
+        // whole vertical region, including the rows the cursor is not on.
+        let mut terminal = terminal(8, 3);
+        terminal.ingest(b"abcdefg\r\nABCDEFG\r\nzyxwvut");
+        terminal.ingest(b"\x1b[2;2H\x1b[2'}");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("a  bcdef"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("A  BCDEF"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("z  yxwvu"));
+    }
+
+    #[test]
+    fn back_index_scrolls_at_the_left_margin_and_steps_back_outside_it() {
+        // DECBI moves the cursor everywhere except at the left margin, where
+        // it moves the screen instead and leaves the cursor where it is.
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"\x1b[1;3Habcde");
+        with_margins(&mut terminal, 3, 5);
+        terminal.ingest(b"\x1b[1;3H\x1b6");
+        // Columns 3-5 held "abc"; they shift right, dropping the "c", and
+        // the "de" outside the right margin stays where it was.
+        assert_eq!(terminal.row_text(0).as_deref(), Some("   abde "));
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (2, 0)
+        );
+
+        // Left of the left margin it is an ordinary step backwards.
+        terminal.ingest(b"\x1b[1;2H\x1b6");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn forward_index_scrolls_at_the_right_margin_and_steps_on_outside_it() {
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"\x1b[1;3Habcde");
+        with_margins(&mut terminal, 3, 5);
+        terminal.ingest(b"\x1b[1;5H\x1b9");
+        // Columns 3-5 shift left, dropping the "a" past the left margin.
+        assert_eq!(terminal.row_text(0).as_deref(), Some("  bc de "));
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (4, 0)
+        );
+
+        // Right of the right margin it is an ordinary step forwards.
+        terminal.ingest(b"\x1b[1;6H\x1b9");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (6, 0)
+        );
+    }
+
+    #[test]
+    fn saving_the_cursor_carries_the_protection_state_with_it() {
+        // Protection looks like a rendition but is not one, so it is easy to
+        // leave out of the saved state. Both save/restore pairs carry it:
+        // the DEC form because it saves renditions, and the SCO form because
+        // esctest2 holds it to that too.
+        for (save, restore) in [(&b"\x1b7"[..], &b"\x1b8"[..]), (b"\x1b[s", b"\x1b[u")] {
+            let mut terminal = terminal(4, 1);
+            terminal.ingest(b"\x1b[1\"q");
+            terminal.ingest(save);
+            terminal.ingest(b"\x1b[0\"q");
+            terminal.ingest(restore);
+            terminal.ingest(b"a");
+            terminal.ingest(b"\x1b[1;1;1;1${");
+            assert_eq!(terminal.row_text(0).as_deref(), Some("a   "));
+        }
+    }
+
+    #[test]
+    fn a_selective_erase_spares_protected_cells_and_an_ordinary_one_does_not() {
+        // DECSCA marks cells the selective erases must leave alone. The
+        // ordinary erases are defined not to honour it, which is the whole
+        // point of the sequences being separate.
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"ab\x1b[1\"qcd\x1b[0\"qef");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abcdef  "));
+
+        // Selective erase of the whole line leaves the protected pair.
+        terminal.ingest(b"\x1b[1;1H\x1b[?2K");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("  cd    "));
+
+        // An ordinary erase takes them too.
+        terminal.ingest(b"\x1b[2K");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("        "));
+    }
+
+    #[test]
+    fn an_iso_guarded_area_is_proof_against_every_erase_not_just_selective_ones() {
+        // SPA/EPA and DECSCA set the same bit but mean different things by
+        // it: ISO 6429's guarded area is meant to survive erasure generally,
+        // so the terminal has to remember which family it was last told
+        // about rather than only what each cell carries.
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"ab\x1bVc\x1bW");
+        terminal.ingest(b"\x1b[1;1H\x1b[2K");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("  c     "));
+
+        // ECH is bound by it as well.
+        terminal.ingest(b"\x1b[1;1H\x1b[3X");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("  c     "));
+
+        // Once DECSCA has spoken, the ordinary erases stop sparing anything,
+        // including cells an earlier SPA protected.
+        terminal.ingest(b"\x1b[0\"q\x1b[1;1H\x1b[2K");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("        "));
+    }
+
+    #[test]
+    fn a_selective_erase_of_the_display_spares_protection_in_every_direction() {
+        // DECSED 0, 1 and 2 all take the sparing path, including the
+        // whole-screen form, which cannot use the bulk clear because some
+        // cells are staying put.
+        for (erase, expected) in [
+            (b"\x1b[?0J".as_slice(), ["ab      ", "xxc     "]),
+            (b"\x1b[?1J", [" b      ", "  cd    "]),
+            (b"\x1b[?2J", [" b      ", "  c     "]),
+        ] {
+            let mut terminal = terminal(8, 2);
+            terminal.ingest(b"a\x1b[1\"qb\x1b[0\"q\x1b[2;1Hxx\x1b[1\"qc\x1b[0\"qd");
+            terminal.ingest(b"\x1b[2;3H");
+            terminal.ingest(erase);
+            assert_eq!(terminal.row_text(0).as_deref(), Some(expected[0]));
+            assert_eq!(terminal.row_text(1).as_deref(), Some(expected[1]));
+        }
+    }
+
+    #[test]
+    fn a_protected_cell_an_erase_spares_still_scrolls_into_history() {
+        // Leaving a protected cell in place is only half of sparing it: the
+        // row's occupied extent has to keep reaching it too, because a scroll
+        // trusts that extent both to carry the line into history and to clear
+        // the row it recycles. Each erase is aimed to cover the whole first
+        // line, leaving the protected `c` as the last thing on it.
+        let iso = &b"ab\x1bVc\x1bW"[..];
+        let dec = &b"ab\x1b[1\"qc\x1b[0\"q"[..];
+        for (protect, erase) in [
+            (iso, &b"\x1b[1;1H\x1b[K"[..]),
+            (iso, b"\x1b[1;8H\x1b[1K"),
+            (iso, b"\x1b[2K"),
+            (iso, b"\x1b[1;1H\x1b[J"),
+            (iso, b"\x1b[1;8H\x1b[1J"),
+            (iso, b"\x1b[2J"),
+            (iso, b"\x1b[1;1H\x1b[8X"),
+            (dec, b"\x1b[1;1H\x1b[?0K"),
+            (dec, b"\x1b[1;8H\x1b[?1K"),
+            (dec, b"\x1b[?2K"),
+            (dec, b"\x1b[1;1H\x1b[?0J"),
+            (dec, b"\x1b[1;8H\x1b[?1J"),
+            (dec, b"\x1b[?2J"),
+        ] {
+            let mut terminal = terminal(8, 2);
+            terminal.ingest(protect);
+            terminal.ingest(erase);
+            terminal.ingest(b"\x1b[2;1H\n");
+            let erase = String::from_utf8_lossy(erase);
+            let history = terminal.scrollback_lines().collect::<Vec<_>>();
+            assert_eq!(history.len(), 1, "{erase:?}");
+            assert_eq!(
+                history[0]
+                    .cells()
+                    .iter()
+                    .map(|cell| cell.character())
+                    .collect::<String>(),
+                "  c",
+                "{erase:?}"
+            );
+            assert_eq!(
+                terminal.row_text(1).as_deref(),
+                Some("        "),
+                "{erase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_soft_reset_forgets_both_the_protection_and_who_asked_for_it() {
+        // DECSTR returns DECSCA to normal. The source has to go with it:
+        // leaving it at ISO would have the next ordinary erase keep sparing
+        // cells that nothing has protected.
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"\x1bVab\x1bW\x1b[!p");
+        terminal.ingest(b"\x1b[1;3Hcd\x1b[1;1H\x1b[2K");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("        "));
+    }
+
+    fn mode_report(terminal: &mut Terminal, query: &[u8]) -> String {
+        terminal.ingest(query);
+        String::from_utf8(terminal.drain_replies()).unwrap()
+    }
+
+    #[test]
+    fn a_mode_report_follows_the_mode_it_is_reporting_on() {
+        // DECRQM answers 1 for set and 2 for reset, and the answer has to
+        // track the mode rather than being a fixed opinion about it.
+        let mut terminal = terminal(8, 3);
+        assert_eq!(mode_report(&mut terminal, b"\x1b[?7$p"), "\x1b[?7;1$y");
+        assert_eq!(mode_report(&mut terminal, b"\x1b[?6$p"), "\x1b[?6;2$y");
+
+        terminal.ingest(b"\x1b[?6h\x1b[?7l");
+        assert_eq!(mode_report(&mut terminal, b"\x1b[?7$p"), "\x1b[?7;2$y");
+        assert_eq!(mode_report(&mut terminal, b"\x1b[?6$p"), "\x1b[?6;1$y");
+
+        // The ANSI modes are asked about without the `?` and answered the
+        // same way.
+        assert_eq!(mode_report(&mut terminal, b"\x1b[4$p"), "\x1b[4;2$y");
+        terminal.ingest(b"\x1b[4h");
+        assert_eq!(mode_report(&mut terminal, b"\x1b[4$p"), "\x1b[4;1$y");
+    }
+
+    #[test]
+    fn a_mode_we_do_not_perform_is_reported_permanently_reset_not_set() {
+        // The reply says whether a mode is set, not whether we act on it, and
+        // conflating the two is a lie a program can act on. Storing a bit for
+        // a function we do not perform and reporting it back would tell an
+        // application we will do something we will not, so the answer is
+        // "permanently reset" - which is the value that exists to say so.
+        let mut terminal = terminal(8, 3);
+        for query in [b"\x1b[?42$p".as_slice(), b"\x1b[?18$p", b"\x1b[?3$p"] {
+            terminal.ingest(query);
+            let reply = String::from_utf8(terminal.drain_replies()).unwrap();
+            assert!(reply.ends_with(";4$y"), "unexpected reply {reply:?}");
+        }
+
+        // Setting one does not change that: the bit is not stored, so it
+        // cannot be reported back.
+        terminal.ingest(b"\x1b[?42h");
+        assert_eq!(mode_report(&mut terminal, b"\x1b[?42$p"), "\x1b[?42;4$y");
+
+        // A mode we cannot name at all is 0 rather than 4, because "I do not
+        // do this" and "I have never heard of this" are different answers.
+        assert_eq!(
+            mode_report(&mut terminal, b"\x1b[?12345$p"),
+            "\x1b[?12345;0$y"
+        );
+
+        // SRM is the other way round: we can never echo locally, so we are
+        // permanently in send-receive mode rather than able to leave it.
+        assert_eq!(mode_report(&mut terminal, b"\x1b[12$p"), "\x1b[12;3$y");
+    }
+
+    #[test]
+    fn a_locked_keyboard_sends_nothing_and_a_backarrow_mode_changes_what_it_sends() {
+        // KAM and DECBKM are reported because they are performed, which is
+        // the standard this file holds the mode reports to.
+        let mut terminal = terminal(8, 3);
+        terminal.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(terminal.drain_input(), [0x7f]);
+
+        terminal.ingest(b"\x1b[?67h");
+        terminal.handle_input(InputEvent::Key(Key::Backspace));
+        assert_eq!(terminal.drain_input(), [0x08]);
+        assert_eq!(mode_report(&mut terminal, b"\x1b[?67$p"), "\x1b[?67;1$y");
+
+        // A locked keyboard queues nothing at all rather than queueing it to
+        // deliver later, so the program is owed nothing when it unlocks.
+        terminal.ingest(b"\x1b[2h");
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Character('a'))),
+            InputEventOutcome::Rejected
+        );
+        assert!(terminal.drain_input().is_empty());
+        assert_eq!(mode_report(&mut terminal, b"\x1b[2$p"), "\x1b[2;1$y");
+
+        terminal.ingest(b"\x1b[2l");
+        terminal.handle_input(InputEvent::Key(Key::Character('a')));
+        assert_eq!(terminal.drain_input(), b"a");
+    }
+
+    #[test]
+    fn character_input_matches_prepared_utf8_and_preserves_queue_bounds() {
+        let mut terminal = terminal(8, 3);
+        for character in ['\0', 'a', 'é', '漢', '🙂', '\u{10ffff}'] {
+            let event = InputEvent::Key(Key::Character(character));
+            let prepared = terminal
+                .prepare_input(std::slice::from_ref(&event), 4)
+                .unwrap();
+            let expected = prepared.bytes().to_vec();
+            assert_eq!(
+                terminal.handle_input(event),
+                InputEventOutcome::Encoded {
+                    bytes: expected.len()
+                }
+            );
+            assert_eq!(terminal.drain_input(), expected);
+        }
+
+        terminal.queue_input(b"prefix");
+        terminal.ingest(b"\x1b[2h");
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Character('a'))),
+            InputEventOutcome::Rejected
+        );
+        assert_eq!(terminal.drain_input(), b"prefix");
+        terminal.ingest(b"\x1b[2l");
+
+        let prefix = vec![b'x'; TRANSPORT_QUEUE_HIGH_WATERMARK - 3];
+        terminal.queue_input(&prefix);
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Character('🙂'))),
+            InputEventOutcome::QueueOverflow
+        );
+        assert_eq!(terminal.drain_input(), prefix);
+        assert!(terminal.take_input_queue_overflowed());
+    }
+
+    #[test]
+    fn borrowed_input_drain_is_bounded_and_empty_after_consumer_panics() {
+        let mut terminal = terminal(8, 3);
+        terminal.queue_input(b"short");
+        assert_eq!(terminal.drain_input_with(|bytes| bytes.to_vec()), b"short");
+        assert!(terminal.queued_input().is_empty());
+        let reusable = terminal.drain_input();
+        assert!(reusable.is_empty());
+        assert!((1..=16).contains(&reusable.capacity()));
+
+        let large = vec![b'x'; 64];
+        terminal.queue_input(&large);
+        terminal.drain_input_with(|bytes| assert_eq!(bytes, large));
+        assert_eq!(terminal.drain_input().capacity(), 0);
+
+        for expected in [b"prefix".as_slice(), large.as_slice()] {
+            terminal.queue_input(expected);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                terminal.drain_input_with(|bytes| {
+                    assert_eq!(bytes, expected);
+                    panic!("consumer failed");
+                });
+            }));
+            assert!(result.is_err());
+            assert!(terminal.queued_input().is_empty());
+            assert_eq!(terminal.drain_input().capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn form_feed_and_vertical_tab_index_exactly_as_a_line_feed_does() {
+        // FF and VT are LF under different names: they move down a line and
+        // scroll at the bottom of the region, and they leave the column
+        // alone unless LNM says otherwise.
+        for control in [b"\n".as_slice(), b"\x0b", b"\x0c"] {
+            let mut terminal = terminal(8, 3);
+            terminal.ingest(b"\x1b[1;5H");
+            terminal.ingest(control);
+            assert_eq!(
+                (terminal.cursor().column(), terminal.cursor().row()),
+                (4, 1),
+                "{control:?} should index without changing the column"
+            );
+
+            // At the bottom of the screen it scrolls rather than stalling.
+            terminal.ingest(b"\x1b[2;1Htop\x1b[3;1H");
+            terminal.ingest(control);
+            assert_eq!(terminal.row_text(0).as_deref(), Some("top     "));
+            assert_eq!(terminal.cursor().row(), 2);
+        }
+    }
+
+    #[test]
+    fn new_line_mode_adds_a_carriage_return_to_every_index_control() {
+        // LNM (`CSI 20h`) is the one thing that distinguishes LF, VT and FF
+        // from a bare index, and it must apply to all three alike.
+        for control in [b"\n".as_slice(), b"\x0b", b"\x0c"] {
+            let mut terminal = terminal(8, 3);
+            terminal.ingest(b"\x1b[20h\x1b[1;5H");
+            terminal.ingest(control);
+            assert_eq!(
+                (terminal.cursor().column(), terminal.cursor().row()),
+                (0, 1),
+                "{control:?} should return as well as index under LNM"
+            );
+
+            // And stops the moment the mode is reset again.
+            terminal.ingest(b"\x1b[20l\x1b[1;5H");
+            terminal.ingest(control);
+            assert_eq!(
+                (terminal.cursor().column(), terminal.cursor().row()),
+                (4, 1),
+                "{control:?} should only index once LNM is reset"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_mode_shifts_the_line_right_and_drops_what_passes_the_margin() {
+        // IRM makes room rather than overwriting, and the room it makes ends
+        // where a line would wrap. Cells pushed past that end are lost:
+        // insert mode does not carry them to the next line.
+        let mut terminal = terminal(12, 2);
+        terminal.ingest(b"\x1b[1;5Habcdef");
+        with_margins(&mut terminal, 5, 10);
+        terminal.ingest(b"\x1b[1;7H\x1b[4hX");
+
+        assert_eq!(terminal.row_text(0).as_deref(), Some("    abXcde  "));
+        // The 'f' pushed past the right margin is gone, not carried onto the
+        // line below: insert mode does not wrap.
+        assert_eq!(terminal.row_text(1).as_deref(), Some("            "));
+    }
+
+    #[test]
+    fn insert_mode_ends_when_a_soft_reset_puts_the_terminal_back_to_replace() {
+        // DECSTR lists IRM among the modes it returns to their power-on
+        // state, so an application that leaves insert mode on cannot poison
+        // the one that follows it.
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"abcd\x1b[1;1H\x1b[4hX");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("Xabcd   "));
+
+        terminal.ingest(b"\x1b[!p\x1b[1;1HY");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("Yabcd   "));
+    }
+
+    #[test]
+    fn a_forward_tab_is_caught_by_the_right_margin_even_from_outside_it() {
+        // A cursor left of the left margin tabs *into* the margins, so the
+        // far one still binds it. Only a cursor already past the right
+        // margin is outside what the margin describes.
+        let mut terminal = terminal(40, 2);
+        with_margins(&mut terminal, 5, 30);
+
+        terminal.ingest(b"\x1b[1;7H\x1b[2I");
+        assert_eq!(terminal.cursor().column(), 16);
+
+        // Two more tabs would reach column 33, so the right margin catches it.
+        terminal.ingest(b"\x1b[2I");
+        assert_eq!(terminal.cursor().column(), 29);
+
+        // And the same from column one, which is left of the left margin.
+        terminal.ingest(b"\x1b[1;1H\x1b[9I");
+        assert_eq!(terminal.cursor().column(), 29);
+    }
+
+    #[test]
+    fn a_backward_tab_is_bounded_by_the_screen_rather_than_the_left_margin() {
+        // CBT is the exception to the rule above: it tabs backwards out of a
+        // left/right region entirely and stops at column one.
+        let mut terminal = terminal(40, 2);
+        terminal.ingest(b"\x1b[1;25H\x1b[2Z");
+        assert_eq!(terminal.cursor().column(), 8);
+
+        terminal.ingest(b"\x1b[1;25H\x1b[5Z");
+        assert_eq!(terminal.cursor().column(), 0);
+
+        with_margins(&mut terminal, 5, 30);
+        terminal.ingest(b"\x1b[1;7H\x1b[2Z");
+        assert_eq!(terminal.cursor().column(), 0);
+    }
+
+    #[test]
+    fn the_relative_position_controls_move_the_cursor_without_addressing_it() {
+        // HPR (`CSI a`) and VPR (`CSI e`) are CUF and CUD under different
+        // names. A relative move has no frame of reference for origin mode
+        // to change, so they behave the same inside a region as outside one.
+        let mut terminal = terminal(10, 6);
+        terminal.ingest(b"\x1b[2;3H\x1b[2a\x1b[3e");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (4, 4)
+        );
+
+        // Both stop at the edge rather than wrapping or scrolling.
+        terminal.ingest(b"\x1b[1;1H\x1b[99a\x1b[99e");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (9, 5)
+        );
+    }
+
+    #[test]
+    fn text_wraps_at_the_right_margin_and_continues_at_the_left_one() {
+        // With left/right margins a line is a column of text, not the whole
+        // screen: it wraps at the right margin and resumes at the left one,
+        // leaving everything either side untouched.
+        let mut terminal = terminal(8, 3);
+        with_margins(&mut terminal, 2, 4);
+        terminal.ingest(b"abcdefgh");
+
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abcd    "));
+        assert_eq!(terminal.row_text(1).as_deref(), Some(" efg    "));
+        assert_eq!(terminal.row_text(2).as_deref(), Some(" h      "));
+
+        // Dropping the mode discards the margins rather than merely
+        // suspending them, so the next line uses the whole width.
+        terminal.ingest(b"\x1b[?69l\x1b[1;1HABCDEFGH");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("ABCDEFGH"));
+    }
+
+    #[test]
+    fn a_cursor_outside_the_margins_neither_scrolls_nor_shifts_cells() {
+        // The margins describe a window. A cursor outside that window is not
+        // in the thing these operations act on, so they must do nothing at
+        // all rather than fall back to acting on the whole row.
+        let mut terminal = terminal(6, 4);
+        terminal.ingest(b"\x1b[1;1Habcdef");
+        with_margins(&mut terminal, 2, 4);
+
+        terminal.ingest(b"\x1b[1;1H\x1b[99P");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abcdef"));
+        terminal.ingest(b"\x1b[1;1H\x1b[99@");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abcdef"));
+
+        // Inside the window they act, but only as far as the right margin:
+        // the `e` past it stays put and the `d` falls off the edge.
+        terminal.ingest(b"\x1b[1;2H\x1b[P");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("acd ef"));
+    }
+
+    #[test]
+    fn an_index_outside_the_margins_does_not_scroll_the_screen_under_it() {
+        // At the bottom margin an index normally scrolls. Outside the
+        // left/right margins there is nothing to scroll, and the cursor must
+        // not move either - it cannot go down, and the region it would push
+        // is not the region it is in.
+        let mut terminal = terminal(6, 4);
+        terminal.ingest(b"\x1b[2;4r"); // rows 2..4
+        with_margins(&mut terminal, 2, 4);
+        terminal.ingest(b"\x1b[4;2Hx");
+
+        terminal.ingest(b"\x1b[4;6H\x1bD");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (5, 3)
+        );
+        assert_eq!(terminal.row_text(3).as_deref(), Some(" x    "));
+
+        // NEL indexes first and returns second, so the same cursor still
+        // fails to scroll, and only then moves to the left margin.
+        terminal.ingest(b"\x1b[4;6H\x1bE");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (1, 3)
+        );
+        assert_eq!(terminal.row_text(3).as_deref(), Some(" x    "));
+
+        // From inside the margins it does scroll, and only within them.
+        terminal.ingest(b"\x1b[4;3H\x1bD");
+        assert_eq!(terminal.row_text(3).as_deref(), Some("      "));
+    }
+
+    #[test]
+    fn scrolling_within_margins_moves_only_the_columns_between_them() {
+        let mut terminal = terminal(5, 3);
+        for (row, text) in ["abcde", "fghij", "klmno"].iter().enumerate() {
+            terminal.ingest(format!("\x1b[{};1H{text}", row + 1).as_bytes());
+        }
+        with_margins(&mut terminal, 2, 4);
+        terminal.ingest(b"\x1b[1;3H\x1b[M"); // delete line, inside the margins
+
+        assert_eq!(terminal.row_text(0).as_deref(), Some("aghie"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("flmnj"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("k   o"));
+    }
+
+    #[test]
+    fn origin_mode_measures_columns_from_the_left_margin_but_hpa_does_not() {
+        // CHA and HPA address the same column and differ in exactly one way:
+        // origin mode moves CHA's frame of reference and leaves HPA's alone.
+        let mut terminal = terminal(12, 4);
+        with_margins(&mut terminal, 5, 10);
+        terminal.ingest(b"\x1b[2;4r\x1b[?6h");
+
+        terminal.ingest(b"\x1b[1;1H");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (4, 1)
+        );
+
+        terminal.ingest(b"\x1b[3G");
+        assert_eq!(terminal.cursor().column(), 6);
+        terminal.ingest(b"\x1b[3`");
+        assert_eq!(terminal.cursor().column(), 2);
+
+        // A cursor that origin mode does not reach reports where it is,
+        // since it has no meaningful offset from an origin it is outside.
+        terminal.ingest(b"\x1b[6n");
+        assert_eq!(terminal.drain_replies(), b"\x1b[1;3R");
+        terminal.ingest(b"\x1b[3G\x1b[6n");
+        assert_eq!(terminal.drain_replies(), b"\x1b[1;3R");
+    }
+
+    #[test]
+    fn a_carriage_return_returns_to_the_left_margin_only_from_inside_it() {
+        let mut terminal = terminal(12, 2);
+        with_margins(&mut terminal, 5, 10);
+
+        terminal.ingest(b"\x1b[1;6H\r");
+        assert_eq!(terminal.cursor().column(), 4);
+        terminal.ingest(b"\x1b[1;5H\r");
+        assert_eq!(terminal.cursor().column(), 4);
+        terminal.ingest(b"\x1b[1;4H\r");
+        assert_eq!(terminal.cursor().column(), 0);
+
+        // Origin mode is the exception: there the left margin *is* column 1,
+        // so that is where a return goes from anywhere on the row.
+        terminal.ingest(b"\x1b[?6h\x1b[1;4H\r");
+        assert_eq!(terminal.cursor().column(), 4);
+    }
+
+    #[test]
+    fn a_soft_reset_discards_the_margins_and_the_mode_that_gated_them() {
+        // Resetting one without the other would leave margins that spring
+        // back the moment an application enables the mode for its own use.
+        let mut terminal = terminal(8, 2);
+        with_margins(&mut terminal, 2, 4);
+        terminal.ingest(b"\x1b[!p");
+        terminal.ingest(b"\x1b[?69h\x1b[1;1Habcdefgh");
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abcdefgh"));
+    }
+
+    #[test]
+    fn checksums_a_rectangle_by_its_characters_and_nothing_else() {
+        // DECRQCRA is the only way a program can read the screen back out of
+        // the terminal, so what it reports is deliberately narrow: the sum of
+        // the character codes, with an unwritten cell counting as a space.
+        // Attributes deliberately do not contribute - a caller could not tell
+        // a bold `a` from a different character if they did.
+        let mut terminal = terminal(4, 2);
+        terminal.ingest(b"ab");
+
+        terminal.ingest(b"\x1b[1;0;1;1;1;2*y");
+        assert_eq!(
+            terminal.drain_replies(),
+            format!("\x1bP1!~{:04X}\x1b\\", u16::from(b'a') + u16::from(b'b')).as_bytes()
+        );
+
+        // The two cells the text did not reach read as spaces, as does the
+        // whole of the second row.
+        terminal.ingest(b"\x1b[7;0;1;1;2;4*y");
+        let expected = u16::from(b'a') + u16::from(b'b') + 6 * u16::from(b' ');
+        assert_eq!(
+            terminal.drain_replies(),
+            format!("\x1bP7!~{expected:04X}\x1b\\").as_bytes()
+        );
+
+        // An omitted rectangle is the whole screen, and so is one whose edges
+        // are all zero.
+        terminal.ingest(b"\x1b[7*y\x1b[7;0;0;0;0;0*y");
+        let whole = format!("\x1bP7!~{expected:04X}\x1b\\");
+        assert_eq!(
+            terminal.drain_replies(),
+            format!("{whole}{whole}").as_bytes()
+        );
+
+        // The same characters with a pen set still check out the same.
+        let mut attributed = crate::tests::terminal(4, 2);
+        attributed.ingest(b"\x1b[1;4;7;31;42mab\x1b[m");
+        attributed.ingest(b"\x1b[7*y");
+        assert_eq!(attributed.drain_replies(), whole.as_bytes());
+    }
+
+    #[test]
+    fn a_checksum_request_is_answered_even_when_it_asks_for_nothing() {
+        // A request that names an inverted or off-screen rectangle is still a
+        // request. Leaving it unanswered strands the caller until its read
+        // times out, which is a worse failure than a zero.
+        let mut terminal = terminal(4, 2);
+        terminal.ingest(b"ab");
+        terminal.ingest(b"\x1b[3;0;2;1;1;4*y");
+        assert_eq!(terminal.drain_replies(), b"\x1bP3!~0000\x1b\\");
+
+        // Edges past the screen are clipped to it rather than refused.
+        terminal.ingest(b"\x1b[4;0;1;1;99;99*y");
+        let expected = u16::from(b'a') + u16::from(b'b') + 6 * u16::from(b' ');
+        assert_eq!(
+            terminal.drain_replies(),
+            format!("\x1bP4!~{expected:04X}\x1b\\").as_bytes()
+        );
+    }
+
+    #[test]
+    fn relative_vertical_motion_is_bound_by_the_region_it_starts_in() {
+        // A program that reserved rows 2..4 and moves down from row 3 is
+        // moving inside the pane it reserved; letting it fall out puts its
+        // next write in someone else's pane. A cursor that starts outside
+        // the region was never in that pane, so the screen bounds it. Origin
+        // mode is not part of this rule - esctest2's CUD/CUU margin tests
+        // never set it.
+        let mut terminal = terminal(5, 25);
+        terminal.ingest(b"\x1b[2;4r\x1b[3;1H\x1b[99B");
+        assert_eq!(terminal.cursor().row(), 3);
+
+        terminal.ingest(b"\x1b[3;1H\x1b[99A");
+        assert_eq!(terminal.cursor().row(), 1);
+
+        // Starting below the region, the screen is the bound.
+        terminal.ingest(b"\x1b[10;1H\x1b[99B");
+        assert_eq!(terminal.cursor().row(), 24);
+
+        // And starting above it.
+        terminal.ingest(b"\x1b[1;1H\x1b[99A");
+        assert_eq!(terminal.cursor().row(), 0);
+    }
+
+    #[test]
+    fn restoring_with_nothing_saved_returns_to_the_power_on_state() {
+        // "Nothing saved" is the power-on state, not "do nothing". Returning
+        // early instead makes a restore's effect depend on history the
+        // caller cannot see.
+        for restore in [&b"\x1b8"[..], &b"\x1b[u"[..]] {
+            let mut terminal = terminal(8, 4);
+            terminal.ingest(b"\x1b[3;5H");
+            terminal.ingest(restore);
+            assert_eq!(
+                (terminal.cursor().column(), terminal.cursor().row()),
+                (0, 0)
+            );
+        }
+
+        let mut terminal = terminal(8, 4);
+        terminal.ingest(b"\x1b[?6h\x1b[3;5H\x1b8");
+        assert!(!terminal.modes().origin_mode());
+    }
+
+    #[test]
+    fn saving_the_cursor_does_not_carry_autowrap_with_it() {
+        // DECSC saves the cursor, the pen, the character sets and the
+        // last-column flag. It does not save DECAWM: a program that turned
+        // wrapping off did so to stop a wrap happening, and having an
+        // unrelated restore turn it back on hands it exactly the wrap it was
+        // avoiding.
+        let mut terminal = terminal(4, 3);
+        terminal.ingest(b"\x1b[?7h\x1b7\x1b[?7l\x1b8");
+        assert!(!terminal.modes().auto_wrap());
+
+        terminal.ingest(b"\x1b[1;3Habcd");
+        assert_eq!(terminal.cursor().row(), 0);
+    }
+
+    #[test]
+    fn a_soft_reset_clears_the_saved_cursor_without_clearing_the_screen() {
+        // DECSTR puts the modes back without throwing away what the user is
+        // looking at. The saved cursor is part of "the modes": with nothing
+        // able to clear it, a saved position outlives whatever wrote it and
+        // reappears at an unrelated restore much later.
+        let mut terminal = terminal(8, 4);
+        terminal.ingest(b"ab\x1b[3;5H\x1b7\x1b[?6h\x1b[2;3r\x1b[?7l\x1b[31m");
+        terminal.ingest(b"\x1b[!p");
+
+        assert!(!terminal.modes().origin_mode());
+        assert!(terminal.modes().auto_wrap());
+        assert_eq!(terminal.row_text(0).unwrap().trim_end(), "ab");
+
+        // The saved cursor is gone, so restoring now goes home rather than
+        // back to the position saved before the reset.
+        terminal.ingest(b"\x1b[4;7H\x1b8");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 0)
+        );
+
+        // The scroll region went with it: a scroll now uses the whole screen.
+        terminal.ingest(b"\x1b[8;1H");
+        assert_eq!(terminal.cursor().row(), 3);
+    }
+
+    #[test]
+    fn reports_the_screen_size_but_refuses_to_manipulate_a_window() {
+        // `CSI 18 t` and `CSI 19 t` are questions the grid can answer
+        // exactly, and that nothing else can answer - a caller left
+        // unanswered just blocks until it times out. The rest of the xterm
+        // window-operation set moves and resizes a window, which is the
+        // embedder's business, so those are ignored rather than guessed at.
+        let mut terminal = terminal(5, 3);
+        terminal.ingest(b"\x1b[18t\x1b[19t");
+        assert_eq!(terminal.drain_replies(), b"\x1b[8;3;5t\x1b[9;3;5t");
+
+        for manipulation in [
+            &b"\x1b[1t"[..],
+            &b"\x1b[2t"[..],
+            &b"\x1b[3;1;1t"[..],
+            &b"\x1b[8;10;20t"[..],
+            &b"\x1b[14t"[..],
+        ] {
+            terminal.ingest(manipulation);
+            assert!(terminal.drain_replies().is_empty());
+        }
+        assert_eq!(terminal.screen().dimensions().columns(), 5);
+        assert_eq!(terminal.screen().dimensions().rows(), 3);
+    }
+
+    #[test]
+    fn osc_titles_and_allowlisted_hyperlinks_are_passive_and_bounded() {
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(
+            b"\x1b]2;fesTerm\x07\
+              \x1b]8;id=one;https://example.com/path\x1b\\link\
+              \x1b]8;;\x1b\\\
+              \x1b]8;;javascript:alert(1)\x1b\\X",
+        );
+
+        assert_eq!(terminal.title(), "fesTerm");
+        assert_eq!(terminal.cell(0, 0).unwrap().text(), "l");
+        assert_eq!(
+            terminal.cell(0, 0).unwrap().hyperlink(),
+            Some("https://example.com/path")
+        );
+        assert_eq!(terminal.cell(4, 0).unwrap().text(), "X");
+        assert_eq!(terminal.cell(4, 0).unwrap().hyperlink(), None);
+        assert!(terminal.drain_replies().is_empty());
+    }
+
+    fn replies(terminal: &mut Terminal) -> String {
+        String::from_utf8(terminal.drain_replies()).expect("replies are ASCII")
+    }
+
+    #[test]
+    fn osc_color_queries_report_the_colors_the_embedder_paints() {
+        // Without these answers a program cannot tell a light terminal from a
+        // dark one, and the usual fallback is to drop background styling
+        // entirely rather than risk an unreadable guess.
+        let mut terminal = terminal(8, 1);
+        terminal.set_color_scheme(ColorScheme::new(
+            Rgb::new(0xe8, 0xed, 0xf2),
+            Rgb::new(0x11, 0x16, 0x1e),
+            Rgb::new(0xff, 0x00, 0x00),
+            ColorScheme::DEFAULT_ANSI,
+        ));
+        terminal.ingest(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b]4;1;?\x1b\\");
+
+        assert_eq!(
+            replies(&mut terminal),
+            "\x1b]10;rgb:e8e8/eded/f2f2\x1b\\\
+             \x1b]11;rgb:1111/1616/1e1e\x1b\\\
+             \x1b]12;rgb:ffff/0000/0000\x1b\\\
+             \x1b]4;1;rgb:cdcd/3131/3131\x1b\\"
+        );
+    }
+
+    #[test]
+    fn a_color_reply_mirrors_the_terminator_of_its_request() {
+        // A program that ended its request with BEL is reading until BEL;
+        // answering with ST would leave it waiting for a byte never sent.
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b]11;?\x07");
+
+        assert_eq!(replies(&mut terminal), "\x1b]11;rgb:1111/1616/1e1e\x07");
+    }
+
+    #[test]
+    fn consecutive_dynamic_colors_are_answered_in_request_order() {
+        // `OSC 10;?;?` asks for the foreground and then the color after it.
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b]10;?;?;?\x1b\\");
+
+        assert_eq!(
+            replies(&mut terminal),
+            "\x1b]10;rgb:e8e8/eded/f2f2\x1b\\\
+             \x1b]11;rgb:1111/1616/1e1e\x1b\\\
+             \x1b]12;rgb:e8e8/eded/f2f2\x1b\\"
+        );
+    }
+
+    #[test]
+    fn a_color_set_is_ignored_and_never_changes_a_later_report() {
+        // This terminal does not repaint on a program's command, so accepting
+        // a set would make the next query describe a color nothing draws.
+        // Reporting no color is recoverable; reporting a false one is not.
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b]4;1;#00ff00\x1b\\");
+        assert!(
+            terminal.drain_replies().is_empty(),
+            "a set is not a query and gets no reply"
+        );
+
+        terminal.ingest(b"\x1b]11;?\x1b\\\x1b]4;1;?\x1b\\");
+        assert_eq!(
+            replies(&mut terminal),
+            "\x1b]11;rgb:1111/1616/1e1e\x1b\\\x1b]4;1;rgb:cdcd/3131/3131\x1b\\",
+            "the reported colors are still the ones actually painted"
+        );
+    }
+
+    #[test]
+    fn the_answerable_half_of_a_mixed_palette_request_is_still_answered() {
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b]4;1;#ff0000;2;?\x1b\\");
+
+        assert_eq!(replies(&mut terminal), "\x1b]4;2;rgb:0d0d/bcbc/7979\x1b\\");
+    }
+
+    #[test]
+    fn malformed_and_out_of_range_color_requests_are_silent() {
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(
+            b"\x1b]4;256;?\x1b\\\
+              \x1b]4;-1;?\x1b\\\
+              \x1b]4;1x;?\x1b\\\
+              \x1b]4;;?\x1b\\\
+              \x1b]4;7\x1b\\\
+              \x1b]13;?\x1b\\\
+              \x1b]11\x1b\\",
+        );
+
+        assert!(
+            terminal.drain_replies().is_empty(),
+            "a request this terminal cannot describe is answered with silence"
+        );
+        assert_eq!(terminal.cell(0, 0).unwrap().text(), " ");
+    }
+
+    #[test]
+    fn a_color_query_burst_is_bounded() {
+        // One string may carry hundreds of `index;?` pairs. Replies share the
+        // bounded transport queue with everything else the session needs to
+        // say, so the count a single request can trigger is capped.
+        let mut terminal = terminal(8, 1);
+        let mut request = b"\x1b]4".to_vec();
+        for index in 0..=255u16 {
+            request.extend_from_slice(format!(";{index};?").as_bytes());
+        }
+        request.extend_from_slice(b"\x1b\\");
+        terminal.ingest(&request);
+
+        let answered = replies(&mut terminal).matches("\x1b]4;").count();
+        assert!(
+            (1..=64).contains(&answered),
+            "expected a bounded number of replies, got {answered}"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_color_query_is_never_answered() {
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b]11;?\x1b[0m");
+
+        assert!(
+            terminal.drain_replies().is_empty(),
+            "a request that never reached its terminator was never a request"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_string_never_swallows_what_follows_it() {
+        // `ESC` inside a string leaves the string; only `ESC \` ends it
+        // normally. A program that writes a truncated title - or dies
+        // mid-sequence - must not take the rest of the session's output with
+        // it, so the next escape sequence has to land.
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b]2;before\x07\x1b]2;truncated\x1b[31mred");
+
+        assert_eq!(
+            terminal.title(),
+            "before",
+            "a string abandoned before its terminator is discarded, not applied"
+        );
+        assert_eq!(terminal.cell(0, 0).unwrap().text(), "r");
+        assert_eq!(
+            terminal.cell(0, 0).unwrap().foreground(),
+            Color::Indexed(1),
+            "the sequence that ended the string must still take effect"
+        );
+    }
+
+    #[test]
+    fn a_string_abandoned_by_escape_escape_recovers_on_the_next_sequence() {
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b]0;title\x1b\x1b[32mgo");
+
+        assert!(terminal.title().is_empty());
+        assert_eq!(terminal.cell(0, 0).unwrap().text(), "g");
+        assert_eq!(terminal.cell(0, 0).unwrap().foreground(), Color::Indexed(2));
+    }
+
+    #[test]
+    fn an_abandoned_payload_does_not_leak_into_the_next_string() {
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b]2;discarded\x1b[0m\x1b]2;kept\x1b\\");
+
+        assert_eq!(terminal.title(), "kept");
+    }
+
+    #[test]
+    fn a_truncated_dcs_does_not_swallow_the_following_sequence() {
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1bP$q\x1b[33mok");
+
+        assert_eq!(terminal.cell(0, 0).unwrap().text(), "o");
+        assert_eq!(terminal.cell(0, 0).unwrap().foreground(), Color::Indexed(3));
+        assert!(
+            terminal.drain_replies().is_empty(),
+            "an abandoned DECRQSS is not answered"
+        );
+    }
+
+    #[test]
+    fn hyperlink_targets_are_shared_across_cells() {
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(b"\x1b]8;;https://example.com/long-target\x1b\\links");
+
+        let first = terminal.cell(0, 0).unwrap().hyperlink_target().unwrap();
+        let second = terminal.cell(4, 0).unwrap().hyperlink_target().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn osc8_rejects_malformed_spoofable_and_non_web_targets() {
+        for target in [
+            "https://",
+            "https://a b",
+            "https://example.com/\u{202e}spoof",
+            "https://github.com@evil.example/login",
+            "mailto:user@example.com",
+            "javascript:alert(1)",
+            "file://user@other-host/etc/passwd",
+        ] {
+            let mut terminal = terminal(8, 1);
+            terminal.ingest(format!("\x1b]8;;{target}\x1b\\X").as_bytes());
+            assert_eq!(
+                terminal.cell(0, 0).unwrap().hyperlink(),
+                None,
+                "{target:?} must not become an activatable link"
+            );
+        }
+
+        let mut terminal = terminal(8, 1);
+        terminal.ingest(
+            b"\x1b]8;;https://example.com\x1b\\A\
+              \x1b]8;;https://\x1b\\B",
+        );
+        assert_eq!(
+            terminal.cell(0, 0).unwrap().hyperlink(),
+            Some("https://example.com/")
+        );
+        assert_eq!(terminal.cell(1, 0).unwrap().hyperlink(), None);
+    }
+
+    #[test]
+    fn unterminated_osc8_links_end_at_security_boundaries() {
+        let mut terminal = terminal(16, 2);
+        terminal.ingest(b"\x1b]8;;https://example.com\x1b\\linked\nplain");
+        assert_eq!(
+            terminal.cell(0, 0).unwrap().hyperlink(),
+            Some("https://example.com/")
+        );
+        assert_eq!(terminal.cell(6, 1).unwrap().hyperlink(), None);
+
+        terminal.reset_to_initial_state();
+        terminal.ingest(b"\x1b]8;;https://example.com\x1b\\linked\x1b[0mplain");
+        assert_eq!(terminal.cell(6, 0).unwrap().hyperlink(), None);
+
+        terminal.reset_to_initial_state();
+        terminal.ingest(b"\x1b]8;;https://example.com\x1b\\linked\x1b[?1049hplain");
+        assert_eq!(terminal.cell(0, 0).unwrap().hyperlink(), None);
+
+        let mut bounded = Terminal::new(Dimensions::new(80, 60).unwrap()).unwrap();
+        bounded.ingest(b"\x1b]8;;https://example.com\x1b\\");
+        bounded.ingest(&vec![b'x'; 4_097]);
+        assert_eq!(
+            bounded.cell(15, 51).unwrap().hyperlink(),
+            Some("https://example.com/")
+        );
+        assert_eq!(bounded.cell(16, 51).unwrap().hyperlink(), None);
+    }
+
+    #[test]
+    fn resize_reflows_visible_content_and_clamps_state() {
+        let mut terminal = terminal(5, 3);
+        terminal.ingest(b"abcdefghi\x1b[2;3r\x1b[?6h\x1b[3;5H");
+        terminal.resize(Dimensions::new(3, 2).unwrap()).unwrap();
+        // Reflow (ADR 0017): "abcdefghi" plus the still-blank row the
+        // cursor was addressed onto rewraps at width 3 into
+        // "abc"/"def"/"ghi"/"   "; with only 2 rows now visible, the
+        // first two rewrapped rows move into retained history.
+        assert_eq!(terminal.row_text(0).as_deref(), Some("ghi"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("   "));
+        let scrollback = terminal.scrollback_lines().next().unwrap();
+        assert_eq!(
+            scrollback
+                .cells()
+                .iter()
+                .map(|cell| cell.character())
+                .collect::<String>(),
+            "abcdef"
+        );
+        assert_eq!(scrollback.physical_rows(), 2);
+        // The cursor had been moved (via origin-mode CSI addressing) onto
+        // a blank row below all printed content; that row has no stable
+        // logical anchor of its own, so the cursor falls back to the
+        // bottom-left of the new screen.
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (0, 1)
+        );
+        assert_eq!(terminal.take_dirty_rows(), vec![0, 1]);
+    }
+
+    #[test]
+    fn repeated_resize_reflows_banner_and_prompt_cells_and_recovers_scrolled_off_lines() {
+        // Under reflow (ADR 0017), shrinking the row count can push older
+        // hard-broken lines into retained history rather than always
+        // keeping them clipped in place at the top; growing back to a
+        // taller size pulls them back onto the visible screen unchanged.
+        let mut terminal = terminal(12, 4);
+        terminal.ingest(b"Windows cmd\r\nCopyright\r\nC:\\Users\\fes>");
+
+        terminal.resize(Dimensions::new(11, 4).unwrap()).unwrap();
+        assert_eq!(terminal.row_text(0).as_deref(), Some("Windows cmd"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("Copyright  "));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("C:\\Users\\fe"));
+        assert_eq!(terminal.row_text(3).as_deref(), Some("s>         "));
+
+        // Only 3 rows now fit; the wrapped prompt alone needs 2 of them, so
+        // "Windows cmd" scrolls into retained history.
+        terminal.resize(Dimensions::new(12, 3).unwrap()).unwrap();
+        assert_eq!(terminal.row_text(0).as_deref(), Some("Copyright   "));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("C:\\Users\\fes"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some(">           "));
+        assert!(terminal.scrollback_lines().next().is_some_and(|line| line
+            .cells()
+            .iter()
+            .map(|cell| cell.character())
+            .collect::<String>()
+            == "Windows cmd"));
+
+        terminal.resize(Dimensions::new(11, 3).unwrap()).unwrap();
+        assert_eq!(terminal.row_text(0).as_deref(), Some("Copyright  "));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("C:\\Users\\fe"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("s>         "));
+
+        terminal.resize(Dimensions::new(12, 3).unwrap()).unwrap();
+        assert_eq!(terminal.row_text(0).as_deref(), Some("Copyright   "));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("C:\\Users\\fes"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some(">           "));
+
+        // Growing back to the original height recovers "Windows cmd" from
+        // history onto the visible screen, exactly as it was originally.
+        terminal.resize(Dimensions::new(11, 4).unwrap()).unwrap();
+        assert_eq!(terminal.row_text(0).as_deref(), Some("Windows cmd"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("Copyright  "));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("C:\\Users\\fe"));
+        assert_eq!(terminal.row_text(3).as_deref(), Some("s>         "));
+    }
+
+    #[test]
+    fn transport_queues_are_bounded_observable_and_preserve_accepted_order() {
+        let mut terminal = terminal(2, 1);
+        assert_eq!(
+            terminal.queue_input(&[0x80, b'A']),
+            QueuePushResult {
+                accepted: 2,
+                overflowed: false
+            }
+        );
+        let input_fill = vec![b'i'; TRANSPORT_QUEUE_HIGH_WATERMARK - 2];
+        assert_eq!(
+            terminal.queue_input(&input_fill).accepted(),
+            input_fill.len()
+        );
+        assert_eq!(
+            terminal.queue_input(b"overflow"),
+            QueuePushResult {
+                accepted: 0,
+                overflowed: true
+            }
+        );
+
+        assert_eq!(&terminal.queued_input()[..2], &[0x80, b'A']);
+        assert_eq!(
+            terminal.queued_input().len(),
+            TRANSPORT_QUEUE_HIGH_WATERMARK
+        );
+        assert!(terminal.take_input_queue_overflowed());
+        assert!(!terminal.take_input_queue_overflowed());
+        let drained_input = terminal.drain_input();
+        assert_eq!(&drained_input[..2], &[0x80, b'A']);
+        assert!(terminal.queued_input().is_empty());
+
+        let reply_fill = vec![b'r'; TRANSPORT_QUEUE_HIGH_WATERMARK - 3];
+        assert_eq!(
+            terminal.queue_reply(&reply_fill).accepted(),
+            reply_fill.len()
+        );
+        terminal.ingest(b"\x1b[5n");
+        assert_eq!(terminal.queued_replies(), reply_fill);
+        assert!(terminal.take_reply_queue_overflowed());
+        assert!(!terminal.take_reply_queue_overflowed());
+        assert_eq!(terminal.drain_replies(), reply_fill);
+    }
+
+    #[test]
+    fn recovery_snapshots_validate_terminal_state_before_adoption() {
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"\x1b[?1049hRECOVERED");
+        assert!(terminal
+            .recovery_clone()
+            .validate_recovery_snapshot()
+            .is_ok());
+
+        let mut invalid = terminal.recovery_clone();
+        invalid.set_tab_stops_for_test(Vec::new());
+        let error = invalid
+            .validate_recovery_snapshot()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tab stops"));
+    }
+
+    #[test]
+    fn recovery_snapshots_reject_queued_replies_and_input() {
+        let mut invalid_reply = terminal(8, 2).recovery_clone();
+        invalid_reply.set_transport_queues_for_test(vec![1, 2, 3], Vec::new());
+        assert!(invalid_reply
+            .validate_recovery_snapshot()
+            .unwrap_err()
+            .to_string()
+            .contains("queued replies or input"));
+
+        let mut invalid_input = terminal(8, 2).recovery_clone();
+        invalid_input.set_transport_queues_for_test(Vec::new(), vec![4]);
+        assert!(invalid_input
+            .validate_recovery_snapshot()
+            .unwrap_err()
+            .to_string()
+            .contains("queued replies or input"));
+    }
+
+    #[test]
+    fn recording_checkpoint_excludes_history_queues_titles_and_link_targets() {
+        let mut terminal = terminal(32, 2);
+        terminal.ingest(b"HISTORY-PRIVATE\r\nnext\r\nvisible");
+        terminal.ingest(b"\x1b]2;TITLE-PRIVATE\x07");
+        terminal.ingest(b"\x1b]8;;https://private.example/path\x07 link\x1b]8;;\x07");
+        terminal.queue_input(b"INPUT-PRIVATE");
+        terminal.queue_reply(b"REPLY-PRIVATE");
+        let rows = [terminal.row_text(0), terminal.row_text(1)];
+
+        let checkpoint = terminal
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap();
+        let serialized = serde_json::to_string(&checkpoint).unwrap();
+        for forbidden in [
+            "HISTORY-PRIVATE",
+            "INPUT-PRIVATE",
+            "REPLY-PRIVATE",
+            "TITLE-PRIVATE",
+            "private.example",
+        ] {
+            assert!(!serialized.contains(forbidden), "retained {forbidden}");
+        }
+        let restored = checkpoint.into_terminal().unwrap();
+        assert_eq!([restored.row_text(0), restored.row_text(1)], rows);
+        assert!(restored.queued_input().is_empty());
+        assert!(restored.queued_replies().is_empty());
+        assert_eq!(restored.scrollback_stats().logical_lines(), 0);
+        for row in 0..2 {
+            for column in 0..32 {
+                assert!(restored
+                    .screen()
+                    .cell_ref(column, row)
+                    .unwrap()
+                    .hyperlink()
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn recording_checkpoint_redacts_concealed_text() {
+        let mut terminal = terminal(32, 3);
+        terminal.ingest(b"visible\r\n");
+        terminal.ingest("\x1b[8mCONCEALED界\x1b[0m".as_bytes());
+
+        let restored = terminal
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap()
+            .into_terminal()
+            .unwrap();
+        assert!(restored.row_text(0).unwrap().starts_with("visible"));
+        for row in 0..3 {
+            let text = restored.row_text(row).unwrap();
+            assert!(!text.contains("CONCEALED"));
+            assert!(!text.contains('界'));
+        }
+        assert_eq!(
+            restored.screen().cell_ref(9, 1).unwrap().width(),
+            super::CellWidth::Double
+        );
+        assert_eq!(
+            restored.screen().cell_ref(10, 1).unwrap().width(),
+            super::CellWidth::Continuation
+        );
+    }
+
+    #[test]
+    fn recording_checkpoint_refuses_ambiguous_colored_text() {
+        let hidden_colors = b"\x1b[38;2;0;0;0;48;2;0;0;0m";
+        let mut emoji = terminal(20, 2);
+        emoji.ingest(b"\x1b[?25l");
+        emoji.ingest(hidden_colors);
+        emoji.ingest("🤖".as_bytes());
+        assert!(emoji
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap_err()
+            .to_string()
+            .contains("visibility is ambiguous"));
+
+        let mut cursor = terminal(20, 2);
+        cursor.ingest(hidden_colors);
+        cursor.ingest(b"secret\x1b[H\x1b[2 q");
+        assert!(cursor
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap_err()
+            .to_string()
+            .contains("visibility is ambiguous"));
+        cursor.ingest(b"\x1b[6 q");
+        assert!(cursor
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .is_err());
+
+        let mut concealed = terminal(20, 2);
+        concealed.ingest(b"\x1b[8m");
+        concealed.ingest("🤖".as_bytes());
+        concealed.ingest(b"\x1b[H\x1b[2 q");
+        assert!(concealed
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .is_ok());
+    }
+
+    #[test]
+    fn recording_checkpoint_refuses_faint_text_with_ambiguous_blending() {
+        for style in [
+            b"\x1b[2;38;2;16;22;30m".as_slice(),
+            b"\x1b[2;38;2;130;130;130;48;2;100;100;100m".as_slice(),
+            b"\x1b[2;7;38;2;100;100;100;48;2;130;130;130m".as_slice(),
+        ] {
+            let mut terminal = terminal(20, 2);
+            terminal.ingest(style);
+            terminal.ingest(b"PRIVATE");
+            assert!(terminal
+                .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+                .is_err());
+        }
+        let mut visible = terminal(20, 2);
+        visible.ingest(b"\x1b[2;38;2;255;255;255;48;2;0;0;0mFAINT-VISIBLE");
+        let restored = visible
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap()
+            .into_terminal()
+            .unwrap();
+        assert!(restored.row_text(0).unwrap().contains("FAINT-VISIBLE"));
+    }
+
+    #[test]
+    fn recording_checkpoint_omits_inactive_screen_and_refuses_partial_sequences() {
+        let mut terminal = terminal(32, 2);
+        terminal.ingest(b"HIDDEN-PRIMARY");
+        terminal.ingest(b"\x1b[?1049hvisible alternate");
+        let checkpoint = terminal
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap();
+        let serialized = serde_json::to_string(&checkpoint).unwrap();
+        assert!(!serialized.contains("HIDDEN-PRIMARY"));
+        let restored = checkpoint.into_terminal().unwrap();
+        assert!(restored.modes().alternate_screen());
+        assert_eq!(restored.row_text(0), terminal.row_text(0));
+
+        terminal.ingest(b"\x1b]2;NOT-VISIBLE");
+        assert!(terminal
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .is_err());
+        terminal.ingest(b"\x07");
+        terminal.ingest(&[0xe2, 0x82]);
+        assert!(terminal
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .is_err());
+        terminal.ingest(&[0xac]);
+        assert!(terminal
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .is_ok());
+        assert!(terminal.recording_checkpoint(100).is_err());
+    }
+
+    #[test]
+    fn recording_checkpoint_omits_offscreen_repeat_character() {
+        let mut terminal = terminal(20, 2);
+        terminal.ingest("🧬".as_bytes());
+        terminal.ingest(b"\x1b[2J\x1b[H");
+        let checkpoint = terminal
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap();
+        let serialized = serde_json::to_string(&checkpoint).unwrap();
+        assert!(!serialized.contains('🧬'));
+
+        let mut restored = checkpoint.into_terminal().unwrap();
+        restored.ingest(b"\x1b[2b");
+        assert_eq!(
+            restored.row_text(0).as_deref(),
+            Some("                    ")
+        );
+    }
+
+    #[test]
+    fn recording_checkpoint_continues_charset_and_rendering_state() {
+        let mut original = terminal(20, 3);
+        original.ingest(b"\x1b)0\x0e\x1b[31m\x1b[2;4Hq");
+        let checkpoint = original
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap();
+        let encoded = serde_json::to_vec(&checkpoint).unwrap();
+        let checkpoint: super::RecordingCheckpoint = serde_json::from_slice(&encoded).unwrap();
+        let mut replay = checkpoint.into_terminal().unwrap();
+
+        let output = b"xl\x0f normal\x1b[2b";
+        original.ingest(output);
+        replay.ingest(output);
+        assert_eq!(replay.cursor(), original.cursor());
+        assert_eq!(replay.modes(), original.modes());
+        for row in 0..3 {
+            for column in 0..20 {
+                assert_eq!(
+                    replay.screen().cell_ref(column, row),
+                    original.screen().cell_ref(column, row)
+                );
+            }
+        }
+        assert!(replay.row_text(1).unwrap().contains("─│┌ normal"));
+    }
+
+    #[test]
+    fn recording_checkpoint_rejects_malformed_screen_and_cell_text() {
+        let terminal = terminal(8, 2);
+        let checkpoint = terminal
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap();
+        let value = serde_json::to_value(&checkpoint).unwrap();
+
+        let mut oversized_text = value.clone();
+        oversized_text["visible"]["screen"]["cells"][0]["text"] =
+            serde_json::Value::String("x".repeat(crate::unicode::MAX_GRAPHEME_BYTES + 1));
+        assert!(serde_json::from_value::<super::RecordingCheckpoint>(oversized_text).is_err());
+
+        let mut missing_cell = value.clone();
+        missing_cell["visible"]["screen"]["cells"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        let malformed: super::RecordingCheckpoint = serde_json::from_value(missing_cell).unwrap();
+        assert!(malformed.into_terminal().is_err());
+
+        let mut inconsistent_mode = value;
+        inconsistent_mode["modes"]["alternate_screen"] = serde_json::Value::Bool(true);
+        let malformed: super::RecordingCheckpoint =
+            serde_json::from_value(inconsistent_mode).unwrap();
+        assert!(malformed.into_terminal().is_err());
+    }
+
+    #[test]
+    fn encodes_ctrl_chords_as_their_conventional_control_bytes() {
+        let mut terminal = terminal(8, 2);
+
+        // Letters, either case: same control byte (Ctrl+B and Ctrl+Shift+B
+        // both send 0x02, matching what every other terminal emulator sends
+        // and what tmux/GNU Screen expect for their default prefix key).
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Control('b'))),
+            InputEventOutcome::Encoded { bytes: 1 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Control('B'))),
+            InputEventOutcome::Encoded { bytes: 1 }
+        );
+        assert_eq!(terminal.drain_input(), [0x02, 0x02]);
+
+        // A handful of punctuation keys conventionally paired with Ctrl for
+        // the remaining low control codes.
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Control(' '))),
+            InputEventOutcome::Encoded { bytes: 1 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Control('['))),
+            InputEventOutcome::Encoded { bytes: 1 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Control('\\'))),
+            InputEventOutcome::Encoded { bytes: 1 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Control(']'))),
+            InputEventOutcome::Encoded { bytes: 1 }
+        );
+        assert_eq!(terminal.drain_input(), [0x00, 0x1b, 0x1c, 0x1d]);
+
+        // A character without an established Ctrl mapping sends nothing,
+        // rather than guessing at a byte.
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Control('1'))),
+            InputEventOutcome::Rejected
+        );
+        assert!(terminal.drain_input().is_empty());
+    }
+
+    #[test]
+    fn encodes_cursor_keypad_paste_and_focus_input_modes_exactly() {
+        let mut terminal = terminal(8, 2);
+
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::ArrowUp)),
+            InputEventOutcome::Encoded { bytes: 3 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Keypad(KeypadKey::Digit(1)))),
+            InputEventOutcome::Encoded { bytes: 1 }
+        );
+        assert_eq!(terminal.drain_input(), b"\x1b[A1");
+
+        terminal.ingest(b"\x1b[?1h\x1b=");
+        assert!(terminal.modes().application_cursor());
+        assert!(terminal.modes().application_keypad());
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::ArrowLeft)),
+            InputEventOutcome::Encoded { bytes: 3 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Keypad(KeypadKey::Decimal))),
+            InputEventOutcome::Encoded { bytes: 3 }
+        );
+        assert_eq!(terminal.drain_input(), b"\x1bOD\x1bOn");
+
+        terminal.ingest(b"\x1b[?1l\x1b>");
+        assert!(!terminal.modes().application_cursor());
+        assert!(!terminal.modes().application_keypad());
+
+        assert_eq!(
+            terminal.handle_input(InputEvent::Focus(FocusEvent::In)),
+            InputEventOutcome::Rejected
+        );
+        terminal.ingest(b"\x1b[?1004h\x1b[?2004h");
+        assert_eq!(
+            terminal.handle_input(InputEvent::Focus(FocusEvent::In)),
+            InputEventOutcome::Encoded { bytes: 3 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Focus(FocusEvent::Out)),
+            InputEventOutcome::Encoded { bytes: 3 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Paste("a\x1b[201~b".to_owned())),
+            InputEventOutcome::Encoded { bytes: 20 }
+        );
+        assert_eq!(
+            terminal.drain_input(),
+            b"\x1b[I\x1b[O\x1b[200~a\x1b[201~b\x1b[201~"
+        );
+
+        terminal.ingest(b"\x1b[?1004l\x1b[?2004l");
+        assert_eq!(
+            terminal.handle_input(InputEvent::Focus(FocusEvent::Out)),
+            InputEventOutcome::Rejected
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Paste("plain".to_owned())),
+            InputEventOutcome::Encoded { bytes: 5 }
+        );
+        assert_eq!(terminal.drain_input(), b"plain");
+    }
+
+    #[test]
+    fn unbracketed_paste_normalizes_each_line_break_to_one_enter() {
+        for (text, expected) in [
+            ("first\nsecond\nthird", "first\rsecond\rthird"),
+            ("first\r\nsecond\r\nthird", "first\rsecond\rthird"),
+            ("first\rsecond\rthird", "first\rsecond\rthird"),
+            ("first\r\n\nsecond\rthird\n", "first\r\rsecond\rthird\r"),
+            (
+                " first\t\u{03bb}\r\n\u{7b2c}\u{4e8c}\nthird ",
+                " first\t\u{03bb}\r\u{7b2c}\u{4e8c}\rthird ",
+            ),
+            ("first\x07\x1b[201~\nsecond", "first\x07\x1b[201~\rsecond"),
+        ] {
+            let mut terminal = terminal(8, 2);
+            assert_eq!(
+                terminal.handle_input(InputEvent::Paste(text.to_owned())),
+                InputEventOutcome::Encoded {
+                    bytes: expected.len()
+                },
+                "{text:?}"
+            );
+            assert_eq!(terminal.drain_input(), expected.as_bytes(), "{text:?}");
+            assert_eq!(
+                terminal.handle_input(InputEvent::Key(Key::Control('j'))),
+                InputEventOutcome::Encoded { bytes: 1 }
+            );
+            assert_eq!(terminal.drain_input(), b"\n");
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_preserves_multiline_payload_and_marker_bytes() {
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"\x1b[?2004h");
+        let text = "first\r\nsecond\rthird\n\n\x1b[201~\t\u{03bb}";
+        let expected = format!("\x1b[200~{text}\x1b[201~");
+        assert_eq!(
+            terminal.handle_input(InputEvent::Paste(text.to_owned())),
+            InputEventOutcome::Encoded {
+                bytes: expected.len()
+            }
+        );
+        assert_eq!(terminal.drain_input(), expected.as_bytes());
+    }
+
+    #[test]
+    fn unbracketed_paste_admits_exact_normalized_length_atomically() {
+        let mut terminal = terminal(8, 2);
+        let text = format!("{}\r\n", "x".repeat(TRANSPORT_QUEUE_HIGH_WATERMARK - 1));
+        assert_eq!(
+            terminal.handle_input(InputEvent::Paste(text.clone())),
+            InputEventOutcome::Encoded {
+                bytes: TRANSPORT_QUEUE_HIGH_WATERMARK
+            }
+        );
+        let encoded = terminal.drain_input();
+        assert_eq!(encoded.len(), TRANSPORT_QUEUE_HIGH_WATERMARK);
+        assert!(encoded[..encoded.len() - 1]
+            .iter()
+            .all(|byte| *byte == b'x'));
+        assert_eq!(encoded.last(), Some(&b'\r'));
+        assert!(!terminal.take_input_queue_overflowed());
+
+        terminal.queue_input(b"prefix");
+        assert_eq!(
+            terminal.handle_input(InputEvent::Paste(text)),
+            InputEventOutcome::QueueOverflow
+        );
+        assert_eq!(terminal.drain_input(), b"prefix");
+        assert!(terminal.take_input_queue_overflowed());
+    }
+
+    #[test]
+    fn mouse_modes_claim_selection_and_encode_sgr_coordinates_beyond_legacy_limits() {
+        let mut terminal = terminal(8, 2);
+        let press = MouseEvent {
+            kind: MouseEventKind::Press(MouseButton::Left),
+            column: 300,
+            row: 400,
+            modifiers: Modifiers::SHIFT.with(Modifiers::CONTROL),
+        };
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(press)),
+            InputEventOutcome::SelectionAllowed
+        );
+
+        terminal.ingest(b"\x1b[?9h");
+        assert_eq!(terminal.modes().mouse_tracking(), MouseTrackingMode::X10);
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Release(MouseButton::Left),
+                ..press
+            })),
+            InputEventOutcome::SelectionClaimed
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(press)),
+            InputEventOutcome::Rejected
+        );
+
+        terminal.ingest(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            terminal.modes().mouse_tracking(),
+            MouseTrackingMode::ButtonMotion
+        );
+        assert!(terminal.modes().sgr_mouse());
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(press)),
+            InputEventOutcome::Encoded { bytes: 14 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Release(MouseButton::Left),
+                ..press
+            })),
+            InputEventOutcome::Encoded { bytes: 14 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Move {
+                    button: Some(MouseButton::Right),
+                },
+                ..press
+            })),
+            InputEventOutcome::Encoded { bytes: 14 }
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Move { button: None },
+                ..press
+            })),
+            InputEventOutcome::SelectionClaimed
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Wheel(MouseWheel::Down),
+                ..press
+            })),
+            InputEventOutcome::Encoded { bytes: 14 }
+        );
+        assert_eq!(
+            terminal.drain_input(),
+            b"\x1b[<20;301;401M\x1b[<20;301;401m\x1b[<54;301;401M\x1b[<85;301;401M"
+        );
+
+        terminal.ingest(b"\x1b[?1003h\x1b[?1002l");
+        assert_eq!(
+            terminal.modes().mouse_tracking(),
+            MouseTrackingMode::AnyMotion
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Move { button: None },
+                ..press
+            })),
+            InputEventOutcome::Encoded { bytes: 14 }
+        );
+        terminal.ingest(b"\x1b[?1003l\x1b[?1000h\x1b[?1006l");
+        assert_eq!(
+            terminal.modes().mouse_tracking(),
+            MouseTrackingMode::ButtonEvent
+        );
+        assert_eq!(
+            terminal.handle_input(InputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Press(MouseButton::Middle),
+                column: 2,
+                row: 3,
+                modifiers: Modifiers::SHIFT,
+            })),
+            InputEventOutcome::Encoded { bytes: 6 }
+        );
+        assert_eq!(terminal.drain_input(), b"\x1b[<55;301;401M\x1b[M%#$");
+    }
+
+    #[test]
+    fn rejects_input_atomically_when_the_bounded_queue_is_full() {
+        let mut terminal = terminal(2, 1);
+        terminal.ingest(b"\x1b[?2004h");
+        assert_eq!(
+            terminal.handle_input(InputEvent::Paste(
+                "x".repeat(TRANSPORT_QUEUE_HIGH_WATERMARK)
+            )),
+            InputEventOutcome::QueueOverflow
+        );
+        assert!(terminal.queued_input().is_empty());
+        assert!(terminal.take_input_queue_overflowed());
+        terminal.queue_input(&vec![b'x'; TRANSPORT_QUEUE_HIGH_WATERMARK]);
+        assert_eq!(
+            terminal.handle_input(InputEvent::Key(Key::Character('a'))),
+            InputEventOutcome::QueueOverflow
+        );
+        assert_eq!(
+            terminal.queued_input().len(),
+            TRANSPORT_QUEUE_HIGH_WATERMARK
+        );
+    }
+
+    #[test]
+    fn decodes_unicode_incrementally_and_repairs_wide_cells_after_grid_mutations() {
+        let mut unicode_terminal = terminal(8, 1);
+        unicode_terminal.ingest(b"A\xe7");
+        unicode_terminal.ingest(b"\x95\x8ce\xcc");
+        unicode_terminal.ingest(b"\x81\xf0\x9f\x98\x80");
+        assert_eq!(unicode_terminal.row_text(0).as_deref(), Some("A界 e😀   "));
+        assert_eq!(
+            unicode_terminal.cell(1, 0).unwrap().width(),
+            CellWidth::Double
+        );
+        assert!(unicode_terminal.cell(2, 0).unwrap().is_continuation());
+        assert_eq!(unicode_terminal.cell(3, 0).unwrap().text(), "e\u{301}");
+        assert_eq!(
+            unicode_terminal.cell(4, 0).unwrap().width(),
+            CellWidth::Double
+        );
+        assert!(unicode_terminal.cell(5, 0).unwrap().is_continuation());
+        assert_eq!(
+            (
+                unicode_terminal.cursor().column(),
+                unicode_terminal.cursor().row()
+            ),
+            (6, 0)
+        );
+
+        let mut malformed = terminal(5, 1);
+        malformed.ingest(b"\xf0\x28A");
+        assert_eq!(malformed.row_text(0).as_deref(), Some("�(A  "));
+
+        let mut edited = terminal(6, 1);
+        edited.ingest("A界BC".as_bytes());
+        edited.ingest(b"\x1b[1;2H\x1b[@");
+        assert_eq!(edited.row_text(0).as_deref(), Some("A 界 BC"));
+        assert_eq!(edited.cell(2, 0).unwrap().width(), CellWidth::Double);
+        assert!(edited.cell(3, 0).unwrap().is_continuation());
+        edited.ingest(b"\x1b[1;4H\x1b[1P");
+        assert_eq!(edited.row_text(0).as_deref(), Some("A  BC "));
+        assert_eq!(edited.cell(2, 0).unwrap().width(), CellWidth::Single);
+        assert!(!edited.cell(3, 0).unwrap().is_continuation());
+
+        let mut resized = terminal(5, 1);
+        resized.ingest("A界".as_bytes());
+        resized.resize(Dimensions::new(2, 1).unwrap()).unwrap();
+        // Reflow (ADR 0017): "A" and "界" no longer fit together at width
+        // 2, so "A" moves into retained history and "界" (kept intact as
+        // one atomic double-width unit) becomes the sole visible row.
+        assert_eq!(resized.row_text(0).as_deref(), Some("界 "));
+        assert_eq!(resized.cell(0, 0).unwrap().width(), CellWidth::Double);
+        assert_eq!(
+            resized.scrollback_lines().next().unwrap().cells()[0].character(),
+            'A'
+        );
+    }
+
+    #[test]
+    fn emoji_sequences_use_grapheme_width_across_incremental_input() {
+        let mut agency = terminal(12, 1);
+        agency.ingest("🤖⚠".as_bytes());
+        agency.ingest("\u{fe0f}ℹ".as_bytes());
+        agency.ingest("\u{fe0f}🧹".as_bytes());
+
+        for column in [0, 2, 4, 6] {
+            assert_eq!(agency.cell(column, 0).unwrap().width(), CellWidth::Double);
+            assert!(agency.cell(column + 1, 0).unwrap().is_continuation());
+        }
+        assert_eq!(agency.cell(0, 0).unwrap().text(), "🤖");
+        assert_eq!(agency.cell(2, 0).unwrap().text(), "⚠️");
+        assert_eq!(agency.cell(4, 0).unwrap().text(), "ℹ️");
+        assert_eq!(agency.cell(6, 0).unwrap().text(), "🧹");
+        assert_eq!((agency.cursor().column(), agency.cursor().row()), (8, 0));
+
+        let mut joined = terminal(8, 1);
+        joined.ingest("👩".as_bytes());
+        joined.ingest("\u{200d}".as_bytes());
+        joined.ingest("🔬".as_bytes());
+        assert_eq!(joined.cell(0, 0).unwrap().text(), "👩‍🔬");
+        assert_eq!(joined.cell(0, 0).unwrap().width(), CellWidth::Double);
+        assert!(joined.cell(1, 0).unwrap().is_continuation());
+        assert_eq!((joined.cursor().column(), joined.cursor().row()), (2, 0));
+
+        let mut composed = terminal(8, 1);
+        composed.ingest("1".as_bytes());
+        composed.ingest("\u{fe0f}\u{20e3}".as_bytes());
+        composed.ingest("🇺".as_bytes());
+        composed.ingest("🇸".as_bytes());
+        assert_eq!(composed.cell(0, 0).unwrap().text(), "1️⃣");
+        assert_eq!(composed.cell(0, 0).unwrap().width(), CellWidth::Double);
+        assert_eq!(composed.cell(2, 0).unwrap().text(), "🇺🇸");
+        assert_eq!(composed.cell(2, 0).unwrap().width(), CellWidth::Double);
+        assert_eq!(
+            (composed.cursor().column(), composed.cursor().row()),
+            (4, 0)
+        );
+    }
+
+    #[test]
+    fn emoji_width_changes_preserve_right_margin_wrap_policy() {
+        let mut wrapped = terminal(3, 2);
+        wrapped.ingest("ab⚠".as_bytes());
+        wrapped.ingest("\u{fe0f}".as_bytes());
+        assert_eq!(wrapped.row_text(0).as_deref(), Some("ab "));
+        assert_eq!(wrapped.cell(0, 1).unwrap().text(), "⚠️");
+        assert_eq!(wrapped.cell(0, 1).unwrap().width(), CellWidth::Double);
+        assert!(wrapped.cell(1, 1).unwrap().is_continuation());
+        assert_eq!((wrapped.cursor().column(), wrapped.cursor().row()), (2, 1));
+
+        let mut no_wrap = terminal(3, 1);
+        no_wrap.ingest(b"\x1b[?7l");
+        no_wrap.ingest("ab⚠".as_bytes());
+        no_wrap.ingest("\u{fe0f}".as_bytes());
+        assert_eq!(no_wrap.row_text(0).as_deref(), Some("ab�"));
+        assert_eq!(no_wrap.cell(2, 0).unwrap().width(), CellWidth::Single);
+    }
+
+    #[test]
+    fn emoji_sequence_families_match_across_byte_chunk_boundaries() {
+        let mut cases = vec![
+            "🤖".to_owned(),
+            "⚠️".to_owned(),
+            "ℹ️".to_owned(),
+            "👋🏻".to_owned(),
+            "👍🏽".to_owned(),
+            "🧑🏿".to_owned(),
+            "👩‍🔬".to_owned(),
+            "👨‍💻".to_owned(),
+            "🧑🏽‍🚀".to_owned(),
+            "👨‍👩‍👧‍👦".to_owned(),
+            "🏃‍♀️".to_owned(),
+            "🏳️‍🌈".to_owned(),
+            "🏴‍☠️".to_owned(),
+            "❤️‍🔥".to_owned(),
+            "🇺🇸".to_owned(),
+            "🇨🇦".to_owned(),
+            "🇯🇵".to_owned(),
+            "🇧🇷".to_owned(),
+            "🇿🇦".to_owned(),
+            "🇪🇺".to_owned(),
+            "🏴\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}\u{e007f}".to_owned(),
+        ];
+        cases.extend(
+            ['#', '*']
+                .into_iter()
+                .chain('0'..='9')
+                .map(|base| format!("{base}\u{fe0f}\u{20e3}")),
+        );
+
+        for emoji in cases {
+            let input = format!("{emoji}X");
+            let mut contiguous = terminal(6, 1);
+            contiguous.ingest(input.as_bytes());
+
+            let mut fragmented = terminal(6, 1);
+            for byte in input.as_bytes() {
+                fragmented.ingest(std::slice::from_ref(byte));
+            }
+
+            for column in 0..6 {
+                let expected = contiguous.cell(column, 0).unwrap();
+                let actual = fragmented.cell(column, 0).unwrap();
+                assert_eq!(actual.text(), expected.text(), "{emoji} text at {column}");
+                assert_eq!(
+                    actual.width(),
+                    expected.width(),
+                    "{emoji} width at {column}"
+                );
+            }
+            assert_eq!(fragmented.cell(0, 0).unwrap().text(), emoji);
+            assert_eq!(
+                fragmented.cell(0, 0).unwrap().width(),
+                CellWidth::Double,
+                "{emoji}"
+            );
+            assert!(fragmented.cell(1, 0).unwrap().is_continuation(), "{emoji}");
+            assert_eq!(fragmented.cell(2, 0).unwrap().text(), "X", "{emoji}");
+            assert_eq!(
+                (fragmented.cursor().column(), fragmented.cursor().row()),
+                (3, 0),
+                "{emoji}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_unicode_15_1_rgi_emoji_is_an_atomic_double_width_grapheme() {
+        for emoji in unicode_emoji_15_1_fully_qualified() {
+            let input = format!("{emoji}X");
+            let mut terminal = terminal(5, 1);
+            for byte in input.as_bytes() {
+                terminal.ingest(std::slice::from_ref(byte));
+            }
+            assert_eq!(terminal.cell(0, 0).unwrap().text(), emoji);
+            assert_eq!(
+                terminal.cell(0, 0).unwrap().width(),
+                CellWidth::Double,
+                "{emoji}"
+            );
+            assert!(terminal.cell(1, 0).unwrap().is_continuation(), "{emoji}");
+            assert_eq!(terminal.cell(2, 0).unwrap().text(), "X", "{emoji}");
+        }
+    }
+
+    #[test]
+    fn text_presentation_sequences_remain_single_width() {
+        for text in ["⚠︎", "ℹ︎", "☀︎", "▶︎"] {
+            let mut terminal = terminal(4, 1);
+            for byte in format!("{text}X").as_bytes() {
+                terminal.ingest(std::slice::from_ref(byte));
+            }
+            assert_eq!(terminal.cell(0, 0).unwrap().text(), text);
+            assert_eq!(terminal.cell(0, 0).unwrap().width(), CellWidth::Single);
+            assert_eq!(terminal.cell(1, 0).unwrap().text(), "X");
+            assert_eq!(
+                (terminal.cursor().column(), terminal.cursor().row()),
+                (2, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn a_grapheme_at_the_storage_limit_remains_intact() {
+        let mut text = String::from("é");
+        text.extend(std::iter::repeat_n('\u{301}', 127));
+        assert_eq!(text.len(), crate::unicode::MAX_GRAPHEME_BYTES);
+
+        let mut terminal = terminal(4, 1);
+        terminal.ingest(text.as_bytes());
+        terminal.ingest(b"b");
+
+        assert_eq!(terminal.cell(0, 0).unwrap().text(), text);
+        assert_eq!(terminal.cell(1, 0).unwrap().text(), "b");
+    }
+
+    #[test]
+    fn oversized_graphemes_are_replaced_and_stop_absorbing_input() {
+        let mut terminal = terminal(4, 1);
+        let mut input = String::from("a");
+        input.extend(std::iter::repeat_n('\u{301}', 300));
+        input.push('b');
+        terminal.ingest(input.as_bytes());
+
+        assert_eq!(terminal.cell(0, 0).unwrap().text(), "�");
+        assert_eq!(terminal.cell(0, 0).unwrap().width(), CellWidth::Single);
+        assert_eq!(terminal.cell(1, 0).unwrap().text(), "b");
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (2, 0)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_second_byte_ranges_without_delaying_replacement() {
+        for (leading, invalid_second) in [(0xe0, 0x80), (0xed, 0xa0), (0xf0, 0x80), (0xf4, 0x90)] {
+            let mut terminal = terminal(3, 1);
+            terminal.ingest(&[leading]);
+            assert_eq!(terminal.row_text(0).as_deref(), Some("   "));
+
+            terminal.ingest(&[invalid_second]);
+            assert_eq!(terminal.row_text(0).as_deref(), Some("�� "));
+        }
+
+        let mut terminal = terminal(3, 1);
+        terminal.ingest(&[0xe0, 0xc2]);
+        assert_eq!(terminal.row_text(0).as_deref(), Some("�  "));
+        terminal.ingest(&[0xa2]);
+        assert_eq!(terminal.row_text(0).as_deref(), Some("�¢ "));
+    }
+
+    #[test]
+    fn resize_clears_a_clipped_combining_anchor() {
+        let mut terminal = terminal(3, 1);
+        terminal.ingest("A界\u{09bc}".as_bytes());
+        assert_eq!(terminal.cell(1, 0).unwrap().text(), "界\u{09bc}");
+
+        terminal.resize(Dimensions::new(2, 1).unwrap()).unwrap();
+        terminal.ingest("\u{09bc}".as_bytes());
+
+        // Reflow (ADR 0017): "A" moves into retained history and the wide
+        // "界" cell (with its already-attached combining mark) becomes the
+        // sole visible row. The combining anchor itself does not survive a
+        // reflow (its position is not stable across a rewrap), so the
+        // extra combining mark ingested after resize has nothing to attach
+        // to and is dropped rather than appended anywhere.
+        assert_eq!(terminal.row_text(0).as_deref(), Some("界 "));
+        assert_eq!(terminal.cell(0, 0).unwrap().text(), "界\u{09bc}");
+        assert_eq!(terminal.cell(0, 0).unwrap().width(), CellWidth::Double);
+    }
+
+    #[test]
+    fn primary_full_screen_scroll_retains_hard_and_soft_logical_lines() {
+        let mut primary = terminal(4, 2);
+        primary.ingest(b"one\r\ntwo\r\n");
+
+        let lines = primary.scrollback_lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0]
+                .cells()
+                .iter()
+                .map(|cell| cell.character())
+                .collect::<String>(),
+            "one"
+        );
+        assert!(lines[0].has_hard_break());
+        assert_eq!(lines[0].physical_rows(), 1);
+
+        let mut spaced = terminal(5, 2);
+        spaced.ingest(b"a  \r\nb\r\n");
+        let spaced_line = spaced.scrollback_lines().next().unwrap();
+        assert_eq!(
+            spaced_line
+                .cells()
+                .iter()
+                .map(|cell| cell.character())
+                .collect::<String>(),
+            "a  "
+        );
+
+        let mut wrapped = terminal(4, 2);
+        wrapped.ingest(b"abcdefghX\r\nz\r\n");
+        let lines = wrapped.scrollback_lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0]
+                .cells()
+                .iter()
+                .map(|cell| cell.character())
+                .collect::<String>(),
+            "abcdefghX"
+        );
+        assert!(lines[0].has_hard_break());
+        assert_eq!(lines[0].physical_rows(), 3);
+    }
+
+    #[test]
+    fn resize_reflows_retained_scrollback_to_the_new_width() {
+        // "abcdefghX" wraps to 3 physical rows at width 4 ("abcd","efgh","X").
+        let mut terminal = terminal(4, 2);
+        terminal.ingest(b"abcdefghX\r\nz\r\n");
+        assert_eq!(terminal.scrollback_stats().physical_rows(), 3);
+
+        // Widen: the same logical content now fits in fewer physical rows.
+        terminal.resize(Dimensions::new(9, 2).unwrap()).unwrap();
+        let lines = terminal.scrollback_lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0]
+                .cells()
+                .iter()
+                .map(|cell| cell.character())
+                .collect::<String>(),
+            "abcdefghX"
+        );
+        assert!(lines[0].has_hard_break());
+        assert_eq!(lines[0].physical_rows(), 1);
+        assert_eq!(terminal.scrollback_stats().physical_rows(), 1);
+        assert_eq!(
+            terminal
+                .scrollback_physical_row(0)
+                .unwrap()
+                .iter()
+                .map(|cell| cell.character())
+                .collect::<String>(),
+            "abcdefghX"
+        );
+
+        // Shrink further: the same content now needs more physical rows.
+        terminal.resize(Dimensions::new(3, 2).unwrap()).unwrap();
+        let lines = terminal.scrollback_lines().collect::<Vec<_>>();
+        assert_eq!(lines[0].physical_rows(), 3);
+        assert_eq!(terminal.scrollback_stats().physical_rows(), 3);
+        assert_eq!(
+            (0..3)
+                .map(|row| terminal
+                    .scrollback_physical_row(row)
+                    .unwrap()
+                    .iter()
+                    .map(|cell| cell.character())
+                    .collect::<String>())
+                .collect::<Vec<_>>(),
+            vec!["abc", "def", "ghX"]
+        );
+
+        // Growing rows only (columns unchanged) pulls the previously
+        // scrolled-off content back onto the now-taller visible screen
+        // rather than leaving it stranded in history.
+        terminal.resize(Dimensions::new(3, 5).unwrap()).unwrap();
+        assert_eq!(terminal.scrollback_stats().physical_rows(), 0);
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abc"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("def"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("ghX"));
+        assert_eq!(terminal.row_text(3).as_deref(), Some("z  "));
+    }
+
+    #[test]
+    fn resize_remaps_content_positions_through_logical_lines() {
+        let mut terminal = terminal(4, 2);
+        terminal.ingest(b"abcdefghX\r\nz\r\n");
+
+        let mapped = terminal
+            .resize_with_content_positions(
+                Dimensions::new(3, 2).unwrap(),
+                &[
+                    ContentPosition {
+                        column: 1,
+                        absolute_row: 1,
+                    },
+                    ContentPosition {
+                        column: 0,
+                        absolute_row: 3,
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            mapped,
+            vec![
+                Some(ContentPosition {
+                    column: 2,
+                    absolute_row: 1,
+                }),
+                Some(ContentPosition {
+                    column: 0,
+                    absolute_row: 3,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn height_only_resize_preserves_large_history_cursor_and_selection_with_bounded_anchor_work() {
+        let mut terminal = terminal(8, 4);
+        terminal.ingest(&b"abcd\r\n".repeat(8_192));
+        let stats = terminal.scrollback_stats();
+        assert!(stats.logical_lines() > 8_000);
+        let positions = [
+            ContentPosition {
+                column: 2,
+                absolute_row: stats.content_row_origin(),
+            },
+            ContentPosition {
+                column: 4,
+                absolute_row: stats.screen_row_origin() - 1,
+            },
+        ];
+        let cursor_row = stats.screen_row_origin() + terminal.cursor().row() as u64;
+        let cursor_column = terminal.cursor().column();
+        for rows in [2, 7, 3, 6, 4].into_iter().cycle().take(40) {
+            crate::history::ANCHOR_LOOKUP_STEPS.with(|steps| steps.set(0));
+            let mapped = terminal
+                .resize_with_content_positions(Dimensions::new(8, rows).unwrap(), &positions)
+                .unwrap();
+            let work = crate::history::ANCHOR_LOOKUP_STEPS.with(std::cell::Cell::get);
+            assert_eq!(mapped, positions.map(Some));
+            assert_eq!(terminal.cursor().column(), cursor_column);
+            assert_eq!(
+                terminal.scrollback_stats().screen_row_origin() + terminal.cursor().row() as u64,
+                cursor_row
+            );
+            assert!(
+                work <= 128,
+                "height-only resize used {work} anchor lookup steps"
+            );
+            assert_eq!(
+                terminal
+                    .scrollback_physical_row(0)
+                    .unwrap()
+                    .iter()
+                    .map(|cell| cell.character())
+                    .collect::<String>(),
+                "abcd"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_does_not_alias_blank_trailing_rows_to_real_content() {
+        let mut terminal = terminal(4, 4);
+        terminal.ingest(b"abc");
+
+        let mapped = terminal
+            .resize_with_content_positions(
+                Dimensions::new(3, 4).unwrap(),
+                &[ContentPosition {
+                    column: 0,
+                    absolute_row: 3,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(mapped, vec![None]);
+    }
+
+    #[test]
+    fn overwriting_a_wide_cell_mid_row_shrinks_the_occupied_extent_for_reflow() {
+        // Regression test for Screen::extend_occupied_or_recompute's
+        // fast/slow path split: printing at or beyond a row's known
+        // occupied extent may take an O(1) shortcut, but overwriting mid-
+        // row (column < the row's occupied extent) must still fall back to
+        // a full rescan, since breaking a wide character's continuation
+        // pair can shrink - not just extend - what's actually occupied.
+        let mut terminal = terminal(6, 2);
+        // Print 'A' + wide '界' (row 0 occupies columns 0..3), then move the
+        // cursor back to column 1 (1-based column 2) and overwrite the wide
+        // character's leading cell with a single-width 'X'. This orphans
+        // the old continuation cell at column 2, which
+        // `repair_neighborhood` blanks out, so the row's true occupied
+        // extent shrinks from 3 to 2 ('A', 'X'). The remaining printed
+        // lines push this row deep into scrollback history so it stays
+        // retained (rather than folded back onto the visible screen) after
+        // the reflow below.
+        terminal.ingest("A界\x1b[1;2HX\r\nz\r\n1\r\n2\r\n3\r\n4\r\n5\r\n".as_bytes());
+
+        // Reflowing to width 2 forces every logical line to wrap two
+        // characters per physical row. If the occupied extent had wrongly
+        // stayed at 3 (i.e. the shrink was missed), this logical line
+        // would fold in a phantom trailing blank cell, splitting it across
+        // two physical rows instead of fitting on one.
+        terminal.resize(Dimensions::new(2, 2).unwrap()).unwrap();
+        let lines = terminal.scrollback_lines().collect::<Vec<_>>();
+        let line = &lines[0];
+        assert_eq!(line.physical_rows(), 1, "'A','X' should fit on one row");
+        let row0 = line.physical_row(0).unwrap();
+        assert_eq!(row0.len(), 2);
+        assert_eq!(row0[0].character(), 'A');
+        assert_eq!(row0[1].character(), 'X');
+    }
+
+    #[test]
+    fn scrolled_rows_move_into_history_intact_and_leave_a_blank_row() {
+        // Scrolling moves departing cells into history instead of cloning
+        // them and only clears the revealed row's occupied prefix, so check
+        // both sides: history keeps text, style and link, and the reused
+        // row holds nothing of its previous content.
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(
+            b"\x1b]8;;https://e.x\x1b\\\x1b[31mab\x1b[0m\x1b]8;;\x1b\\cdefgh\r\nmid\x1b[1;2HX\r\n\r\n\r\n",
+        );
+        let lines = terminal.scrollback_lines().collect::<Vec<_>>();
+        let row = lines[0].physical_row(0).unwrap();
+        let text = row.iter().map(crate::Cell::character).collect::<String>();
+        assert_eq!(
+            text, "aXcdefgh",
+            "a mid-row overwrite keeps the whole extent"
+        );
+        assert_eq!(row[0].hyperlink(), Some("https://e.x/"));
+        assert_ne!(row[0].foreground(), Color::Default);
+        assert_eq!(row[2].hyperlink(), None);
+        assert_eq!(lines[1].physical_row(0).unwrap().len(), 3);
+        for row in 0..2 {
+            assert_eq!(terminal.screen().row_occupied_columns(row), Some(0));
+            assert!((0..8).all(|column| terminal.screen().cell(column, row).unwrap().text() == " "));
+        }
+    }
+
+    #[test]
+    fn full_history_reuses_cell_storage_for_line_feed_and_explicit_scroll() {
+        for input in [b"row\r\n".as_slice(), b"\x1b[2;1Hrow\x1b[S".as_slice()] {
+            let mut terminal =
+                Terminal::with_scrollback_limit(Dimensions::new(80, 2).unwrap(), 4096).unwrap();
+            for _ in 0..100 {
+                terminal.ingest(input);
+                if terminal.scrollback_stats().evicted_lines() > 0 {
+                    break;
+                }
+            }
+            let before = terminal.scrollback_stats();
+            assert!(before.evicted_lines() > 0);
+            let oldest = terminal.scrollback_lines().next().unwrap();
+            let oldest_id = oldest.id();
+            let oldest_cells = oldest.cells().as_ptr();
+            let surviving_id = terminal.scrollback_lines().nth(1).unwrap().id();
+
+            terminal.ingest(input);
+
+            let after = terminal.scrollback_stats();
+            assert_eq!(after.evicted_lines(), before.evicted_lines() + 1);
+            assert_eq!(after.content_row_origin(), before.content_row_origin() + 1);
+            assert_eq!(after.screen_row_origin(), before.screen_row_origin() + 1);
+            assert_eq!(after.charged_bytes(), before.charged_bytes());
+            assert_eq!(
+                terminal.scrollback_lines().next().unwrap().id(),
+                surviving_id
+            );
+            assert!(terminal
+                .scrollback_lines()
+                .all(|line| line.id() != oldest_id));
+            let inserted = terminal.scrollback_lines().last().unwrap();
+            assert_eq!(inserted.cells().as_ptr(), oldest_cells);
+            assert_eq!(
+                inserted
+                    .cells()
+                    .iter()
+                    .map(crate::Cell::character)
+                    .collect::<String>(),
+                "row"
+            );
+            assert!(inserted.has_hard_break());
+            terminal
+                .recovery_clone()
+                .validate_recovery_snapshot()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn cell_reuse_skips_different_row_sizes_and_unretained_scrolls() {
+        let mut terminal =
+            Terminal::with_scrollback_limit(Dimensions::new(80, 3).unwrap(), 4096).unwrap();
+        for _ in 0..100 {
+            terminal.ingest(b"row\r\n");
+            if terminal.scrollback_stats().evicted_lines() > 0 {
+                break;
+            }
+        }
+        let before = terminal.scrollback_stats();
+        assert!(before.evicted_lines() > 0);
+
+        terminal.ingest(b"\x1b[H\n");
+        assert_eq!(terminal.scrollback_stats(), before);
+        terminal.ingest(b"\x1b[?1049halt\r\none\r\ntwo\r\nthree\r\n\x1b[?1049l");
+        terminal.ingest(b"\x1b[2;3r\x1b[3;1Hpartial\r\n\x1b[r");
+        assert_eq!(terminal.scrollback_stats(), before);
+
+        let oldest_cells = terminal.scrollback_lines().next().unwrap().cells().as_ptr();
+        terminal.ingest(b"\x1b[1;1Hlonger\x1b[3;1H\x1b[S");
+        let inserted = terminal.scrollback_lines().last().unwrap();
+        assert_ne!(inserted.cells().as_ptr(), oldest_cells);
+        assert_eq!(
+            inserted
+                .cells()
+                .iter()
+                .map(crate::Cell::character)
+                .collect::<String>(),
+            "longer"
+        );
+        assert!(terminal.scrollback_stats().charged_bytes() <= before.limit_bytes());
+        terminal
+            .recovery_clone()
+            .validate_recovery_snapshot()
+            .unwrap();
+    }
+
+    #[test]
+    fn multirow_scroll_preserves_history_order() {
+        let mut terminal = terminal(8, 4);
+        terminal.ingest(b"\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hfour\x1b[3S");
+        let history: Vec<String> = terminal
+            .scrollback_lines()
+            .map(|line| line.cells().iter().map(crate::Cell::character).collect())
+            .collect();
+        assert_eq!(history, ["one", "two", "three"]);
+        assert_eq!(terminal.row_text(0).unwrap().trim_end(), "four");
+        for row in 1..4 {
+            assert_eq!(terminal.screen().row_occupied_columns(row), Some(0));
+        }
+    }
+
+    #[test]
+    fn reflow_keeps_a_double_width_cell_and_its_continuation_together() {
+        let mut terminal = terminal(6, 2);
+        // "A" + wide "界" + "B" + wide "界" -> 6 columns at width 6, one row.
+        terminal.ingest("A界B界\r\nz\r\n".as_bytes());
+        let before = terminal.scrollback_lines().next().unwrap();
+        assert_eq!(before.physical_rows(), 1);
+
+        // Shrink to width 3: "A界" (3 cols: A + double) must stay on one row
+        // rather than splitting the double cell from its continuation.
+        terminal.resize(Dimensions::new(3, 2).unwrap()).unwrap();
+        let lines = terminal.scrollback_lines().collect::<Vec<_>>();
+        let line = &lines[0];
+        assert_eq!(line.physical_rows(), 2);
+        let row0 = line.physical_row(0).unwrap();
+        let row1 = line.physical_row(1).unwrap();
+        assert_eq!(row0.len(), 3, "A + double-width cell + its continuation");
+        assert_eq!(row0[0].character(), 'A');
+        assert_eq!(row0[1].character(), '界');
+        assert!(row0[2].is_continuation());
+        assert_eq!(row1[0].character(), 'B');
+        assert_eq!(row1[1].character(), '界');
+        assert!(row1[2].is_continuation());
+    }
+
+    #[test]
+    fn repeated_grow_and_shrink_reflow_preserves_content_and_stays_within_budget() {
+        let dimensions = Dimensions::new(10, 3).unwrap();
+        let mut terminal = Terminal::with_scrollback_limit(dimensions, 65536).unwrap();
+        for line in 0..40 {
+            terminal.ingest(format!("line-{line:03}-abcdefghijklmnop\r\n").as_bytes());
+        }
+        let stats_before = terminal.scrollback_stats();
+        assert!(stats_before.logical_lines() > 0);
+
+        for columns in [40, 5, 25, 3, 80, 10] {
+            terminal
+                .resize(Dimensions::new(columns, 3).unwrap())
+                .unwrap();
+            let stats = terminal.scrollback_stats();
+            assert!(stats.charged_bytes() <= stats.limit_bytes());
+            let total_physical_rows: usize = terminal
+                .scrollback_lines()
+                .map(|line| line.physical_rows())
+                .sum();
+            assert_eq!(total_physical_rows, stats.physical_rows());
+            for line in terminal.scrollback_lines() {
+                let reconstructed = (0..line.physical_rows())
+                    .flat_map(|row| line.physical_row(row).unwrap().iter())
+                    .map(|cell| cell.character())
+                    .collect::<String>();
+                let expected = line
+                    .cells()
+                    .iter()
+                    .map(|cell| cell.character())
+                    .collect::<String>();
+                assert_eq!(reconstructed, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn alternate_and_partial_margin_scrolling_never_enter_primary_history() {
+        let mut terminal = terminal(5, 3);
+        terminal.ingest(b"base\r\n");
+        terminal.ingest(b"\x1b[?1049halt\r\none\r\ntwo\r\nthree\x1b[?1049l");
+        assert_eq!(terminal.scrollback_stats().logical_lines(), 0);
+
+        terminal.ingest(b"\x1b[2;3r\x1b[3;1H\n\n");
+        assert_eq!(terminal.scrollback_stats().logical_lines(), 0);
+    }
+
+    #[test]
+    fn discarded_scroll_rows_match_extracted_rows() {
+        let mut terminal = terminal(8, 4);
+        terminal.ingest(b"\x1b[4;1Hring\r\n\x1b[1;1H\x1b[31m123456789");
+        terminal.ingest("\x1b[2;3H界".as_bytes());
+        terminal.ingest(b"\x1b[3;2H\x1b]8;;https://example.com/\x1b\\link\x1b]8;;\x1b\\");
+        terminal.ingest(format!("\x1b[4;1Ha{}", "\u{301}".repeat(16)).as_bytes());
+        assert_eq!(terminal.screen().row_soft_wrapped(0), Some(true));
+
+        let blank = crate::cell::blank_cell();
+        let mut colored = blank.clone();
+        colored.background = Color::Indexed(4);
+        let span = crate::screen::ColumnSpan::full(8);
+        for (top, bottom, count) in [(0, 3, 1), (0, 3, 3), (0, 3, 4), (1, 3, 1), (0, 2, 2)] {
+            for fill in [&blank, &colored] {
+                let mut extracted = terminal.screen().clone();
+                let mut discarded = extracted.clone();
+                let rows = extracted.scroll_up(top, bottom, count, fill.clone(), span, true);
+                let none = discarded.scroll_up(top, bottom, count, fill.clone(), span, false);
+                assert_eq!(rows.len(), count);
+                assert!(none.is_empty());
+                assert_eq!(discarded, extracted);
+            }
+        }
+    }
+
+    #[test]
+    fn scrollback_is_strictly_bounded_and_clear_preserves_visible_cells() {
+        let dimensions = Dimensions::new(4, 2).unwrap();
+        let mut disabled = Terminal::with_scrollback_limit(dimensions, 0).unwrap();
+        disabled.ingest(b"one\r\ntwo\r\nthree\r\n");
+        assert_eq!(disabled.scrollback_stats().charged_bytes(), 0);
+        assert_eq!(disabled.scrollback_stats().logical_lines(), 0);
+
+        let mut bounded = Terminal::with_scrollback_limit(dimensions, 256).unwrap();
+        for _ in 0..32 {
+            bounded.ingest(b"abc\r\n");
+        }
+        let stats = bounded.scrollback_stats();
+        assert!(stats.charged_bytes() <= stats.limit_bytes());
+        assert!(stats.evicted_lines() > 0 || stats.oversize_lines() > 0);
+
+        let before = bounded.row_text(0);
+        bounded.ingest(b"\x1b[3J");
+        assert_eq!(bounded.scrollback_stats().charged_bytes(), 0);
+        assert_eq!(bounded.scrollback_stats().logical_lines(), 0);
+        assert_eq!(bounded.row_text(0), before);
+    }
+
+    #[test]
+    fn an_unrelated_oversized_line_does_not_evict_prior_in_budget_history() {
+        // Regression test: a single logical line that grows past the
+        // scrollback byte budget without ever hitting a hard break (a long
+        // unbroken write with no trailing newline - e.g. a giant minified
+        // JSON/base64 blob, or a `\r`-updated progress line) must not wipe
+        // out unrelated history that was already comfortably retained
+        // under budget. Only as much prior history as is genuinely needed
+        // to stay within budget may be evicted (normal FIFO pressure);
+        // nothing may be wiped wholesale just because *some* line elsewhere
+        // in the stream happened to grow large (see `Scrollback::push_row`
+        // and `Scrollback::enforce_limit`).
+        let dimensions = Dimensions::new(8, 4).unwrap();
+        let mut terminal = Terminal::with_scrollback_limit(dimensions, 131_072).unwrap();
+        for index in 0..20 {
+            terminal.ingest(format!("early-line-{index}\r\n").as_bytes());
+        }
+        let logical_lines_before = terminal.scrollback_stats().logical_lines();
+        assert!(
+            logical_lines_before > 0,
+            "some early lines must be retained under budget"
+        );
+        let early_lines_before: Vec<String> = terminal
+            .scrollback_lines()
+            .filter(|line| line.has_hard_break())
+            .map(|line| line.cells().iter().map(crate::Cell::character).collect())
+            .collect();
+        assert!(
+            early_lines_before
+                .iter()
+                .any(|line| line.contains("early-line")),
+            "at least one early line must still be present before the oversize burst"
+        );
+
+        // Cross the Vec capacity-doubling boundary that originally made
+        // unused allocation headroom look like retained payload. The
+        // compact line and the existing history still fit together, so no
+        // early line may be evicted.
+        terminal.ingest(&vec![b'x'; 1_100]);
+
+        let stats = terminal.scrollback_stats();
+        assert!(stats.charged_bytes() <= stats.limit_bytes());
+
+        let early_lines_after: Vec<String> = terminal
+            .scrollback_lines()
+            .filter(|line| line.has_hard_break())
+            .map(|line| line.cells().iter().map(crate::Cell::character).collect())
+            .filter(|line: &String| line.contains("early-line"))
+            .collect();
+        assert!(
+            early_lines_after.starts_with(&early_lines_before),
+            "unused Vec capacity must preserve every previously retained line: \
+             before={early_lines_before:?}, after={early_lines_after:?}"
+        );
+
+        // Now push a burst so large that it alone exceeds the entire
+        // budget; only *this* line's own oldest rows may be discarded (via
+        // incremental front-trimming), and total retained bytes must never
+        // exceed the configured limit, however this plays out.
+        terminal.ingest(&vec![b'y'; 400_000]);
+        terminal.ingest(b"\r\n");
+        let stats = terminal.scrollback_stats();
+        assert!(stats.charged_bytes() <= stats.limit_bytes());
+        assert_eq!(
+            stats.oversize_lines(),
+            1,
+            "one oversized logical line must be counted once, not once per trim"
+        );
+        assert!(
+            terminal.scrollback_trim_compactions() < 400_000 / (dimensions.columns() * 4) as u64,
+            "oversized-line trimming must compact in batches rather than once per physical row"
+        );
+    }
+
+    #[test]
+    fn a_fully_trimmed_open_line_counts_as_one_oversize_event() {
+        let dimensions = Dimensions::new(8, 2).unwrap();
+        let mut terminal = Terminal::with_scrollback_limit(dimensions, 1).unwrap();
+
+        terminal.ingest(&vec![b'x'; 10_000]);
+        assert_eq!(terminal.scrollback_stats().oversize_lines(), 1);
+
+        terminal.ingest(b"\r\n");
+        terminal.ingest(&vec![b'y'; 10_000]);
+        assert_eq!(terminal.scrollback_stats().oversize_lines(), 2);
+    }
+
+    #[test]
+    fn zero_scrollback_resize_preserves_the_visible_screen() {
+        let dimensions = Dimensions::new(8, 2).unwrap();
+        let mut terminal = Terminal::with_scrollback_limit(dimensions, 0).unwrap();
+        terminal.ingest(b"abcdefgh\r\nZ");
+
+        terminal.resize(Dimensions::new(4, 3).unwrap()).unwrap();
+
+        assert_eq!(terminal.scrollback_stats().charged_bytes(), 0);
+        assert_eq!(terminal.row_text(0).as_deref(), Some("abcd"));
+        assert_eq!(terminal.row_text(1).as_deref(), Some("efgh"));
+        assert_eq!(terminal.row_text(2).as_deref(), Some("Z   "));
+        assert_eq!(
+            (terminal.cursor().column(), terminal.cursor().row()),
+            (1, 2)
+        );
+    }
+
+    #[test]
+    fn resize_eviction_rejects_stale_positions_instead_of_aliasing() {
+        let dimensions = Dimensions::new(8, 2).unwrap();
+        let mut terminal = Terminal::with_scrollback_limit(dimensions, 2_048).unwrap();
+        for index in 0..20 {
+            terminal.ingest(format!("{index:02}-abcde\r\n").as_bytes());
+        }
+        let oldest_row = terminal.scrollback_stats().content_row_origin();
+
+        let mapped = terminal
+            .resize_with_content_positions(
+                Dimensions::new(2, 2).unwrap(),
+                &[ContentPosition {
+                    column: 0,
+                    absolute_row: oldest_row,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(mapped, vec![None]);
+        let stats = terminal.scrollback_stats();
+        assert!(stats.content_row_origin() > oldest_row);
+        assert!(stats.charged_bytes() <= stats.limit_bytes());
+    }
+
+    #[test]
+    fn changing_scrollback_limit_evicts_immediately_and_can_disable_history() {
+        let mut terminal = terminal(8, 2);
+        terminal.ingest(b"first\r\nsecond\r\nthird\r\n");
+        assert!(terminal.scrollback_stats().logical_lines() > 0);
+
+        terminal.set_scrollback_limit(0);
+        assert_eq!(terminal.scrollback_stats().limit_bytes(), 0);
+        assert_eq!(terminal.scrollback_stats().charged_bytes(), 0);
+        assert_eq!(terminal.scrollback_stats().logical_lines(), 0);
+
+        terminal.ingest(b"fourth\r\nfifth\r\n");
+        assert_eq!(terminal.scrollback_stats().logical_lines(), 0);
+    }
+
+    #[test]
+    fn resize_growing_past_a_bottom_row_prompt_still_ingests_new_output() {
+        let mut terminal = terminal(20, 6);
+        // Fill the screen with 5 filler lines + a prompt, landing the
+        // cursor exactly on the last visible row (mirrors "prompt at the
+        // bottom row" after two `ls -l`s).
+        terminal.ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nprompt$ ");
+        terminal.resize(Dimensions::new(20, 12).unwrap()).unwrap();
+        terminal.ingest(b"foo");
+        let found = (0..12)
+            .map(|row| terminal.row_text(row).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("")
+            .contains("foo");
+        assert!(found, "foo should appear somewhere on screen");
+    }
+
+    #[test]
+    fn reset_to_initial_state_clears_screen_cursor_style_and_modes_but_keeps_scrollback() {
+        let mut terminal = terminal(10, 4);
+        // Push enough content to build up real scrollback, then leave the
+        // screen in a non-default state: colored/bold text, cursor moved
+        // away from home, alternate screen active, and a custom scroll
+        // region.
+        terminal.ingest(b"first\r\nsecond\r\nthird\r\nfourth\r\n");
+        terminal.ingest(b"\x1b[1;31mred bold\x1b[3;5H\x1b[?1049h\x1b[2;3r");
+        assert_ne!(terminal.attributes(), Attributes::NONE);
+        assert_ne!(terminal.foreground(), Color::Default);
+        assert!(terminal.scrollback_stats().logical_lines() > 0);
+        let scrollback_lines_before = terminal.scrollback_stats().logical_lines();
+
+        terminal.reset_to_initial_state();
+
+        assert_eq!(terminal.cursor().column, 0);
+        assert_eq!(terminal.cursor().row, 0);
+        assert_eq!(terminal.attributes(), Attributes::NONE);
+        assert_eq!(terminal.foreground(), Color::Default);
+        assert_eq!(terminal.background(), Color::Default);
+        assert!(terminal.title().is_empty());
+        assert_eq!(
+            terminal.alternate_screen(),
+            None,
+            "reset should exit the alternate screen"
+        );
+        for row in 0..terminal.dimensions().rows() {
+            assert_eq!(
+                terminal.row_text(row).unwrap_or_default().trim(),
+                "",
+                "the visible screen should be blank after reset"
+            );
+        }
+        // Scrollback history is a separate, opt-in action
+        // (`clear_scrollback`) and must survive a display reset.
+        assert_eq!(
+            terminal.scrollback_stats().logical_lines(),
+            scrollback_lines_before
+        );
+
+        // The reset terminal must still behave normally afterward: a scroll
+        // region set before reset must not still be constraining new
+        // output (this is exactly the stale-scroll-region bug class fixed
+        // above, so a full reset must not reintroduce it).
+        terminal.ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        assert!(
+            (0..terminal.dimensions().rows())
+                .map(|row| terminal.row_text(row).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("")
+                .contains("five"),
+            "output after reset should scroll normally"
+        );
+    }
+
+    #[test]
+    fn ris_restores_display_modes_and_charset_without_discarding_history_or_input() {
+        let mut terminal = terminal(12, 4);
+        terminal.ingest(b"first\r\nsecond\r\nthird\r\nfourth\r\n");
+        let history_before = terminal.scrollback_stats().logical_lines();
+        assert!(history_before > 0);
+        terminal.queue_input(b"queued input");
+        terminal.ingest(
+            b"\x1b[3;4H\x1b7\x1b[s\x1b[3g\x1b[?1049h\x1b[2;3r\x1b[?69h\x1b[3;8s\
+              \x1b[?6;1000;2004h\x1b[?25l\x1b[3 q\x1b[31m\x1b[1\"q\x1b)0\x0eq",
+        );
+        let generation = terminal.screen_generation();
+
+        terminal.ingest(b"\x1bc");
+
+        assert_eq!(terminal.modes(), super::TerminalModes::default());
+        assert_eq!(terminal.cursor().column(), 0);
+        assert_eq!(terminal.cursor().row(), 0);
+        assert_eq!(terminal.cursor_style(), super::CursorStyle::default());
+        assert!(!terminal.cursor_style_requested_by_program());
+        assert_eq!(terminal.foreground(), Color::Default);
+        assert_eq!(terminal.attributes(), Attributes::NONE);
+        assert_eq!(terminal.alternate_screen(), None);
+        assert_ne!(terminal.screen_generation(), generation);
+        assert_eq!(terminal.scrollback_stats().logical_lines(), history_before);
+        assert_eq!(terminal.drain_input(), b"queued input");
+        for row in 0..terminal.dimensions().rows() {
+            assert!(terminal.row_text(row).unwrap().trim().is_empty());
+        }
+
+        terminal.ingest(b"\x1b[2b\x1b8\x1b[uq");
+        assert_eq!(terminal.row_text(0).unwrap().trim(), "q");
+        terminal.ingest(b"\x1b[?2K");
+        assert!(terminal.row_text(0).unwrap().trim().is_empty());
+        terminal.ingest(b"\r\t");
+        assert_eq!(terminal.cursor().column(), 8);
+    }
+
+    #[test]
+    fn ris_recovers_from_incomplete_controls_and_utf8_across_chunks() {
+        for prefix in [
+            b"".as_slice(),
+            b"\x1b[".as_slice(),
+            b"\x1b[12;".as_slice(),
+            b"\x1b]0;unfinished".as_slice(),
+            b"\x1bPunfinished".as_slice(),
+            b"\x1b_unfinished".as_slice(),
+            b"\xf0\x9f".as_slice(),
+        ] {
+            let mut terminal = terminal(12, 3);
+            terminal.ingest(b"\x1b)0\x0eq");
+            terminal.ingest(prefix);
+            terminal.ingest(b"\x1b");
+            terminal.ingest(b"c");
+            terminal.ingest(b"\x1b[2bq");
+
+            assert_eq!(terminal.row_text(0).unwrap().trim(), "q", "{prefix:?}");
+            assert_eq!(terminal.cursor().column(), 1, "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn ris_preserves_query_order_within_one_output_chunk() {
+        let mut terminal = terminal(12, 4);
+        terminal.ingest(b"\x1b[3;4H\x1b[6n\x1bc\x1b[6nX");
+
+        assert_eq!(terminal.drain_replies(), b"\x1b[3;4R\x1b[1;1R");
+        assert_eq!(terminal.row_text(0).unwrap().trim(), "X");
+    }
+
+    #[test]
+    fn ris_discards_incomplete_hyperlinks_queries_and_overflowed_controls() {
+        let mut prefixes = vec![
+            b"\x1b]8;;https://unfinished.example/".to_vec(),
+            b"\x1b]10;?".to_vec(),
+            b"\x1bP$qm".to_vec(),
+        ];
+        let mut csi = b"\x1b[".to_vec();
+        csi.extend_from_slice("1;".repeat(MAX_CSI_PARAMETERS + 1).as_bytes());
+        prefixes.push(csi);
+        for introducer in [b"\x1b]".as_slice(), b"\x1bP"] {
+            let mut prefix = introducer.to_vec();
+            prefix.extend(vec![b'x'; MAX_STRING_BYTES + 1]);
+            prefixes.push(prefix);
+        }
+
+        for prefix in prefixes {
+            let mut terminal = terminal(12, 3);
+            terminal.ingest(b"\x1b]8;;https://example.com/\x07old");
+            terminal.queue_reply(b"pending");
+            terminal.ingest(&prefix);
+            terminal.ingest(b"\x1b");
+            terminal.ingest(b"cX");
+
+            assert_eq!(terminal.row_text(0).unwrap().trim(), "X");
+            assert!(terminal.cell(0, 0).unwrap().hyperlink().is_none());
+            assert_eq!(terminal.drain_replies(), b"pending");
+        }
+    }
+
+    #[test]
+    fn ris_clears_iso_and_dec_protection_and_both_character_sets() {
+        for (protection, erase) in [
+            (b"\x1b[1\"q".as_slice(), b"\x1b[?2K".as_slice()),
+            (b"\x1bV".as_slice(), b"\x1b[2K".as_slice()),
+        ] {
+            let mut terminal = terminal(8, 2);
+            terminal.ingest(b"\x1b(0\x1b)0\x0eq");
+            terminal.ingest(protection);
+            terminal.ingest(b"\x1bc\x0eq");
+            assert_eq!(terminal.row_text(0).unwrap().trim(), "q");
+            terminal.ingest(erase);
+            assert!(terminal.row_text(0).unwrap().trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_semantics_preserve_old_ris_and_direct_reset_behavior() {
+        let mut terminal = terminal(12, 2);
+        terminal.set_semantics(super::TerminalSemantics::Legacy);
+        terminal.ingest(b"ABC\x1b");
+        terminal.ingest(b"cXYZ");
+        assert_eq!(terminal.row_text(0).unwrap().trim(), "ABCXYZ");
+
+        terminal.ingest(b"\x1b[1\"qR");
+        terminal.reset_to_initial_state();
+        terminal.ingest(b"x\x1b[?2K");
+        assert_eq!(terminal.row_text(0).unwrap().trim(), "x");
+        assert_eq!(terminal.semantics(), super::TerminalSemantics::Legacy);
+
+        terminal.ingest(b"\x1b(0q\x1bcq");
+        assert!(terminal.row_text(0).unwrap().contains("──"));
+    }
+
+    #[test]
+    fn reset_separates_retained_wrapped_history_from_new_output() {
+        for use_ris in [false, true] {
+            let mut terminal = terminal(4, 2);
+            terminal.ingest(b"abcdefghijk");
+            assert!(!terminal.scrollback_lines().next().unwrap().has_hard_break());
+            if use_ris {
+                terminal.ingest(b"\x1bc");
+            } else {
+                terminal.reset_to_initial_state();
+            }
+            terminal.ingest(b"XYZ");
+            assert_eq!(terminal.text_snapshot().text(), "abcd\nXYZ");
+
+            terminal.resize(Dimensions::new(8, 2).unwrap()).unwrap();
+            assert_eq!(terminal.text_snapshot().text(), "abcd\nXYZ");
+        }
+    }
+
+    #[test]
+    fn ris_recording_replay_does_not_repeat_pre_reset_characters() {
+        let mut live = terminal(12, 3);
+        live.ingest(b"\x1b[?1049hsecret");
+        let mut replay = live
+            .recording_checkpoint(MAX_RECORDING_CHECKPOINT_BYTES)
+            .unwrap()
+            .into_terminal()
+            .unwrap();
+        let mut repeats = Vec::new();
+        let mut visible_changes = Vec::new();
+        let output = b"\x1bc\x1b[2bX";
+        live.ingest_observing_recording(
+            output,
+            |offset, character| repeats.push((offset, character)),
+            |offset, _| visible_changes.push(offset),
+        );
+        replay
+            .ingest_recorded_output(output, repeats.clone())
+            .unwrap();
+
+        assert_eq!(repeats, vec![(5, None)]);
+        assert!(visible_changes.contains(&1));
+        assert_eq!(live.row_text(0).unwrap().trim(), "X");
+        assert_eq!(live.row_text(0), replay.row_text(0));
+        assert_eq!(live.modes(), replay.modes());
+    }
+
+    #[test]
+    fn text_snapshot_preserves_soft_wraps_and_graphemes() {
+        let mut terminal = terminal(4, 2);
+        terminal.ingest("e\u{301}🤖AB".as_bytes());
+        terminal.ingest(b"CD\r\ntail");
+
+        let snapshot = terminal.text_snapshot();
+
+        assert_eq!(snapshot.screen(), TerminalTextSnapshotScreen::Primary);
+        assert_eq!(snapshot.text(), "e\u{301}🤖ABCD\ntail");
+    }
+
+    #[test]
+    fn text_snapshot_preserves_blank_lines_across_screen_and_history() {
+        for rows in [2, 10] {
+            let mut terminal = terminal(4, rows);
+            terminal.ingest(b"\r\nalpha\r\n\r\nbeta\r\n");
+            let snapshot = terminal.bounded_text_snapshot(100, 10, 20).unwrap();
+            assert_eq!(snapshot.text(), "\nalpha\n\nbeta\n");
+        }
+    }
+
+    #[test]
+    fn alternate_screen_snapshot_keeps_retained_history_and_visible_alt_screen_only() {
+        let mut terminal = terminal(4, 2);
+        terminal.ingest(b"one\r\ntwo\r\nthree\r\nfour");
+        terminal.ingest(b"\x1b[?1049hmenu");
+
+        let snapshot = terminal.text_snapshot();
+
+        assert_eq!(snapshot.screen(), TerminalTextSnapshotScreen::Alternate);
+        assert_eq!(snapshot.text(), "one\ntwo\nthre\nmenu");
+    }
+
+    #[test]
+    fn bounded_text_snapshot_refuses_an_overlong_logical_line() {
+        let mut terminal = terminal(4, 2);
+        terminal.ingest(&[b'x'; 65]);
+
+        let refusal = terminal
+            .bounded_text_snapshot(4 * 1024, 64, 64)
+            .unwrap_err();
+
+        assert_eq!(
+            refusal,
+            TerminalTextSnapshotRefusal::LineTooLong { line: 1, limit: 64 }
+        );
+    }
+
+    #[test]
+    fn bounded_text_snapshot_refuses_when_line_count_exceeds_the_limit() {
+        let mut terminal = terminal(4, 2);
+        terminal.ingest(b"one\r\ntwo\r\nthree");
+
+        let refusal = terminal.bounded_text_snapshot(4 * 1024, 2, 64).unwrap_err();
+
+        assert_eq!(
+            refusal,
+            TerminalTextSnapshotRefusal::TooManyLines { lines: 3, limit: 2 }
+        );
+    }
+
+    #[test]
+    fn bounded_text_snapshot_refuses_when_total_bytes_exceed_the_limit() {
+        let mut terminal = terminal(4, 2);
+        terminal.ingest(b"one\r\ntwo\r\nthree\r\nfour");
+
+        let refusal = terminal.bounded_text_snapshot(9, 8, 64).unwrap_err();
+
+        assert_eq!(
+            refusal,
+            TerminalTextSnapshotRefusal::TooLarge {
+                bytes: 10,
+                limit: 9
+            }
+        );
+    }
+
+    #[test]
+    fn text_snapshot_reports_when_older_history_was_evicted() {
+        let dimensions = Dimensions::new(4, 2).unwrap();
+        let mut terminal = Terminal::with_scrollback_limit(dimensions, 96).unwrap();
+        for line in 0..20 {
+            terminal.ingest(format!("{line:02}\r\n").as_bytes());
+        }
+
+        let snapshot = terminal.text_snapshot();
+
+        assert!(
+            snapshot.evicted_logical_lines() > 0,
+            "the tiny history budget must report prior retained-line eviction"
+        );
+        assert!(
+            !snapshot.text().is_empty(),
+            "the retained snapshot still has text"
+        );
+    }
+
+    #[test]
+    fn empty_text_snapshot_is_empty() {
+        let terminal = terminal(8, 3);
+        let snapshot = terminal.text_snapshot();
+        assert!(snapshot.text().is_empty());
+        assert_eq!(snapshot.evicted_logical_lines(), 0);
+    }
+
+    #[test]
+    fn scroll_region_spanning_full_screen_grows_with_the_screen_on_resize() {
+        // Regression test for a real bug: after growing the primary screen
+        // (e.g. dragging a window corner to make it both wider and taller),
+        // the scroll region's bottom margin stayed pinned to the *old*
+        // screen's last row instead of expanding to the new one. Since a
+        // shell never sets a custom DECSTBM margin, the region always
+        // spans the whole screen (`scroll_top == 0`,
+        // `scroll_bottom == rows - 1`) — but the old margin clamp logic
+        // only reset the margin when it was inverted, not when it was
+        // simply stale-but-still-valid for the smaller old height. That
+        // left the margin stuck at the old bottom row, so once the cursor
+        // (already past that stale row) received a newline, the terminal
+        // never scrolled and instead silently overwrote the last row in
+        // place on every subsequent line, discarding all of that output.
+        let mut terminal = terminal(20, 6);
+        // Build up plenty of prior scrollback (more lines than fit in the
+        // original 6-row screen) before landing the cursor on the last
+        // visible row, mirroring a bottom-row prompt after real output like
+        // `ls -l` that already scrolled several lines into history. This
+        // matters because after growing, the reflow anchor resolves the
+        // cursor to its logical position across *all* retained content, not
+        // just the old screen — with enough prior scrollback, that lands
+        // the cursor well below the old screen's last row, exactly where
+        // the stale scroll margin bug bites.
+        for line in 1..=20 {
+            terminal.ingest(format!("line{line}\r\n").as_bytes());
+        }
+        terminal.ingest(b"prompt$ ");
+        terminal
+            .resize(Dimensions::new(40, 16).unwrap())
+            .expect("grow both columns and rows");
+        // Typing a command and pressing enter must still scroll fresh lines
+        // into view rather than getting stuck overwriting the last row in
+        // place, which (in the buggy version) garbles the final prompt row
+        // with leftover fragments of the overwritten text instead of
+        // leaving it as a clean, fresh prompt.
+        terminal.ingest(b"echo done\r\ndone\r\nprompt$ ");
+        let last_row = terminal
+            .row_text(terminal.dimensions().rows() - 1)
+            .unwrap_or_default();
+        assert_eq!(
+            last_row.trim_end(),
+            "prompt$",
+            "the final prompt row should be clean, not overwritten in place"
+        );
+        let rendered = (0..terminal.dimensions().rows())
+            .map(|row| terminal.row_text(row).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("echo done"),
+            "typed command should remain visible, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("done"),
+            "command output should remain visible, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn incremental_grow_matches_a_single_atomic_grow() {
+        // Simulate a real live drag: many rapid incremental resize steps
+        // (as the window edge moves pixel by pixel) instead of one atomic
+        // jump, and compare the final content to a single atomic resize.
+        let mut incremental = terminal(20, 6);
+        incremental.ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nprompt$ ");
+        for rows in 7..=12 {
+            incremental
+                .resize(Dimensions::new(20, rows).unwrap())
+                .unwrap();
+        }
+        incremental.ingest(b"foo");
+
+        let mut atomic = terminal(20, 6);
+        atomic.ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nprompt$ ");
+        atomic.resize(Dimensions::new(20, 12).unwrap()).unwrap();
+        atomic.ingest(b"foo");
+
+        let render = |terminal: &Terminal| {
+            (0..12)
+                .map(|row| terminal.row_text(row).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(render(&incremental), render(&atomic));
+    }
+
+    #[test]
+    fn jittery_diagonal_grow_preserves_content() {
+        // Real corner-drags change both columns and rows together, and
+        // mouse movement isn't perfectly monotonic (small jitter/overshoot
+        // is common), unlike a clean single-axis resize.
+        let mut terminal = terminal(20, 6);
+        terminal.ingest(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nprompt$ ");
+        let steps: &[(usize, usize)] = &[
+            (21, 7),
+            (19, 8),
+            (23, 7),
+            (25, 9),
+            (24, 11),
+            (28, 10),
+            (30, 12),
+        ];
+        for &(columns, rows) in steps {
+            terminal
+                .resize(Dimensions::new(columns, rows).unwrap())
+                .unwrap();
+        }
+        terminal.ingest(b"foo");
+        let rendered = (0..terminal.dimensions().rows())
+            .map(|row| terminal.row_text(row).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("foo"), "foo should still be visible");
+        assert!(
+            rendered.contains("prompt$"),
+            "prompt should still be visible"
+        );
+        assert!(
+            rendered.contains("one"),
+            "oldest filler line should survive"
+        );
+    }
+}

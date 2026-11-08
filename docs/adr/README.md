@@ -1,0 +1,112 @@
+# Architecture Decision Records
+
+Architecture decision records preserve decisions that affect the project across subsystems or over time. They record context and consequences so future changes can revisit the reasoning rather than only the result.
+
+## Accepted Decisions
+
+- [ADR 0001: Terminal Compatibility Baseline](0001-terminal-compatibility-baseline.md)
+- [ADR 0002: Separate Profiles and Workspaces](0002-separate-profiles-and-workspaces.md)
+- [ADR 0003: Local-First Operation and Metadata-Only Sync](0003-local-first-sync-metadata-not-secrets.md) — local-first/no-secret-sync remains accepted; see the 2026-09-01 status update on cloud metadata sync scope
+- [ADR 0004: Componentized, Testable Terminal Core](0004-componentized-testable-terminal-core.md)
+- [ADR 0005: Foundation-First Delivery with Capability Milestones](0005-foundation-first-capability-milestones.md)
+- [ADR 0006: Native SSH Backend with OpenSSH Interoperability](0006-native-ssh-with-openssh-interoperability.md)
+- [ADR 0007: `egui` Front End with a Pragmatic Renderer Boundary](0007-egui-front-end-pragmatic-renderer-boundary.md)
+- [ADR 0009: Mutable Core State with Early Observability](0009-mutable-core-and-early-observability.md)
+- [ADR 0010: Preserve Future Extension Seams without Early Scope Expansion](0010-preserve-future-extension-seams.md)
+- [ADR 0011: Trusted Windows ConPTY Runtime Selection](0011-trusted-windows-conpty-runtime-selection.md)
+- [ADR 0012: Cell Geometry Owns Ligature and Fallback Mapping](0012-cell-geometry-owns-ligature-and-fallback-mapping.md)
+- [ADR 0013: `russh` for Native SSH Transport](0013-russh-native-ssh-transport.md) — reconnect-default policy refined by ADR 0018
+- [ADR 0014: Window, Workspace, Tab, and Session Ownership](0014-window-workspace-tab-session-ownership.md)
+- [ADR 0015: Startup Load and Transactional Autosave Without External Reload](0015-explicit-transactional-configuration-reload.md)
+- [ADR 0016: Native Secret Store Boundary](0016-native-secret-store-boundary.md) — extended to stored private keys by ADR 0024
+- [ADR 0017: Bounded Logical Scrollback and Anchored Viewports](0017-bounded-logical-scrollback-and-anchored-viewports.md)
+- [ADR 0080: Bounded Scrollback Reuse](0080-bounded-scrollback-reuse.md) - immediate, charged handoff without a retained pool; compact storage is a separate decision
+- [ADR 0081: Compact Cells With Stable Recovery Charges](0081-compact-cells-with-stable-recovery-charges.md) - smaller in-memory cells while preserving schema-2/3 wire fields and conservative historical charges
+- [ADR 0018: SSH Liveness, Reconnect, and Persistent Session Recovery](0018-ssh-liveness-reconnect-and-persistent-session-recovery.md)
+- [ADR 0019: Fingerprint-First SSH Authentication Ordering](0019-fingerprint-first-ssh-authentication-ordering.md)
+- [ADR 0020: Persistent Host-Key Trust](0020-persistent-host-key-trust.md)
+- [ADR 0021: `cargo-packager` and GitHub Releases for Distribution and Updates](0021-cargo-packager-github-releases-distribution.md)
+- [ADR 0022: Focused-Chip-First Single-Row Chrome Allocation](0022-focused-chip-first-single-row-chrome.md)
+- [ADR 0023: `serialport` Crate and Worker-Thread Model for the Serial Session Backend](0023-serialport-worker-thread-serial-backend.md)
+- [ADR 0024: Native Secret Store Extended to Stored Private Keys](0024-native-secret-store-stored-private-keys.md)
+- [ADR 0026: Grapheme Width and Color Emoji Fallback](0026-grapheme-width-and-color-emoji-fallback.md)
+- [ADR 0032: Single-Process Multi-Window via egui Viewports](0032-single-process-multi-window.md) — see issue #119
+- [ADR 0033: Moving Tabs Between Windows](0033-moving-tabs-between-windows.md) — builds on ADR 0032
+- [ADR 0035: Syntax Highlighting as a Cached View of Parsed Text](0035-syntax-highlighting.md) — extends ADR 0034's document/view split to tree-sitter highlighting
+- [ADR 0036: The Core Reports Colors From an Embedder-Supplied Scheme](0036-embedder-color-scheme-in-core.md) — keeps `OSC 4/10/11/12` answers in `festerm-core` while `festerm-ui-egui` owns the values; see issue #222
+- [ADR 0037: Reverse Wraparound Climbs Only the Line It Is On](0037-reverse-wraparound-bounds.md) — implements `DECSET 45` with xterm's post-383 bounds and retires stale soft-wrap marks on explicit line breaks
+- [ADR 0038: Authoritative Terminal Snapshots for `festerm-sessiond` Reattach Recovery](0038-sessiond-terminal-recovery-snapshots.md) — updates ADR 0025's recovery model to use protocol-v2 terminal snapshots rather than raw replay tails
+- [ADR 0043: Immutable Native Font Atlas Snapshots](0043-immutable-native-font-atlas-snapshots.md) - narrowly vendored non-consuming identity and bounded context snapshot ownership only; native CPU/resource/presentation/latency qualification remains open under #298 and CP-18
+- [ADR 0045: Native Atlas Admission Before Capture](0045-native-atlas-admission-before-capture.md) - accepted backend-owned metadata preflight; changes only ADR 0043's oversized capture ordering, with existing limits/fallback preserved
+- [ADR 0039: Direct2D Terminal Composition on Supported Windows x64 WARP](0039-opt-in-direct2d-terminal-composition.md) - automatic supported-route policy and ownership; broader native qualification remains open
+- [ADR 0040: Automatic Final-Target Terminal Copy](0040-opt-in-final-target-terminal-copy.md) - owner-approved bounded WARP rollout without production switches
+- [ADR 0041: Automatic Retained Window Prefix](0041-opt-in-retained-window-prefix.md) - owner-approved exact immutable prefix reuse; resource/native/latency follow-ups remain in #282
+- [ADR 0046: Retained Document Frame](0046-opt-in-retained-document-frame.md) - accepted bounded complete-frame cache on the qualified WARP route after all-miss provenance and final integration review; broader CP-18 gates remain open
+- [ADR 0047: Bounded Local Document Background I/O](0047-bounded-local-document-background-io.md) - owner accepted the bounded immutable worker, completion-only wake and nonblocking write admission on 2026-10-12; native qualification remains CP-15
+- [ADR 0048: Bounded Native SVG and HTML Anchors in Markdown](0048-bounded-native-svg-and-html-anchors.md) - owner accepted 2026-10-14 after pre-parser marker refusal and actual named-target scrolling repairs; narrowly amends ADR 0030, native fidelity/accessibility/DPI qualification remains CP-06/CP-15
+- [ADR 0049: Downloadable Optional Terminal Fonts](0049-downloadable-terminal-fonts.md) - application-owned pinned acquisition and automatic upgrade reconciliation; native released-asset qualification pending
+- [ADR 0051: Adaptive Exact Document Prefix Retention](0051-adaptive-exact-document-prefix.md) - owner accepted the renderer-wide exact-prefix policy on 2026-10-28 after matched Markdown and plain Edit WARP measurements; broader CP-18 gates remain open
+- [ADR 0079: Global Terminal Ingest Budget](0079-global-terminal-ingest-budget.md) - owner-directed shared per-update budget and round-robin session slices; end-to-end performance qualification remains separate
+
+## Superseded Decisions
+
+- [ADR 0008: Versioned TOML Configuration with Safe Hot Reload](0008-versioned-toml-configuration.md) — superseded by ADR 0015
+
+## Proposed Decisions
+
+- [ADR 0077: Synchronized Local Terminal Recording and MP4 Export](0077-synchronized-terminal-recording-and-mp4-export.md) - explicitly selected sessions share a timeline and produce separate local MP4s; platform and privacy qualification required
+- [ADR 0078: Desktop Split-Pane Presentation](0078-desktop-split-pane-presentation.md) - issue #65; bounded live-view presentation trees, unchanged session/document ownership and staged desktop qualification
+- [ADR 0075: Mobile Accessibility Tree and UI Automation](0075-mobile-accessibility-tree.md) - lazily activated platform AccessKit adapters on iOS and Android, privacy-gated terminal rows, named fields without secrets and a shared Maestro suite
+- [ADR 0072: Installed-Profile Dev Tunnel Hosting](0072-installed-profile-tunnel-hosting.md) - explicit profile Save activation, non-attaching native ensure, protected host consent, staged helper updates and shared revocation/teardown
+- [ADR 0071: Explicit Managed Session Repair](0071-explicit-managed-session-repair.md) - explicit fresh-shell repair of a dead legacy host, preserved tunnel/key/grants and generation-journaled interruption safety
+
+- [ADR 0070: Read-Only Remote Observation](0070-read-only-remote-observation.md) - independent host roots, revision-checked reads, bounded native watches, daemon generation correlation and separately authorized exact-tab/root MCP exposure
+- [ADR 0074: Persistent MCP Client Identity and Capability Grants](0074-persistent-mcp-client-permissions.md) - host-defined permission groups, authenticated reconnect, durable read-only status and separately scoped controller input policy
+- [ADR 0066: Opt-in Managed Daemon Recovery](0066-opt-in-managed-daemon-recovery.md) - bounded private lifecycle evidence, explicit unexpected-daemon replacement consent and unchanged client generation pins
+- [ADR 0068: On-device Dictation for iOS Terminal Keyboards](0068-ios-on-device-terminal-dictation.md) - explicit, bounded native speech capture with no cloud fallback, volatile review and source-bound paste insertion; Simulator spike and physical-device qualification remain distinct
+- [ADR 0069: Authorized Shared Documents in the iOS Host](0069-ios-authorized-shared-documents.md) - shared engine and bounded mobile registry; phased authorized Files/editor, Markdown and shared dictation integration; no iOS Edit/Preview split panes
+- [ADR 0067: Rooted Dev Tunnel Host Filesystem](0067-rooted-dev-tunnel-host-filesystem.md) - explicit rooted listing/streamed transfers, independent file streams, conflict-checked publication and managed grant revocation; clients are separate
+
+- [ADR 0053: Separate Dev Tunnels Bridge for Remote Persistent Sessions](0053-separate-dev-tunnels-session-bridge.md) - direct transport with a separate same-user bridge; scoped-token bootstrap, daemon ownership preserved, implementation and hosted/native qualification pending
+- [ADR 0054: iOS Keychain Secret Backend and Mobile Profile Store](0054-ios-keychain-and-mobile-profile-store.md) - Keychain-backed secret store for iOS and a UI-agnostic secret-free profile, host-trust and SSH-key crate
+- [ADR 0055: Platform-Neutral SFTP Core Crate for Mobile](0055-platform-neutral-sftp-core-crate.md) - UI-free bounded SFTP/sandbox crate over russh-sftp; atomic temp-rename transfers, conflict policies, real-sshd harness
+- [ADR 0057: Portable Dev Tunnels Client for iOS](0057-portable-dev-tunnels-client-for-ios.md) - bridge client/relay feature split, mobile session client, takeover/displaced protocol additions and a UI-agnostic blocking tunnels API with no silent reattach
+- [ADR 0058: iOS App Lock and Mobile Document Viewer Model](0058-ios-app-lock-and-mobile-document-viewer.md) - Face ID/passcode lock policy with fail-closed settings and native privacy shield; bounded read-only document viewer decisions
+- [ADR 0059: iOS Profiles, Multi-Session Tabs and Persisted Host Trust](0059-ios-profiles-sessions-and-persisted-trust.md) - real saved profiles, Keychain-backed credentials, tmux/screen attach, persisted host trust, simulator Keychain entitlement
+- [ADR 0060: iOS Files Screen, SFTP Profiles and Markdown Opening](0060-ios-files-screen-and-sftp-profiles.md) - stacked Remote/This iPhone panes, transfers and conflict sheets, SFTP profile kind, sandbox Documents in the Files app
+- [ADR 0061: iOS Dev Tunnel Profiles, Sign-in and App Lock Wiring](0061-ios-dev-tunnel-profiles-and-app-lock-wiring.md) - GitHub device-code sign-in, tunnel attach with RecoverySync, taken-over messaging, app-lock gate
+- [ADR 0063: iOS Dev Tunnel Host Setup Sheet](0063-ios-dev-tunnel-host-setup-sheet.md) - reviewable one-line host installer command and exact embedded script viewer
+- [ADR 0064: Dev Tunnel New Session Connect-Once Form](0064-dev-tunnel-new-session-connect-once-form.md) - inline connect-once form; saving a profile is optional
+
+- [ADR 0052: Session-Bound Local File OSC 8 Links](0052-local-file-osc8-links.md) - local-only internal document opening; OS URL handlers remain web-only, native TI-10 qualification pending
+
+- [ADR 0050: Offline Mermaid Preview Without a Browser](0050-native-mermaid-preview.md) - owner-selected native rendering; desktop visual/accessibility qualification remains CP-06/CP-15
+
+- [ADR 0044: Bounded Ordinary Terminal Row Paint Cache](0044-bounded-ordinary-terminal-row-paint-cache.md) - issue #327's internal presentation repair; independent gates and 52-run cleanup qualification complete, owner accepts the residual shaped-heavy CPU tradeoff under #334; external PR review remains required
+
+- [ADR 0042: Isolated iOS Rendering Spike Host](0042-ios-rendering-spike-host.md) — Phase 1 implementation for review; native feasibility pending
+
+- [ADR 0025: fesTerm-Owned Local Session Persistence via a Standalone `festerm-sessiond` Executable](0025-native-local-session-persistence-daemon.md)
+- [ADR 0027: SSH Port Forwarding for Profiles and Live Sessions](0027-ssh-port-forwarding-for-profiles-and-live-sessions.md) — see issue #38
+- [ADR 0028: Text-Mode SFTP Session Tabs via `russh-sftp`](0028-text-mode-sftp-session-tabs-via-russh-sftp.md)
+- [ADR 0029: GUI SFTP File Manager Surface](0029-gui-sftp-file-manager.md) — see `docs/sftp-ui-design.md`
+- [ADR 0030: Native Markdown Viewer as a First-Class Bounded Application Surface](0030-native-markdown-viewer.md) — amended by ADRs 0034 and 0048
+- [ADR 0031: Mobile (iOS/Android) Port Strategy](0031-mobile-ios-android-port-strategy.md) — exploratory design only; see `docs/mobile-port-plan.md`, `docs/mobile-layout-design.md`, and `docs/mobile-signing-and-release.md`
+- [ADR 0034: Shared Mutable Documents for Native Text Editing](0034-shared-mutable-text-documents.md) — amends ADR 0030's read-only snapshot boundary; see issue #166
+- [ADR 0056: iOS Shell, Design Tokens and Extended Key Encoding](0056-ios-shell-and-design-system.md) - tab shell, theme/widgets, capability-gated screens, new core navigation/function keys
+
+- [ADR 0065: MCP and JavaScript Automation Through One Authority Broker](0065-mcp-and-javascript-automation.md) — Proposed; selected language, deferred broker/runtime/security design, no implementation or enablement
+
+- [ADR 0073: Android Host for the Shared Mobile Application](0073-android-shared-mobile-host.md) - Proposed; shared iOS UI/protocols with an Android native-service boundary, private document imports and development APK packaging
+
+## Status Values
+
+- **Proposed:** under discussion and not yet binding.
+- **Accepted:** the current project decision.
+- **Superseded:** replaced by a later ADR.
+- **Rejected:** considered and deliberately not adopted.
+
+New decisions should use the next sequential number and should link to any ADR they supersede.
+Start from [`TEMPLATE.md`](TEMPLATE.md). Every new or materially changed ADR
+must include `## Validation impact` and update the machine-readable trace
+registry when its requirement, scenario, or evidence relationships change.

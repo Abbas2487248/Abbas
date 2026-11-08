@@ -1,0 +1,546 @@
+# Development Handoff
+
+This is the operational entry point for a new developer or agent. Product
+decisions remain in the main design documents; see [`../AGENTS.md`](../AGENTS.md)
+for a compact document map.
+
+fesTerm's code, tests, documentation, and first-party assets are written
+entirely by GitHub Copilot under human guidance. The human project owner
+defines product direction, requirements, priorities, acceptance decisions,
+and release authorization.
+
+## Current State
+
+Milestones 0 through 5 are implemented with native-window validation pending;
+M6 is the open compatibility acceptance gate. The application now has
+in-memory local-session tabs, Launcher and Settings surfaces, command palette,
+custom title-bar chrome, and a configurable status bar. The terminal core, UI,
+session lifecycle, PTY and serial backends, implemented native SSH transport,
+configuration foundation, and GUI-independent native secret-store foundation
+are separate crates.
+M7 and M8 are implemented; M6 remains the open compatibility acceptance gate.
+M9 scrollback/reflow and M10 packaging/updater work are substantially
+implemented but retain the completion work recorded in `ROADMAP.md`.
+
+At startup, the app loads `config.toml` from the native per-user project
+configuration location (`com.fes.fesTerm`) or the explicit
+`FESTERM_CONFIG_PATH` support/test override. Missing configuration starts with
+defaults and creates nothing. Invalid or unreadable configuration also starts
+with defaults, and Settings provides a content-free actionable diagnostic.
+There is no in-app reload action; fesTerm re-reads the selected location only
+on the next startup. When manually authored configuration enables a
+workspace, its ordered Launcher, Settings, and local-session entries restore
+at startup instead of the default local shell; local entries create fresh
+PTYs from their profiles. Saved SSH entries restore in place as an **SSH
+authentication required** surface with destination metadata pre-filled, but
+never connect without fresh transient authentication. Runtime tab IDs are new
+for each launch, and no terminal output, process, credential/key, channel, or
+host-trust state is restored. No configuration is watched or edited by
+fesTerm from outside the app. Workspace metadata, profiles (create, update,
+delete, reorder), and all current Settings interface preferences save
+automatically to the same selected source the moment they change - there is
+no manual reload/save action anywhere in Settings. Workspace restoration
+remains an explicit off-by-default preference; live-session close confirmation
+remains on by default but can be disabled for consistent immediate close
+behavior across every invocation path. Workspace saves preserve
+the manually authored profiles and cover only ordered Launcher/Settings
+surfaces, restored SSH authentication-required profile surfaces, and
+configured-local profile tabs; default, ad-hoc, and live SSH sessions are
+omitted. Existing saved SSH profiles can explicitly store or use a password
+or a private key (with optional passphrase):
+TOML receives only an opaque reference plus a `credential_kind` discriminant,
+native storage is used only on a
+background worker, and secret resolution occurs immediately before SSH
+authentication ([ADR 0024](adr/0024-native-secret-store-stored-private-keys.md)
+extends the original password-only slice). The
+`festerm-secret-store` foundation uses macOS Keychain, Windows Credential
+Manager, and Linux Secret Service over the logged-in session D-Bus (including
+KWallet only through Secret Service integration). A locked or unavailable
+native store remains an actionable condition with no insecure fallback.
+Host-key trust can also persist: an accepted (or deliberately, explicitly
+replaced) host key is remembered in plain, non-secret TOML
+([ADR 0020](adr/0020-persistent-host-key-trust.md)), so reconnecting to an
+already-trusted `host:port` no longer prompts.
+
+SSH profiles may select a named `tmux` or GNU Screen strategy. Provider
+sessions suppress their own status chrome and receive the actual initial
+fesTerm viewport size; bounded automatic recovery is available only as a
+separate per-launch opt-in. Plain SSH remains manual reconnect and always
+creates a fresh shell. Real-provider create/detach/reattach evidence remains
+tracked by [#49](https://github.com/fes/fesTerm/issues/49).
+
+Saved Local profiles may also select the native `festerm-sessiond` durable
+provider. Closing that tab detaches instead of terminating the shell, and the
+Launcher can optionally surface unattached daemon sessions as one-click
+Resume entries; the capability remains experimental pending ADR-0025's
+remaining validation/security work.
+
+Not implemented: OpenSSH configuration import, real keyboard-interactive/2FA
+authentication ([#60](https://github.com/fes/fesTerm/issues/60)),
+[#40](https://github.com/fes/fesTerm/issues/40) SSH-agent adapters, key-file
+path references, color emoji/script-specific fallback, a custom GPU renderer,
+terminfo distribution, and reference-TUI compatibility sign-off. M7 supplies transient
+password and in-memory OpenSSH private-key authentication plus bounded opt-in
+reconnect; for one-off (non-profile) connections, encrypted-key passphrases
+remain transient in-memory parse inputs only. Read [`milestone-progress.md`](milestone-progress.md)
+before choosing work.
+
+The current single-row chrome follows ADR 0022: the focused chip retains its
+natural width, inactive chips compact by water-filling to a 72 px floor, and
+horizontal scrolling begins only after that exact budget is exhausted. New
+Session stays fixed beside the strip during overflow and directly follows the
+last chip when scrolling is unnecessary. Compact and full-density chips use
+the same allocation contract.
+
+M10's native package and updater infrastructure is implemented. Protected
+GitHub Actions builds signed/notarized macOS DMG, signed Windows NSIS, Linux
+AppImage, and Debian outputs; packaged builds expose explicit
+check/download/install update states. Release credentials live only in the
+protected `release` environment. Use
+[`signing-and-release.md`](signing-and-release.md); the first production
+release and end-to-end upgrade evidence remain
+[#62](https://github.com/fes/fesTerm/issues/62).
+
+## Bootstrap
+
+The repository pins the stable Rust toolchain in `rust-toolchain.toml`.
+On Linux or Windows, launch a development build with separate configuration
+and native-session registry state:
+
+```sh
+python3 scripts/run-development.py
+# Windows: python scripts/run-development.py
+```
+
+The launcher builds the local daemon and tunnel helpers before starting the
+frontend. It uses `target/festerm-dev` for a reusable development config and
+sessiond root, overriding even an inherited `FESTERM_SESSIOND_RUNTIME_ROOT`;
+it refuses symbolic links and Windows reparse points at those state paths. It
+removes the release updater key and `APPLE_*`/`CARGO_PACKAGER_SIGN_*` values
+from the child environment. Persistent development sessions intentionally
+survive the frontend and can be reattached by a later invocation from this
+worktree. On Windows, the state directory inherits its workspace ACL; the
+launcher does not verify or change it, so use a workspace restricted to your
+account.
+The user's OS credential store, shell environment and desktop session are
+still shared; this is not a full sandbox or native qualification.
+
+For an intentional low-level executable probe:
+
+```sh
+cargo build
+cargo run -p festerm
+```
+
+Without an enabled workspace, the first run opens the singleton Launcher;
+selecting Local Shell replaces that chip in place with the platform default
+shell. Launcher and Settings remain available through application chrome. With
+an enabled manually authored workspace, its
+saved tab order/focus restores instead and users must authenticate again before
+an SSH destination connects. If local-shell creation fails, the UI shows the
+session error rather than substituting a demo shell.
+
+### macOS interactive development
+
+Use Python 3.11+ and the pinned `cargo-packager` from
+[`packaging/README.md`](../packaging/README.md), from a logged-in GUI session:
+
+```sh
+python3 scripts/run-macos-development.py
+# Bounded, Launcher-only native identity and normal-Quit check:
+python3 scripts/run-macos-development.py --check
+```
+
+The launcher builds the frontend and all three packaged helpers, using Cargo's
+reported artifact paths rather than potentially stale binaries. It packages an
+ad-hoc-signed **fesTerm Development.app**, identifier
+`dev.fes.festerm.development`, with the canonical icons/version. It never
+installs into `/Applications` or modifies the production bundle. The developer
+build marker disables update actions; Apple/updater signing credentials are
+removed from the build/packaging environment.
+
+Each invocation creates a private directory and prints its path. To choose
+the location, pass `--output /existing/parent/new-directory`; an existing
+destination is refused. Default roots use a short private `.fs-dev-*` directory
+under your home. Overly long output paths are refused to preserve macOS
+Unix-socket space for native sessions. Ancestors must be root/user-owned and
+not group/world-writable: even sticky `/tmp` is rejected by native hosting's
+storage policy. The directory contains the bundle, fresh HOME,
+config/data/cache/state/runtime/temp directories, separate `sessiond` state,
+`app.log`, and `launch.json`
+with revision/dirty status, exact owned PID, native identity and shutdown result.
+The application receives an allowlisted environment, not the user's SSH agent,
+cloud credentials, shell startup environment or injected-library settings.
+This is **data isolation, not an OS sandbox**: Keychain, network, OS services,
+system shell startup files, and explicit file/device actions remain real.
+Use disposable credentials and test resources.
+
+The supervisor launches the bundle executable directly, verifies its exact PID,
+executable, bundle identity/path, regular activation policy, visible native
+window and non-generic icon, then remains attached for interactive testing.
+For an agent's user-testing handoff, keep this supervisor in a tracked
+long-lived process and verify `launch.json` says `running`; do not immediately
+quit the app. At the end, quit normally or interrupt the supervisor: it requests
+native Quit only for its owned identity and bounds the exit wait. Normal
+interactive use has no automatic session-duration timeout. `--check` instead
+requests Quit immediately after readiness; do not interact with its probe.
+
+A nonzero exit, timeout, or surviving helper from this unique bundle fails
+shutdown verification. No forced process termination is performed. Inspect the
+recorded PID/log and finish the owned application's confirmation dialogs or
+explicitly end its disposable persistent sessions; never kill by process name
+or stop the installed app/daemons. Data and evidence are retained on both
+success and failure; remove only the printed private directory after verifying
+its owned frontend/helpers are gone and its test data is no longer needed.
+
+The native check is also included in the opt-in aggregate
+`FESTERM_RUN_OPTIONAL_VALIDATION=1 scripts/run-optional-validation.sh`
+(or the PowerShell equivalent). Specialized bounded OS-input/render smoke
+harnesses remain separate; this rule changes interactive launches, not their
+controlled fixtures. Development identity/Launcher-Quit evidence does not
+qualify signed distribution, live-session teardown, dirty-document consent,
+or absence of macOS warnings. A native launch may update macOS identity records.
+Do not grant App Management/Accessibility permissions, edit login items, or
+reset BTM/TCC to silence a warning. The historical quit timeout and the
+App Management trigger remain unresolved under [#631](https://github.com/fes/fesTerm/issues/631).
+
+## WSL 2 Development and Testing
+
+Use a Linux-native checkout under the WSL home directory (for example,
+`~/src/fesTerm`), not `/mnt/c/...`; this avoids cross-filesystem build and
+file-watching problems. WSLg provides the GUI display when `DISPLAY` or
+`WAYLAND_DISPLAY` is set.
+
+On Ubuntu, install the native build/GUI prerequisites and the P5 reference
+tools:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+  libvulkan-dev mesa-vulkan-drivers xvfb \
+  vttest less vim-nox neovim tmux htop gh
+```
+
+Install Rust for the WSL user, then clone and build:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+. "$HOME/.cargo/env"
+rustup toolchain install stable
+mkdir -p ~/src
+git clone https://github.com/fes/fesTerm.git ~/src/fesTerm
+cd ~/src/fesTerm
+cargo build --workspace
+```
+
+Run the GUI through WSLg with `cargo run -p festerm`. For Linux PTY P4 smoke
+coverage, use the ignored tests in
+[`native-smoke-policy.md`](native-smoke-policy.md); use `Xvfb` only for the
+explicitly unfocused CI smoke. Run `vttest` and the reference
+applications from the P5 checklist in this Linux checkout, recording
+content-free evidence for each scenario. To run the optional scriptable P5
+PTY probes for installed `less`, `nvim`, `htop`, and `tmux`, use
+`scripts/run-p5-reference.sh`; see
+[`m6-compatibility-checklist.md`](m6-compatibility-checklist.md) for its
+content-free result format and manual-validation limits.
+
+## Toolchain and Dependency Currency
+
+Use the current stable Rust toolchain. Before starting a milestone work package
+and before a release candidate, update the toolchain and resolve the current
+stable releases of direct dependencies and their lockfile graph. A breaking
+dependency update is a focused, cross-platform validated change rather than a
+reason to retain an obsolete version constraint. Exact pins are allowed only
+when behavior depends on versioned external data; document their rationale and
+review them when updating the data.
+
+```sh
+rustup update stable
+cargo update
+```
+
+The core's Unicode dependencies remain exact pins so cell-width behavior is
+reproducible; update their fixtures and standards note in the same change.
+The `egui`, `eframe`, and `egui_kittest` requirements deliberately track the
+latest released 0.x line. `Cargo.lock` remains committed for reproducible
+builds; refresh it through the validated dependency-update process rather than
+tracking the upstream Git branch.
+
+## Validation
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace
+git diff --check
+```
+
+For a manual local-PTY smoke check, run the app, type `printf 'hello\n'` on a
+Unix shell or `echo hello` in the default Windows `cmd.exe`, resize the window,
+then exit the shell. Unix integration tests also exercise controlled PTY I/O,
+resize, exit, descendant shutdown, and bounded shutdown without a native
+window. Windows CI runs a cfg-gated ConPTY test for spawn, output/input,
+resize, exit, and shutdown.
+
+To stage the reviewed optional Windows sidecar for the pinned retention smoke,
+run:
+
+```powershell
+pwsh -NoProfile -File scripts\stage-conpty.ps1 -RunSmoke
+```
+
+This command uses a per-user local application-data cache outside the
+repository, verifies the archive and x64 file hashes from
+`third_party/conpty/manifest.json`, builds the workspace, stages both test
+layouts, and runs the pinned resize/content-continuity smoke. If Application
+Control blocks the staged runtime, retain the policy failure as validation
+evidence; do not bypass it.
+
+## Optional Validation Suite
+
+Prefer repository-owned automation to repeated manual validation instructions.
+The global opt-in suite runs every currently automated optional probe: the P5
+reference-application PTY probes, P6 renderer/snapshot validation, the P4
+native-window smoke, and the repository-owned OpenSSH interoperability
+fixture. It writes
+content-free suite status only and exits nonzero when an invoked probe fails.
+Run it from a logged-in desktop session; it opens and closes a native window.
+
+```sh
+FESTERM_RUN_OPTIONAL_VALIDATION=1 scripts/run-optional-validation.sh
+```
+
+```powershell
+$env:FESTERM_RUN_OPTIONAL_VALIDATION = '1'
+pwsh -NoProfile -File scripts\run-optional-validation.ps1
+```
+
+The PowerShell entry point creates and prints a unique
+`optional-validation-<guid>.txt` result filename unless
+`FESTERM_OPTIONAL_VALIDATION_RESULT_PATH` or `-ResultPath` selects one.
+
+On Windows, the PowerShell entry point delegates the reviewed ConPTY staging
+and retention smoke to `stage-conpty.ps1 -RunSmoke`; do not duplicate its
+download or staging behavior. The suite remains opt-in because host GUI,
+graphics, and installed reference applications vary. A `not-run` reference
+tool is recorded by the P5 result file and is not acceptance evidence.
+
+Windows security tests have separate privilege boundaries. The ordinary
+`cargo test --locked -p festerm-windows-security` suite needs no elevation and
+includes private-DACL publication and explicit privilege-denial coverage.
+Four audit/metadata tests are marked privilege-required, not silently omitted
+from acceptance: Windows CI separately requires
+`cargo test --locked -p festerm-windows-security --lib -- --ignored --nocapture`
+on its privileged runner. That command fails if `SeSecurityPrivilege` is
+unavailable. On a deliberately authorized privileged test host, set
+`FESTERM_RUN_WINDOWS_SECURITY_PRIVILEGED=1` to include the same command in the
+optional PowerShell suite; otherwise its result explicitly records the missing
+opt-in. Neither entry point elevates, grants privileges or changes account policy.
+
+The OpenSSH suite builds an Alpine fixture, generates its server host keys and
+password at container start, generates ephemeral unencrypted and encrypted
+client keys outside the repository, and selects a randomized loopback host
+port. The encrypted key's random passphrase is passed only to the test process
+environment and is never persisted. It runs all ignored fixture tests serially,
+including password and both public-key authentication forms. It also restarts
+that same container to prove opt-in bounded reconnect, including a fresh
+host-key decision and usable new shell; it does not claim shell-state
+restoration. Run it alone with `scripts/run-openssh-interop.sh` or
+`pwsh -NoProfile -File scripts\run-openssh-interop.ps1`. If Docker CLI or its
+daemon is unavailable, it records `status=skipped reason=docker-unavailable`;
+an available Docker installation reports test failures normally.
+
+### OpenSSH-derived acceptance matrix
+
+The [OpenSSH portable `regress/`](https://github.com/openssh/openssh-portable/tree/master/regress)
+suite is a behavioral source for this matrix; fesTerm does not invoke, copy,
+or adapt its CLI-coupled scripts. The repository-owned fixture remains
+loopback-only and is the evidence for the scenarios below.
+
+| Scenario | Status and evidence |
+| --- | --- |
+| Password authentication | Implemented: a generated password authenticates the fixture user. |
+| Unencrypted in-memory OpenSSH Ed25519 client key | Implemented: a runner-generated key is bind-mounted only as the fixture user's authorized key. |
+| Encrypted in-memory OpenSSH Ed25519 client key | Implemented: a second runner-generated encrypted key is authorized alongside the unencrypted key; its random passphrase is supplied only through the test-process environment and is consumed during parsing. |
+| ECDSA P-256 server host key | Implemented: the selected fixture profile exposes only its generated ECDSA P-256 host key; the test checks its runner-read SHA-256 fingerprint and canonical host/port prompt, accepts it once, then reaches a shell marker. |
+| Remote PTY, shell, resize, output, and shutdown | Implemented through the controlled password session. |
+| Bounded reconnect | Implemented: killing and restarting the same fixture requires a fresh trust decision and reaches a new shell marker; remote shell state is not restored. |
+| Agent authentication | Deferred until fesTerm owns cross-platform agent adapters, user consent policy, and fixture coverage. |
+| Port/X11/agent forwarding and SFTP | Deferred until channel APIs, authorization policy, lifecycle handling, and isolated fixture tests exist. |
+| OpenSSH user/host certificates | Deferred until certificate selection and host-trust policy are exposed by fesTerm and covered by a dedicated fixture. |
+
+The suite does not replace manual P5 observations that require screen
+semantics or user intent: GitHub Copilot CLI, `vttest`, native
+selection/focus, paste behavior, and application-specific visual inspection.
+`tack` remains separate M10 evidence under #27. On Windows, the suite
+additionally invokes `run-windows-os-input-smoke.ps1`, which uses real OS
+focus, click, resize, and key events to prove the event-to-PTY path without
+recording terminal content.
+
+## Diagnostics and Safety
+
+- [ADR 0046](adr/0046-opt-in-retained-document-frame.md) complete-frame
+  retention defaults on for the qualified WARP route. Set
+  `FESTERM_WARP_RETAIN_DOCUMENT_FRAMES=0` to disable it; unset/empty/`1`
+  requests it. Invalid/non-Unicode values warn and conservatively leave it off.
+  Only supported Windows x64 DX12 CPU/BGRA opaque-root surfaces qualify.
+  Exact managed-texture/geometry/immutable-callback inputs may reuse a single
+  bounded complete image; unsupported/mutable scenes retain ordinary painting.
+  The existing automatic terminal-prefix path takes precedence. Input, document
+  freshness/autosave, callback preparation and presentation cadence are not
+  skipped. Enable `egui_wgpu::retained_ui=debug` for content-free hit/rebuild
+  counters (`whole_frame=true` identifies complete-frame retention).
+  Compare the same frozen executable with the variable `0` and `1`, without
+  concurrent builds or tests. Lower CPU is not a fix for the reported
+  near-zero-CPU interaction freeze or physical input-to-display evidence.
+  The bounded completed-render all-miss regression control is opt-in:
+  set `FESTERM_RUN_OPTIONAL_VALIDATION=1` and
+  `FESTERM_DOCUMENT_RETENTION_PROFILE_OUT` to a fresh absolute directory,
+  then run `cargo test --release -p festerm --bin festerm profile_document_retention_changing_frames -- --ignored --nocapture --test-threads=1`.
+  `FESTERM_RUN_DOCUMENT_RETENTION_PROFILE=1` includes the same control in
+  `scripts\run-optional-validation.ps1`. It checks pixel equivalence, zero hits
+  on changing signatures, and a 10% mean CPU/completed-render regression
+  ceiling for its exact Edit/Preview/Split fixtures, not general latency.
+
+- For idle-rendering CPU regressions on a Windows desktop, build the workspace,
+  set `FESTERM_RUN_OPTIONAL_VALIDATION=1`, and run
+  `pwsh -NoProfile -File scripts\check-windows-idle-rendering.ps1`.
+  It opens two isolated-config
+  windows in sequence: maximized Launcher discovery and an idle background
+  PowerShell tab with unread output. Each must average at most 5% of total
+  machine CPU after warmup. Run without competing builds, and do not interact
+  with or minimize the test windows during measurement. Add
+  `-RequireSoftwareRenderer` to require WARP/another CPU adapter rather than
+  treating a hardware-GPU run as software-renderer evidence. Results and
+  local logs go under `target`; `-Executable` and `-ResultPath` support
+  before/after comparisons. Logs retain the sensitivity boundary below.
+  Add `-IncludeSustainedOutput` to measure a third window with a foreground
+  PowerShell fixture updating a short line at 10 Hz. This case defaults to a
+  30% CPU ceiling and at least five GUI frames built per second; override with
+  `-MaximumOutputCpuPercent` and `-MinimumOutputFramesPerSecond` for a recorded
+  machine-specific budget. The optional Windows suite includes this case.
+  Frame counts come from content-free `festerm::rendering=debug` events and
+  measure UI paint construction, not completed OS presentations. The script
+  sets and restores its log filter. GPU pixel comparisons and native visual
+  review remain separate oracles; Windows `PrintWindow` can return a stale
+  startup image for GPU-rendered windows.
+  The native solid-background path does not eliminate the cost of dense text,
+  colored cells, or full-frame rendering.
+- Required Windows CI runs Cargo's repository-owned test executables through
+  `scripts\run-windows-tests.ps1`; see [native test exit diagnostics](windows-test-diagnostics.md).
+  This is separate from the installed application's lifecycle journal below.
+  It retains content-free exit/exception/termination, concurrent-thread stack
+  and module metadata without retries, serialized tests, or uploaded dumps.
+  The unexplained UI-test exit 2173 in [#330](https://github.com/fes/fesTerm/issues/330)
+  remains unresolved pending a causal reproduction.
+- `RUST_LOG` configures structured log filtering. The default is
+  `festerm=info,warn`.
+- For native responsiveness attribution, separately opt into
+  `festerm::input_timing=debug`, `festerm::ui_timing=debug`,
+  `egui_wgpu::frame_timing=debug`, or `egui_winit::pointer_input=debug`.
+  The outer application forwards the native raw-input hook to the primary
+  window; recording it only on the inner window app does not observe the
+  shipped multi-window host.
+  These record per-frame native pointer batch counts, application logic/UI
+  durations, root host paint phases/primitive counts/surface policy, and
+  adapted pointer positions/buttons/wheel deltas respectively, without
+  document, keyboard or clipboard text. Input/UI `frame` is the count before
+  `run_ui` completes; paint's
+  `completed_frames` is that count plus one. Begin/end timestamps expose
+  intervening gaps.
+  Paint durations are not GPU timestamps or proof of display latency;
+  configuration and acquisition are separate buckets, unavailable surfaces
+  are logged before recovery/skip, and submission/presentation may wait.
+  The targets do not
+  add device polling, input replay, cursor-position substitution or repaint
+  requests. Logs remain local; review before sharing.
+  `festerm::pointer_selection=debug` additionally records the text widget's
+  selected-character count, character-index anchor/endpoint and
+  focus/hover/drag/button state, not selected text.
+- fesTerm keeps local lifecycle metadata and logs under
+  `diagnostics/runs-v2/<run-id>/` in its native per-user state directory.
+  Each run owns its marker, exit intent, final record, at most one 256 KiB Rust
+  panic report, and one 2 MiB application log; concurrent processes never rotate
+  or overwrite each other's files. No report upload is implemented.
+  Future explicit next-start review/consent and first-party Firebase-backed
+  `feslabs.com` intake are tracked separately in
+  [#232](https://github.com/fes/fesTerm/issues/232), including private storage,
+  optional Sentry grouping, retention, idempotency, and abuse controls.
+- The About/Copy Version Information summary uses lifecycle metadata, not raw
+  report/log contents. **Raw panic messages, backtraces, and ordinary tracing
+  logs are not scrubbed and may contain sensitive data, including user paths,
+  terminal-derived values, or secrets from application/dependency errors.**
+  Not intentionally recording terminal traffic is not a guarantee that these
+  files contain no terminal content or secrets. Keep them local and review/redact
+  before sharing; About explicitly warns about this boundary.
+- Native smoke runs instead write beside `FESTERM_NATIVE_SMOKE_RESULT_PATH`,
+  appending `.diagnostics` to that path, so smoke exits and forced runner
+  termination do not contaminate the real user's exit history. Missing/empty
+  smoke result configuration disables durable diagnostics with a warning rather
+  than falling back to the user journal. These isolated files follow the same
+  sensitivity/retention rules; the runner owns their cleanup.
+- An OS-held lifetime lock, not PID existence or age, distinguishes live runs
+  from abandoned ones. A permanent `diagnostics/catalog.lock` serializes
+  creation, scanning, and retention; never delete lock files while fesTerm is
+  running. Catalog acquisition has a two-second deadline. Diagnostic errors
+  are reported through tracing/stderr and a content-free About warning rather
+  than preventing GUI startup. A panic hook uses a nonblocking journal lock;
+  if busy, it warns that the report could not be written. An independently
+  published panic flag preserves the panic even when a concurrent finish has
+  already chosen a clean record.
+- At each startup, retain the five newest inactive failed runs and five newest
+  inactive clean runs, including their logs/reports. Active runs are exempt
+  until a later startup observes their locks released. About reports the
+  newest retained failure, or the newest clean exit if no failure remains;
+  unrelated clean exits cannot hide an unclean run. This startup snapshot is
+  not a live process monitor. A caught worker panic remains a panic even if the
+  event loop later returns normally. Native faults, forced termination, and
+  power loss remain unclean/unknown, not a diagnosed cause.
+- Old experimental shared files directly inside `diagnostics/` are left
+  untouched and excluded from v2 scanning: their markers cannot safely
+  distinguish an older still-running binary from an abandoned run. After all
+  older processes stop, those legacy files can be archived or removed manually.
+  Atomic file replacement avoids deleting valid evidence before a replacement
+  succeeds; Unix parent directories are synced, but this is not a guarantee
+  against every filesystem or hardware power-loss failure.
+- `FESTERM_PROTOCOL_TRACE=1` only reports that tracing was requested; terminal
+  content tracing is intentionally not implemented.
+- `FESTERM_CONFIG_PATH` selects a non-empty Unicode configuration-file path
+  instead of the native per-user location. It is intended for support and
+  tests; configuration diagnostics intentionally omit the selected path and
+  source TOML. This narrower contract does not sanitize arbitrary panic
+  payloads or other tracing messages.
+- The normal status line is compact; use the **Diagnostics** control to reveal
+  lifecycle, queue pressure, bytes, errors, resize, and input-to-paint-
+  submission details, plus per-frame render diagnostics (frame time, dirty
+  row count) appended from `festerm-ui-egui`'s `TerminalView`. Backend event
+  delivery requests an egui repaint, so an idle window does not need a
+  polling timer to show output.
+- Terminal content, clipboard values, and credentials are sensitive. Do not add
+  them to fixtures, logs, or diagnostics by default.
+
+## Resuming Work
+
+1. Check `git status --short` and the latest `ROADMAP.md` milestone status.
+2. Review open GitHub issues at milestone start and before release; classify
+   defects against current completion criteria, schedule compatible reports in
+   their owning milestone, and retain future product requests without pulling
+   them into the current scope.
+3. Read the matching requirements and compatibility sections before editing.
+4. Preserve the ownership flow: PTY output -> app -> core -> UI, and UI input
+   -> core encoder -> app -> session.
+5. Add deterministic fixtures or isolated tests for compatibility fixes.
+6. Keep status documentation current only after the corresponding behavior and
+   validation exist.
+
+Milestone 6 is the open acceptance gate. Use the
+[compatibility checklist](m6-compatibility-checklist.md) for reference-
+application scenarios and the [M6 automation backlog](ui-test-plan.md#m6-automation-backlog)
+for implementation order. P0 through P2 are implemented; prioritize P3 visual
+evidence, P4 real-window validation, and P5 manual reference-application
+evidence against the exact candidate recorded in the acceptance document. M7
+and M8 are implemented. Keep remaining M9 work and M10 release validation
+bounded by their existing ADRs/issues, and convert every corrected failure into
+a concrete regression before broadening scope.

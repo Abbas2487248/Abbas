@@ -1,0 +1,97 @@
+[package]
+name = "festerm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "An AI-friendly local, SSH, and serial terminal."
+
+[features]
+default = ["experimental-dev-tunnels"]
+experimental-dev-tunnels = ["dep:festerm-tunnel-bridge", "dep:festerm-tunnel-client", "dep:tokio-util", "dep:zip"]
+
+[dependencies]
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
+directories = "6"
+fs2 = "0.4"
+getrandom = "0.3"
+eframe = "0"
+egui-winit = "=0.36.1"
+festerm-config = { path = "../../crates/festerm-config" }
+festerm-automation = { path = "../../crates/festerm-automation" }
+festerm-automation-js = { path = "../../crates/festerm-automation-js" }
+festerm-automation-mcp = { path = "../../crates/festerm-automation-mcp" }
+festerm-automation-workflow = { path = "../../crates/festerm-automation-workflow" }
+festerm-core = { path = "../../crates/festerm-core" }
+festerm-document = { path = "../../crates/festerm-document" }
+festerm-markdown = { path = "../../crates/festerm-markdown" }
+festerm-syntax = { path = "../../crates/festerm-syntax" }
+festerm-host-setup = { path = "../../crates/festerm-host-setup" }
+festerm-linux-power = { path = "../../crates/festerm-linux-power" }
+festerm-macos-window = { path = "../../crates/festerm-macos-window" }
+festerm-pty = { path = "../../crates/festerm-pty" }
+festerm-recording = { path = "../../crates/festerm-recording" }
+festerm-recording-export = { path = "../../crates/festerm-recording-export" }
+festerm-session = { path = "../../crates/festerm-session" }
+festerm-sessiond = { path = "../../crates/festerm-sessiond" }
+festerm-tunnel-bridge = { path = "../../crates/festerm-tunnel-bridge", optional = true, features = ["relay"] }
+festerm-tunnel-client = { path = "../../crates/festerm-tunnel-client", optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
+festerm-secret-store = { path = "../../crates/festerm-secret-store" }
+festerm-serial = { path = "../../crates/festerm-serial" }
+festerm-ssh = { path = "../../crates/festerm-ssh" }
+festerm-ui-egui = { path = "../../crates/festerm-ui-egui" }
+festerm-windows-power = { path = "../../crates/festerm-windows-power" }
+image = "0.25"
+mermaid-svg = "=0.7.0"
+resvg = { version = "0.48.1", default-features = false, features = ["text"] }
+roxmltree = "0.21"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rfd = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+tempfile = "3"
+tokio = { version = "1.17.0", default-features = false, features = ["rt", "sync", "time", "process", "io-util", "macros", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cargo-packager-updater = "0.2.3"
+bytemuck = "1"
+zeroize = "1"
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "4", default-features = false, features = ["deflate"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+festerm-recording-apple = { path = "../../crates/festerm-recording-apple" }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+raw-window-handle = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+festerm-unix-security = { path = "../../crates/festerm-unix-security" }
+nix = { version = "0.31", default-features = false, features = ["fs", "process", "signal", "user"] }
+
+[target.'cfg(windows)'.dependencies]
+festerm-windows-security = { path = "../../crates/festerm-windows-security" }
+winapi-util = "0.1.11"
+
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+festerm-windows-direct2d = { path = "../../crates/festerm-windows-direct2d" }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+festerm-automation-mcp-client = { path = "../../crates/festerm-automation-mcp-client" }
+festerm-test-support = { path = "../../crates/festerm-test-support" }
+festerm-syntax = { path = "../../crates/festerm-syntax", features = ["test-support"] }
+accesskit = "0.24"
+egui_kittest = { version = "0.36", features = ["snapshot", "wgpu"] }
+rmcp = { version = "3.8", default-features = false, features = ["client", "transport-async-rw"] }
+russh = { version = "0.62.5", default-features = false, features = ["ring"] }
+stats_alloc = "0.1.10"
+
+[lints]
+workspace = true

@@ -1,0 +1,449 @@
+# ADR 0042: Isolated iOS Rendering Spike Host
+
+- **Status:** Proposed — terminal and offline workflow preview implemented; native feasibility not accepted
+- **Date:** 2026-09-26
+- **Supersedes:** ADR 0031's planning-only scope for this owner-requested iOS experiment; persistent-input layout replaces the earlier focus-only design
+
+## Context
+
+The owner requested starting the iOS port. ADR 0031 requires a concrete host
+decision before implementation and a rendering/lifecycle feasibility gate
+before further phases. The desktop composition root imports PTY, sessiond,
+serial, filesystem dialogs, desktop integration and the self-updater. Using
+that root on iOS would couple the first experiment to unrelated product work.
+
+The owner further requested a persistent vertical terminal/keyboard layout on
+both iPhone and iPad. Include this narrow input slice in the feasibility host
+rather than treating a transient desktop-like focus model as the target.
+
+The owner subsequently requested a testable facsimile of the mobile tab, SFTP
+and Markdown designs. That preview must exercise responsive composition without
+misrepresenting synthetic data as a live connection or widening the mobile
+dependency graph to the desktop composition root.
+
+## Decision
+
+Add `app/festerm-mobile` as an experimental workspace member. It depends
+downward on `festerm-core` and `festerm-ui-egui`, plus the already pinned
+eframe 0.36.1 / winit 0.30.13 host libraries. Use eframe's public
+`create_native` with a main-thread winit `ApplicationHandler` and wgpu/Metal.
+Do not use desktop run-on-demand loops. Do not fork upstream libraries.
+
+The host is the single owner/writer of a bounded fixture terminal. Input uses
+the existing renderer/core encoder and a content-free counting sink; there is
+no fake shell, network connection, credential store or persisted input.
+Scrollback is limited to 256 KiB. Probe controls are limited to resetting the
+fixture and exercising encoded keys; they are not new product commands.
+
+The event-loop adapter forwards native lifecycle callbacks to eframe, records
+idempotent resume/suspend counters, suppresses redraw/repaint work while
+suspended, and waits for native events. On memory warning the next UI frame
+reconstructs view caches while preserving the grid/history. This is an
+experiment, not a guarantee of complete GPU-resource eviction or background
+execution. Process death restarts the fixture; it does not restore a session.
+
+Target-qualified dependencies keep Linux window-system support available for
+a development harness without importing desktop application backends on iOS.
+A dependency-graph check rejects PTY, serial, sessiond, the desktop app and
+self-updater in normal/build dependencies. Dev-only core fixtures are not
+part of the shipping graph.
+
+Simulator packaging is a separate unsigned-distribution development script
+(ad-hoc code signature only), not a modification of desktop release trust.
+No signing credentials, provisioning profiles or store uploads are involved
+in that Simulator path. Owner-authorized campaign #422/#426 adds a separate
+local development-device packager, `scripts/build-ios-device.py`, using an
+existing local Apple Development identity and an explicit device-provisioned
+profile. It validates app/team/certificate/device membership and expiry,
+requests only the minimal development entitlements, builds with the device
+SDK, and signs/verifies a fresh private bundle. It does not install, enroll,
+provision, distribute or upload; the embedded profile stays in local private
+output. Portable policy tests are not native signing/install acceptance.
+This additive packaging path changes no runtime dependency or ownership
+boundary. The device packager defaults to the offline fixture. Explicit
+`--live-ssh` selects the reviewed transient SSH composition below for both
+dependency preflight and Cargo compilation, adds its local-network purpose
+string and labels fresh private output/receipts with the selected mode.
+Both modes request the same minimal development entitlements; including the
+feature is not evidence of device signing, network access or native usability.
+
+**Experimental CI policy (owner-approved 2026-10-03):** affected PRs retain
+mobile unit/dependency checks, device compilation and Simulator app builds.
+CoreSimulator preparation and isolated launch/relaunch/screenshot smoke run
+only nightly on the default branch or via manual dispatch, not as desktop PR
+merge gates. PR build checks retain the `simulator-build` name; nightly/manual
+runs use `experimental-simulator-smoke` so runtime evidence cannot overwrite
+the build-check context when dispatched on a PR branch.
+Runtime failures still fail those runs and preserve receipts;
+no failed attempt is retried, and CoreSimulator application-command deadlines
+plus ownership and capture guards remain unchanged.
+
+**Readiness instrumentation update (owner-requested 2026-10-28):** after each successful
+`simctl launch`, the existing three-second startup grace is split into three
+one-second first-UI observations. The receipt records the actual grace duration
+and whether the marker first appeared at poll 1, 2 or 3. After that unchanged
+grace, the harness retains the prior exact PID/executable check, screenshot,
+PNG validation, second liveness check and final marker evaluation; a marker
+first observed after capture remains accepted exactly as before. No
+application/process deadline or pass/fail guard changes before #303's required
+attribution. A process that never reaches first UI or dies while waiting still
+gets failed evidence.
+If the pre-capture liveness guard fails, readiness is retained with capture
+marked `not-attempted` and the screenshot remains blocked as before.
+The in-memory capture record is created before capture and persisted when a
+controlled screenshot timeout or invalid PNG unwinds, retaining readiness and
+capture-error evidence. An external hard job termination can still prevent the
+final manifest write.
+This changes when experimental evidence is collected, not mobile feasibility
+acceptance or desktop branch protection. Review an explicit runtime merge gate
+when mobile product support is accepted; #303 remains the runner-stability
+tracker and `MOB-01`–`05` remain native qualification gates.
+
+The same portrait/landscape/Split View arrangement is used on iPhone and
+iPad: terminal, docked terminal-key row, native system keyboard. Keyboard
+requests persist for the active terminal. `festerm-ios-window` is a narrow,
+main-thread UIKit adapter: it retains the host UIView, measures its docked
+`UIKeyboardLayoutGuide`, and subscribes to keyboard-frame notifications to
+request repaint without polling. It unregisters observers on drop. Native
+unsafe calls live only in that adapter, following the AppKit crate precedent.
+Hardware/floating keyboard geometry is owned by UIKit; no guessed heights.
+
+The owner-requested optional terminal keyboards (2026-11-02) remain app-owned
+widgets over the same encoder. Built-in, Hold symbols and Shell row have a
+persisted startup default and an independent runtime switch. While a custom
+keyboard owns eligible terminal input, the UIKit adapter uses a main-thread
+UIKeyInput responder with an empty input view, forwarding hardware text and
+deletion to winit's existing receiver without storing text. Forms, native IME,
+lock and session readiness retain their existing ownership/gates; no upstream
+fork, new terminal writer, parser or transport queue is introduced.
+The custom input view adopts `UIInputViewAudioFeedback`; key-click requests use
+`UIDevice.playInputClick` so iOS enforces the user's keyboard-sound preference.
+No private keyboard-haptics settings, forced vibration, speech permissions or
+remote microphone routing are added. Dictation uses the existing native keyboard.
+The native adapter distinguishes System, Terminal and Hidden presentation:
+resign the other receiver before acquiring the requested one, reload the custom
+input view only on acquisition, and explicitly dismiss both for extended keys
+or other no-IME states. This prevents a cached host IME flag from keeping the
+native keyboard underneath an app-owned input panel.
+
+`InputEvent::ModifiedKey` adds explicit Ctrl/Alt/arrow chord encoding to the
+shared core; byte semantics stay out of mobile widgets. It uses the ordinary
+bounded atomic input queue and KAM gate. The mobile adapter applies one-shot
+latches to text/IME commits and preserves composition completion events without
+sending the text twice. Existing unmodified desktop dispatch is unchanged.
+Native keyboard appearance, frame animation and IME remain qualification gates.
+
+Persistent input opts into the shared view's idempotent keyboard-focus policy;
+desktop callers keep their existing default. Mobile accessory controls do not
+take keyboard focus, and outside clicks do not automatically blur the terminal.
+This avoids egui's explicit composition interruption on every `request_focus`,
+which the winit integration implements by disabling and re-enabling native IME.
+Do not mask that loop with UIKit polling or an upstream fork. Regression
+assertions inspect final egui platform output, not just the UI callback's request.
+
+The owner-requested arrow interaction lives in the mobile adapter: stationary
+hold then directional drag, transient helper and three repeat speeds. It emits
+core key intents, consumes synthesized pointer duplicates while captured, and
+cancels on release, multitouch, geometry/focus/lifecycle changes. Ordinary early
+drags retain shared renderer routing. Following the owner's request to continue,
+the same input experiment includes pinch/arrow arbitration: a second terminal
+touch takes over pending hold/arrow navigation, scales the existing session-local
+zoom through a bounded renderer API, and captures remaining fingers until all
+lift. A drag already delivered to the renderer keeps ownership. Memory-warning
+cache reconstruction preserves the chosen text size. This tests the mobile
+input seam without accepting native feasibility or starting mobile sessions.
+Native selection handles, spacebar gestures and extended key configuration
+remain Phase 2.
+
+The host also owns three fixed workflow categories: Terminal, Files and README.
+They retain in-memory preview state while switching, but they are not yet the
+product tab lifecycle (no create, rename, reorder, close or restoration).
+Terminal remains the only category that requests persistent keyboard focus or
+owns terminal gestures.
+
+Files is an offline interaction model over repository-owned Local/Remote
+listings. It proves measured-space layout selection: horizontal panes at Wide,
+stacked Remote/Local panes and a horizontal transfer rail at Compact, and a
+focused-pane toggle at Minimal. Selection determines upload/download direction;
+bounded animated progress and explicit collision decisions are UI state only.
+There is no filesystem or SFTP request.
+
+README parses a repository-owned synthetic runbook through the shared bounded
+`festerm-markdown` model. It exposes Preview, Source and heading navigation,
+with a persistent Wide contents rail and a collapsible Compact/Minimal contents
+panel. Resources stay inert. Reusing the parser adds `festerm-markdown` and its
+`festerm-syntax` dependency to the audited mobile graph; it does not import the
+desktop app, source I/O or native dialogs.
+
+## Opt-in transient SSH prototype extension (campaign #422/#424)
+
+Owner direction on 2026-10-30 advances the smallest functional iOS prototype.
+Independent architectural review on 2026-10-30 approved this feature-gated
+composition as the basis for prototype work; native feasibility and mobile
+product support remain unaccepted. The offline fixture
+and nightly smoke remain the default. The explicit `live-ssh` feature adds
+`festerm-session`, `festerm-ssh` and zeroizing transient credential input to
+the mobile composition root, without importing the desktop app or backends.
+
+The app owns the sole presented Terminal writer. The existing SSH worker
+publishes bounded session events and an event-loop-safe notifier; the app
+processes at most 32 events per UI frame, including while Files/README is
+selected and without repeating the budget during layout retries, ingests output, returns core protocol
+replies, and forwards encoded keyboard/gesture input through the existing
+atomic backend admission. There is no second protocol parser or unbounded
+frontend payload queue. Refused input/replies retire the session with a
+notice; earlier admitted commands may have executed and are never replayed.
+One pending resize coalesces geometry changes with a 100 ms debounce.
+
+The minimal connection form requests host/port/user, then the existing worker
+orders fingerprint review before interactive password authentication. A pin
+is retained only in memory for the same canonical host/port during this app
+session. Unknown hosts require explicit approval; changed pins have Reject
+only. A bounded zeroizing text buffer and sensitive/no-undo password widget
+avoid credential persistence and retained editing snapshots. Native secret
+storage remains Unsupported on iOS; no memory/plaintext persistence fallback
+is introduced. Cancellation and replacement retire prompts and transport
+ownership. A main-thread suspension handle shares only the live connection
+state with the native host, not terminal ownership. The native suspension
+callback clears plain-SSH prompts/passwords and retires plain-SSH transport without waiting for
+a UI frame or synchronous worker shutdown. Resetting the offline fixture
+preserves this callback binding. Reconnection is explicit and starts a fresh shell;
+neither always-live background sockets nor remote process survival is promised.
+
+Terminal focus, accessory keys and gestures yield to connection/auth controls
+and otherwise preserve the approved persistent keyboard and directional helper.
+Termius is the interaction reference; saved-host management, persistent
+credentials, native selection handles and paste affordances remain separate
+follow-ups. Files and README remain inert offline previews. Feature builds
+have a separate Simulator artifact; offline smoke cannot be relabeled as
+live-service evidence.
+
+## Alternatives considered
+
+- Feature-gate the entire desktop root: much wider work than needed for the
+  Phase 1 go/no-go question and harder to audit for mobile exclusions.
+- Native SwiftUI terminal renderer: contradicts the shared renderer decision
+  without evidence that the existing renderer cannot be hosted.
+- Direct wgpu/UIKit integration: retain as a fallback only if this public
+  eframe/winit path demonstrably fails the native gate.
+
+## Consequences
+
+Existing desktop ownership and behavior are unchanged. The workspace gains a
+small experimental binary and portable tests. Normal workspace checks compile
+the host; the iOS workflow checks device code and links a Simulator app.
+Dependency versions remain locked; no existing dependencies are upgraded.
+
+Live SSH/SFTP, iOS Keychain, profiles, full tab lifecycle, advanced
+gestures/F-keys, clipboard policy,
+durable resume, Android and TestFlight remain later work. Accepting this ADR
+does not accept mobile product support. Architectural review and native
+feasibility evidence are required before moving beyond this experiment.
+
+## Native evidence checkpoint (2026-09-27)
+
+The SDK-matched iOS 18.5 Simulator run at `7670d52` failed the native gate:
+iPhone launch timed out; iPad launch and relaunch survived but both screenshots
+were black. Desktop CI and native package smoke passed. Process survival alone
+therefore cannot qualify even startup. The smoke now captures application
+stdout/stderr and requires the first UI callback marker, preserving screenshots
+on failure. The marker proves UI construction only, not presentation or keyboard
+correctness. Host/renderer warnings are logged without retaining typed input.
+The diagnostic run at `c7ecb14` captured the same initialization error on both
+families: default `max_inter_stage_shader_variables=16` exceeds the Simulator
+Metal adapter's limit of 15. The mobile host now requests wgpu's downlevel
+baseline, retaining adapter texture dimensions for full-resolution surfaces.
+This uses the public device descriptor callback; validation remains enabled and
+desktop configuration is unchanged. A regression reproduces the rejected default
+request and verifies the mobile descriptor against constrained limits. Native
+presentation still requires a successful rerun; track the gate in issue #261.
+
+A later local iPhone 17 / iOS 26.5 run with the Xcode 27 SDK renders the fixture.
+Native responder tracing identified repeated egui focus requests as the cause
+of continual keyboard hide/show animation. The idempotent focus policy removes
+that loop; local software-keyboard evidence covers idle presentation, native
+character/Return/Delete actions and background/foreground. The Simulator's
+hardware-keyboard emulation must be disconnected for this software-keyboard
+case. This does not replace SDK-matched CI, iPad, physical-device, complex IME
+or native accessory/gesture qualification; the ADR remains Proposed.
+
+On 2026-10-02 the same local iPhone environment rendered the three workflow
+categories. Native review caught a Compact transfer rail consuming remaining
+height and pushing the lower pane off-screen; a bounded-rail fix and geometry
+regression now keep both panes visible. Native review also caught overlapping
+Markdown controls and a desktop-width reading column; the Compact toolbar now
+uses two rows and the document wraps to measured width. This is bounded iPhone
+visual evidence for `MOB-05`, not iPad, rotation, accessibility or physical
+device acceptance.
+
+An isolated iPad Pro 13-inch (M5) Simulator on the same 26.5 runtime also
+rendered the Wide terminal surface and measured keyboard region before the
+temporary device was removed. Files/README interaction, rotation, multitasking,
+accessibility and physical-device acceptance remain open on iPad.
+
+## Validation impact
+
+The optional keyboard slice updates `MOB-02` in the GUI action graph,
+traceability and manual inventory. Actual-widget regressions cover saved
+defaults versus runtime switching/hiding, responsive pinned controls, forms
+and lifecycle gating, real core/backend byte admission and local shortcuts,
+hold alternates and cancelled/bounded repeat scheduling. The gallery captures
+both layouts and their symbols layer on phone/tablet; preview tests cover press,
+alternate and release/cancellation behavior, and measured layouts assert centered
+Space-bar width. Native responder handoff, sound settings,
+hardware input, keyboard animations, IME, touch comfort and accessibility remain
+manual gates; cross-compilation is not native runtime acceptance.
+
+Campaign #424 adds test-only mobile composition coverage over an owned SSH
+loopback peer. The real form, host-key resolver, interactive password retry,
+single-writer terminal pump, core text/IME/control/application-cursor encoding,
+DSR reply, window resize and disconnect cleanup are exercised together.
+`mobile_loopback_ssh_connects_after_explicit_trust_and_password_retry` and
+`mobile_loopback_ssh_rejects_unknown_and_changed_hosts_before_authentication`
+run with the live feature. The server binds only an owned ephemeral 127.0.0.1
+port, uses a generated in-memory host key and public fixture credential, bounds
+input/observations/deadlines and joins its owned runtime on cleanup. It does not
+execute an OS shell. russh/tokio additions are dev-only and already locked;
+normal mobile/desktop dependencies and runtime ownership are unchanged.
+
+Socket-free actual-widget gallery states expose unknown/changed host review
+and empty password entry for phone/tablet visual review. They are synthetic
+prompts without resolver/worker activity, separate from real loopback tests.
+Neither the host protocol tests nor headless captures accept native iOS,
+OpenSSH/TUI interoperability, signing or physical-device behavior.
+
+The MOB-06 recovery slice reuses the shared renderer's existing read-only
+contract: retained history remains locally interactive while keys/paste,
+stale mouse reporting and focus reports cannot target a retired transport.
+Terminal DEC modes, app single-writer ownership and bounded session queues
+are preserved. Live desktop mouse/focus behavior is unchanged. The mobile
+recovery card explicitly opens a new-shell form, never replays input, and
+replaces history only on explicit worker start (before authentication).
+Portable regressions `mobile_disconnected_history_scrolls_and_copies_without_transport_input`,
+`mobile_reconnect_reviews_form_without_replay_or_early_history_clear` and
+`disconnected_session_keeps_selection_copy_and_navigation_but_drops_keystrokes`
+cover the policy/interaction seam. Synthetic phone/tablet capture supports
+visual review; native Copy/IME/VoiceOver and real SSH/device recovery remain
+MOB-06 gates.
+
+
+The before capture exposed missing Unicode arrow glyphs in the proportional
+font; directional strokes now avoid that font dependency. The owner-board
+screen 04 refinement adds a dark temporary arrow pad with active
+direction, neutral/three-speed feedback and release guidance. One speed
+classifier serves both the existing repeat scheduler and presentation; hold,
+dead-zone, repeat intervals, cancellation and input ownership remain unchanged.
+`mobile_arrow_feedback_matches_repeat_speed_and_stays_inside_terminal` covers
+feedback/deadline agreement, cancellation and safe-space layout. The gallery
+drives synthetic hold/drag events through MobileApp and captures phone/tablet
+helper states before/after, without sockets or private content. Headless pixels
+do not accept native gesture feel, finger occlusion, accessibility or device use.
+
+
+The owner-provided iOS product boards guide a mobile-scoped navy/blue presentation,
+two-line actual-host identity and labelled Host/Port/Username controls. The
+Esc/Tab/Ctrl/Alt order preserves one-shot semantics. This is presentation within
+MOB-05/MOB-06, with no desktop style, terminal/session ownership, trust or secret
+boundary changes. Existing measured-space/menu/input regressions and the
+exact-source phone/tablet gallery cover portable behavior; native comparison,
+Dynamic Type, VoiceOver and real-device input remain manual gates. Deferred
+product screens and deliberate transient-prototype differences are recorded in
+`docs/mobile-layout-design.md#owner-provided-product-mock-ups`.
+
+
+The #425 connection-form layout correction uses a direct scroll area bounded
+by 45% of measured safe space, growing only to its content. The owner-requested
+cleanup uses one compact header, secondary preview/reset actions and diagnostics
+under More, and 44-point control targets. Repeated experiment/counter/explanatory
+strips are removed; trust/authentication, active replacement and recovery remain
+explicit. Menu interaction cannot route terminal keys or gestures. This fixes
+the shrinking panel and excessive chrome without changing terminal ownership,
+transport/authentication, persistence or persistent-keyboard policy.
+`mobile_connection_form_fits_measured_phone_tablet_space_and_releases_it` and
+`mobile_connection_form_short_layout_scrolls_to_connect_without_terminal_input`
+cover actual-widget geometry, reopening, short-view scrolling and zero terminal
+input. `mobile_header_menu_resets_demo_without_stale_input_and_has_no_preview_entries`
+covers actual overflow navigation, latch retirement and reset. Before/after
+headless capture is visual evidence; native keyboard/touch,
+rotation, SSH/TUI and physical-device acceptance remain MOB-06 requirements.
+
+The owner-requested iteration screenshot review adds an opt-in, test-only
+`egui_kittest` gallery for actual mobile widgets, with controlled offline
+fixtures and no native host/network/clipboard/user-resource access. It emits
+phone/tablet terminal/connect-form PNGs and an exact-source/hash manifest into
+fresh, non-overwritten output. PR CI uploads a distinct headless review
+artifact; optional aggregate runners expose the same capture path. Dev-only
+capture dependencies do not enter either iOS shipping graph. Simulated
+keyboard reservation and headless pixels do not qualify native rendering,
+keyboard/touch, live SSH or physical-device acceptance. No runtime ownership,
+Termius interaction or experimental native smoke policy changes.
+
+- **Invariants introduced or changed:** additive mobile composition root;
+  shared core/renderer and single writer preserved; no desktop session backend
+  or updater in the iOS normal/build graph; no retained user input.
+- **GUI/action edges affected:** `MOB-06` (opt-in live SSH), `MOB-01`, `MOB-02`, `MOB-03`, `MOB-04`,
+  `MOB-05` (isolated preview);
+  `ZOOM-02` shares the existing size bounds.
+- **Automated tests required:** Opt-in live host tests:
+  `mobile_live_ssh_pump_uses_core_replies_and_bounded_event_work`,
+  `mobile_live_ssh_hidden_workspaces_keep_pumping_output_and_replies`,
+  `mobile_live_ssh_native_suspension_retires_without_a_ui_frame`,
+  `mobile_live_ssh_input_refusal_retires_session_without_replay`,
+  `mobile_live_ssh_stop_clears_prompts_password_resize_and_stale_output`,
+  `mobile_live_ssh_resize_coalesces_and_rejects_unrepresentable_grids`,
+  `mobile_live_ssh_password_buffer_bounds_unicode_edits_and_take`;
+  feature-enabled desktop tests, iOS device compilation and Simulator linking.
+  `scripts/tests/test_ios_device_build.py` covers development-profile admission,
+  exact local signing identity, entitlement minimization, non-building preflight,
+  device/Simulator separation, failure receipts and private output/receipt policy;
+  live/offline feature selection, feature-qualified graph refusal before build,
+  live-only local-network metadata and mode-labeled receipts (including failures);
+  `mobile_gpu_limits_accept_simulator_downlevel_capabilities`,
+  `mobile_lifecycle_is_idempotent_and_counts_resume_after_suspend`,
+  `mobile_probe_uses_core_encoding_without_echoing_or_retaining_input`,
+  `mobile_fixture_renders_at_phone_width_and_preserves_grid_on_memory_warning`;
+  `mobile_phone_ipad_and_split_view_keep_terminal_above_persistent_keyboard`,
+  `mobile_persistent_keyboard_does_not_restart_ime_between_frames`,
+  `mobile_sticky_modifiers_are_one_shot_and_preserve_ime_commit_boundaries`,
+  `explicit_modifiers_encode_control_meta_and_cursor_chords_atomically`;
+  `mobile_arrow_hold_drag_repeats_with_dead_zone_and_stops_on_release`,
+  `mobile_arrow_tap_and_early_drag_reach_existing_pointer_routing`,
+  `mobile_arrow_multitouch_resize_and_background_cancel_without_keys`,
+  `mobile_arrow_gesture_keeps_keyboard_and_does_not_leak_mouse_reports`;
+  `mobile_pinch_takes_over_arrows_and_quarantines_remaining_finger`,
+  `mobile_pinch_cancellation_and_existing_pointer_ownership_are_respected`,
+  `mobile_pinch_resizes_only_terminal_and_preserves_zoom_on_memory_warning`,
+  `terminal_pinch_zoom_uses_shared_bounds_and_rejects_invalid_samples`,
+  `mobile_workspaces_limit_native_keyboard_and_terminal_gestures_to_terminal`,
+  `responsive_tiers_follow_measured_space_not_device_identity`,
+  `markdown_fixture_uses_shared_parser_and_has_navigable_contents`;
+  `scripts/build-ios-spike.py --check-dependencies`; iOS workflow build/link;
+  portable Simulator policy regressions
+  `test_ios_pr_build_checks_remain_unconditional`,
+  `test_ios_native_smoke_runs_only_on_schedule_or_manual_dispatch`,
+  `test_ios_scheduled_smoke_preserves_failures_evidence_and_toolchain`,
+  `test_ios_pr_paths_preserve_mobile_and_shared_source_coverage`;
+  preparation regressions
+  `test_ios_smoke_read_only_preparation_is_not_application_evidence` and
+  `test_ios_smoke_preparation_cannot_build_or_run_an_application`;
+  `test_ios_smoke_waits_for_delayed_first_ui_without_retrying_launch` and
+  `test_ios_smoke_live_process_without_ui_fails_and_preserves_capture`;
+  `scripts/tests/test_ios_simulator_smoke.py` for isolated device ownership,
+  runtime selection, failure/cleanup behavior, bounded delayed-first-UI
+  readiness and live-process-without-UI rejection; `scripts/smoke-ios-simulator.py
+  --run` in nightly/manual CI or opt-in local validation for iPhone/iPad
+  launch-survival, first UI callback, terminate/relaunch and PNG capture.
+  Only devices created by that invocation may be shut down/deleted. Artifacts
+  identify the commit/runtime and never count screenshots as visual acceptance.
+- **Native/manual evidence required:** `MOB-01` through `MOB-05` in
+  `docs/manual-validation.md`, on Simulator and a physical iOS device.
+- **Coverage superseded:** None; desktop acceptance is unchanged.
+
+### Dev Tunnel lifecycle exception (#496)
+
+ADR 0057's retained-mobile amendment narrows the earlier suspension teardown
+wording to plain SSH. Established Dev Tunnel attachments remain owned while
+inactive, including parked tabs. On foreground return a bounded asynchronous
+host-authenticated ping gates input independently of app lock/privacy. Healthy
+attachments retain terminal/view state; failures use safe same-generation
+recovery. MOB-03/MOB-06 native-device qualification remains pending.

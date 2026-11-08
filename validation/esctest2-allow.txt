@@ -1,0 +1,185 @@
+# Which esctest2 tests fesTerm is held to.
+#
+# esctest2 has 559 test methods and we pass 414 of them; #220 records what is
+# deliberately left out. A suite that is mostly red on every run gets
+# ignored, so this file is the contract instead: everything listed here must
+# pass, and a regression in any of it fails CI.
+#
+# Entries are Python regexes matched against the full test name
+# (`ClassName.test_Method`). A bare class name enables the whole class.
+# Individual tests inside an enabled class can be excluded in
+# `esctest2-skip.txt`, which requires a reason for each. That file is
+# currently empty: every test enabled here runs.
+#
+# Anything not listed here is not enabled yet, and that is a statement about
+# features we have not implemented rather than about tests we are avoiding.
+#
+# Run it with `scripts/run-esctest2.sh`, or survey the whole suite with
+# `scripts/run-esctest2.sh --everything`.
+
+# Cursor addressing, absolute and relative.
+CHATests
+CNLTests
+CPLTests
+CRTests
+CUBTests
+CUDTests
+CUFTests
+CUPTests
+CUUTests
+HPATests
+HVPTests
+VPATests
+
+# Line feed, index, reverse index and next line - the four ways of moving
+# between rows, and the scrolling they cause at a margin.
+INDTests
+LFTests
+NELTests
+RITests
+DECSTBMTests
+
+# Scrolling the region explicitly, rather than as a side effect of moving
+# off the end of it.
+SDTests
+SUTests
+
+# Erasing and editing within a line or the screen.
+DCHTests
+ECHTests
+EDTests
+ELTests
+DECSEDTests
+DECSELTests
+ICHTests
+ILTests
+DLTests
+
+# Tab stops: set one, clear one, clear all, and tab forwards and back.
+HTSTests
+TBCTests
+CHTTests
+CBTTests
+
+# The index variants. FF and VT are LF under different names, and HPR and VPR
+# are CUF and CUD under different names.
+FFTests
+VTTests
+HPRTests
+VPRTests
+
+# Insert and new-line modes, the two ANSI modes we answer to.
+SMTests
+RMTests
+
+# Mode reporting. Listed test by test rather than as a class: DECRQM can be
+# asked about every mode a DEC terminal ever had, and the ones absent here
+# are the ones whose function we do not perform and therefore report as
+# permanently reset. That is an honest answer to the query and a failure of
+# the test, which expects a terminal that does perform them.
+DECRQMTests\.test_DECRQM$
+DECRQMTests\.test_DECRQM_ANSI_(IRM|LNM|KAM)$
+DECRQMTests\.test_DECRQM_ANSI_(GATM|SRTM|VEM|HEM|PUM|FEAM|FETM|MATM|TTM|SATM|TSM|EBM)$
+DECRQMTests\.test_DECRQM_DEC_(DECCKM|DECOM|DECAWM|DECTCEM|DECNKM|DECBKM|DECLRMM)$
+DECRQMTests\.test_DECRQM_DEC_DECHCCM$
+
+# Save and restore cursor, in all three of its spellings: DECSC/DECRC, the
+# SCO form, and DECSET 1048. And the soft reset that clears the saved state.
+DECRCTests
+SCORCTests
+DECSETTiteInhibitTests
+DECSTRTests
+
+# String controls we deliberately consume and ignore. These pass by *not*
+# doing anything, which is exactly the property worth pinning: an APC or PM
+# string must not leak its payload onto the screen or swallow what follows.
+APCTests
+DCSTests
+PMTests
+SOSTests
+ManipulateSelectionDataTests
+SMTitleTests
+S8C1TTests
+
+# Reset mode.
+RMTests
+
+# The repeat control and the alignment pattern.
+REPTests
+DECALNTests
+
+# Device status reports. Every one of these asks about a device we do not
+# have, and is listed because the answer is the "no such thing" value rather
+# than an agreeable one: no printer, no locator, no macro storage, no link to
+# have errors on. The keyboard report is absent because we would have to
+# invent a keyboard type to answer it.
+DECDSRTests\.test_DECDSR_DECXCPR
+DECDSRTests\.test_DECDSR_DSRPrinterPort
+DECDSRTests\.test_DECDSR_DSRUDKLocked
+DECDSRTests\.test_DECDSR_DSRDECLocatorStatus
+DECDSRTests\.test_DECDSR_LocatorType
+DECDSRTests\.test_DECDSR_DECMSR
+DECDSRTests\.test_DECDSR_DECCKSR
+DECDSRTests\.test_DECDSR_DSRDataIntegrity
+DECDSRTests\.test_DECDSR_DSRMultipleSessionStatus
+
+# Setting reports. Listed one at a time for the same reason DECRQM is: we
+# answer for the settings we actually hold and reply "unrecognised" for the
+# rest, so the tests absent here are the settings we do not keep.
+DECRQSSTests\.test_DECRQSS_SGR
+DECRQSSTests\.test_DECRQSS_DECSCUSR
+DECRQSSTests\.test_DECRQSS_DECSTBM
+DECRQSSTests\.test_DECRQSS_DECSLRM
+DECRQSSTests\.test_DECRQSS_DECSCA
+
+# Rectangular editing. These are the one family that ignores the margins
+# entirely: DECSTBM and DECSLRM bound almost everything else, but a rectangle
+# is addressed against the page, so setting margins must not move it.
+DECCRATests
+DECFRATests
+DECERATests
+DECSERATests
+DECICTests
+DECDCTests
+DECBITests
+DECFITests
+
+# Left and right margins. DECSLRM itself has no test class - it is measured
+# through the operations above, which is why enabling it widened so many of
+# them at once - but these pin the mode that gates it.
+DECSETTests\.test_DECSET_DECLRMM
+DECSETTests\.test_DECSET_DECAWM_O(n|ff)RespectsLeftRightMargin
+DECSETTests\.test_DECSET_DECAWM_NoLineWrapOnTabWithLeftRightMargin
+DECSETTests\.test_DECSET_DECOM
+
+# Colour: the 47 tests in ChangeColorTests, ChangeDynamicColorTests,
+# ChangeSpecialColorTests, ResetColorTests and ResetSpecialColorTests stay
+# disabled, and they will not move on the strength of the OSC 4/10/11/12
+# *query* support added for #222.
+#
+# Every one of those tests sets a colour and then queries it back, so they
+# measure the half fesTerm deliberately does not do. ADR 0036 answers queries
+# with the colours the renderer actually paints and ignores sets, because the
+# renderer does not read a scheme back at paint time: accepting a set would
+# make the next query describe a colour nothing on screen uses. Enabling this
+# family means implementing runtime palette changes and the cache
+# invalidation they imply, which is #220's remaining colour item.
+#
+# esctest2 has no query-only colour test, so the query behaviour is pinned by
+# exact-byte tests in festerm-core instead.
+
+# Reverse wraparound, DECSET 45. The two CUBTests entries that used to be
+# skipped now run. The harness is told `--xterm-reverse-wrap 383` because
+# fesTerm implements the semantics xterm settled on in patch 383: the cursor
+# climbs only across rows that actually soft-wrapped and stops at the start
+# of the logical line, rather than the older behaviour of climbing
+# unconditionally onto whatever happens to be above. ADR 0037 records why.
+
+# XtermWinops is deliberately out of scope. Its tests resize, move, raise,
+# lower and iconify the window, and report its position in pixels - requests
+# that hand a remote program control of a local window. fesTerm does not
+# answer them, so the family is not an unfinished phase but a boundary.
+
+# DA, DA2 and DECID report a fixed identity chosen to match the feature set
+# fesTerm actually implements, and that identity is pinned by exact-byte
+# tests in festerm-core rather than by this suite.

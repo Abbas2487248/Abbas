@@ -1,0 +1,6471 @@
+use std::{
+    collections::{BTreeMap, VecDeque},
+    env,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    process::{self, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use festerm_core::{Dimensions, Terminal};
+#[cfg(unix)]
+use std::os::unix::{
+    fs::PermissionsExt,
+    net::{UnixListener, UnixStream},
+};
+
+#[cfg(windows)]
+use festerm_windows_security::named_pipe::{Pipe, PipeListener};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+};
+
+#[cfg(test)]
+use std::cell::RefCell;
+
+use festerm_pty::default_local_profile;
+use festerm_sessiond::lifecycle::{self, Event as LifecycleEvent, FailureStage};
+use festerm_sessiond::AttachKind;
+use festerm_ssh::PersistentSessionName;
+use fs2::FileExt;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize};
+use std::sync::{Mutex, OnceLock};
+
+/// Opt-in diagnostic tracing for debugging the Windows native-smoke daemon
+/// path (see issue #71). Writes to the file named by
+/// `FESTERM_SESSIOND_TRACE_FILE` if set; otherwise a no-op. A file is used
+/// instead of stderr because the native-smoke test spawns the daemon with
+/// `Stdio::null()` for its own stdio, which would silently discard
+/// `eprintln!` output.
+fn trace_file() -> Option<&'static Mutex<fs::File>> {
+    static TRACE_FILE: OnceLock<Option<Mutex<fs::File>>> = OnceLock::new();
+    TRACE_FILE
+        .get_or_init(|| {
+            let path = env::var_os("FESTERM_SESSIOND_TRACE_FILE")?;
+            if path.is_empty() {
+                return None;
+            }
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Mutex::new)
+        })
+        .as_ref()
+}
+
+fn sessiond_trace(message: impl std::fmt::Display) {
+    if let Some(file) = trace_file() {
+        if let Ok(mut file) = file.lock() {
+            let _ = writeln!(file, "{message}");
+            let _ = file.flush();
+        }
+    }
+}
+
+const CLIENT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+static DAEMON_GENERATION: OnceLock<u128> = OnceLock::new();
+static DAEMON_LOG: OnceLock<(PathBuf, festerm_sessiond::NativeSessionIdentity)> = OnceLock::new();
+
+fn lifecycle_event(event: LifecycleEvent) {
+    if let Some((root, identity)) = DAEMON_LOG.get() {
+        if lifecycle::record(root, identity, event).is_err() {
+            eprintln!("festerm-sessiond: lifecycle.record_failed");
+        }
+    }
+}
+
+fn lifecycle_failure(stage: FailureStage, error: &(dyn std::error::Error + 'static)) {
+    lifecycle_event(LifecycleEvent::Failure {
+        stage,
+        os_code: error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::raw_os_error),
+    });
+}
+#[cfg(windows)]
+const WINDOWS_CLIENT_READ_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long shutdown waits for a worker thread before detaching it.
+///
+/// The pseudoterminal reader can be parked in a blocking read on a handle that
+/// only releases when the pseudoterminal closes, so shutdown must never join a
+/// worker unconditionally. The process is exiting either way, so detaching a
+/// straggler is strictly better than hanging forever.
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long shutdown waits for the shell to be reaped before giving up on it.
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+const GENERATION_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the daemon keeps draining pseudoterminal output after it observes
+/// that the shell exited, so the last screenful still reaches the client.
+#[cfg(windows)]
+const SHELL_EXIT_DRAIN: Duration = Duration::from_millis(250);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const CLIENT_QUEUE_CAPACITY: usize = 64;
+const CLIENT_FRAME_HEADER_BYTES: usize = 9;
+const CLIENT_FRAME_MAGIC: &[u8; 4] = b"FSD1";
+const CLIENT_FRAME_INPUT: u8 = 1;
+const CLIENT_FRAME_RESIZE: u8 = 2;
+const CLIENT_FRAME_RECOVERY_SYNC: u8 = 3;
+const CLIENT_FRAME_RECOVERY_ADOPTED: u8 = 4;
+const MAX_CLIENT_FRAME_BYTES: usize = 64 * 1024;
+const ATTACH_RECOVERY_DEADLINE: Duration = Duration::from_secs(15);
+const PTY_EVENT_CHANNEL_CAPACITY: usize = 64;
+
+#[cfg(any(windows, test))]
+const WINDOWS_ATTACHMENT_QUEUE_CAPACITY: usize = 16;
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsAttachmentAdmissionError {
+    Full,
+    Stopped,
+}
+
+#[cfg(any(windows, test))]
+struct WindowsAttachmentSender<S> {
+    attachments: mpsc::SyncSender<S>,
+    failure: mpsc::SyncSender<io::Error>,
+}
+
+#[cfg(any(windows, test))]
+struct WindowsAttachmentInbox<S> {
+    attachments: mpsc::Receiver<S>,
+    failure: mpsc::Receiver<io::Error>,
+}
+
+#[cfg(any(windows, test))]
+fn windows_attachment_queue<S>() -> (WindowsAttachmentSender<S>, WindowsAttachmentInbox<S>) {
+    let (attachments, receiver) = mpsc::sync_channel(WINDOWS_ATTACHMENT_QUEUE_CAPACITY);
+    // The broker reports one terminal failure; a full backlog must not hide it.
+    let (failure, failure_receiver) = mpsc::sync_channel(1);
+    (
+        WindowsAttachmentSender {
+            attachments,
+            failure,
+        },
+        WindowsAttachmentInbox {
+            attachments: receiver,
+            failure: failure_receiver,
+        },
+    )
+}
+
+#[cfg(any(windows, test))]
+impl<S> WindowsAttachmentSender<S> {
+    fn enqueue(&self, stream: S) -> Result<(), WindowsAttachmentAdmissionError> {
+        self.attachments
+            .try_send(stream)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(stream) => {
+                    drop(stream);
+                    WindowsAttachmentAdmissionError::Full
+                }
+                mpsc::TrySendError::Disconnected(stream) => {
+                    drop(stream);
+                    WindowsAttachmentAdmissionError::Stopped
+                }
+            })
+    }
+
+    fn report_failure(&self, error: io::Error) -> Result<(), mpsc::TrySendError<io::Error>> {
+        self.failure.try_send(error)
+    }
+}
+
+#[cfg(any(windows, test))]
+impl<S> WindowsAttachmentInbox<S> {
+    fn process_one(&self, adopt: impl FnOnce(S)) -> io::Result<()> {
+        match self.failure.try_recv() {
+            Ok(error) => return Err(error),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "named pipe listener stopped",
+                ));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        match self.attachments.try_recv() {
+            Ok(stream) => adopt(stream),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "named pipe attachment queue closed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spawn_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<String>,
+    name: String,
+    pid: u32,
+    socket: String,
+    shell: String,
+    #[serde(default)]
+    arguments: Vec<String>,
+    #[serde(default)]
+    working_directory: Option<String>,
+    cols: u16,
+    rows: u16,
+    #[serde(default = "default_scrollback_limit_bytes")]
+    scrollback_limit_bytes: usize,
+    created_at_unix_ms: u128,
+    #[serde(default)]
+    attached: bool,
+    #[serde(default)]
+    attached_by: Option<AttachKind>,
+    #[serde(default)]
+    attach_kinds: bool,
+    #[serde(default = "legacy_protocol_version")]
+    protocol_version: u16,
+    #[serde(default = "legacy_recovery_snapshot_schema_version")]
+    snapshot_schema_version: u16,
+    #[serde(default)]
+    helper_identity: Option<String>,
+}
+
+const fn legacy_protocol_version() -> u16 {
+    1
+}
+
+const fn legacy_recovery_snapshot_schema_version() -> u16 {
+    0
+}
+
+const fn default_scrollback_limit_bytes() -> usize {
+    festerm_core::DEFAULT_SCROLLBACK_LIMIT_BYTES
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SessionRegistry {
+    sessions: BTreeMap<String, SessionRecord>,
+    /// Records written by a helper this build cannot interpret.
+    ///
+    /// They are kept verbatim so updating one session never deletes another
+    /// release's session, and so their names stay reserved.
+    foreign: BTreeMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for SessionRegistry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Default, Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            sessions: BTreeMap<String, serde_json::Value>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let mut registry = SessionRegistry::default();
+        for (name, value) in raw.sessions {
+            match serde_json::from_value::<SessionRecord>(value.clone()) {
+                Ok(record) => {
+                    registry.sessions.insert(name, record);
+                }
+                Err(_) => {
+                    registry.foreign.insert(name, value);
+                }
+            }
+        }
+        Ok(registry)
+    }
+}
+
+impl Serialize for SessionRegistry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sessions = self.foreign.clone();
+        for (name, record) in &self.sessions {
+            let value = serde_json::to_value(record).map_err(serde::ser::Error::custom)?;
+            sessions.insert(name.clone(), value);
+        }
+        let mut registry = serializer.serialize_struct("SessionRegistry", 1)?;
+        registry.serialize_field("sessions", &sessions)?;
+        registry.end()
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CommandSpec {
+    Start {
+        name: String,
+        shell: ShellSpec,
+        cols: u16,
+        rows: u16,
+        scrollback_limit_bytes: usize,
+    },
+    Daemon {
+        name: String,
+        shell: ShellSpec,
+        cols: u16,
+        rows: u16,
+        scrollback_limit_bytes: usize,
+    },
+    List,
+    Kill {
+        name: String,
+    },
+    KillUnattached {
+        expected: festerm_sessiond::NativeSessionIdentity,
+    },
+    Attach {
+        name: String,
+    },
+}
+
+struct ParsedSessionOptions {
+    name: String,
+    shell: ShellSpec,
+    cols: u16,
+    rows: u16,
+    scrollback_limit_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShellSpec {
+    executable: String,
+    arguments: Vec<String>,
+    working_directory: Option<String>,
+}
+
+struct SpawnedShell {
+    child: Box<dyn portable_pty::Child + Send>,
+    /// The pseudoterminal master, kept in an [`Option`] so shutdown can close
+    /// it explicitly. On Windows the reader half of a ConPTY only reports end
+    /// of file once the pseudoconsole is closed, so a daemon that never drops
+    /// this handle can never observe the reader finishing.
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+}
+
+impl SpawnedShell {
+    fn master(&self) -> io::Result<&(dyn portable_pty::MasterPty + Send)> {
+        match self.master.as_deref() {
+            Some(master) => Ok(master),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the session pseudoterminal is closed",
+            )),
+        }
+    }
+
+    /// Closes the pseudoterminal so blocking readers observe end of file.
+    fn close_master(&mut self) {
+        self.master = None;
+    }
+
+    /// Terminates the shell and reaps it, without blocking forever if the
+    /// termination request does not take effect.
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let deadline = Instant::now() + CHILD_EXIT_TIMEOUT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if Instant::now() >= deadline => return,
+                Ok(None) => thread::sleep(CLIENT_POLL_INTERVAL),
+            }
+        }
+    }
+}
+
+impl Drop for SpawnedShell {
+    fn drop(&mut self) {
+        self.terminate();
+        self.close_master();
+    }
+}
+
+/// Resizes `master`, reporting a closed pseudoterminal as a broken pipe.
+///
+/// This takes the master directly rather than a [`SpawnedShell`] so callers can
+/// borrow the pseudoterminal and the child process independently.
+fn resize_master(
+    master: Option<&(dyn portable_pty::MasterPty + Send)>,
+    size: PtySize,
+) -> io::Result<()> {
+    match master {
+        Some(master) => master
+            .resize(size)
+            .map_err(|error| io::Error::other(error.to_string())),
+        None => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the session pseudoterminal is closed",
+        )),
+    }
+}
+
+fn resize_shadow_terminal(terminal: &mut Terminal, size: PtySize) -> io::Result<()> {
+    let dimensions = Dimensions::new(size.cols as usize, size.rows as usize)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    terminal
+        .resize(dimensions)
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+fn mirror_terminal_output(terminal: &mut Terminal, bytes: &[u8]) -> Vec<u8> {
+    terminal.ingest(bytes);
+    let replies = terminal.drain_replies();
+    let _ = terminal.drain_input();
+    let _ = terminal.take_reply_queue_overflowed();
+    let _ = terminal.take_input_queue_overflowed();
+    replies
+}
+
+fn apply_recovery_sync_command(
+    terminal: &mut Terminal,
+    command: &festerm_sessiond::RecoverySyncCommand,
+) {
+    match command {
+        festerm_sessiond::RecoverySyncCommand::SetScrollbackLimit { limit_bytes } => {
+            terminal.set_scrollback_limit(*limit_bytes);
+        }
+        festerm_sessiond::RecoverySyncCommand::SetColorScheme(scheme) => {
+            terminal.set_color_scheme(*scheme);
+        }
+        festerm_sessiond::RecoverySyncCommand::MirrorBytes(bytes) => {
+            let _ = mirror_terminal_output(terminal, bytes);
+        }
+        festerm_sessiond::RecoverySyncCommand::ResetToInitialState => {
+            terminal.reset_to_initial_state();
+            let _ = terminal.drain_replies();
+            let _ = terminal.drain_input();
+            let _ = terminal.take_reply_queue_overflowed();
+            let _ = terminal.take_input_queue_overflowed();
+        }
+    }
+}
+
+fn main() {
+    if let Err(error) = festerm_sessiond::cleanup_superseded_package_helpers() {
+        eprintln!("festerm-sessiond: could not clean up superseded helpers: {error}");
+    }
+    if let Err(error) = run() {
+        eprintln!("festerm-sessiond: {error}");
+        process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let spec = parse_args(env::args().skip(1).collect())?;
+    match spec {
+        CommandSpec::Start {
+            name,
+            shell,
+            cols,
+            rows,
+            scrollback_limit_bytes,
+        } => run_start(name, shell, cols, rows, scrollback_limit_bytes),
+        CommandSpec::Daemon {
+            name,
+            shell,
+            cols,
+            rows,
+            scrollback_limit_bytes,
+        } => run_daemon(name, shell, cols, rows, scrollback_limit_bytes),
+        CommandSpec::List => run_list(),
+        CommandSpec::Kill { name } => run_kill(name),
+        CommandSpec::KillUnattached { expected } => run_kill_unattached(expected),
+        CommandSpec::Attach { name } => run_attach(name),
+    }
+}
+
+fn parse_args(args: Vec<String>) -> Result<CommandSpec, Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        return Err(
+            "usage: festerm-sessiond <start|daemon|list|kill|kill-unattached|attach> ...".into(),
+        );
+    }
+
+    match args[0].as_str() {
+        "start" => parse_start(&args[1..]),
+        "daemon" => parse_daemon(&args[1..]),
+        "list" => {
+            if !args[1..].is_empty() {
+                return Err("list takes no additional arguments".into());
+            }
+            Ok(CommandSpec::List)
+        }
+        "kill" => {
+            let name = parse_name_only(&args[1..], "kill")?;
+            Ok(CommandSpec::Kill { name })
+        }
+        "kill-unattached" => {
+            let [name_flag, name, pid_flag, pid, created_flag, created, endpoint_flag, endpoint] =
+                &args[1..]
+            else {
+                return Err(
+                    "kill-unattached requires name, PID, creation time and endpoint".into(),
+                );
+            };
+            if name_flag != "--name"
+                || pid_flag != "--pid"
+                || created_flag != "--created-at"
+                || endpoint_flag != "--endpoint"
+            {
+                return Err("invalid kill-unattached identity arguments".into());
+            }
+            let pid = pid.parse::<u32>()?;
+            if pid == 0 || endpoint.is_empty() {
+                return Err("invalid kill-unattached identity".into());
+            }
+            Ok(CommandSpec::KillUnattached {
+                expected: festerm_sessiond::NativeSessionIdentity {
+                    name: validate_name(name.clone())?,
+                    pid,
+                    created_at_unix_ms: created.parse()?,
+                    endpoint: endpoint.clone(),
+                },
+            })
+        }
+        "attach" => {
+            let name = parse_name_only(&args[1..], "attach")?;
+            Ok(CommandSpec::Attach { name })
+        }
+        other => Err(format!("unknown command: {other}").into()),
+    }
+}
+
+fn parse_start(args: &[String]) -> Result<CommandSpec, Box<dyn std::error::Error>> {
+    let ParsedSessionOptions {
+        name,
+        shell,
+        cols,
+        rows,
+        scrollback_limit_bytes,
+    } = parse_session_options(args, "start")?;
+    Ok(CommandSpec::Start {
+        name,
+        shell,
+        cols,
+        rows,
+        scrollback_limit_bytes,
+    })
+}
+
+fn parse_daemon(args: &[String]) -> Result<CommandSpec, Box<dyn std::error::Error>> {
+    let ParsedSessionOptions {
+        name,
+        shell,
+        cols,
+        rows,
+        scrollback_limit_bytes,
+    } = parse_session_options(args, "daemon")?;
+    Ok(CommandSpec::Daemon {
+        name,
+        shell,
+        cols,
+        rows,
+        scrollback_limit_bytes,
+    })
+}
+
+fn parse_name_only(args: &[String], command: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if let [flag, name] = args {
+        if flag == "--name" {
+            return Ok(name.clone());
+        }
+    }
+    Err(format!("usage: festerm-sessiond {command} --name <id>").into())
+}
+
+fn parse_session_options(
+    args: &[String],
+    command: &str,
+) -> Result<ParsedSessionOptions, Box<dyn std::error::Error>> {
+    let mut name = None;
+    let mut shell = None;
+    let mut shell_arguments = Vec::new();
+    let mut working_directory = None;
+    let mut cols = None;
+    let mut rows = None;
+    let mut scrollback_limit_bytes = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let Some(value) = args.get(index + 1) else {
+            return Err(format!("{command} requires a value for {flag}").into());
+        };
+        match flag {
+            "--name" => set_once(&mut name, value.clone(), command, flag)?,
+            "--shell" => set_once(&mut shell, value.clone(), command, flag)?,
+            "--arg" => shell_arguments.push(value.clone()),
+            "--cwd" => set_once(&mut working_directory, value.clone(), command, flag)?,
+            "--cols" => {
+                let value = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("{command} requires a valid u16 for {flag}"))?;
+                set_once(&mut cols, value, command, flag)?;
+            }
+            "--rows" => {
+                let value = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("{command} requires a valid u16 for {flag}"))?;
+                set_once(&mut rows, value, command, flag)?;
+            }
+            "--scrollback-limit-bytes" => {
+                let value = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("{command} requires a valid usize for {flag}"))?;
+                set_once(&mut scrollback_limit_bytes, value, command, flag)?;
+            }
+            other => return Err(format!("{command} does not recognize {other}").into()),
+        }
+        index += 2;
+    }
+    Ok(ParsedSessionOptions {
+        name: name.ok_or_else(|| format!("{command} requires --name <value>"))?,
+        shell: match shell {
+            Some(executable) => ShellSpec {
+                executable,
+                arguments: shell_arguments,
+                working_directory,
+            },
+            None => {
+                if !shell_arguments.is_empty() {
+                    return Err(format!("{command} requires --shell with --arg").into());
+                }
+                let mut shell = default_shell();
+                shell.working_directory = working_directory;
+                shell
+            }
+        },
+        cols: cols.unwrap_or(80),
+        rows: rows.unwrap_or(24),
+        scrollback_limit_bytes: scrollback_limit_bytes
+            .unwrap_or(festerm_core::DEFAULT_SCROLLBACK_LIMIT_BYTES),
+    })
+}
+
+fn set_once<T>(
+    target: &mut Option<T>,
+    value: T,
+    command: &str,
+    flag: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if target.replace(value).is_some() {
+        return Err(format!("{command} received {flag} more than once").into());
+    }
+    Ok(())
+}
+
+fn default_shell() -> ShellSpec {
+    default_local_profile()
+        .map(|profile| ShellSpec {
+            executable: profile.executable().to_string_lossy().into_owned(),
+            arguments: profile
+                .arguments()
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect(),
+            working_directory: profile
+                .working_directory()
+                .map(|directory| directory.to_string_lossy().into_owned()),
+        })
+        .unwrap_or_else(|_| {
+            #[cfg(unix)]
+            {
+                ShellSpec {
+                    executable: "/bin/sh".to_owned(),
+                    arguments: vec!["-l".to_owned()],
+                    working_directory: None,
+                }
+            }
+            #[cfg(windows)]
+            {
+                ShellSpec {
+                    executable: "cmd.exe".to_owned(),
+                    arguments: vec!["/Q".to_owned()],
+                    working_directory: None,
+                }
+            }
+        })
+}
+
+fn run_start(
+    name: String,
+    shell: ShellSpec,
+    cols: u16,
+    rows: u16,
+    scrollback_limit_bytes: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = validate_name(name)?;
+    let runtime_root = festerm_sessiond::runtime_root()?;
+    if !runtime_root.exists() {
+        festerm_sessiond::prepare_native_runtime(&runtime_root)?;
+    }
+    fs::create_dir_all(&runtime_root)?;
+    set_dir_mode(&runtime_root, 0o700)?;
+
+    let start_lock = lock_session_file(&runtime_root, &name, "start")?;
+
+    with_registry_lock(|registry| {
+        if registry.foreign.contains_key(&name) {
+            return Err(format!(
+                "session '{name}' was registered by a newer festerm-sessiond; \
+                 this helper cannot read or replace that record"
+            )
+            .into());
+        }
+        if let Some(record) = registry.sessions.get(&name) {
+            if record_is_live(record)? {
+                if !festerm_sessiond::protocol_is_supported(record.protocol_version) {
+                    return Err(format!(
+                        "session '{name}' uses persistent-session protocol {}, but this helper supports {}",
+                        record.protocol_version,
+                        festerm_sessiond::PROTOCOL_VERSION
+                    )
+                    .into());
+                }
+                if record.protocol_version >= 2
+                    && !festerm_sessiond::snapshot_schema_is_supported(
+                        record.snapshot_schema_version,
+                    )
+                {
+                    return Err(format!(
+                        "session '{name}' uses recovery snapshot schema {}, but this helper supports schemas 2, 3 and {}",
+                        record.snapshot_schema_version,
+                        festerm_sessiond::RECOVERY_SNAPSHOT_SCHEMA_VERSION
+                    )
+                    .into());
+                }
+                return Err(format!("session '{name}' is already running").into());
+            }
+            cleanup_dead_generation(&runtime_root, record, true)?;
+            registry.sessions.remove(&name);
+        }
+        Ok(())
+    })?;
+
+    let packaged_exe = env::current_exe()?;
+    #[cfg(windows)]
+    let exe = festerm_sessiond::stage_windows_daemon(&packaged_exe, &runtime_root)?;
+    #[cfg(not(windows))]
+    let exe = packaged_exe;
+    // The parent must know the generation even if the child fails before
+    // publishing its registry record.
+    let generation = match env::var("FESTERM_SESSIOND_GENERATION") {
+        Ok(value) => value.parse::<u128>()?,
+        Err(env::VarError::NotPresent) => now_ms(),
+        Err(error) => return Err(error.into()),
+    };
+
+    #[cfg(unix)]
+    let mut daemon = {
+        let mut command = Command::new(&exe);
+        command
+            .env("FESTERM_SESSIOND_GENERATION", generation.to_string())
+            .arg("daemon")
+            .arg("--name")
+            .arg(&name)
+            .arg("--shell")
+            .arg(&shell.executable)
+            .arg("--cols")
+            .arg(cols.to_string())
+            .arg("--rows")
+            .arg(rows.to_string())
+            .arg("--scrollback-limit-bytes")
+            .arg(scrollback_limit_bytes.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for argument in &shell.arguments {
+            command.arg("--arg").arg(argument);
+        }
+        if let Some(working_directory) = &shell.working_directory {
+            command.arg("--cwd").arg(working_directory);
+        }
+        command.spawn()?
+    };
+
+    // Redirecting the daemon's own stdio (even to NUL) forces Windows to
+    // create it with bInheritHandles = TRUE, which duplicates *every*
+    // inheritable handle in this process into the daemon — not just the
+    // three we explicitly redirect. When this "start" helper's own stdout
+    // or stderr was piped by its caller (see `connect_or_start`, which
+    // reads `Command::output()` on this very process), that pipe's write
+    // end is inheritable, so the long-lived, deliberately detached daemon
+    // grandchild would otherwise inherit a duplicate write handle to it.
+    // Since the daemon never exits, that duplicate handle never closes,
+    // so the caller's blocking read of the pipe (waiting for EOF) hangs
+    // forever. Clearing the inherit flag on our own std handles before
+    // spawning the daemon prevents that leak.
+    #[cfg(windows)]
+    festerm_windows_security::disable_std_handle_inheritance();
+
+    #[cfg(windows)]
+    let mut daemon = {
+        // `CREATE_BREAKAWAY_FROM_JOB` fails with `ERROR_ACCESS_DENIED` (os
+        // error 5) whenever our own process is already a member of a job
+        // object that does not grant `JOB_OBJECT_LIMIT_BREAKAWAY_OK`. That is
+        // not a hypothetical: Cargo places `cargo run`/`cargo test` child
+        // processes in exactly such a job on Windows, and other launchers
+        // (sandboxes, some IDEs/service managers) do the same. Without a
+        // fallback, starting a persistent session from any of those contexts
+        // would fail outright instead of degrading gracefully. So: try to
+        // break away first (the common case, e.g. launched from the fesTerm
+        // GUI or an ordinary shell), and if that specific error occurs,
+        // retry without the flag — the daemon will then share our job and
+        // may die when it closes, but that is strictly better than refusing
+        // to start at all.
+        let build_command = |creation_flags: u32| {
+            let mut command = Command::new(&exe);
+            command
+                .env("FESTERM_SESSIOND_GENERATION", generation.to_string())
+                .env(
+                    "FESTERM_SESSIOND_BREAKAWAY",
+                    if creation_flags & CREATE_BREAKAWAY_FROM_JOB != 0 {
+                        "granted"
+                    } else {
+                        "denied"
+                    },
+                )
+                .arg("daemon")
+                .arg("--name")
+                .arg(&name)
+                .arg("--shell")
+                .arg(&shell.executable)
+                .arg("--cols")
+                .arg(cols.to_string())
+                .arg("--rows")
+                .arg(rows.to_string())
+                .arg("--scrollback-limit-bytes")
+                .arg(scrollback_limit_bytes.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(creation_flags);
+            for argument in &shell.arguments {
+                command.arg("--arg").arg(argument);
+            }
+            if let Some(working_directory) = &shell.working_directory {
+                command.arg("--cwd").arg(working_directory);
+            }
+            command
+        };
+
+        match build_command(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                eprintln!(
+                    "festerm-sessiond: could not break away from the current job object \
+                     (it likely disallows JOB_OBJECT_LIMIT_BREAKAWAY_OK); starting session \
+                     '{name}' without breakaway, so it may not outlive this process's job"
+                );
+                build_command(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS).spawn()?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let daemon_pid = daemon.id();
+
+    let registration = (|| -> Result<SessionRecord, Box<dyn std::error::Error>> {
+        // Report address errors to the caller rather than losing them with
+        // the detached daemon's stderr. The actual child PID determines length.
+        #[cfg(unix)]
+        session_socket_path(&runtime_root, &format!("{daemon_pid}-{}", now_ms()))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let registry = load_registry()?;
+            if let Some(record) = registry.sessions.get(&name) {
+                if record.pid == daemon_pid {
+                    return Ok(record.clone());
+                }
+            }
+            if let Some(status) = daemon.try_wait()? {
+                return Err(format!(
+                    "session daemon for '{name}' exited during startup with {status}"
+                )
+                .into());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("timed out waiting for session '{name}' to register").into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    })();
+    let record = match registration {
+        Ok(record) => record,
+        Err(error) => {
+            let record = generation_record(
+                &runtime_root,
+                GenerationRecordSpec {
+                    name: name.clone(),
+                    pid: daemon_pid,
+                    generation,
+                    shell: &shell,
+                    cols,
+                    rows,
+                    scrollback_limit_bytes,
+                },
+            )?;
+            let cleanup = cleanup_failed_start(&runtime_root, &mut daemon, &record);
+            return combine_cleanup_result(Err(error), cleanup);
+        }
+    };
+    FileExt::unlock(&start_lock)?;
+
+    println!(
+        "started {} pid={} socket={} shell={}",
+        name, record.pid, record.socket, record.shell
+    );
+    Ok(())
+}
+
+fn run_daemon(
+    name: String,
+    shell: ShellSpec,
+    cols: u16,
+    rows: u16,
+    scrollback_limit_bytes: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    nix::unistd::setsid()?;
+
+    let name = validate_name(name)?;
+    let runtime_root = festerm_sessiond::runtime_root()?;
+    if !runtime_root.exists() {
+        festerm_sessiond::prepare_native_runtime(&runtime_root)?;
+    }
+    fs::create_dir_all(&runtime_root)?;
+    set_dir_mode(&runtime_root, 0o700)?;
+    // Independent of the start-helper lock: that helper waits for registration.
+    // Also fences direct `daemon` invocation before it can spawn a second shell.
+    let _daemon_lock = lock_session_file(&runtime_root, &name, "daemon")?;
+    let registry = load_registry()?;
+    if registry.foreign.contains_key(&name)
+        || registry
+            .sessions
+            .get(&name)
+            .map(record_is_live)
+            .transpose()?
+            .unwrap_or(false)
+    {
+        return Err("native generation already running or unsupported".into());
+    }
+    let profile = festerm_pty::LocalProfile::new(&shell.executable)
+        .with_arguments(shell.arguments.iter().cloned());
+    let profile = match &shell.working_directory {
+        Some(cwd) => profile.with_working_directory(cwd),
+        None => profile,
+    };
+    let (shell, fingerprint) = match festerm_sessiond::normalize_spawn_profile(&profile) {
+        Ok(profile) => {
+            let fingerprint = festerm_sessiond::spawn_fingerprint(&profile)?;
+            let shell = ShellSpec {
+                executable: profile
+                    .executable()
+                    .to_str()
+                    .ok_or("unverifiable executable")?
+                    .into(),
+                arguments: profile
+                    .arguments()
+                    .iter()
+                    .map(|arg| {
+                        arg.to_str()
+                            .map(str::to_owned)
+                            .ok_or("unverifiable argument")
+                    })
+                    .collect::<Result<_, _>>()?,
+                working_directory: Some(
+                    profile
+                        .working_directory()
+                        .ok_or("unverifiable directory")?
+                        .to_str()
+                        .ok_or("unverifiable directory")?
+                        .into(),
+                ),
+            };
+            (shell, Some(fingerprint))
+        }
+        // Ordinary legacy launches retain their existing resolution behavior.
+        Err(_) => (shell, None),
+    };
+    if let Some(expected) = env::var_os("FESTERM_SESSIOND_EXPECTED_SPAWN") {
+        if expected.to_str() != fingerprint.as_deref() {
+            return Err("native spawn evidence changed before launch".into());
+        }
+    }
+    let generation = match env::var("FESTERM_SESSIOND_GENERATION") {
+        Ok(generation) => generation.parse::<u128>()?,
+        Err(env::VarError::NotPresent) => now_ms(),
+        Err(error) => return Err(error.into()),
+    };
+    let _ = DAEMON_GENERATION.set(generation);
+    let mut record = generation_record(
+        &runtime_root,
+        GenerationRecordSpec {
+            name: name.clone(),
+            pid: process::id(),
+            generation,
+            shell: &shell,
+            cols,
+            rows,
+            scrollback_limit_bytes,
+        },
+    )?;
+    record.spawn_fingerprint = fingerprint;
+    record.launch_request = match env::var("FESTERM_SESSIOND_LAUNCH_REQUEST") {
+        Ok(value) => {
+            let id = uuid::Uuid::parse_str(&value)?;
+            if id.get_version_num() != 4
+                || id.get_variant() != uuid::Variant::RFC4122
+                || id.hyphenated().to_string() != value
+            {
+                return Err("invalid native hosting launch request".into());
+            }
+            Some(value)
+        }
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err("invalid native hosting launch request".into()),
+    };
+    let identity = festerm_sessiond::NativeSessionIdentity {
+        name: name.clone(),
+        pid: record.pid,
+        created_at_unix_ms: generation,
+        endpoint: record.socket.clone(),
+    };
+    let _ = DAEMON_LOG.set((runtime_root.clone(), identity));
+    lifecycle_event(LifecycleEvent::Starting);
+    #[cfg(windows)]
+    match env::var("FESTERM_SESSIOND_BREAKAWAY").as_deref() {
+        Ok("granted") => lifecycle_event(LifecycleEvent::BreakawayGranted),
+        Ok("denied") => lifecycle_event(LifecycleEvent::BreakawayDenied),
+        _ => {}
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        lifecycle_event(LifecycleEvent::Panic);
+        previous(info);
+    }));
+    #[cfg(unix)]
+    session_socket_path(&runtime_root, &format!("{}-{generation}", process::id()))?;
+    let result = with_daemon_generation(&runtime_root, &record, |socket_owned| {
+        #[cfg(unix)]
+        {
+            let socket_path = Path::new(&record.socket);
+            let listener = bind_unix_listener(socket_path)?;
+            *socket_owned = true;
+            set_file_mode(socket_path, 0o600)?;
+            let mut spawned = spawn_shell(&shell, cols, rows, record.correlation_id.as_deref())
+                .inspect_err(|error| {
+                    lifecycle_failure(FailureStage::ShellSpawn, error.as_ref());
+                })?;
+            let mut terminal = Terminal::with_scrollback_limit(
+                Dimensions::new(cols as usize, rows as usize)?,
+                scrollback_limit_bytes,
+            )?;
+            save_registry_record(record.clone())?;
+            lifecycle_event(LifecycleEvent::Ready);
+            let reader = spawned.master()?.try_clone_reader()?;
+            let writer = spawned.master()?.take_writer()?;
+            daemon_client_loop(listener, reader, writer, &mut spawned, &name, &mut terminal)?;
+        }
+
+        #[cfg(windows)]
+        {
+            let _ = socket_owned;
+            let initial_listener = create_secure_pipe_listener(&record.socket, true)?;
+            let mut spawned = spawn_shell(&shell, cols, rows, record.correlation_id.as_deref())
+                .inspect_err(|error| {
+                    lifecycle_failure(FailureStage::ShellSpawn, error.as_ref());
+                })?;
+            let mut terminal = Terminal::with_scrollback_limit(
+                Dimensions::new(cols as usize, rows as usize)?,
+                scrollback_limit_bytes,
+            )?;
+            save_registry_record(record.clone())?;
+            lifecycle_event(LifecycleEvent::Ready);
+            let reader = spawned.master()?.try_clone_reader()?;
+            let writer = spawned.master()?.take_writer()?;
+            daemon_client_loop_windows(
+                &record.socket,
+                initial_listener,
+                reader,
+                writer,
+                &mut spawned,
+                &name,
+                &mut terminal,
+            )?;
+        }
+        lifecycle_event(LifecycleEvent::Stopping);
+        Ok(())
+    });
+    if let Err(error) = &result {
+        lifecycle_failure(FailureStage::Daemon, error.as_ref());
+    }
+    lifecycle_event(LifecycleEvent::Shutdown {
+        success: result.is_ok(),
+    });
+    result
+}
+
+struct GenerationRecordSpec<'a> {
+    name: String,
+    pid: u32,
+    generation: u128,
+    shell: &'a ShellSpec,
+    cols: u16,
+    rows: u16,
+    scrollback_limit_bytes: usize,
+}
+
+fn generation_record(
+    root: &Path,
+    spec: GenerationRecordSpec<'_>,
+) -> Result<SessionRecord, Box<dyn std::error::Error>> {
+    let GenerationRecordSpec {
+        name,
+        pid,
+        generation,
+        shell,
+        cols,
+        rows,
+        scrollback_limit_bytes,
+    } = spec;
+    let identity = format!("{pid}-{generation}");
+    #[cfg(unix)]
+    let socket = root
+        .join(format!("{identity}.sock"))
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(windows)]
+    let socket = {
+        let _ = root;
+        session_pipe_name(&identity)
+    };
+    Ok(SessionRecord {
+        spawn_fingerprint: None,
+        launch_request: None,
+        correlation_id: Some(format!("fesTerm:{pid}:{generation}")),
+        name,
+        pid,
+        socket,
+        shell: shell.executable.clone(),
+        arguments: shell.arguments.clone(),
+        working_directory: shell.working_directory.clone(),
+        cols,
+        rows,
+        scrollback_limit_bytes,
+        created_at_unix_ms: generation,
+        attached: false,
+        attached_by: None,
+        attach_kinds: true,
+        protocol_version: festerm_sessiond::PROTOCOL_VERSION,
+        snapshot_schema_version: festerm_sessiond::RECOVERY_SNAPSHOT_SCHEMA_VERSION,
+        helper_identity: env::current_exe().ok().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        }),
+    })
+}
+
+fn combine_cleanup_result(
+    result: Result<(), Box<dyn std::error::Error>>,
+    cleanup: Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match (result, cleanup) {
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup failed: {cleanup}").into()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn with_daemon_generation(
+    root: &Path,
+    record: &SessionRecord,
+    serve: impl FnOnce(&mut bool) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_artifact_root(root)?;
+    let lease_path = generation_lease_path(root, record);
+    let lease = match private_runtime_directory(root)? {
+        Some(directory) => festerm_sessiond::private_storage::open_private_file(
+            &directory,
+            Path::new(lease_path.file_name().ok_or("invalid lease")?),
+            true,
+        )?,
+        None => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lease_path)?,
+    };
+    let mut socket_owned = false;
+    let result = (|| {
+        lease.lock_exclusive()?;
+        set_file_mode(&lease_path, 0o600)?;
+        serve(&mut socket_owned)
+    })();
+    // Release before taking the registry lock: kill holds that lock while
+    // waiting for this generation's lease to become available.
+    drop(lease);
+    let cleanup = with_registry_lock(|registry| {
+        cleanup_dead_generation(root, record, socket_owned)?;
+        remove_registry_record_if_generation_matches(registry, record);
+        Ok(())
+    });
+    combine_cleanup_result(result, cleanup)
+}
+
+#[cfg(unix)]
+fn bind_unix_listener(path: &Path) -> io::Result<UnixListener> {
+    UnixListener::bind(path)
+}
+
+#[cfg(unix)]
+fn daemon_client_loop<R: Read + Send + 'static>(
+    listener: UnixListener,
+    reader: R,
+    mut writer: Box<dyn Write + Send>,
+    spawned: &mut SpawnedShell,
+    name: &str,
+    terminal: &mut Terminal,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pid = process::id();
+    let name_owned = name.to_owned();
+    let result = {
+        // Borrow the pseudoterminal and the child process separately so the
+        // command and shutdown closures below do not both borrow `spawned`.
+        let master = spawned.master.as_deref();
+        let child = &mut spawned.child;
+        session_client_loop(
+            listener,
+            reader,
+            None,
+            |command| match command {
+                ClientCommand::Input(data) => writer.write_all(&data).and_then(|()| writer.flush()),
+                ClientCommand::Resize(size) => resize_master(master, size),
+                ClientCommand::RecoverySync(_) | ClientCommand::RecoveryAdopted => Ok(()),
+            },
+            || {
+                let _ = child.kill();
+            },
+            attachment_reporter(name_owned, pid),
+            terminal,
+        )
+    };
+    if result.is_ok() {
+        if let Ok(Some(status)) = spawned.child.try_wait() {
+            lifecycle_event(LifecycleEvent::ShellExited {
+                code: status.exit_code(),
+            });
+        }
+    }
+    spawned.terminate();
+    spawned.close_master();
+    Ok(result?)
+}
+
+#[cfg(unix)]
+fn session_client_loop<R: Read + Send + 'static>(
+    listener: UnixListener,
+    reader: R,
+    observer: Option<mpsc::Sender<ClientLoopEvent>>,
+    mut handle_client_command: impl FnMut(ClientCommand) -> io::Result<()>,
+    mut shutdown: impl FnMut(),
+    mut on_attach_changed: impl FnMut(Option<AttachKind>) -> bool,
+    terminal: &mut Terminal,
+) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
+    let (pty_rx, reader_thread) = spawn_pty_reader(reader);
+    let (client_input_tx, client_input_rx) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+    let mut active: Option<ActiveClient> = None;
+    let mut retired_clients = Vec::new();
+    let mut next_generation = 1u64;
+    let mut attached_reported = None;
+    let mut pending = PendingOutput::default();
+    let result = loop {
+        if let Err(error) = reap_client_threads(&mut retired_clients) {
+            shutdown();
+            break Err(error);
+        }
+        retire_active_if_finished(&mut active, &mut retired_clients);
+        if let Err(error) = handle_pending_client_input(
+            &client_input_rx,
+            active.as_ref(),
+            terminal,
+            &mut pending,
+            &mut handle_client_command,
+        ) {
+            shutdown();
+            break Err(error);
+        }
+        // Output the client has not taken yet must be delivered before any more
+        // is consumed from the reader channel, so delivery stays ordered.
+        flush_pending_output(&mut active, &mut retired_clients, &mut pending);
+        if let Err(error) = accept_unix_clients(
+            &listener,
+            &mut active,
+            &mut retired_clients,
+            terminal,
+            observer.as_ref(),
+            &client_input_tx,
+            &mut next_generation,
+        ) {
+            shutdown();
+            break Err(error);
+        }
+        flush_pending_output(&mut active, &mut retired_clients, &mut pending);
+        if pending.is_pending() {
+            thread::sleep(CLIENT_POLL_INTERVAL);
+            continue;
+        }
+        match drain_ready_pty_output(
+            &pty_rx,
+            terminal,
+            observer.as_ref(),
+            &mut active,
+            &mut retired_clients,
+            &mut pending,
+            &mut handle_client_command,
+        ) {
+            Ok(Some(())) => break Ok(()),
+            Err(error) => {
+                shutdown();
+                break Err(error);
+            }
+            Ok(None) => {}
+        }
+        if pending.is_pending() {
+            thread::sleep(CLIENT_POLL_INTERVAL);
+            continue;
+        }
+        report_attach_state_change(
+            active.as_ref().map(|client| client.kind),
+            &mut attached_reported,
+            &mut on_attach_changed,
+        );
+        match pty_rx.recv_timeout(CLIENT_POLL_INTERVAL) {
+            Ok(PtyEvent::Data(data)) => {
+                let replies = mirror_terminal_output(terminal, &data);
+                if !replies.is_empty() {
+                    handle_client_command(ClientCommand::Input(replies))?;
+                }
+                if let Some(observer) = observer.as_ref() {
+                    let _ = observer.send(ClientLoopEvent::OutputBuffered);
+                }
+                send_to_active(&mut active, &mut retired_clients, &mut pending, data);
+                report_attach_state_change(
+                    active.as_ref().map(|client| client.kind),
+                    &mut attached_reported,
+                    &mut on_attach_changed,
+                );
+            }
+            Ok(PtyEvent::Eof) => {
+                send_control_to_active(
+                    &mut active,
+                    &mut retired_clients,
+                    &mut pending,
+                    ClientOutput::Exited,
+                );
+                break Ok(());
+            }
+            Ok(PtyEvent::Error(error)) => {
+                lifecycle_failure(FailureStage::PtyRead, &error);
+                break Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+        }
+    };
+
+    let result = result
+        .and_then(|()| finish_pending_output(&mut active, &mut retired_clients, &mut pending));
+    retire_active(&mut active, &mut retired_clients, false);
+    report_attach_state_change(None, &mut attached_reported, &mut on_attach_changed);
+    for client in retired_clients {
+        join_client_thread_within(client, WORKER_JOIN_TIMEOUT)?;
+    }
+    join_io_thread_within(reader_thread, WORKER_JOIN_TIMEOUT)?;
+    result
+}
+
+fn report_attach_state_change(
+    currently_attached: Option<AttachKind>,
+    previously_reported: &mut Option<AttachKind>,
+    on_change: &mut impl FnMut(Option<AttachKind>) -> bool,
+) {
+    if currently_attached != *previously_reported && on_change(currently_attached) {
+        *previously_reported = currently_attached;
+    }
+}
+
+/// An accepted socket inherits `O_NONBLOCK` from the nonblocking listener on
+/// macOS/BSD, which makes the read timeout a no-op and turns the client I/O
+/// loop into a busy loop. Force blocking mode so the timeouts apply.
+#[cfg(unix)]
+fn configure_accepted_client_stream(stream: &UnixStream) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(CLIENT_POLL_INTERVAL))?;
+    stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))
+}
+
+#[cfg(unix)]
+fn accept_unix_clients(
+    listener: &UnixListener,
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    terminal: &Terminal,
+    observer: Option<&mpsc::Sender<ClientLoopEvent>>,
+    client_input_tx: &mpsc::SyncSender<ClientInput>,
+    next_generation: &mut u64,
+) -> io::Result<()> {
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                configure_accepted_client_stream(&stream)?;
+                let Some((recovery_limit, kind)) = admit_client(&mut stream, active)? else {
+                    continue;
+                };
+                if let Err(error) = replace_active_limited(
+                    active,
+                    retired_clients,
+                    stream,
+                    terminal,
+                    client_input_tx.clone(),
+                    next_generation,
+                    recovery_limit,
+                    kind,
+                ) {
+                    eprintln!("fesTerm rejected a replacement session client: {error}");
+                    return Ok(());
+                }
+                if let Some(observer) = observer {
+                    let _ = observer.send(ClientLoopEvent::ClientAttached);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientLoopEvent {
+    #[cfg(unix)]
+    ClientAttached,
+    OutputBuffered,
+}
+
+fn attachment_reporter(name: String, pid: u32) -> impl FnMut(Option<AttachKind>) -> bool {
+    let mut retry_after = Instant::now();
+    move |attached| {
+        if Instant::now() < retry_after {
+            return false;
+        }
+        match set_registry_attached(&name, pid, attached) {
+            Ok(()) => true,
+            Err(error) => {
+                sessiond_trace(format_args!("could not publish attachment state: {error}"));
+                retry_after = Instant::now() + Duration::from_millis(500);
+                false
+            }
+        }
+    }
+}
+
+fn set_registry_attached(
+    name: &str,
+    pid: u32,
+    attached: Option<AttachKind>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    with_registry_lock(|registry: &mut SessionRegistry| {
+        if let Some(record) = registry.sessions.get_mut(name) {
+            if record.pid == pid {
+                record.attached = attached.is_some();
+                record.attached_by = attached;
+            }
+        }
+        Ok(())
+    })
+}
+
+#[cfg(windows)]
+fn daemon_client_loop_windows<R: Read + Send + 'static>(
+    pipe_name: &str,
+    initial_listener: PipeListener,
+    reader: R,
+    mut writer: Box<dyn Write + Send>,
+    spawned: &mut SpawnedShell,
+    name: &str,
+    terminal: &mut Terminal,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let accept_cancelled = Arc::new(AtomicBool::new(false));
+    let (accept_rx, accept_thread) = spawn_windows_attachment_listener(
+        pipe_name,
+        initial_listener,
+        Arc::clone(&accept_cancelled),
+    );
+
+    let (pty_rx, reader_thread) = spawn_pty_reader(reader);
+    let (client_input_tx, client_input_rx) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+    let mut active: Option<ActiveClient> = None;
+    let mut retired_clients = Vec::new();
+    let mut next_generation = 1u64;
+    let mut attached_reported = None;
+    let pid = process::id();
+    let name_owned = name.to_owned();
+    let mut on_attach_changed = attachment_reporter(name_owned, pid);
+    let mut shell_exited_at: Option<Instant> = None;
+    let mut pending = PendingOutput::default();
+    let result = loop {
+        // Windows keeps the pseudoconsole open for as long as this process
+        // holds the master handle, so the pseudoterminal reader never reports
+        // end of file when the shell exits. Poll the child directly instead;
+        // without this the daemon outlives its shell forever and the launcher
+        // keeps offering a session that can be attached but never responds.
+        if shell_exited_at.is_none() {
+            match spawned.child.try_wait() {
+                Ok(Some(status)) => {
+                    sessiond_trace(format_args!("shell exited: {status:?}"));
+                    lifecycle_event(LifecycleEvent::ShellExited {
+                        code: status.exit_code(),
+                    });
+                    shell_exited_at = Some(Instant::now());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    lifecycle_failure(FailureStage::ShellWait, &error);
+                    break Err(error);
+                }
+            }
+        }
+        if shell_exited_at.is_some_and(|exited_at| exited_at.elapsed() >= SHELL_EXIT_DRAIN) {
+            send_control_to_active(
+                &mut active,
+                &mut retired_clients,
+                &mut pending,
+                ClientOutput::Exited,
+            );
+            break Ok(());
+        }
+        if let Err(error) = reap_client_threads(&mut retired_clients) {
+            let _ = spawned.child.kill();
+            break Err(error);
+        }
+        retire_active_if_finished(&mut active, &mut retired_clients);
+        if let Err(error) = handle_pending_client_input(
+            &client_input_rx,
+            active.as_ref(),
+            terminal,
+            &mut pending,
+            &mut |command| match command {
+                ClientCommand::Input(data) => writer.write_all(&data).and_then(|()| writer.flush()),
+                ClientCommand::Resize(size) => resize_master(spawned.master.as_deref(), size),
+                ClientCommand::RecoverySync(_) | ClientCommand::RecoveryAdopted => Ok(()),
+            },
+        ) {
+            let _ = spawned.child.kill();
+            break Err(error);
+        }
+        // Accept before checking backpressure so a stalled client can be replaced.
+        if let Err(error) = accept_windows_clients(
+            &accept_rx,
+            &mut active,
+            &mut retired_clients,
+            terminal,
+            &client_input_tx,
+            &mut next_generation,
+        ) {
+            let _ = spawned.child.kill();
+            break Err(error);
+        }
+        // Deliver parked output before consuming more from the reader channel.
+        flush_pending_output(&mut active, &mut retired_clients, &mut pending);
+        if pending.is_pending() {
+            thread::sleep(CLIENT_POLL_INTERVAL);
+            continue;
+        }
+        match drain_ready_pty_output(
+            &pty_rx,
+            terminal,
+            None,
+            &mut active,
+            &mut retired_clients,
+            &mut pending,
+            &mut |command| match command {
+                ClientCommand::Input(data) => writer.write_all(&data).and_then(|()| writer.flush()),
+                ClientCommand::Resize(size) => resize_master(spawned.master.as_deref(), size),
+                ClientCommand::RecoverySync(_) | ClientCommand::RecoveryAdopted => Ok(()),
+            },
+        ) {
+            Ok(Some(())) => break Ok(()),
+            Err(error) => {
+                let _ = spawned.child.kill();
+                break Err(error);
+            }
+            Ok(None) => {}
+        }
+        if pending.is_pending() {
+            thread::sleep(CLIENT_POLL_INTERVAL);
+            continue;
+        }
+        report_attach_state_change(
+            active.as_ref().map(|client| client.kind),
+            &mut attached_reported,
+            &mut on_attach_changed,
+        );
+        match pty_rx.recv_timeout(CLIENT_POLL_INTERVAL) {
+            Ok(PtyEvent::Data(data)) => {
+                let replies = mirror_terminal_output(terminal, &data);
+                if !replies.is_empty() {
+                    writer.write_all(&replies).and_then(|()| writer.flush())?;
+                }
+                send_to_active(&mut active, &mut retired_clients, &mut pending, data);
+                report_attach_state_change(
+                    active.as_ref().map(|client| client.kind),
+                    &mut attached_reported,
+                    &mut on_attach_changed,
+                );
+            }
+            Ok(PtyEvent::Eof) => {
+                send_control_to_active(
+                    &mut active,
+                    &mut retired_clients,
+                    &mut pending,
+                    ClientOutput::Exited,
+                );
+                break Ok(());
+            }
+            Ok(PtyEvent::Error(error)) => {
+                lifecycle_failure(FailureStage::PtyRead, &error);
+                break Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+        }
+    };
+
+    accept_cancelled.store(true, Ordering::Release);
+    drop(accept_rx);
+    sessiond_trace(format_args!("shutdown: loop ended: {result:?}"));
+    let result = result
+        .and_then(|()| finish_pending_output(&mut active, &mut retired_clients, &mut pending));
+    retire_active(&mut active, &mut retired_clients, false);
+    report_attach_state_change(None, &mut attached_reported, &mut on_attach_changed);
+    // The shell must not outlive the daemon that owns its pseudoterminal, and
+    // closing the pseudoconsole is what finally lets the reader see end of
+    // file. Both have to happen before any worker thread is joined.
+    spawned.terminate();
+    spawned.close_master();
+    let reader_result = join_io_thread_within(reader_thread, WORKER_JOIN_TIMEOUT);
+    let accept_result = join_io_thread_within(accept_thread, WORKER_JOIN_TIMEOUT);
+    let client_result = retired_clients
+        .into_iter()
+        .try_for_each(|client| join_client_thread_within(client, WORKER_JOIN_TIMEOUT));
+    sessiond_trace("shutdown: complete");
+    reader_result?;
+    accept_result?;
+    client_result?;
+    result.map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn create_secure_pipe_listener(pipe_name: &str, first: bool) -> io::Result<PipeListener> {
+    let guard = festerm_windows_security::restrict_default_dacl_to_current_user()?;
+    let listener = PipeListener::bind(pipe_name, first)?;
+    guard.restore()?;
+    Ok(listener)
+}
+
+#[cfg(windows)]
+fn spawn_windows_attachment_listener(
+    pipe_name: &str,
+    initial_listener: PipeListener,
+    accept_stopped: Arc<AtomicBool>,
+) -> (
+    WindowsAttachmentInbox<Pipe>,
+    thread::JoinHandle<io::Result<()>>,
+) {
+    let (accept_tx, accept_rx) = windows_attachment_queue();
+    let pipe_name = pipe_name.to_owned();
+    let accept_thread = thread::spawn(move || -> io::Result<()> {
+        let mut initial_listener = Some(initial_listener);
+        while !accept_stopped.load(Ordering::Acquire) {
+            let server = match initial_listener.take() {
+                Some(listener) => listener.accept(&accept_stopped),
+                None => {
+                    match create_secure_pipe_listener(&pipe_name, false) {
+                        Ok(listener) => listener.accept(&accept_stopped),
+                        Err(_) if accept_stopped.load(Ordering::Acquire) => break,
+                        Err(error) => {
+                            let forwarded = io::Error::new(
+                                error.kind(),
+                                format!("named pipe listener could not be created: {error}"),
+                            );
+                            if let Err(error) = accept_tx.report_failure(forwarded) {
+                                sessiond_trace(format_args!(
+                                    "listener failure reporting failed: {error}"
+                                ));
+                                eprintln!("fesTerm could not report its session listener failure: {error}");
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+            };
+            let server = match server {
+                Ok(server) => server,
+                Err(_) if accept_stopped.load(Ordering::Acquire) => break,
+                Err(error) => {
+                    let forwarded =
+                        io::Error::new(error.kind(), format!("named pipe accept failed: {error}"));
+                    if let Err(error) = accept_tx.report_failure(forwarded) {
+                        sessiond_trace(format_args!("listener failure reporting failed: {error}"));
+                        eprintln!("fesTerm could not report its session listener failure: {error}");
+                    }
+                    return Err(error);
+                }
+            };
+            if accept_stopped.load(Ordering::Acquire) {
+                break;
+            }
+            match accept_tx.enqueue(server) {
+                Ok(()) => {}
+                Err(WindowsAttachmentAdmissionError::Full) => {
+                    sessiond_trace(format_args!(
+                        "rejected replacement client: attachment queue full ({WINDOWS_ATTACHMENT_QUEUE_CAPACITY})"
+                    ));
+                    eprintln!(
+                        "fesTerm rejected a replacement session connection: all {WINDOWS_ATTACHMENT_QUEUE_CAPACITY} waiting slots are full; retry attachment"
+                    );
+                }
+                Err(WindowsAttachmentAdmissionError::Stopped)
+                    if accept_stopped.load(Ordering::Acquire) =>
+                {
+                    break;
+                }
+                Err(WindowsAttachmentAdmissionError::Stopped) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "accept loop closed",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    });
+    (accept_rx, accept_thread)
+}
+
+#[cfg(windows)]
+fn accept_windows_clients(
+    accept_rx: &WindowsAttachmentInbox<Pipe>,
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    terminal: &Terminal,
+    client_input_tx: &mpsc::SyncSender<ClientInput>,
+    next_generation: &mut u64,
+) -> io::Result<()> {
+    accept_rx.process_one(|mut stream| {
+        sessiond_trace("accept_windows_clients: new client");
+        stream.set_read_timeout(WINDOWS_CLIENT_READ_TIMEOUT);
+        stream.set_write_timeout(CLIENT_WRITE_TIMEOUT);
+        let (recovery_limit, kind) = match admit_client(&mut stream, active) {
+            Ok(Some(admitted)) => admitted,
+            _ => return,
+        };
+        if let Err(error) = replace_active_limited(
+            active,
+            retired_clients,
+            stream,
+            terminal,
+            client_input_tx.clone(),
+            next_generation,
+            recovery_limit,
+            kind,
+        ) {
+            eprintln!("fesTerm rejected a replacement session client: {error}");
+        }
+    })
+}
+
+fn spawn_pty_reader<R: Read + Send + 'static>(
+    mut reader: R,
+) -> (mpsc::Receiver<PtyEvent>, thread::JoinHandle<io::Result<()>>) {
+    let (sender, receiver) = mpsc::sync_channel(PTY_EVENT_CHANNEL_CAPACITY);
+    let thread = thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    sessiond_trace("pty-reader: eof");
+                    let _ = sender.send(PtyEvent::Eof);
+                    return Ok(());
+                }
+                Ok(count) => {
+                    sessiond_trace(format_args!("pty-reader: read {count} bytes"));
+                    if sender
+                        .send(PtyEvent::Data(buffer[..count].to_vec()))
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    sessiond_trace(format_args!("pty-reader: error {error}"));
+                    let kind = error.kind();
+                    let message = error.to_string();
+                    let _ = sender.send(PtyEvent::Error(io::Error::new(kind, message)));
+                    return Ok(());
+                }
+            }
+        }
+    });
+    (receiver, thread)
+}
+
+#[derive(Debug)]
+enum ClientCommand {
+    Input(Vec<u8>),
+    Resize(PtySize),
+    RecoverySync(festerm_sessiond::RecoverySyncCommand),
+    RecoveryAdopted,
+}
+
+#[derive(Debug)]
+struct ClientInput {
+    generation: u64,
+    command: ClientCommand,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClientOutput {
+    Data(Vec<u8>),
+    RecoverySync(Vec<u8>),
+    ResizeApplied(PtySize),
+    Exited,
+}
+
+struct ActiveClient {
+    generation: u64,
+    kind: AttachKind,
+    output: mpsc::SyncSender<ClientOutput>,
+    stolen: Arc<AtomicBool>,
+    thread: thread::JoinHandle<io::Result<()>>,
+}
+
+#[cfg(all(test, windows))]
+fn replace_active<S: Read + Write + Send + 'static>(
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    replacement: S,
+    terminal: &Terminal,
+    input: mpsc::SyncSender<ClientInput>,
+    next_generation: &mut u64,
+) -> io::Result<()> {
+    replace_active_limited(
+        active,
+        retired_clients,
+        replacement,
+        terminal,
+        input,
+        next_generation,
+        usize::MAX,
+        AttachKind::Local,
+    )
+}
+
+/// This runs on the sole daemon admission loop, not an independent registry
+/// check. No other client can become active between refusal and replacement.
+fn admit_client(
+    stream: &mut (impl Read + Write),
+    active: &Option<ActiveClient>,
+) -> io::Result<Option<(usize, AttachKind)>> {
+    let mut request = [0; festerm_sessiond::ADMISSION_BYTES];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut offset = 0;
+    while offset < request.len() && Instant::now() < deadline {
+        match stream.read(&mut request[offset..]) {
+            Ok(0) => return Ok(None),
+            Ok(count) => offset += count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let limit = u32::from_be_bytes(request[25..29].try_into().expect("fixed admission"));
+    let header = (offset == request.len())
+        .then(|| festerm_sessiond::decode_admission_header(&request))
+        .flatten();
+    let admitted = header.filter(|&(takeover, kind)| {
+        let generation = *DAEMON_GENERATION.get().unwrap_or(&0);
+        let expected = if request[3] == b'4' {
+            festerm_sessiond::encode_admission_for(process::id(), generation, takeover, kind, limit)
+        } else {
+            festerm_sessiond::encode_admission(process::id(), generation, takeover, limit)
+        };
+        request == expected
+    });
+    let occupied = active
+        .as_ref()
+        .is_some_and(|client| !client.thread.is_finished());
+    let Some((_, kind)) = admitted.filter(|&(takeover, _)| takeover || !occupied) else {
+        stream.write_all(&[0])?;
+        return Ok(None);
+    };
+    let limit = limit as usize;
+    if limit == 0 {
+        stream.write_all(&[0])?;
+        return Ok(None);
+    }
+    stream.write_all(&[1])?;
+    Ok(Some((limit.min(768 * 1024 * 1024), kind)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_active_limited<S: Read + Write + Send + 'static>(
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    replacement: S,
+    terminal: &Terminal,
+    input: mpsc::SyncSender<ClientInput>,
+    next_generation: &mut u64,
+    recovery_limit: usize,
+    kind: AttachKind,
+) -> io::Result<()> {
+    let recovery = festerm_sessiond::encode_recovery_snapshot_with_limit(terminal, recovery_limit)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let generation = *next_generation;
+    sessiond_trace(format_args!("replace_active: generation={generation}"));
+    let (output, output_rx) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+    let (adopted_tx, adopted_rx) = mpsc::sync_channel(1);
+    let stolen = Arc::new(AtomicBool::new(false));
+    let worker_stolen = Arc::clone(&stolen);
+    let thread = thread::Builder::new()
+        .name(format!("festerm-sessiond-client-{generation}"))
+        .spawn(move || {
+            let result = client_io_loop(
+                replacement,
+                generation,
+                recovery,
+                input,
+                output_rx,
+                worker_stolen,
+                Some(adopted_tx),
+            );
+            if let Err(error) = &result {
+                sessiond_trace(format_args!(
+                    "client_io_loop[{generation}]: worker exited with error: {error}"
+                ));
+            }
+            result
+        })?;
+    if let Err(error) = adopted_rx.recv_timeout(ATTACH_RECOVERY_DEADLINE) {
+        stolen.store(true, Ordering::Release);
+        drop(output);
+        retired_clients.push(thread);
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("replacement did not adopt its recovery snapshot: {error}"),
+        ));
+    }
+    retire_active(active, retired_clients, true);
+    *next_generation = next_generation.wrapping_add(1);
+    let client = ActiveClient {
+        generation,
+        kind,
+        output,
+        stolen,
+        thread,
+    };
+    *active = Some(client);
+    Ok(())
+}
+
+fn retire_active(
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    stolen: bool,
+) {
+    if let Some(previous) = active.take() {
+        // The store must precede the drop: `client_io_loop`'s disconnect paths
+        // re-read this flag to decide whether the retired client is owed a
+        // notice, and they only run once the sender below is gone.
+        previous.stolen.store(stolen, Ordering::Release);
+        drop(previous.output);
+        retired_clients.push(previous.thread);
+    }
+}
+
+/// Retires `active` if its I/O thread has already exited on its own (e.g.
+/// the client disconnected after reading `Ok(0)`/EOF from the socket).
+///
+/// [`send_to_active`] is the *other* place a dead client gets noticed, but
+/// it only runs when the pty produces new output to relay. A client whose
+/// process was killed while its shell sits idle (no output at all) would
+/// otherwise never be detected: the socket has already closed and the I/O
+/// thread has returned, but nothing pushes data through `client.output` to
+/// surface that via a failed `try_send`. Left unnoticed, `active` (and thus
+/// the on-disk registry's `attached` flag surfaced by
+/// `list_unattached_local_sessions` in `festerm-sessiond`'s library crate)
+/// stays `true` forever, hiding a perfectly resumable session from the
+/// Launcher's "resume" list. Since this is checked once per main-loop
+/// iteration, which runs at least every `CLIENT_POLL_INTERVAL`, a dead
+/// client is noticed within one poll interval regardless of pty activity.
+fn retire_active_if_finished(
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+) {
+    if active
+        .as_ref()
+        .is_some_and(|client| client.thread.is_finished())
+    {
+        retire_active(active, retired_clients, false);
+    }
+}
+
+fn send_to_active(
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    pending: &mut PendingOutput,
+    data: Vec<u8>,
+) {
+    sessiond_trace(format_args!(
+        "send_to_active: {} bytes, active_present={}",
+        data.len(),
+        active.is_some()
+    ));
+    pending.hold(active.as_ref().map(|client| client.generation), data);
+    flush_pending_output(active, retired_clients, pending);
+}
+
+fn send_control_to_active(
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    pending: &mut PendingOutput,
+    output: ClientOutput,
+) {
+    pending.hold_output(active.as_ref().map(|client| client.generation), output);
+    flush_pending_output(active, retired_clients, pending);
+}
+
+/// Output that has been read from the pseudoterminal but not yet accepted by
+/// the attached client.
+///
+/// A client's queue is bounded, so any client that briefly stops reading will
+/// fill it: the GUI drains session output on its frame loop, and one long frame
+/// (or a burst larger than the queue) is enough. Dropping the client there
+/// turned ordinary backpressure into a lost session, so the main loop parks
+/// the chunk here instead and stops consuming its reader channel until the
+/// client takes it. The PTY-reader channel is also bounded, so a slow client
+/// eventually backpressures the pseudoterminal rather than growing an
+/// unbounded in-memory backlog.
+#[derive(Default)]
+struct PendingOutput {
+    /// The chunk awaiting delivery, and the client generation it was produced
+    /// for. Output parked for a client that has since been replaced is dropped
+    /// rather than delivered, because the replacement already received a fresh
+    /// recovery snapshot that includes it.
+    held: VecDeque<(u64, ClientOutput)>,
+}
+
+impl PendingOutput {
+    fn is_pending(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    fn hold(&mut self, generation: Option<u64>, data: Vec<u8>) {
+        self.hold_output(generation, ClientOutput::Data(data));
+    }
+
+    fn hold_output(&mut self, generation: Option<u64>, output: ClientOutput) {
+        let Some(generation) = generation else {
+            // With no client attached the authoritative recovery terminal
+            // already reflects this output, so there is nothing to deliver.
+            return;
+        };
+        assert!(
+            self.held.len() <= CLIENT_QUEUE_CAPACITY,
+            "bounded pending output overflow"
+        );
+        self.held.push_back((generation, output));
+    }
+}
+
+/// Tries once to hand any parked output to the attached client.
+///
+/// Only a client that is *gone* is retired here. A client that is merely full
+/// keeps its session and its place in the stream.
+fn flush_pending_output(
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    pending: &mut PendingOutput,
+) {
+    while let Some((generation, output)) = pending.held.pop_front() {
+        let Some(client) = active.as_ref() else {
+            continue;
+        };
+        if client.generation != generation {
+            continue;
+        }
+        match client.output.try_send(output) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(output)) => {
+                pending.held.push_front((generation, output));
+                break;
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                retire_active(active, retired_clients, false);
+            }
+        }
+    }
+}
+
+fn finish_pending_output(
+    active: &mut Option<ActiveClient>,
+    retired: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    pending: &mut PendingOutput,
+) -> io::Result<()> {
+    let deadline = Instant::now() + WORKER_JOIN_TIMEOUT;
+    while pending.is_pending() {
+        flush_pending_output(active, retired, pending);
+        if pending.is_pending() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "final session output remained blocked",
+                ));
+            }
+            thread::sleep(CLIENT_POLL_INTERVAL);
+        }
+    }
+    Ok(())
+}
+
+fn drain_ready_pty_output(
+    pty_rx: &mpsc::Receiver<PtyEvent>,
+    terminal: &mut Terminal,
+    observer: Option<&mpsc::Sender<ClientLoopEvent>>,
+    active: &mut Option<ActiveClient>,
+    retired_clients: &mut Vec<thread::JoinHandle<io::Result<()>>>,
+    pending: &mut PendingOutput,
+    handle: &mut impl FnMut(ClientCommand) -> io::Result<()>,
+) -> io::Result<Option<()>> {
+    // A bounded channel can stay full while its producer refills it. Yield to
+    // client acceptance and input handling even when PTY output never pauses.
+    for _ in 0..PTY_EVENT_CHANNEL_CAPACITY {
+        if pending.is_pending() {
+            break;
+        }
+        match pty_rx.try_recv() {
+            Ok(PtyEvent::Data(data)) => {
+                let replies = mirror_terminal_output(terminal, &data);
+                if !replies.is_empty() {
+                    handle(ClientCommand::Input(replies))?;
+                }
+                if let Some(observer) = observer {
+                    let _ = observer.send(ClientLoopEvent::OutputBuffered);
+                }
+                send_to_active(active, retired_clients, pending, data);
+            }
+            Ok(PtyEvent::Eof) => {
+                send_control_to_active(active, retired_clients, pending, ClientOutput::Exited);
+                return Ok(Some(()));
+            }
+            Ok(PtyEvent::Error(error)) => return Err(error),
+            Err(mpsc::TryRecvError::Empty) => return Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => return Ok(Some(())),
+        }
+    }
+    Ok(None)
+}
+
+fn handle_pending_client_input(
+    input: &mpsc::Receiver<ClientInput>,
+    active: Option<&ActiveClient>,
+    terminal: &mut Terminal,
+    pending: &mut PendingOutput,
+    handle: &mut impl FnMut(ClientCommand) -> io::Result<()>,
+) -> io::Result<()> {
+    for input in input
+        .try_iter()
+        .take(CLIENT_QUEUE_CAPACITY.saturating_sub(pending.held.len()))
+    {
+        if active.is_some_and(|client| client.generation == input.generation)
+            || matches!(&input.command, ClientCommand::RecoverySync(_))
+        {
+            match input.command {
+                ClientCommand::Input(data) => handle(ClientCommand::Input(data))?,
+                ClientCommand::Resize(size) => {
+                    handle(ClientCommand::Resize(size))?;
+                    resize_shadow_terminal(terminal, size)?;
+                    pending.hold_output(
+                        active.map(|client| client.generation),
+                        ClientOutput::ResizeApplied(size),
+                    );
+                }
+                ClientCommand::RecoverySync(command) => {
+                    apply_recovery_sync_command(terminal, &command);
+                    if let Some(active) = active {
+                        let payload = festerm_sessiond::encode_recovery_sync_command(&command)
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                        pending.hold_output(
+                            Some(active.generation),
+                            ClientOutput::RecoverySync(payload),
+                        );
+                    }
+                }
+                ClientCommand::RecoveryAdopted => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Advances an output chunk without preventing the worker from reading input.
+/// A timeout or a completed byte budget yields with the offset intact; neither
+/// disconnects the client nor repeats bytes already delivered.
+fn write_to_client<S: Write>(
+    stream: &mut S,
+    data: &[u8],
+    written: &mut usize,
+    stolen: &AtomicBool,
+) -> io::Result<bool> {
+    let mut budget = MAX_CLIENT_FRAME_BYTES;
+    while *written < data.len() {
+        if budget == 0 || stolen.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let end = data.len().min(*written + budget);
+        match stream.write(&data[*written..end]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "session client accepted no bytes",
+                ))
+            }
+            Ok(count) => {
+                *written += count;
+                budget -= count;
+            }
+            Err(error) if is_retryable_client_write(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    // Named-pipe flush waits for the peer to drain, without the write timeout.
+    #[cfg(not(windows))]
+    match stream.flush() {
+        Ok(()) => {}
+        Err(error) if is_retryable_client_write(&error) => {}
+        Err(error) => return Err(error),
+    }
+    Ok(true)
+}
+
+fn is_retryable_client_write(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+fn write_stolen_notice<S: Write>(stream: &mut S) -> io::Result<()> {
+    stream.write_all(&festerm_sessiond::encode_server_stolen_frame())?;
+    #[cfg(not(windows))]
+    stream.flush()?;
+    Ok(())
+}
+
+/// Decides how a worker exits once one of the daemon's channels has closed.
+///
+/// [`retire_active`] sets `stolen` and *then* drops the channels, so a worker
+/// that passed its `stolen` check microseconds before the takeover observes the
+/// disconnect rather than the flag. Re-checking here keeps the invariant that a
+/// stolen client is owed exactly one notice, while an ordinary daemon shutdown
+/// (flag clear, as in the failed-attach path of [`replace_active`]) still exits
+/// silently instead of fabricating one.
+fn finish_disconnected_client<S: Write>(stream: &mut S, stolen: &AtomicBool) -> io::Result<()> {
+    if !stolen.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    write_stolen_notice(stream)
+}
+
+// Test seam that makes the takeover race above reproducible: it runs in the
+// window between the worker's `stolen` check and its `output` poll, which is
+// otherwise too narrow to schedule deterministically. Compiled away entirely
+// outside tests.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_OUTPUT_POLL: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_before_output_poll_hook(hook: impl FnMut() + 'static) {
+    BEFORE_OUTPUT_POLL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[inline]
+fn before_output_poll() {
+    #[cfg(test)]
+    BEFORE_OUTPUT_POLL.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            if let Some(hook) = slot.as_mut() {
+                hook();
+            }
+        }
+    });
+}
+
+fn client_io_loop<S: Read + Write>(
+    mut stream: S,
+    generation: u64,
+    recovery: Vec<u8>,
+    input: mpsc::SyncSender<ClientInput>,
+    output: mpsc::Receiver<ClientOutput>,
+    stolen: Arc<AtomicBool>,
+    mut adoption: Option<mpsc::SyncSender<()>>,
+) -> io::Result<()> {
+    let mut parser = ClientFrameParser::default();
+    let mut pending_input = None;
+    let mut pending_output = (!recovery.is_empty()).then_some((recovery, 0));
+    let mut recovery_adopted = pending_output.is_none();
+    let adoption_deadline = Instant::now() + ATTACH_RECOVERY_DEADLINE;
+    let mut buffer = [0u8; 4096];
+    'client: loop {
+        if stolen.load(Ordering::Acquire) {
+            return write_stolen_notice(&mut stream);
+        }
+        if !recovery_adopted && Instant::now() >= adoption_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "recovery adoption timed out",
+            ));
+        }
+        loop {
+            if stolen.load(Ordering::Acquire) {
+                continue 'client;
+            }
+            let retrying = pending_input.is_some();
+            let command = match pending_input.take() {
+                Some(command) => command,
+                None => match parser.next_command()? {
+                    Some(command) => ClientInput {
+                        generation,
+                        command,
+                    },
+                    None => break,
+                },
+            };
+            if !recovery_adopted {
+                match command.command {
+                    ClientCommand::RecoveryAdopted => {
+                        if pending_output.is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "recovery acknowledged before snapshot delivery",
+                            ));
+                        }
+                        recovery_adopted = true;
+                        if let Some(adoption) = adoption.take() {
+                            adoption.send(()).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "recovery candidate cancelled",
+                                )
+                            })?;
+                        }
+                        continue;
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "session client sent commands before adopting recovery state",
+                        ))
+                    }
+                }
+            }
+            match input.try_send(command) {
+                Ok(()) => {
+                    if retrying {
+                        sessiond_trace(format_args!(
+                            "client_io_loop[{generation}]: input queue resumed"
+                        ));
+                    }
+                }
+                Err(mpsc::TrySendError::Full(command)) => {
+                    // Keep just one decoded command and the bounded parser
+                    // buffer. Do not read ahead or block on send: output and
+                    // takeover must still progress while the daemon is busy.
+                    if !retrying {
+                        sessiond_trace(format_args!(
+                            "client_io_loop[{generation}]: input queue full; pausing reads"
+                        ));
+                    }
+                    pending_input = Some(command);
+                    break;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return finish_disconnected_client(&mut stream, &stolen)
+                }
+            }
+        }
+        for _ in 0..CLIENT_QUEUE_CAPACITY {
+            if stolen.load(Ordering::Acquire) {
+                continue 'client;
+            }
+            if recovery_adopted && pending_output.is_none() {
+                before_output_poll();
+                match output.try_recv() {
+                    Ok(ClientOutput::Data(data)) => {
+                        sessiond_trace(format_args!(
+                            "client_io_loop[{generation}]: writing {} bytes to client",
+                            data.len()
+                        ));
+                        pending_output =
+                            Some((festerm_sessiond::encode_server_output_frame(&data), 0));
+                    }
+                    Ok(ClientOutput::RecoverySync(payload)) => {
+                        pending_output = Some((
+                            festerm_sessiond::encode_server_recovery_sync_frame(&payload),
+                            0,
+                        ));
+                    }
+                    Ok(ClientOutput::ResizeApplied(size)) => {
+                        let mut payload = Vec::with_capacity(8);
+                        for value in [size.cols, size.rows, size.pixel_width, size.pixel_height] {
+                            payload.extend_from_slice(&value.to_be_bytes());
+                        }
+                        pending_output = Some((
+                            festerm_sessiond::encode_server_resize_applied_frame(&payload),
+                            0,
+                        ));
+                    }
+                    Ok(ClientOutput::Exited) => {
+                        pending_output = Some((festerm_sessiond::encode_server_exited_frame(), 0));
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return finish_disconnected_client(&mut stream, &stolen)
+                    }
+                }
+            }
+            if pending_output.is_none() {
+                break;
+            }
+            let (data, written) = pending_output
+                .as_mut()
+                .expect("output is held until written");
+            if !write_to_client(&mut stream, data, written, &stolen)? {
+                break;
+            }
+            pending_output = None;
+        }
+        if pending_input.is_some() {
+            thread::sleep(CLIENT_POLL_INTERVAL);
+            continue;
+        }
+        // A maximum-sized frame may end in the same transport read as the
+        // next frame. Limit the read, not the combined frames' validity.
+        let read_limit = buffer.len().min(parser.remaining_capacity());
+        match stream.read(&mut buffer[..read_limit]) {
+            Ok(0) => return Ok(()),
+            Ok(count) => parser.push(&buffer[..count])?,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ClientFrameParser {
+    bytes: Vec<u8>,
+}
+
+impl ClientFrameParser {
+    fn remaining_capacity(&self) -> usize {
+        MAX_CLIENT_FRAME_BYTES + CLIENT_FRAME_HEADER_BYTES - self.bytes.len()
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.bytes.len().saturating_add(bytes.len())
+            > MAX_CLIENT_FRAME_BYTES + CLIENT_FRAME_HEADER_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session client frame exceeds the protocol limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn next_command(&mut self) -> io::Result<Option<ClientCommand>> {
+        if self.bytes.len() < CLIENT_FRAME_HEADER_BYTES {
+            return Ok(None);
+        }
+        if &self.bytes[..CLIENT_FRAME_MAGIC.len()] != CLIENT_FRAME_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session client frame has an invalid magic value",
+            ));
+        }
+        let kind = self.bytes[4];
+        let payload_len =
+            u32::from_be_bytes(self.bytes[5..9].try_into().expect("fixed frame header")) as usize;
+        if payload_len > MAX_CLIENT_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session client frame payload exceeds the protocol limit",
+            ));
+        }
+        let frame_len = CLIENT_FRAME_HEADER_BYTES + payload_len;
+        if self.bytes.len() < frame_len {
+            return Ok(None);
+        }
+        let payload = &self.bytes[CLIENT_FRAME_HEADER_BYTES..frame_len];
+        let command = match kind {
+            CLIENT_FRAME_INPUT => ClientCommand::Input(payload.to_vec()),
+            CLIENT_FRAME_RESIZE => ClientCommand::Resize(parse_resize_frame(payload)?),
+            CLIENT_FRAME_RECOVERY_SYNC => {
+                let command = bincode::deserialize(payload).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("session client recovery-sync payload is invalid: {error}"),
+                    )
+                })?;
+                ClientCommand::RecoverySync(command)
+            }
+            CLIENT_FRAME_RECOVERY_ADOPTED if payload.is_empty() => ClientCommand::RecoveryAdopted,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session client frame has an unknown command",
+                ))
+            }
+        };
+        self.bytes.drain(..frame_len);
+        Ok(Some(command))
+    }
+}
+
+fn parse_resize_frame(payload: &[u8]) -> io::Result<PtySize> {
+    if payload.len() != 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session resize frame has an invalid length",
+        ));
+    }
+    let value = |offset| u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    let size = PtySize {
+        cols: value(0),
+        rows: value(2),
+        pixel_width: value(4),
+        pixel_height: value(6),
+    };
+    if size.cols < 2 || size.rows == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session resize frame has invalid terminal dimensions",
+        ));
+    }
+    Ok(size)
+}
+
+fn join_io_thread(thread: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
+    thread
+        .join()
+        .map_err(|_| io::Error::other("session daemon worker thread panicked"))?
+}
+
+/// Joins `thread` if it finishes within `timeout`, and otherwise detaches it.
+///
+/// Shutdown runs immediately before the process exits, so a straggling worker
+/// costs nothing once it is abandoned. Blocking on it, by contrast, strands the
+/// daemon: it stops serving clients but never deregisters, so the launcher keeps
+/// advertising a session that can no longer be attached.
+fn join_io_thread_within(
+    thread: thread::JoinHandle<io::Result<()>>,
+    timeout: Duration,
+) -> io::Result<()> {
+    if wait_for_thread(&thread, timeout) {
+        return join_io_thread(thread);
+    }
+    sessiond_trace("shutdown: detaching a worker thread that did not finish");
+    Ok(())
+}
+
+fn join_client_thread_within(
+    thread: thread::JoinHandle<io::Result<()>>,
+    timeout: Duration,
+) -> io::Result<()> {
+    if wait_for_thread(&thread, timeout) {
+        return join_client_thread(thread);
+    }
+    sessiond_trace("shutdown: detaching a client thread that did not finish");
+    Ok(())
+}
+
+fn wait_for_thread(thread: &thread::JoinHandle<io::Result<()>>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(CLIENT_POLL_INTERVAL);
+    }
+    true
+}
+
+fn join_client_thread(thread: thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
+    let _ = thread
+        .join()
+        .map_err(|_| io::Error::other("session client worker thread panicked"))?;
+    Ok(())
+}
+
+fn reap_client_threads(clients: &mut Vec<thread::JoinHandle<io::Result<()>>>) -> io::Result<()> {
+    let mut index = 0;
+    while index < clients.len() {
+        if clients[index].is_finished() {
+            join_client_thread(clients.swap_remove(index))?;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum PtyEvent {
+    Data(Vec<u8>),
+    Eof,
+    Error(io::Error),
+}
+
+const STOLEN_NOTICE_BYTES: &[u8] =
+    b"\n[festerm-sessiond] SESSION_STOLEN: reattached from another client\n";
+const EXITED_NOTICE_BYTES: &[u8] = b"\n[festerm-sessiond] SESSION_EXITED\n";
+
+fn run_list() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = with_registry_lock(|registry| {
+        prune_dead_records(registry)?;
+        Ok(registry.clone())
+    })?;
+
+    if registry.sessions.is_empty() {
+        println!("no live sessions");
+        return Ok(());
+    }
+
+    println!("name\tpid\tsocket\tshell\tattached");
+    for record in registry.sessions.values() {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            record.name, record.pid, record.socket, record.shell, record.attached
+        );
+    }
+    Ok(())
+}
+
+fn run_kill(name: String) -> Result<(), Box<dyn std::error::Error>> {
+    let name = validate_name(name)?;
+    let root = festerm_sessiond::runtime_root()?;
+    with_registry_lock(|registry: &mut SessionRegistry| {
+        kill_registered_session(
+            &root,
+            registry,
+            &name,
+            terminate_pid,
+            GENERATION_EXIT_TIMEOUT,
+        )
+    })
+}
+
+fn run_kill_unattached(
+    expected: festerm_sessiond::NativeSessionIdentity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = festerm_sessiond::runtime_root()?;
+    with_registry_lock(|registry| {
+        kill_unattached_registered_session(
+            &root,
+            registry,
+            &expected,
+            terminate_pid,
+            GENERATION_EXIT_TIMEOUT,
+        )
+    })
+}
+
+fn kill_unattached_registered_session(
+    root: &Path,
+    registry: &mut SessionRegistry,
+    expected: &festerm_sessiond::NativeSessionIdentity,
+    terminate: impl FnOnce(u32) -> Result<(), Box<dyn std::error::Error>>,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let current = registry
+        .sessions
+        .get(&expected.name)
+        .ok_or("Selected session is no longer registered; refresh Running Sessions")?;
+    if current.name != expected.name
+        || current.pid != expected.pid
+        || current.created_at_unix_ms != expected.created_at_unix_ms
+        || current.socket != expected.endpoint
+        || current.attached
+    {
+        return Err("Selected session was replaced or attached; refresh Running Sessions".into());
+    }
+    kill_registered_session(root, registry, &expected.name, terminate, timeout)
+}
+
+fn kill_registered_session(
+    root: &Path,
+    registry: &mut SessionRegistry,
+    name: &str,
+    terminate: impl FnOnce(u32) -> Result<(), Box<dyn std::error::Error>>,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(record) = registry.sessions.get(name).cloned() else {
+        if registry.foreign.contains_key(name) {
+            return Err(format!(
+                "session '{name}' was registered by a newer festerm-sessiond; \
+                 terminate it with that version"
+            )
+            .into());
+        }
+        return Err(format!("session '{name}' is not registered").into());
+    };
+    if !generation_has_exited(root, &record)?
+        && festerm_sessiond::daemon_generation_is_live(
+            root,
+            record.pid,
+            record.created_at_unix_ms,
+            &record.socket,
+        )?
+    {
+        // Best effort: without this record recovery refuses to restart, which
+        // is the safe direction, so a diagnostics failure must not block kill.
+        if let Err(error) = lifecycle::record(
+            root,
+            &festerm_sessiond::NativeSessionIdentity {
+                name: record.name.clone(),
+                pid: record.pid,
+                created_at_unix_ms: record.created_at_unix_ms,
+                endpoint: record.socket.clone(),
+            },
+            LifecycleEvent::StopRequested,
+        ) {
+            eprintln!("festerm-sessiond: could not record stop request for '{name}': {error}");
+        }
+        terminate(record.pid).map_err(|error| {
+            format!("could not terminate session '{name}': {error}; record retained; retry kill")
+        })?;
+    }
+    wait_for_dead_generation(root, &record, timeout)?;
+    cleanup_dead_generation(root, &record, true)?;
+    remove_registry_record_if_generation_matches(registry, &record);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachOutcome {
+    Closed,
+    Exited,
+    Stolen,
+}
+
+#[cfg(test)]
+fn forward_attach_stream<R: Read, W: Write>(
+    reader: &mut R,
+    output: &mut W,
+) -> io::Result<AttachOutcome> {
+    let mut buffer = [0u8; 4096];
+    let mut scanner = AttachOutputScanner::default();
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return scanner.close(output),
+            Ok(count) => {
+                if let Some(outcome) = scanner.push(&buffer[..count], output)? {
+                    return Ok(outcome);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                return scanner.close(output)
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AttachOutputScanner {
+    pending: Vec<u8>,
+}
+
+impl AttachOutputScanner {
+    fn push<W: Write>(
+        &mut self,
+        bytes: &[u8],
+        output: &mut W,
+    ) -> io::Result<Option<AttachOutcome>> {
+        self.pending.extend_from_slice(bytes);
+        if let Some(position) = find_bytes(&self.pending, STOLEN_NOTICE_BYTES) {
+            output.write_all(&self.pending[..position])?;
+            output.flush()?;
+            self.pending.clear();
+            return Ok(Some(AttachOutcome::Stolen));
+        }
+        if let Some(position) = find_bytes(&self.pending, EXITED_NOTICE_BYTES) {
+            output.write_all(&self.pending[..position])?;
+            output.flush()?;
+            self.pending.clear();
+            return Ok(Some(AttachOutcome::Exited));
+        }
+
+        let retained = partial_marker_suffix_len(&self.pending);
+        let flush_count = self.pending.len() - retained;
+        if flush_count > 0 {
+            output.write_all(&self.pending[..flush_count])?;
+            self.pending.drain(..flush_count);
+            output.flush()?;
+        }
+        Ok(None)
+    }
+
+    fn close<W: Write>(&mut self, output: &mut W) -> io::Result<AttachOutcome> {
+        output.write_all(&self.pending)?;
+        output.flush()?;
+        self.pending.clear();
+        Ok(AttachOutcome::Closed)
+    }
+}
+
+fn partial_marker_suffix_len(data: &[u8]) -> usize {
+    [STOLEN_NOTICE_BYTES, EXITED_NOTICE_BYTES]
+        .into_iter()
+        .map(|marker| {
+            let maximum = data.len().min(marker.len().saturating_sub(1));
+            (1..=maximum)
+                .rev()
+                .find(|&length| data.ends_with(&marker[..length]))
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn write_attach_recovery<W: Write>(
+    terminal: &Terminal,
+    output: &mut W,
+    include_history: bool,
+) -> io::Result<()> {
+    let mut line = Vec::new();
+    if include_history && !terminal.modes().alternate_screen() {
+        for row in 0..terminal.scrollback_stats().physical_rows() {
+            line.clear();
+            for cell in terminal.scrollback_physical_row(row).into_iter().flatten() {
+                line.extend_from_slice(cell.text().as_bytes());
+            }
+            output.write_all(&line)?;
+            output.write_all(b"\r\n")?;
+        }
+    }
+    output.write_all(b"\x1b[H\x1b[2J")?;
+    for row in 0..terminal.dimensions().rows() {
+        write!(output, "\x1b[{};1H", row + 1)?;
+        line.clear();
+        for column in 0..terminal.dimensions().columns() {
+            if let Some(cell) = terminal.cell_ref(column, row) {
+                line.extend_from_slice(cell.text().as_bytes());
+            }
+        }
+        output.write_all(&line)?;
+    }
+    write!(
+        output,
+        "\x1b[{};{}H",
+        terminal.cursor().row() + 1,
+        terminal.cursor().column() + 1,
+    )?;
+    output.flush()
+}
+
+fn begin_attach_admission(
+    stream: &mut (impl Read + Write),
+    record: &SessionRecord,
+) -> io::Result<()> {
+    if record.protocol_version < 3 {
+        return Ok(());
+    }
+    stream.write_all(&festerm_sessiond::encode_admission(
+        record.pid,
+        record.created_at_unix_ms,
+        true,
+        768 * 1024 * 1024,
+    ))?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut reply = [0];
+    loop {
+        match stream.read(&mut reply) {
+            Ok(1) if reply[0] == 1 => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                ) && Instant::now() < deadline =>
+            {
+                continue
+            }
+            _ => return Err(io::Error::other("daemon admission refused")),
+        }
+    }
+}
+
+fn run_attach(name: String) -> Result<(), Box<dyn std::error::Error>> {
+    let name = validate_name(name)?;
+    let registry = load_registry()?;
+    let record = match registry.sessions.get(&name) {
+        Some(record) => record,
+        None if registry.foreign.contains_key(&name) => {
+            return Err(format!(
+                "session '{name}' was registered by a newer festerm-sessiond; \
+                 attach with that version"
+            )
+            .into())
+        }
+        None => return Err(format!("session '{name}' is not registered").into()),
+    };
+    if !festerm_sessiond::protocol_is_supported(record.protocol_version) {
+        return Err(format!(
+            "session '{name}' uses persistent-session protocol {}, but this helper supports {}",
+            record.protocol_version,
+            festerm_sessiond::PROTOCOL_VERSION
+        )
+        .into());
+    }
+    if record.protocol_version >= 2
+        && !festerm_sessiond::snapshot_schema_is_supported(record.snapshot_schema_version)
+    {
+        return Err(format!(
+            "session '{name}' uses recovery snapshot schema {}, but this helper supports schemas 2, 3 and {}",
+            record.snapshot_schema_version,
+            festerm_sessiond::RECOVERY_SNAPSHOT_SCHEMA_VERSION
+        )
+        .into());
+    }
+
+    #[cfg(unix)]
+    let outcome = {
+        let mut stream = UnixStream::connect(&record.socket)?;
+        stream.set_read_timeout(Some(CLIENT_POLL_INTERVAL))?;
+        stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
+        begin_attach_admission(&mut stream, record)?;
+        forward_attach_duplex(
+            &mut stream,
+            record.protocol_version,
+            record.snapshot_schema_version,
+            &mut io::stdout(),
+        )?
+    };
+
+    #[cfg(windows)]
+    let outcome = {
+        let mut stream =
+            Pipe::connect(&record.socket, WORKER_JOIN_TIMEOUT, &AtomicBool::new(false))?;
+        stream.set_read_timeout(CLIENT_POLL_INTERVAL);
+        stream.set_write_timeout(CLIENT_WRITE_TIMEOUT);
+        begin_attach_admission(&mut stream, record)?;
+        forward_attach_duplex(
+            &mut stream,
+            record.protocol_version,
+            record.snapshot_schema_version,
+            &mut io::stdout(),
+        )?
+    };
+
+    if outcome == AttachOutcome::Stolen {
+        eprintln!(
+            "[festerm-sessiond] session taken over by another client; this attach lost the session"
+        );
+    }
+
+    Ok(())
+}
+
+fn forward_attach_duplex<S: Read + Write, W: Write>(
+    stream: &mut S,
+    protocol_version: u16,
+    snapshot_schema_version: u16,
+    output: &mut W,
+) -> io::Result<AttachOutcome> {
+    let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(CLIENT_QUEUE_CAPACITY);
+    thread::Builder::new()
+        .name("festerm-sessiond-stdin".to_owned())
+        .spawn(move || {
+            let mut stdin = io::stdin();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(count) => {
+                        if input_tx.send(buffer[..count].to_vec()).is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
+        })?;
+
+    forward_attach_with_input(
+        stream,
+        protocol_version,
+        snapshot_schema_version,
+        output,
+        &input_rx,
+    )
+}
+
+fn forward_attach_with_input<S: Read + Write, W: Write>(
+    stream: &mut S,
+    protocol_version: u16,
+    snapshot_schema_version: u16,
+    output: &mut W,
+    input_rx: &mpsc::Receiver<Vec<u8>>,
+) -> io::Result<AttachOutcome> {
+    let mut scanner = AttachOutputScanner::default();
+    let mut recovered = festerm_sessiond::read_attach_recovery_terminal(
+        stream,
+        protocol_version,
+        snapshot_schema_version,
+        Instant::now() + ATTACH_RECOVERY_DEADLINE,
+    )?;
+    if let Some(terminal) = &recovered {
+        write_attach_recovery(terminal, output, true)?;
+        write_client_frame(stream, CLIENT_FRAME_RECOVERY_ADOPTED, &[])?;
+    }
+    let mut frames = festerm_sessiond::ServerFrameParser::default();
+    let mut buffer = [0u8; 4096];
+    loop {
+        for input in input_rx.try_iter() {
+            write_client_frame(stream, CLIENT_FRAME_INPUT, &input)?;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) if protocol_version >= 2 => {
+                frames.close()?;
+                return Ok(AttachOutcome::Closed);
+            }
+            Ok(0) => return scanner.close(output),
+            Ok(count) => {
+                if let Some(terminal) = &mut recovered {
+                    frames.push(&buffer[..count])?;
+                    while let Some(event) = frames.next_event()? {
+                        match event {
+                            festerm_sessiond::ServerFrameEvent::Output(bytes) => {
+                                let _ = mirror_terminal_output(terminal, &bytes);
+                            }
+                            festerm_sessiond::ServerFrameEvent::RecoverySync(payload) => {
+                                let command =
+                                    festerm_sessiond::decode_recovery_sync_command(&payload)
+                                        .map_err(io::Error::other)?;
+                                apply_recovery_sync_command(terminal, &command);
+                            }
+                            festerm_sessiond::ServerFrameEvent::ResizeApplied(size) => {
+                                terminal
+                                    .resize(
+                                        Dimensions::new(
+                                            usize::from(size.columns()),
+                                            usize::from(size.rows()),
+                                        )
+                                        .map_err(io::Error::other)?,
+                                    )
+                                    .map_err(io::Error::other)?;
+                            }
+                            festerm_sessiond::ServerFrameEvent::Stolen => {
+                                return Ok(AttachOutcome::Stolen)
+                            }
+                            festerm_sessiond::ServerFrameEvent::Exited => {
+                                return Ok(AttachOutcome::Exited)
+                            }
+                        }
+                        write_attach_recovery(terminal, output, false)?;
+                    }
+                    continue;
+                }
+                if let Some(outcome) = scanner.push(&buffer[..count], output)? {
+                    return Ok(outcome);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                if protocol_version >= 2 {
+                    frames.close()?;
+                    return Ok(AttachOutcome::Closed);
+                }
+                return scanner.close(output);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn write_client_frame<W: Write>(writer: &mut W, kind: u8, payload: &[u8]) -> io::Result<()> {
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session client frame payload is too large",
+        )
+    })?;
+    if payload.len() > MAX_CLIENT_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session client frame payload exceeds the protocol limit",
+        ));
+    }
+    writer.write_all(CLIENT_FRAME_MAGIC)?;
+    writer.write_all(&[kind])?;
+    writer.write_all(&payload_len.to_be_bytes())?;
+    writer.write_all(payload)?;
+    writer.flush()
+}
+
+fn validate_name(name: String) -> Result<String, Box<dyn std::error::Error>> {
+    let session_name = PersistentSessionName::new(name)?;
+    Ok(session_name.as_str().to_owned())
+}
+
+#[cfg(unix)]
+fn session_socket_path(
+    runtime_root: &Path,
+    name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = runtime_root.join(format!("{name}.sock"));
+    std::os::unix::net::SocketAddr::from_pathname(&path).map_err(|error| {
+        format!(
+            "invalid Unix session socket {} ({} path bytes): {error}; use a shorter XDG_STATE_HOME",
+            path.display(),
+            path.as_os_str().as_encoded_bytes().len()
+        )
+    })?;
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn session_pipe_name(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|character| match character {
+            ch if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') => ch,
+            _ => '_',
+        })
+        .collect();
+    format!(r"\\.\pipe\festerm-sessiond-{sanitized}")
+}
+
+fn registry_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(festerm_sessiond::runtime_root()?.join("registry.json"))
+}
+
+fn private_runtime_directory(root: &Path) -> io::Result<Option<File>> {
+    match festerm_sessiond::private_storage::private_directory(root, false) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if env::var_os("FESTERM_SESSIOND_EXPECTED_SPAWN").is_some() => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+fn lock_session_file(
+    root: &Path,
+    name: &str,
+    kind: &str,
+) -> Result<File, Box<dyn std::error::Error>> {
+    let file_name = format!("{name}.{kind}.lock");
+    let lock = match private_runtime_directory(root)? {
+        Some(directory) => match festerm_sessiond::private_storage::open_private_file(
+            &directory,
+            Path::new(&file_name),
+            true,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                festerm_sessiond::private_storage::open_private_file(
+                    &directory,
+                    Path::new(&file_name),
+                    false,
+                )?
+            }
+            Err(error) => return Err(error.into()),
+        },
+        // Old ordinary CLI sessions remain usable in their original roots.
+        // Hosting itself never takes this compatibility path.
+        None => {
+            let path = root.join(file_name);
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            set_file_mode(&path, 0o600)?;
+            file
+        }
+    };
+    bounded_registry_lock(&lock, true)?;
+    Ok(lock)
+}
+
+fn bounded_registry_lock(file: &File, exclusive: bool) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let result = if exclusive {
+            FileExt::try_lock_exclusive(file)
+        } else {
+            FileExt::try_lock_shared(file)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if festerm_sessiond::lock_is_contended(&error)
+                    && std::time::Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20))
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn registry_lock_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(festerm_sessiond::runtime_root()?.join("registry.lock"))
+}
+
+fn read_registry_at(path: &Path) -> Result<SessionRegistry, Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        if let Some(directory) = private_runtime_directory(parent)? {
+            return match festerm_sessiond::private_storage::read_private(
+                &directory,
+                Path::new("registry.json"),
+                4 * 1024 * 1024,
+            ) {
+                Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok(SessionRegistry::default())
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
+    }
+    if !path.exists() {
+        return Ok(SessionRegistry::default());
+    }
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(SessionRegistry::default());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn open_registry_lock_file() -> Result<(PathBuf, File), Box<dyn std::error::Error>> {
+    let path = registry_path()?;
+    let lock_path = registry_lock_path()?;
+    let parent = lock_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    set_dir_mode(parent, 0o700)?;
+    if let Some(directory) = private_runtime_directory(parent)? {
+        let lock_file = match festerm_sessiond::private_storage::open_private_file(
+            &directory,
+            Path::new("registry.lock"),
+            true,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                festerm_sessiond::private_storage::open_private_file(
+                    &directory,
+                    Path::new("registry.lock"),
+                    false,
+                )?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        return Ok((path, lock_file));
+    }
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    set_file_mode(&lock_path, 0o600)?;
+    Ok((path, lock_file))
+}
+
+fn with_registry_lock<T>(
+    mut operation: impl FnMut(&mut SessionRegistry) -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let (path, lock_file) = open_registry_lock_file()?;
+    bounded_registry_lock(&lock_file, true)?;
+    let mut registry = read_registry_at(&path)?;
+    let result = operation(&mut registry);
+    if result.is_ok() {
+        write_registry_at(&path, &registry)?;
+    }
+    FileExt::unlock(&lock_file)?;
+    result
+}
+
+fn write_registry_at(
+    path: &Path,
+    registry: &SessionRegistry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = serde_json::to_string_pretty(registry)?;
+    if let Some(parent) = path.parent() {
+        if let Some(directory) = private_runtime_directory(parent)? {
+            festerm_sessiond::private_storage::replace_private(
+                &directory,
+                Path::new("registry.json"),
+                output.as_bytes(),
+            )?;
+            return Ok(());
+        }
+    }
+    fs::write(path, output)?;
+    set_file_mode(path, 0o600)?;
+    Ok(())
+}
+
+fn load_registry() -> Result<SessionRegistry, Box<dyn std::error::Error>> {
+    let (path, lock_file) = open_registry_lock_file()?;
+    bounded_registry_lock(&lock_file, false)?;
+    let result = read_registry_at(&path);
+    FileExt::unlock(&lock_file)?;
+    result
+}
+
+fn save_registry_record(record: SessionRecord) -> Result<(), Box<dyn std::error::Error>> {
+    with_registry_lock(|registry: &mut SessionRegistry| {
+        if registry.foreign.contains_key(&record.name) {
+            return Err("unsupported native generation already registered".into());
+        }
+        if let Some(existing) = registry.sessions.get(&record.name) {
+            if (existing.pid != record.pid
+                || existing.created_at_unix_ms != record.created_at_unix_ms
+                || existing.socket != record.socket)
+                && record_is_live(existing)?
+            {
+                return Err(format!("session '{}' is already running", record.name).into());
+            }
+        }
+        registry
+            .sessions
+            .insert(record.name.clone(), record.clone());
+        Ok(())
+    })
+}
+
+fn remove_registry_record_if_generation_matches(
+    registry: &mut SessionRegistry,
+    expected: &SessionRecord,
+) {
+    if registry.sessions.get(&expected.name).is_some_and(|record| {
+        record.pid == expected.pid
+            && record.created_at_unix_ms == expected.created_at_unix_ms
+            && record.socket == expected.socket
+    }) {
+        registry.sessions.remove(&expected.name);
+    }
+}
+
+fn record_is_live(record: &SessionRecord) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(festerm_sessiond::daemon_generation_is_live(
+        &festerm_sessiond::runtime_root()?,
+        record.pid,
+        record.created_at_unix_ms,
+        &record.socket,
+    )?)
+}
+
+fn prune_dead_records(registry: &mut SessionRegistry) -> Result<(), Box<dyn std::error::Error>> {
+    prune_dead_records_in(&festerm_sessiond::runtime_root()?, registry)
+}
+
+fn prune_dead_records_in(
+    root: &Path,
+    registry: &mut SessionRegistry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Keep each record until its artifacts are removed. On failure the on-disk
+    // registry remains a retry inventory, including any earlier partial cleanup.
+    let records: Vec<_> = registry.sessions.values().cloned().collect();
+    for record in records {
+        validate_generation_endpoint(root, &record)?;
+        if !festerm_sessiond::daemon_generation_is_live(
+            root,
+            record.pid,
+            record.created_at_unix_ms,
+            &record.socket,
+        )? {
+            cleanup_dead_generation(root, &record, true)?;
+            remove_registry_record_if_generation_matches(registry, &record);
+        }
+    }
+    Ok(())
+}
+
+fn generation_lease_path(root: &Path, record: &SessionRecord) -> PathBuf {
+    root.join(format!(
+        "lease-{}-{}",
+        record.pid, record.created_at_unix_ms
+    ))
+}
+
+/// Only exact generation endpoints confer artifact ownership. Named endpoints
+/// remain usable for old helpers, but have no generation-safe artifacts to unlink.
+fn validate_generation_endpoint(
+    root: &Path,
+    record: &SessionRecord,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    validate_name(record.name.clone())?;
+    let generation = format!("{}-{}", record.pid, record.created_at_unix_ms);
+    #[cfg(unix)]
+    let (expected, legacy) = (
+        root.join(format!("{generation}.sock"))
+            .to_string_lossy()
+            .into_owned(),
+        root.join(format!("{}.sock", record.name))
+            .to_string_lossy()
+            .into_owned(),
+    );
+    #[cfg(windows)]
+    let (expected, legacy) = {
+        let _ = root;
+        (
+            session_pipe_name(&generation),
+            session_pipe_name(&record.name),
+        )
+    };
+    if record.socket == expected {
+        Ok(true)
+    } else if record.socket == legacy {
+        Ok(false)
+    } else {
+        Err(format!(
+            "session '{}' has an endpoint outside its exact owned generation; \
+             refusing to signal or remove artifacts; inspect the registry",
+            record.name
+        )
+        .into())
+    }
+}
+
+fn validate_artifact_root(root: &Path) -> io::Result<()> {
+    // Ancestors may be system aliases such as macOS /tmp -> /private/tmp.
+    // The selected registry directory and artifact leaves must not be links.
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "refusing artifact cleanup through non-directory or symlink {}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+fn artifact_metadata(path: &Path, socket: bool) -> io::Result<Option<fs::Metadata>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    let valid_type = {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        metadata.uid()
+            == fs::metadata(
+                path.parent()
+                    .ok_or("artifact has no parent")
+                    .map_err(io::Error::other)?,
+            )?
+            .uid()
+            && if socket {
+                metadata.file_type().is_socket()
+            } else {
+                metadata.is_file()
+            }
+    };
+    #[cfg(windows)]
+    let valid_type = !socket && metadata.is_file();
+    if metadata.file_type().is_symlink() || !valid_type {
+        return Err(io::Error::other(format!(
+            "refusing to remove unexpected artifact {}; restore the owned artifact and retry",
+            path.display()
+        )));
+    }
+    Ok(Some(metadata))
+}
+
+fn same_artifact(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        left.creation_time() == right.creation_time()
+            && left.last_write_time() == right.last_write_time()
+            && left.file_size() == right.file_size()
+            && left.file_attributes() == right.file_attributes()
+    }
+}
+
+fn open_generation_lease(path: &Path) -> io::Result<Option<fs::File>> {
+    let Some(metadata) = artifact_metadata(path, false)? else {
+        return Ok(None);
+    };
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let lease = match options.open(path) {
+        Ok(lease) => lease,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !same_artifact(&metadata, &lease.metadata()?) {
+        return Err(io::Error::other(format!(
+            "lease {} was replaced; retry",
+            path.display()
+        )));
+    }
+    Ok(Some(lease))
+}
+
+fn generation_has_exited(
+    root: &Path,
+    record: &SessionRecord,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if !validate_generation_endpoint(root, record)? {
+        return Ok(!festerm_sessiond::daemon_generation_is_live(
+            root,
+            record.pid,
+            record.created_at_unix_ms,
+            &record.socket,
+        )?);
+    }
+    validate_artifact_root(root)?;
+    let Some(lease) = open_generation_lease(&generation_lease_path(root, record))? else {
+        return Ok(true);
+    };
+    match lease.try_lock_exclusive() {
+        Ok(()) => Ok(true),
+        Err(error) if festerm_sessiond::lock_is_contended(&error) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn wait_for_dead_generation(
+    root: &Path,
+    record: &SessionRecord,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if generation_has_exited(root, record)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "session '{}' generation {}-{} still holds its lifetime lease; \
+                 record and artifacts retained; retry kill",
+                record.name, record.pid, record.created_at_unix_ms
+            )
+            .into());
+        }
+        thread::sleep(CLIENT_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn remove_artifact_if_unchanged(
+    path: &Path,
+    expected: &fs::Metadata,
+    socket: bool,
+) -> io::Result<()> {
+    if let Some(current) = artifact_metadata(path, socket)? {
+        if !same_artifact(&current, expected) {
+            return Err(io::Error::other(format!(
+                "artifact {} was replaced; refusing cleanup; retry",
+                path.display()
+            )));
+        }
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn cleanup_dead_generation(
+    root: &Path,
+    record: &SessionRecord,
+    socket_owned: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !validate_generation_endpoint(root, record)? {
+        return Ok(());
+    }
+    validate_artifact_root(root)?;
+    let lease_path = generation_lease_path(root, record);
+    let lease = open_generation_lease(&lease_path)?;
+    if let Some(lease) = &lease {
+        lease.try_lock_exclusive().map_err(|error| {
+            format!(
+                "cannot clean session '{}' lease {}: {error}; record retained; retry kill",
+                record.name,
+                lease_path.display()
+            )
+        })?;
+    }
+    #[cfg(unix)]
+    if socket_owned {
+        // This is derived, never an arbitrary registry-supplied path.
+        let socket = root.join(format!("{}-{}.sock", record.pid, record.created_at_unix_ms));
+        if let Some(metadata) = artifact_metadata(&socket, true)? {
+            remove_artifact_if_unchanged(&socket, &metadata, true)?;
+        }
+    }
+    #[cfg(windows)]
+    let _ = socket_owned;
+    if let Some(lease) = &lease {
+        remove_artifact_if_unchanged(&lease_path, &lease.metadata()?, false)?;
+    }
+    Ok(())
+}
+
+fn cleanup_failed_start(
+    root: &Path,
+    daemon: &mut process::Child,
+    record: &SessionRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stopped = (|| {
+        if daemon.try_wait()?.is_none() {
+            terminate_pid(daemon.id())?;
+        }
+        let deadline = Instant::now() + GENERATION_EXIT_TIMEOUT;
+        while daemon.try_wait()?.is_none() {
+            if Instant::now() >= deadline {
+                return Err("startup daemon did not exit; retry kill".into());
+            }
+            thread::sleep(CLIENT_POLL_INTERVAL);
+        }
+        cleanup_dead_generation(root, record, true)
+    })();
+    // Preserve a precise retry handle even when startup never registered.
+    let registry_result = with_registry_lock(|registry| {
+        if stopped.is_ok() {
+            remove_registry_record_if_generation_matches(registry, record);
+        } else if !registry.sessions.contains_key(&record.name) {
+            registry
+                .sessions
+                .insert(record.name.clone(), record.clone());
+        }
+        Ok(())
+    });
+    combine_cleanup_result(stopped, registry_result)
+}
+
+#[cfg(unix)]
+fn set_dir_mode(path: &Path, mode: u32) -> io::Result<()> {
+    let permissions = fs::Permissions::from_mode(mode);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_dir_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_file_mode(path: &Path, mode: u32) -> io::Result<()> {
+    let permissions = fs::Permissions::from_mode(mode);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+fn spawn_shell(
+    shell: &ShellSpec,
+    cols: u16,
+    rows: u16,
+    correlation: Option<&str>,
+) -> Result<SpawnedShell, Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        let selection = festerm_pty::prepare_windows_conpty_runtime()?;
+        sessiond_trace(format_args!(
+            "spawn_shell: conpty runtime selection = {selection:?}"
+        ));
+    }
+
+    let system = native_pty_system();
+    let size = PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let pair = system.openpty(size)?;
+    let mut command = CommandBuilder::new(&shell.executable);
+    command.args(&shell.arguments);
+    command.cwd(match &shell.working_directory {
+        Some(working_directory) => PathBuf::from(working_directory),
+        None => env::current_dir()?,
+    });
+    apply_terminal_environment(&mut command, correlation);
+    let child = pair.slave.spawn_command(command)?;
+    let master = pair.master;
+    Ok(SpawnedShell {
+        child,
+        master: Some(master),
+    })
+}
+
+fn apply_terminal_environment(command: &mut CommandBuilder, correlation: Option<&str>) {
+    command.env("TERM", "xterm-256color");
+    command.env("TERM_PROGRAM", "fesTerm");
+    command.env("COLORTERM", "truecolor");
+    command.env_remove("TERM_SESSION_ID");
+    command.env_remove(festerm_sessiond::SESSION_CORRELATION_ENV);
+    if let Some(marker) = correlation {
+        command.env(festerm_sessiond::SESSION_CORRELATION_ENV, marker);
+    }
+}
+
+fn terminate_pid(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use nix::{
+            errno::Errno,
+            sys::signal::{kill, Signal},
+            unistd::Pid,
+        };
+
+        let pid = Pid::from_raw(pid as i32);
+        match kill(pid, Signal::SIGTERM) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(error) => return Err(error.into()),
+        }
+        thread::sleep(Duration::from_millis(250));
+        if festerm_sessiond::process_alive(pid.as_raw() as u32) {
+            match kill(pid, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        festerm_windows_job::terminate_process(pid)?;
+        Ok(())
+    }
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[cfg(unix)]
+    fn connect_admitted_test_client(path: &Path) -> UnixStream {
+        let mut stream = UnixStream::connect(path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(&festerm_sessiond::encode_admission(
+                process::id(),
+                0,
+                true,
+                768 * 1024 * 1024,
+            ))
+            .unwrap();
+        let mut response = [0];
+        stream.read_exact(&mut response).unwrap();
+        assert_eq!(response, [1]);
+        stream
+    }
+
+    #[test]
+    fn exclusive_admission_refuses_occupied_or_changed_generation_without_retiring_it() {
+        let (output, _events) = mpsc::sync_channel(1);
+        let (finish, wait) = mpsc::sync_channel(1);
+        let stolen = Arc::new(AtomicBool::new(false));
+        let active = Some(ActiveClient {
+            kind: AttachKind::Local,
+            generation: 7,
+            output,
+            stolen: stolen.clone(),
+            thread: thread::spawn(move || {
+                let _ = wait.recv();
+                Ok(())
+            }),
+        });
+        let request = festerm_sessiond::encode_admission(process::id(), 0, false, 1024);
+        let mut stream = io::Cursor::new(request.to_vec());
+        assert!(admit_client(&mut stream, &active).unwrap().is_none());
+        assert!(!stolen.load(Ordering::Acquire));
+        assert_eq!(active.as_ref().unwrap().generation, 7);
+        assert_eq!(stream.into_inner()[festerm_sessiond::ADMISSION_BYTES], 0);
+
+        let mut stale = io::Cursor::new(
+            festerm_sessiond::encode_admission(process::id(), 1, true, 1024).to_vec(),
+        );
+        assert!(admit_client(&mut stale, &active).unwrap().is_none());
+        assert!(!stolen.load(Ordering::Acquire));
+        finish.send(()).unwrap();
+        let Some(client) = active else { unreachable!() };
+        client.thread.join().unwrap().unwrap();
+
+        let mut free = io::Cursor::new(request.to_vec());
+        assert_eq!(
+            admit_client(&mut free, &None).unwrap(),
+            Some((1024, AttachKind::Local))
+        );
+        assert_eq!(free.into_inner()[festerm_sessiond::ADMISSION_BYTES], 1);
+    }
+
+    struct AttachmentDropProbe(Rc<Cell<usize>>);
+
+    impl Drop for AttachmentDropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn windows_attachment_queue_refuses_and_drops_the_seventeenth_handle() {
+        let dropped = Rc::new(Cell::new(0));
+        let (sender, inbox) = windows_attachment_queue();
+        for _ in 0..WINDOWS_ATTACHMENT_QUEUE_CAPACITY {
+            sender
+                .enqueue(AttachmentDropProbe(Rc::clone(&dropped)))
+                .unwrap();
+        }
+        assert_eq!(
+            sender.enqueue(AttachmentDropProbe(Rc::clone(&dropped))),
+            Err(WindowsAttachmentAdmissionError::Full)
+        );
+        assert_eq!(dropped.get(), 1, "refused ownership ends before return");
+        drop(inbox);
+        assert_eq!(dropped.get(), WINDOWS_ATTACHMENT_QUEUE_CAPACITY + 1);
+    }
+
+    #[test]
+    fn windows_attachment_queue_yields_when_a_producer_refills_it() {
+        let (sender, inbox) = windows_attachment_queue();
+        for index in 0..WINDOWS_ATTACHMENT_QUEUE_CAPACITY {
+            sender.enqueue(index).unwrap();
+        }
+        let mut adopted = Vec::new();
+        inbox
+            .process_one(|stream| {
+                adopted.push(stream);
+                if adopted.len() == 1 {
+                    sender.enqueue(WINDOWS_ATTACHMENT_QUEUE_CAPACITY).unwrap();
+                }
+            })
+            .unwrap();
+        assert_eq!(adopted, [0], "one adoption per daemon turn");
+        inbox.process_one(|stream| assert_eq!(stream, 1)).unwrap();
+    }
+
+    #[test]
+    fn windows_attachment_queue_reports_listener_failure_before_queued_adoptions() {
+        let (sender, inbox) = windows_attachment_queue();
+        for index in 0..WINDOWS_ATTACHMENT_QUEUE_CAPACITY {
+            sender.enqueue(index).unwrap();
+        }
+        sender
+            .report_failure(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture listener",
+            ))
+            .unwrap();
+        let mut adopted = 0;
+        let error = inbox.process_one(|_| adopted += 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(adopted, 0, "fatal listener failure bypasses the backlog");
+    }
+
+    #[test]
+    fn windows_attachment_queue_churn_keeps_sixteen_waiters_and_reclaims_each_refusal() {
+        let dropped = Rc::new(Cell::new(0));
+        let (sender, inbox) = windows_attachment_queue();
+        for _ in 0..WINDOWS_ATTACHMENT_QUEUE_CAPACITY {
+            sender
+                .enqueue(AttachmentDropProbe(Rc::clone(&dropped)))
+                .unwrap();
+        }
+        for cycle in 0..1024 {
+            assert_eq!(
+                sender.enqueue(AttachmentDropProbe(Rc::clone(&dropped))),
+                Err(WindowsAttachmentAdmissionError::Full)
+            );
+            assert_eq!(dropped.get(), cycle * 2 + 1);
+            inbox.process_one(drop).unwrap();
+            assert_eq!(dropped.get(), cycle * 2 + 2);
+            sender
+                .enqueue(AttachmentDropProbe(Rc::clone(&dropped)))
+                .unwrap();
+        }
+        drop(inbox);
+        assert_eq!(dropped.get(), 2048 + WINDOWS_ATTACHMENT_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn windows_attachment_queue_shutdown_drops_waiters_and_refuses_late_ownership() {
+        let dropped = Rc::new(Cell::new(0));
+        let (sender, inbox) = windows_attachment_queue();
+        for _ in 0..WINDOWS_ATTACHMENT_QUEUE_CAPACITY {
+            sender
+                .enqueue(AttachmentDropProbe(Rc::clone(&dropped)))
+                .unwrap();
+        }
+        drop(inbox);
+        assert_eq!(dropped.get(), WINDOWS_ATTACHMENT_QUEUE_CAPACITY);
+        assert_eq!(
+            sender.enqueue(AttachmentDropProbe(Rc::clone(&dropped))),
+            Err(WindowsAttachmentAdmissionError::Stopped)
+        );
+        assert_eq!(dropped.get(), WINDOWS_ATTACHMENT_QUEUE_CAPACITY + 1);
+        assert!(matches!(
+            sender.report_failure(io::Error::other("late fixture failure")),
+            Err(mpsc::TrySendError::Disconnected(_))
+        ));
+    }
+
+    #[test]
+    fn windows_attachment_queue_detects_a_stopped_listener_even_with_waiters() {
+        for waiting in [0, WINDOWS_ATTACHMENT_QUEUE_CAPACITY] {
+            let (sender, inbox) = windows_attachment_queue();
+            for index in 0..waiting {
+                sender.enqueue(index).unwrap();
+            }
+            drop(sender);
+            let error = inbox
+                .process_one(|_| panic!("a stopped listener must not adopt another client"))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(error.to_string(), "named pipe listener stopped");
+        }
+    }
+
+    #[test]
+    fn windows_attachment_queue_listener_failure_storage_is_bounded() {
+        let (sender, inbox) = windows_attachment_queue::<usize>();
+        sender
+            .report_failure(io::Error::new(io::ErrorKind::PermissionDenied, "first"))
+            .unwrap();
+        assert!(matches!(
+            sender.report_failure(io::Error::other("second")),
+            Err(mpsc::TrySendError::Full(_))
+        ));
+        let error = inbox.process_one(|_| panic!("no attachment")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "first");
+    }
+
+    #[test]
+    fn windows_attachment_queue_empty_turn_does_not_invoke_adoption() {
+        let (_sender, inbox) = windows_attachment_queue::<usize>();
+        inbox.process_one(|_| panic!("empty queue")).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_attachment_queue_native_overflow_keeps_active_bytes_and_allows_retry() {
+        fn round_trip(
+            client: &mut Pipe,
+            active: &ActiveClient,
+            commands: &mpsc::Receiver<ClientInput>,
+            challenge: &[u8],
+        ) {
+            write_client_frame(client, CLIENT_FRAME_INPUT, challenge).unwrap();
+            let input = commands.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(input.generation, active.generation);
+            assert!(matches!(input.command, ClientCommand::Input(data) if data == challenge));
+            active
+                .output
+                .send(ClientOutput::Data(challenge.to_vec()))
+                .unwrap();
+            assert_eq!(read_server_output(client, challenge.len()), challenge);
+        }
+
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let name = format!(
+            r"\\.\pipe\festerm-attachment-budget-{}-{}",
+            process::id(),
+            now_ms()
+        );
+        let initial = create_secure_pipe_listener(&name, true).unwrap();
+        let mut client =
+            Pipe::connect(&name, Duration::from_secs(5), &AtomicBool::new(false)).unwrap();
+        let mut server = initial.accept(&AtomicBool::new(false)).unwrap();
+        client.set_read_timeout(Duration::from_secs(5));
+        client.set_write_timeout(CLIENT_WRITE_TIMEOUT);
+        server.set_read_timeout(WINDOWS_CLIENT_READ_TIMEOUT);
+        server.set_write_timeout(CLIENT_WRITE_TIMEOUT);
+        let adoption = thread::spawn(move || {
+            read_recovery_terminal(&mut client);
+            acknowledge_recovery(&mut client);
+            client
+        });
+        let (input, commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let mut active = None;
+        let mut retired = Vec::new();
+        let terminal = Terminal::new(Dimensions::new(80, 24).unwrap()).unwrap();
+        let mut generation = 1;
+        replace_active(
+            &mut active,
+            &mut retired,
+            server,
+            &terminal,
+            input,
+            &mut generation,
+        )
+        .unwrap();
+        let mut client = adoption.join().unwrap();
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _stop_on_drop = StopOnDrop(Arc::clone(&cancelled));
+        let listener = create_secure_pipe_listener(&name, false).unwrap();
+        let (inbox, worker) =
+            spawn_windows_attachment_listener(&name, listener, Arc::clone(&cancelled));
+        let mut waiting = Vec::new();
+        for _ in 0..WINDOWS_ATTACHMENT_QUEUE_CAPACITY {
+            let mut pipe = Pipe::connect(&name, Duration::from_secs(5), &cancelled).unwrap();
+            pipe.set_read_timeout(Duration::from_secs(5));
+            waiting.push(pipe);
+        }
+        let mut refused = Pipe::connect(&name, Duration::from_secs(5), &cancelled).unwrap();
+        refused.set_read_timeout(Duration::from_secs(5));
+        let error = festerm_sessiond::read_attach_recovery_terminal(
+            &mut refused,
+            festerm_sessiond::PROTOCOL_VERSION,
+            festerm_sessiond::RECOVERY_SNAPSHOT_SCHEMA_VERSION,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(error.to_string().contains("retry attachment"));
+        round_trip(
+            &mut client,
+            active.as_ref().unwrap(),
+            &commands,
+            b"full queue",
+        );
+
+        inbox.process_one(drop).unwrap();
+        assert_eq!(waiting[0].read(&mut [0]).unwrap(), 0);
+        let mut retry = Pipe::connect(&name, Duration::from_secs(5), &cancelled).unwrap();
+        retry.set_read_timeout(CLIENT_POLL_INTERVAL);
+        // Connecting the next instance fences enqueue of the retry.
+        let mut still_full = Pipe::connect(&name, Duration::from_secs(5), &cancelled).unwrap();
+        still_full.set_read_timeout(Duration::from_secs(5));
+        assert_eq!(still_full.read(&mut [0]).unwrap(), 0);
+        assert_eq!(
+            retry.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        round_trip(
+            &mut client,
+            active.as_ref().unwrap(),
+            &commands,
+            b"after retry",
+        );
+        assert_eq!(active.as_ref().unwrap().generation, 1);
+        assert_eq!(generation, 2, "overflow does not perform takeover");
+
+        cancelled.store(true, Ordering::Release);
+        drop(inbox);
+        assert!(wait_for_thread(&worker, WORKER_JOIN_TIMEOUT));
+        join_io_thread(worker).unwrap();
+        for mut pipe in waiting.into_iter().skip(1).chain([retry]) {
+            assert_eq!(
+                pipe.read(&mut [0]).unwrap(),
+                0,
+                "queued server handle was closed"
+            );
+        }
+        retire_active(&mut active, &mut retired, false);
+        for worker in retired {
+            assert!(wait_for_thread(&worker, WORKER_JOIN_TIMEOUT));
+            join_io_thread(worker).unwrap();
+        }
+    }
+
+    fn client_io_loop_test<S: Read + Write>(
+        stream: S,
+        generation: u64,
+        input: mpsc::SyncSender<ClientInput>,
+        output: mpsc::Receiver<ClientOutput>,
+        stolen: Arc<AtomicBool>,
+    ) -> io::Result<()> {
+        client_io_loop(stream, generation, Vec::new(), input, output, stolen, None)
+    }
+
+    fn read_recovery_terminal<S: Read>(stream: &mut S) -> Terminal {
+        festerm_sessiond::read_attach_recovery_terminal(
+            stream,
+            festerm_sessiond::PROTOCOL_VERSION,
+            festerm_sessiond::RECOVERY_SNAPSHOT_SCHEMA_VERSION,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap()
+        .expect("current protocol carries a recovery snapshot")
+    }
+
+    fn acknowledge_recovery(writer: &mut impl Write) {
+        write_client_frame(writer, CLIENT_FRAME_RECOVERY_ADOPTED, &[]).unwrap();
+    }
+
+    fn read_server_output(reader: &mut impl Read, expected_len: usize) -> Vec<u8> {
+        let mut header = [0u8; 9];
+        reader.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..4], b"FSO1");
+        assert_eq!(header[4], 1);
+        let length = u32::from_be_bytes(header[5..9].try_into().unwrap()) as usize;
+        assert_eq!(length, expected_len);
+        let mut payload = vec![0; length];
+        reader.read_exact(&mut payload).unwrap();
+        payload
+    }
+
+    #[cfg(unix)]
+    fn read_server_stolen(reader: &mut impl Read) {
+        let mut frame = vec![0; festerm_sessiond::encode_server_stolen_frame().len()];
+        reader.read_exact(&mut frame).unwrap();
+        assert_eq!(frame, festerm_sessiond::encode_server_stolen_frame());
+    }
+
+    #[cfg(unix)]
+    fn read_server_recovery_sync(reader: &mut impl Read) -> Vec<u8> {
+        let mut header = [0u8; 9];
+        reader.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..4], b"FSO1");
+        assert_eq!(header[4], 2);
+        let length = u32::from_be_bytes(header[5..9].try_into().unwrap()) as usize;
+        let mut payload = vec![0; length];
+        reader.read_exact(&mut payload).unwrap();
+        payload
+    }
+
+    #[cfg(unix)]
+    fn read_server_resize_applied(reader: &mut impl Read) {
+        let mut header = [0u8; 9];
+        reader.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..4], b"FSO1");
+        assert_eq!(header[4], 5);
+        let length = u32::from_be_bytes(header[5..9].try_into().unwrap()) as usize;
+        assert_eq!(length, 8);
+        let mut payload = [0u8; 8];
+        reader.read_exact(&mut payload).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn read_server_exited(reader: &mut impl Read) {
+        let mut frame = vec![0; festerm_sessiond::encode_server_exited_frame().len()];
+        reader.read_exact(&mut frame).unwrap();
+        assert_eq!(frame, festerm_sessiond::encode_server_exited_frame());
+    }
+
+    #[cfg(unix)]
+    fn write_recovery_sync_frame(
+        writer: &mut impl Write,
+        command: festerm_sessiond::RecoverySyncCommand,
+    ) {
+        let payload = bincode::serialize(&command).unwrap();
+        write_client_frame(writer, CLIENT_FRAME_RECOVERY_SYNC, &payload).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn first_row_text(terminal: &Terminal) -> String {
+        let mut text = String::new();
+        for column in 0..terminal.dimensions().columns() {
+            if let Some(cell) = terminal.cell_ref(column, 0) {
+                text.push_str(cell.text());
+            }
+        }
+        text.trim_end().to_owned()
+    }
+
+    struct ClientTestStream<F> {
+        input: io::Cursor<Vec<u8>>,
+        reads: Rc<Cell<usize>>,
+        output_on_read: Option<mpsc::SyncSender<ClientOutput>>,
+        on_write: F,
+    }
+
+    impl<F> Read for ClientTestStream<F> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            if let Some(output) = self.output_on_read.take() {
+                output
+                    .try_send(ClientOutput::Data(b"duplex output".to_vec()))
+                    .unwrap();
+            }
+            self.input.read(buffer)
+        }
+    }
+
+    impl<F: FnMut(&[u8])> Write for ClientTestStream<F> {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            (self.on_write)(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn client_input_burst_waits_in_order_while_output_keeps_flowing() {
+        let mut frames = Vec::new();
+        let count = CLIENT_QUEUE_CAPACITY + 17;
+        for index in 0..count {
+            if index % 2 == 0 {
+                write_client_frame(&mut frames, CLIENT_FRAME_INPUT, &[index as u8]).unwrap();
+            } else {
+                let payload: Vec<_> = [80 + index as u16, 24, 800, 600]
+                    .into_iter()
+                    .flat_map(u16::to_be_bytes)
+                    .collect();
+                write_client_frame(&mut frames, CLIENT_FRAME_RESIZE, &payload).unwrap();
+            }
+        }
+        assert!(frames.len() < 4096, "the burst must fit in one read");
+        let (input, commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let (output, received_output) = mpsc::sync_channel(1);
+        let mut accepted = Vec::new();
+        let mut written = Vec::new();
+        let reads = Rc::new(Cell::new(0));
+        let stream = ClientTestStream {
+            input: io::Cursor::new(frames),
+            reads: Rc::clone(&reads),
+            output_on_read: Some(output.clone()),
+            on_write: |bytes: &[u8]| {
+                // No daemon command is consumed until the full input queue
+                // has allowed the worker to return to its output pump.
+                written.extend_from_slice(bytes);
+                assert_eq!(reads.get(), 1, "a full input queue must stop reads");
+                accepted.extend(commands.try_iter());
+                assert_eq!(accepted.len(), CLIENT_QUEUE_CAPACITY);
+            },
+        };
+
+        client_io_loop_test(
+            stream,
+            7,
+            input,
+            received_output,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            written,
+            festerm_sessiond::encode_server_output_frame(b"duplex output")
+        );
+        accepted.extend(commands.try_iter());
+        assert_eq!(accepted.len(), count, "no command may be lost");
+        for (index, input) in accepted.into_iter().enumerate() {
+            assert_eq!(input.generation, 7);
+            match input.command {
+                ClientCommand::Input(bytes) => {
+                    assert_eq!(index % 2, 0);
+                    assert_eq!(bytes, [index as u8]);
+                }
+                ClientCommand::Resize(size) => {
+                    assert_eq!(index % 2, 1);
+                    assert_eq!(size.cols, 80 + index as u16);
+                    assert_eq!(size.rows, 24);
+                    assert_eq!(size.pixel_width, 800);
+                    assert_eq!(size.pixel_height, 600);
+                }
+                ClientCommand::RecoverySync(command) => {
+                    panic!("unexpected recovery sync command in duplex burst test: {command:?}")
+                }
+                ClientCommand::RecoveryAdopted => {
+                    panic!("unexpected recovery adoption command in duplex burst test")
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_input_coalesced_burst_keeps_native_socket_attached() {
+        let (mut client, worker_socket) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))
+            .unwrap();
+        worker_socket
+            .set_read_timeout(Some(CLIENT_POLL_INTERVAL))
+            .unwrap();
+        worker_socket
+            .set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))
+            .unwrap();
+        let mut burst = Vec::new();
+        for _ in 0..256 {
+            write_client_frame(&mut burst, CLIENT_FRAME_INPUT, b"x").unwrap();
+        }
+        let marker = b"\nINPUT-BURST-COMPLETE\n";
+        write_client_frame(&mut burst, CLIENT_FRAME_INPUT, marker).unwrap();
+        client.write_all(&burst).unwrap();
+
+        let (input, commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let (output, received_output) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let stolen = Arc::new(AtomicBool::new(false));
+        let worker_stolen = Arc::clone(&stolen);
+        let worker = thread::spawn(move || {
+            client_io_loop_test(worker_socket, 7, input, received_output, worker_stolen)
+        });
+        let expect_input = |expected: &[u8]| {
+            let input = commands.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(input.generation, 7);
+            assert!(matches!(
+                input.command,
+                ClientCommand::Input(bytes) if bytes == expected
+            ));
+        };
+        expect_input(b"x");
+        // Withhold the command consumer until duplex output reaches the
+        // client, so a blocking send cannot masquerade as successful retry.
+        let duplex = b"output while input is queued";
+        output.send(ClientOutput::Data(duplex.to_vec())).unwrap();
+        let received = read_server_output(&mut client, duplex.len());
+        assert_eq!(received, duplex);
+        for _ in 1..256 {
+            expect_input(b"x");
+        }
+        expect_input(marker);
+
+        write_client_frame(&mut client, CLIENT_FRAME_INPUT, b"still attached").unwrap();
+        expect_input(b"still attached");
+        stolen.store(true, Ordering::Release);
+        read_server_stolen(&mut client);
+        assert!(wait_for_thread(&worker, Duration::from_secs(2)));
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn client_input_is_read_while_client_output_writes_are_blocked() {
+        struct DuplexStream {
+            input: io::Cursor<Vec<u8>>,
+            commands: mpsc::Receiver<ClientInput>,
+            written: Vec<u8>,
+            stalled_writes: usize,
+            input_received: bool,
+        }
+
+        impl Read for DuplexStream {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.input.read(buffer)
+            }
+        }
+
+        impl Write for DuplexStream {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.written.is_empty() {
+                    self.written.extend_from_slice(&bytes[..2]);
+                    return Ok(2);
+                }
+                if !self.input_received {
+                    match self.commands.try_recv() {
+                        Ok(command) => {
+                            assert!(matches!(
+                                command.command,
+                                ClientCommand::Input(input) if input == b"\x03"
+                            ));
+                            self.input_received = true;
+                        }
+                        Err(_) => {
+                            self.stalled_writes += 1;
+                            assert!(
+                                self.stalled_writes < 3,
+                                "output retry must yield to read the interrupt"
+                            );
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                    }
+                }
+                self.written.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut frames = Vec::new();
+        write_client_frame(&mut frames, CLIENT_FRAME_INPUT, b"\x03").unwrap();
+        let (input, commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let (output, received_output) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        output
+            .send(ClientOutput::Data(b"uninterrupted output".to_vec()))
+            .unwrap();
+        let mut stream = DuplexStream {
+            input: io::Cursor::new(frames),
+            commands,
+            written: Vec::new(),
+            stalled_writes: 0,
+            input_received: false,
+        };
+        client_io_loop_test(
+            &mut stream,
+            7,
+            input,
+            received_output,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(
+            stream.written,
+            festerm_sessiond::encode_server_output_frame(b"uninterrupted output")
+        );
+        assert!(stream.input_received);
+    }
+
+    #[test]
+    fn pty_output_batches_yield_even_when_the_producer_keeps_refilling() {
+        let (sender, output) = mpsc::sync_channel(PTY_EVENT_CHANNEL_CAPACITY);
+        let data = || PtyEvent::Data(b"x\x1b[6n".to_vec());
+        for _ in 0..PTY_EVENT_CHANNEL_CAPACITY {
+            sender.send(data()).unwrap();
+        }
+        let mut terminal = Terminal::new(Dimensions::new(80, 24).unwrap()).unwrap();
+        let mut handled = 0;
+        assert_eq!(
+            drain_ready_pty_output(
+                &output,
+                &mut terminal,
+                None,
+                &mut None,
+                &mut Vec::new(),
+                &mut PendingOutput::default(),
+                &mut |command| {
+                    assert!(matches!(command, ClientCommand::Input(_)));
+                    handled += 1;
+                    assert!(handled <= PTY_EVENT_CHANNEL_CAPACITY);
+                    sender.try_send(data()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(handled, PTY_EVENT_CHANNEL_CAPACITY);
+        assert_eq!(output.try_iter().count(), PTY_EVENT_CHANNEL_CAPACITY);
+    }
+
+    #[test]
+    fn pty_output_batches_preserve_bytes_before_eof() {
+        let (sender, output) = mpsc::sync_channel(PTY_EVENT_CHANNEL_CAPACITY + 2);
+        let mut expected = Terminal::new(Dimensions::new(80, 24).unwrap()).unwrap();
+        for index in 0..=PTY_EVENT_CHANNEL_CAPACITY {
+            let data = format!("{index:03}\r\n").into_bytes();
+            expected.ingest(&data);
+            sender.send(PtyEvent::Data(data)).unwrap();
+        }
+        sender.send(PtyEvent::Eof).unwrap();
+        let mut terminal = Terminal::new(Dimensions::new(80, 24).unwrap()).unwrap();
+        let drain = |terminal: &mut Terminal| {
+            drain_ready_pty_output(
+                &output,
+                terminal,
+                None,
+                &mut None,
+                &mut Vec::new(),
+                &mut PendingOutput::default(),
+                &mut |_| panic!("fixture does not issue terminal queries"),
+            )
+            .unwrap()
+        };
+        assert_eq!(drain(&mut terminal), None);
+        assert_ne!(terminal, expected);
+        assert_eq!(drain(&mut terminal), Some(()));
+        assert_eq!(terminal, expected);
+    }
+
+    #[test]
+    fn client_input_batches_yield_even_when_the_producer_keeps_refilling() {
+        let (input, commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let command = || ClientInput {
+            generation: 7,
+            command: ClientCommand::Input(b"x".to_vec()),
+        };
+        for _ in 0..CLIENT_QUEUE_CAPACITY {
+            input.send(command()).unwrap();
+        }
+        let (output, _received_output) = mpsc::sync_channel(1);
+        let active = ActiveClient {
+            kind: AttachKind::Local,
+            generation: 7,
+            output,
+            stolen: Arc::new(AtomicBool::new(false)),
+            thread: thread::spawn(|| Ok(())),
+        };
+        let mut handled = 0;
+        let mut terminal = Terminal::new(Dimensions::new(80, 24).unwrap()).unwrap();
+        handle_pending_client_input(
+            &commands,
+            Some(&active),
+            &mut terminal,
+            &mut PendingOutput::default(),
+            &mut |_| {
+                handled += 1;
+                assert!(handled <= CLIENT_QUEUE_CAPACITY);
+                input.try_send(command()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(handled, CLIENT_QUEUE_CAPACITY);
+        assert_eq!(commands.try_iter().count(), CLIENT_QUEUE_CAPACITY);
+        active.thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn client_input_backpressure_stops_reading_and_allows_takeover() {
+        let mut frames = Vec::new();
+        for _ in 0..1000 {
+            write_client_frame(&mut frames, CLIENT_FRAME_INPUT, b"x").unwrap();
+        }
+        assert!(frames.len() > 4096);
+        let (input, commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let probe = input.clone();
+        let (output, received_output) = mpsc::sync_channel(1);
+        let stolen = Arc::new(AtomicBool::new(false));
+        let reads = Rc::new(Cell::new(0));
+        let mut written = Vec::new();
+        let stream = ClientTestStream {
+            input: io::Cursor::new(frames),
+            reads: Rc::clone(&reads),
+            output_on_read: Some(output.clone()),
+            on_write: |bytes: &[u8]| {
+                written.extend_from_slice(bytes);
+                assert_eq!(reads.get(), 1, "backpressure must not read ahead");
+                assert!(matches!(
+                    probe.try_send(ClientInput {
+                        generation: 7,
+                        command: ClientCommand::Input(b"must not fit".to_vec()),
+                    }),
+                    Err(mpsc::TrySendError::Full(_))
+                ));
+                stolen.store(true, Ordering::Release);
+            },
+        };
+
+        client_io_loop_test(stream, 7, input, received_output, Arc::clone(&stolen)).unwrap();
+
+        assert_eq!(
+            written,
+            [
+                festerm_sessiond::encode_server_output_frame(b"duplex output"),
+                festerm_sessiond::encode_server_stolen_frame()
+            ]
+            .concat()
+        );
+        assert_eq!(commands.try_iter().count(), CLIENT_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn client_input_backpressure_exits_when_daemon_channels_close() {
+        for close_input in [false, true] {
+            let mut frames = Vec::new();
+            for _ in 0..CLIENT_QUEUE_CAPACITY + 1 {
+                write_client_frame(&mut frames, CLIENT_FRAME_INPUT, b"x").unwrap();
+            }
+            let (input, commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+            let (output, received_output) = mpsc::sync_channel(1);
+            let mut commands = Some(commands);
+            let mut output = Some(output);
+            let reads = Rc::new(Cell::new(0));
+            let mut written = Vec::new();
+            let stream = ClientTestStream {
+                input: io::Cursor::new(frames),
+                reads: Rc::clone(&reads),
+                output_on_read: output.clone(),
+                on_write: |bytes: &[u8]| {
+                    written.extend_from_slice(bytes);
+                    if close_input {
+                        commands.take();
+                    } else {
+                        output.take();
+                    }
+                },
+            };
+
+            client_io_loop_test(
+                stream,
+                7,
+                input,
+                received_output,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+
+            assert_eq!(
+                written,
+                festerm_sessiond::encode_server_output_frame(b"duplex output")
+            );
+            assert_eq!(reads.get(), 1);
+        }
+    }
+
+    /// A takeover sets `stolen` and only then drops the output sender, so a
+    /// worker that polls `output` an instant after passing its own `stolen`
+    /// check observes the disconnect rather than the flag. It is still owed the
+    /// notice. The hook reproduces that interleaving exactly, without sleeps.
+    #[test]
+    fn a_takeover_during_the_output_poll_still_sends_the_stolen_notice() {
+        let (input, _commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let (output, received_output) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let stolen = Arc::new(AtomicBool::new(false));
+        let takeover_stolen = Arc::clone(&stolen);
+        let mut output = Some(output);
+        set_before_output_poll_hook(move || {
+            if let Some(output) = output.take() {
+                takeover_stolen.store(true, Ordering::Release);
+                drop(output);
+            }
+        });
+
+        let mut written = Vec::new();
+        let stream = ClientTestStream {
+            input: io::Cursor::new(Vec::new()),
+            reads: Rc::new(Cell::new(0)),
+            output_on_read: None,
+            on_write: |bytes: &[u8]| written.extend_from_slice(bytes),
+        };
+
+        client_io_loop_test(stream, 7, input, received_output, Arc::clone(&stolen)).unwrap();
+
+        assert_eq!(written, festerm_sessiond::encode_server_stolen_frame());
+    }
+
+    #[test]
+    fn client_input_retry_is_not_starved_by_continuous_output() {
+        let mut frames = Vec::new();
+        for _ in 0..CLIENT_QUEUE_CAPACITY + 1 {
+            write_client_frame(&mut frames, CLIENT_FRAME_INPUT, b"x").unwrap();
+        }
+        let (input, commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let (output, received_output) = mpsc::sync_channel(1);
+        let reads = Rc::new(Cell::new(0));
+        let mut writes = 0;
+        let stream = ClientTestStream {
+            input: io::Cursor::new(frames),
+            reads: Rc::clone(&reads),
+            output_on_read: Some(output.clone()),
+            on_write: |_: &[u8]| {
+                writes += 1;
+                assert_eq!(reads.get(), 1);
+                if writes == 1 {
+                    assert_eq!(commands.try_iter().count(), CLIENT_QUEUE_CAPACITY);
+                } else if writes == CLIENT_QUEUE_CAPACITY + 1 {
+                    assert_eq!(
+                        commands.try_iter().count(),
+                        1,
+                        "pending input must retry even when output never becomes empty"
+                    );
+                }
+                assert!(writes <= 2 * CLIENT_QUEUE_CAPACITY);
+                output
+                    .try_send(ClientOutput::Data(b"more output".to_vec()))
+                    .unwrap();
+            },
+        };
+
+        client_io_loop_test(
+            stream,
+            7,
+            input,
+            received_output,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        assert_eq!(writes, 2 * CLIENT_QUEUE_CAPACITY);
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn client_input_maximum_frame_accepts_a_coalesced_following_frame() {
+        let payload = vec![b'x'; MAX_CLIENT_FRAME_BYTES];
+        let mut frames = Vec::new();
+        write_client_frame(&mut frames, CLIENT_FRAME_INPUT, &payload).unwrap();
+        write_client_frame(&mut frames, CLIENT_FRAME_INPUT, b"next").unwrap();
+        let (input, commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let (_output, received_output) = mpsc::sync_channel(1);
+
+        client_io_loop_test(
+            io::Cursor::new(frames),
+            7,
+            input,
+            received_output,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        let accepted: Vec<_> = commands.try_iter().collect();
+        assert_eq!(accepted.len(), 2);
+        for (command, expected) in accepted.into_iter().zip([payload, b"next".to_vec()]) {
+            match command.command {
+                ClientCommand::Input(bytes) => assert_eq!(bytes, expected),
+                other => panic!("expected input, received {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn client_input_parser_preserves_fragmented_frames_and_rejects_invalid_frames() {
+        let mut frame = Vec::new();
+        write_client_frame(&mut frame, CLIENT_FRAME_INPUT, b"typed").unwrap();
+        let mut parser = ClientFrameParser::default();
+        for byte in &frame[..frame.len() - 1] {
+            parser.push(&[*byte]).unwrap();
+            assert!(parser.next_command().unwrap().is_none());
+        }
+        parser.push(&frame[frame.len() - 1..]).unwrap();
+        assert!(matches!(
+            parser.next_command().unwrap(),
+            Some(ClientCommand::Input(bytes)) if bytes == b"typed"
+        ));
+        assert!(parser.next_command().unwrap().is_none());
+        assert_eq!(
+            parser.remaining_capacity(),
+            MAX_CLIENT_FRAME_BYTES + CLIENT_FRAME_HEADER_BYTES
+        );
+
+        let mut invalid_magic = frame.clone();
+        invalid_magic[0] = b'?';
+        let mut oversized = frame[..CLIENT_FRAME_HEADER_BYTES].to_vec();
+        oversized[5..9].copy_from_slice(&((MAX_CLIENT_FRAME_BYTES + 1) as u32).to_be_bytes());
+        let mut unknown_kind = frame;
+        unknown_kind[4] = 255;
+        let mut short_resize = Vec::new();
+        write_client_frame(&mut short_resize, CLIENT_FRAME_RESIZE, &[0; 7]).unwrap();
+        let mut invalid_resize = Vec::new();
+        write_client_frame(&mut invalid_resize, CLIENT_FRAME_RESIZE, &[0; 8]).unwrap();
+        for invalid in [
+            invalid_magic,
+            oversized,
+            unknown_kind,
+            short_resize,
+            invalid_resize,
+        ] {
+            let mut parser = ClientFrameParser::default();
+            parser.push(&invalid).unwrap();
+            assert_eq!(
+                parser.next_command().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let mut parser = ClientFrameParser::default();
+        let oversized_buffer = vec![0; MAX_CLIENT_FRAME_BYTES + CLIENT_FRAME_HEADER_BYTES + 1];
+        assert_eq!(
+            parser.push(&oversized_buffer).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn saturated_output_preserves_control_resize_and_exit_order() {
+        let (output, received) = mpsc::sync_channel(1);
+        output.send(ClientOutput::Data(b"first".to_vec())).unwrap();
+        let mut active = Some(ActiveClient {
+            kind: AttachKind::Local,
+            generation: 1,
+            output,
+            stolen: Arc::new(AtomicBool::new(false)),
+            thread: thread::spawn(|| Ok(())),
+        });
+        let mut retired = Vec::new();
+        let mut pending = PendingOutput::default();
+        pending.hold(Some(1), b"second".to_vec());
+        let command = festerm_sessiond::RecoverySyncCommand::ResetToInitialState;
+        let payload = festerm_sessiond::encode_recovery_sync_command(&command).unwrap();
+        let size = PtySize {
+            rows: 4,
+            cols: 12,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let (input, commands) = mpsc::sync_channel(2);
+        input
+            .send(ClientInput {
+                generation: 1,
+                command: ClientCommand::RecoverySync(command),
+            })
+            .unwrap();
+        input
+            .send(ClientInput {
+                generation: 1,
+                command: ClientCommand::Resize(size),
+            })
+            .unwrap();
+        let mut terminal = Terminal::new(Dimensions::new(20, 6).unwrap()).unwrap();
+        handle_pending_client_input(
+            &commands,
+            active.as_ref(),
+            &mut terminal,
+            &mut pending,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        send_control_to_active(
+            &mut active,
+            &mut retired,
+            &mut pending,
+            ClientOutput::Exited,
+        );
+        for expected in [
+            ClientOutput::Data(b"first".to_vec()),
+            ClientOutput::Data(b"second".to_vec()),
+            ClientOutput::RecoverySync(payload),
+            ClientOutput::ResizeApplied(size),
+            ClientOutput::Exited,
+        ] {
+            assert_eq!(received.try_recv().unwrap(), expected);
+            flush_pending_output(&mut active, &mut retired, &mut pending);
+        }
+        assert!(!pending.is_pending());
+        assert_eq!(terminal.dimensions(), Dimensions::new(12, 4).unwrap());
+        active.take().unwrap().thread.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_sync_commands_update_the_snapshot_used_for_takeover() {
+        use festerm_core::{ColorScheme, Rgb, TerminalModes};
+        use std::{
+            io::{self, Read},
+            os::unix::net::{UnixListener, UnixStream},
+            sync::mpsc::{self, Receiver},
+        };
+
+        struct ChannelReader {
+            receiver: Receiver<Vec<u8>>,
+            pending: Vec<u8>,
+        }
+
+        impl Read for ChannelReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.pending.is_empty() {
+                    match self.receiver.recv() {
+                        Ok(data) => self.pending = data,
+                        Err(_) => return Ok(0),
+                    }
+                }
+                if self.pending.is_empty() {
+                    return Ok(0);
+                }
+                let count = output.len().min(self.pending.len());
+                output[..count].copy_from_slice(&self.pending[..count]);
+                self.pending.drain(..count);
+                Ok(count)
+            }
+        }
+
+        fn send_and_receive(
+            pty_sender: &mpsc::Sender<Vec<u8>>,
+            client: &mut UnixStream,
+            bytes: &[u8],
+        ) -> Vec<u8> {
+            pty_sender.send(bytes.to_vec()).unwrap();
+            read_server_output(client, bytes.len())
+        }
+
+        let directory = unique_test_directory("rsync");
+        fs::create_dir_all(&directory).unwrap();
+        let socket_path = directory.join("sessiond.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (pty_sender, pty_receiver) = mpsc::channel::<Vec<u8>>();
+        let mut terminal = Terminal::new(Dimensions::new(16, 1).unwrap()).unwrap();
+        let service = thread::spawn(move || {
+            session_client_loop(
+                listener,
+                ChannelReader {
+                    receiver: pty_receiver,
+                    pending: Vec::new(),
+                },
+                None,
+                |_command| Ok(()),
+                || {},
+                |_attached| true,
+                &mut terminal,
+            )
+        });
+
+        let mut first = connect_admitted_test_client(&socket_path);
+        let _ = read_recovery_terminal(&mut first);
+        acknowledge_recovery(&mut first);
+
+        let scheme = ColorScheme::new(
+            Rgb::new(1, 2, 3),
+            Rgb::new(4, 5, 6),
+            Rgb::new(7, 8, 9),
+            [Rgb::new(10, 11, 12); 16],
+        );
+        write_recovery_sync_frame(
+            &mut first,
+            festerm_sessiond::RecoverySyncCommand::SetScrollbackLimit { limit_bytes: 1024 },
+        );
+        write_recovery_sync_frame(
+            &mut first,
+            festerm_sessiond::RecoverySyncCommand::SetColorScheme(scheme),
+        );
+        write_recovery_sync_frame(
+            &mut first,
+            festerm_sessiond::RecoverySyncCommand::MirrorBytes(b"\x1b[2J\x1b[3J\x1b[H".to_vec()),
+        );
+        for _ in 0..3 {
+            let _ = read_server_recovery_sync(&mut first);
+        }
+        assert_eq!(
+            send_and_receive(
+                &pty_sender,
+                &mut first,
+                b"after-clear-1\r\nafter-clear-2\r\nnext",
+            ),
+            b"after-clear-1\r\nafter-clear-2\r\nnext"
+        );
+        write_recovery_sync_frame(
+            &mut first,
+            festerm_sessiond::RecoverySyncCommand::ResetToInitialState,
+        );
+        let _ = read_server_recovery_sync(&mut first);
+
+        let mut second = connect_admitted_test_client(&socket_path);
+        let recovered = read_recovery_terminal(&mut second);
+        acknowledge_recovery(&mut second);
+        read_server_stolen(&mut first);
+        assert_eq!(recovered.scrollback_stats().limit_bytes(), 1024);
+        assert_eq!(recovered.color_scheme(), &scheme);
+        assert_eq!(first_row_text(&recovered), "");
+        assert_eq!(recovered.title(), "");
+        assert_eq!(recovered.cursor().column(), 0);
+        assert_eq!(recovered.cursor().row(), 0);
+        assert_eq!(recovered.modes(), TerminalModes::default());
+
+        drop(pty_sender);
+        read_server_exited(&mut second);
+        service.join().unwrap().unwrap();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_client_replaces_first_client_and_first_receives_stolen_notice() {
+        use std::{
+            io::{self, Read},
+            os::unix::net::{UnixListener, UnixStream},
+            sync::mpsc::{self, Receiver, Sender},
+        };
+
+        struct ChannelReader {
+            receiver: Receiver<Vec<u8>>,
+            pending: Vec<u8>,
+        }
+
+        impl Read for ChannelReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.pending.is_empty() {
+                    match self.receiver.recv() {
+                        Ok(data) => self.pending = data,
+                        Err(_) => return Ok(0),
+                    }
+                }
+                if self.pending.is_empty() {
+                    return Ok(0);
+                }
+                let count = output.len().min(self.pending.len());
+                output[..count].copy_from_slice(&self.pending[..count]);
+                self.pending.drain(..count);
+                Ok(count)
+            }
+        }
+
+        fn send_and_receive(
+            pty: &Sender<Vec<u8>>,
+            client: &mut UnixStream,
+            data: &[u8],
+        ) -> Vec<u8> {
+            pty.send(data.to_vec()).unwrap();
+            read_server_output(client, data.len())
+        }
+
+        let directory = unique_test_directory("steal");
+        fs::create_dir_all(&directory).unwrap();
+        let socket_path = directory.join("session.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (pty_sender, pty_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let (command_sender, command_receiver) = mpsc::channel();
+        let service = thread::spawn(move || {
+            let mut terminal = Terminal::new(Dimensions::new(80, 24).unwrap()).unwrap();
+            session_client_loop(
+                listener,
+                ChannelReader {
+                    receiver: pty_receiver,
+                    pending: Vec::new(),
+                },
+                Some(event_sender),
+                move |command| {
+                    command_sender
+                        .send(command)
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "test closed"))
+                },
+                || {},
+                |_attached| true,
+                &mut terminal,
+            )
+        });
+
+        pty_sender.send(b"detached".to_vec()).unwrap();
+        assert_eq!(
+            event_receiver.recv().unwrap(),
+            ClientLoopEvent::OutputBuffered
+        );
+
+        let mut first = connect_admitted_test_client(&socket_path);
+        first
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let first_terminal = read_recovery_terminal(&mut first);
+        assert_eq!(first_row_text(&first_terminal), "detached");
+        acknowledge_recovery(&mut first);
+        assert_eq!(
+            event_receiver.recv().unwrap(),
+            ClientLoopEvent::ClientAttached
+        );
+        write_client_frame(&mut first, CLIENT_FRAME_INPUT, b"typed").unwrap();
+        match command_receiver.recv().unwrap() {
+            ClientCommand::Input(data) => assert_eq!(data, b"typed"),
+            command => panic!("expected input command, received {command:?}"),
+        }
+
+        assert_eq!(
+            send_and_receive(&pty_sender, &mut first, b"first"),
+            b"first"
+        );
+        assert_eq!(
+            event_receiver.recv().unwrap(),
+            ClientLoopEvent::OutputBuffered
+        );
+
+        let mut rejected = connect_admitted_test_client(&socket_path);
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = read_recovery_terminal(&mut rejected);
+        drop(rejected);
+        write_client_frame(&mut first, CLIENT_FRAME_INPUT, b"survived failed takeover").unwrap();
+        match command_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+        {
+            ClientCommand::Input(data) => assert_eq!(data, b"survived failed takeover"),
+            command => panic!("unexpected command: {command:?}"),
+        }
+
+        let mut second = connect_admitted_test_client(&socket_path);
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let second_terminal = read_recovery_terminal(&mut second);
+        assert_eq!(first_row_text(&second_terminal), "detachedfirst");
+        acknowledge_recovery(&mut second);
+        assert_eq!(
+            event_receiver.recv().unwrap(),
+            ClientLoopEvent::ClientAttached
+        );
+        read_server_stolen(&mut first);
+        let mut eof = [0u8; 1];
+        assert_eq!(first.read(&mut eof).unwrap(), 0);
+
+        let mut resize = Vec::new();
+        for value in [120u16, 40, 1200, 800] {
+            resize.extend_from_slice(&value.to_be_bytes());
+        }
+        write_client_frame(&mut second, CLIENT_FRAME_RESIZE, &resize).unwrap();
+        match command_receiver.recv().unwrap() {
+            ClientCommand::Resize(size) => {
+                assert_eq!(size.cols, 120);
+                assert_eq!(size.rows, 40);
+                assert_eq!(size.pixel_width, 1200);
+                assert_eq!(size.pixel_height, 800);
+            }
+            command => panic!("expected resize command, received {command:?}"),
+        }
+
+        let mut third = connect_admitted_test_client(&socket_path);
+        third
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let third_terminal = read_recovery_terminal(&mut third);
+        acknowledge_recovery(&mut third);
+        assert_eq!(
+            event_receiver.recv().unwrap(),
+            ClientLoopEvent::ClientAttached
+        );
+        read_server_resize_applied(&mut second);
+        read_server_stolen(&mut second);
+        assert_eq!(third_terminal.dimensions().columns(), 120);
+        assert_eq!(third_terminal.dimensions().rows(), 40);
+        assert_eq!(first_row_text(&third_terminal), "detachedfirst");
+
+        assert_eq!(
+            send_and_receive(&pty_sender, &mut third, b"second"),
+            b"second"
+        );
+        assert_eq!(
+            event_receiver.recv().unwrap(),
+            ClientLoopEvent::OutputBuffered
+        );
+
+        drop(pty_sender);
+        read_server_exited(&mut third);
+        assert_eq!(third.read(&mut eof).unwrap(), 0);
+        service.join().unwrap().unwrap();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    /// Regression test for a client that disappears (crashes/is killed)
+    /// while its shell sits completely idle, i.e. with no pty output at all
+    /// after the disconnect. `send_to_active`'s failed-`try_send` detection
+    /// only runs when there is data to relay, so before
+    /// `retire_active_if_finished` was added the daemon would keep
+    /// reporting `attached: true` forever in this scenario, hiding an
+    /// otherwise-resumable session from `list_unattached_local_sessions`.
+    #[cfg(unix)]
+    #[test]
+    fn idle_client_disconnect_is_detected_without_pty_output() {
+        use std::{
+            io::{self, Read},
+            os::unix::net::UnixListener,
+            sync::{mpsc, Mutex},
+        };
+
+        let directory = unique_test_directory("idle-disconnect");
+        fs::create_dir_all(&directory).unwrap();
+        let socket_path = directory.join("session.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (_pty_sender, pty_receiver) = mpsc::channel::<Vec<u8>>();
+        let attach_events: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let attach_events_clone = Arc::clone(&attach_events);
+
+        struct ChannelReader {
+            receiver: mpsc::Receiver<Vec<u8>>,
+        }
+
+        impl Read for ChannelReader {
+            fn read(&mut self, _output: &mut [u8]) -> io::Result<usize> {
+                match self.receiver.recv() {
+                    Ok(_) => unreachable!("this test never sends pty output"),
+                    Err(_) => Ok(0),
+                }
+            }
+        }
+
+        let service = thread::spawn(move || {
+            let mut terminal = Terminal::new(Dimensions::new(80, 24).unwrap()).unwrap();
+            session_client_loop(
+                listener,
+                ChannelReader {
+                    receiver: pty_receiver,
+                },
+                None,
+                |_command| Ok(()),
+                || {},
+                move |attached| {
+                    attach_events_clone.lock().unwrap().push(attached.is_some());
+                    true
+                },
+                &mut terminal,
+            )
+        });
+
+        let mut client = connect_admitted_test_client(&socket_path);
+        let _ = read_recovery_terminal(&mut client);
+        acknowledge_recovery(&mut client);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while attach_events.lock().unwrap().as_slice() != [true] {
+            if std::time::Instant::now() > deadline {
+                panic!("daemon never reported the client as attached");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Simulate the client process crashing/being killed: the socket
+        // closes with no further protocol activity and the shell stays
+        // idle (no pty output is ever sent on `_pty_sender`).
+        drop(client);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while attach_events.lock().unwrap().as_slice() != [true, false] {
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "idle client disconnect was never detected; attach events: {:?}",
+                    attach_events.lock().unwrap()
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        drop(_pty_sender);
+        service.join().unwrap().unwrap();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn cli_v2_acknowledges_recovery_and_consumes_frames_without_forwarding_queries() {
+        struct Duplex {
+            read: io::Cursor<Vec<u8>>,
+            written: Vec<u8>,
+        }
+        impl Read for Duplex {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.read.read(buffer)
+            }
+        }
+        impl Write for Duplex {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut terminal = Terminal::new(Dimensions::new(20, 4).unwrap()).unwrap();
+        terminal.ingest(b"recovered");
+        let mut wire = festerm_sessiond::encode_recovery_snapshot(&terminal).unwrap();
+        wire.extend(festerm_sessiond::encode_server_output_frame(
+            b"\r\nlive\x1b[6n",
+        ));
+        wire.extend(festerm_sessiond::encode_server_exited_frame());
+        let mut stream = Duplex {
+            read: io::Cursor::new(wire),
+            written: Vec::new(),
+        };
+        let (_input, incoming) = mpsc::sync_channel(1);
+        let mut output = Vec::new();
+        assert_eq!(
+            forward_attach_with_input(
+                &mut stream,
+                2,
+                festerm_sessiond::RECOVERY_SNAPSHOT_SCHEMA_VERSION,
+                &mut output,
+                &incoming,
+            )
+            .unwrap(),
+            AttachOutcome::Exited,
+        );
+        let mut expected = Vec::new();
+        write_client_frame(&mut expected, CLIENT_FRAME_RECOVERY_ADOPTED, &[]).unwrap();
+        assert_eq!(stream.written, expected);
+        assert!(find_bytes(&output, b"recovered").is_some());
+        assert!(find_bytes(&output, b"live").is_some());
+        assert!(find_bytes(&output, b"\x1b[6n").is_none());
+        assert!(find_bytes(&output, b"FSO1").is_none());
+    }
+
+    #[test]
+    fn attach_sentinel_is_detected_across_read_boundaries_without_forwarding_it() {
+        struct SplitReader {
+            chunks: std::collections::VecDeque<Vec<u8>>,
+        }
+
+        impl Read for SplitReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let Some(chunk) = self.chunks.pop_front() else {
+                    return Ok(0);
+                };
+                output[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let split = STOLEN_NOTICE_BYTES.len() / 2;
+        let mut reader = SplitReader {
+            chunks: std::collections::VecDeque::from([
+                [b"shell output".as_slice(), &STOLEN_NOTICE_BYTES[..split]].concat(),
+                STOLEN_NOTICE_BYTES[split..].to_vec(),
+            ]),
+        };
+        let mut output = Vec::new();
+
+        assert_eq!(
+            forward_attach_stream(&mut reader, &mut output).unwrap(),
+            AttachOutcome::Stolen
+        );
+        assert_eq!(output, b"shell output");
+    }
+
+    #[test]
+    fn attach_scanner_does_not_retain_normal_short_output() {
+        assert_eq!(partial_marker_suffix_len(b"$ "), 0);
+        assert_eq!(partial_marker_suffix_len(&STOLEN_NOTICE_BYTES[..12]), 12);
+        assert_eq!(
+            partial_marker_suffix_len(
+                [b"ordinary output".as_slice(), &STOLEN_NOTICE_BYTES[..9]]
+                    .concat()
+                    .as_slice()
+            ),
+            9
+        );
+    }
+
+    #[test]
+    fn default_shell_accepts_a_working_directory_without_losing_its_arguments() {
+        let expected = default_shell();
+        let directory = env::temp_dir().to_string_lossy().into_owned();
+        for command in ["start", "daemon"] {
+            let parsed = parse_args(
+                [command, "--name", "default-shell", "--cwd", &directory]
+                    .map(str::to_owned)
+                    .to_vec(),
+            )
+            .unwrap();
+            let shell = match parsed {
+                CommandSpec::Start { shell, .. } | CommandSpec::Daemon { shell, .. } => shell,
+                _ => panic!("expected a session launch"),
+            };
+            assert_eq!(shell.executable, expected.executable);
+            assert_eq!(shell.arguments, expected.arguments);
+            assert_eq!(shell.working_directory.as_deref(), Some(directory.as_str()));
+        }
+    }
+
+    #[test]
+    fn shell_arguments_still_require_an_explicit_shell_with_or_without_a_directory() {
+        let mut args = vec![
+            "--name".to_owned(),
+            "default-shell".to_owned(),
+            "--arg".to_owned(),
+            "-NoProfile".to_owned(),
+        ];
+        for with_directory in [false, true] {
+            if with_directory {
+                args.extend([
+                    "--cwd".to_owned(),
+                    env::temp_dir().to_string_lossy().into_owned(),
+                ]);
+            }
+            assert!(parse_start(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("requires --shell"));
+            assert!(parse_daemon(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("requires --shell"));
+        }
+    }
+
+    #[test]
+    fn parser_rejects_invalid_dimensions_duplicate_and_unknown_flags() {
+        let invalid_dimension = vec![
+            "--name".to_owned(),
+            "demo".to_owned(),
+            "--cols".to_owned(),
+            "wide".to_owned(),
+        ];
+        assert!(parse_start(&invalid_dimension)
+            .unwrap_err()
+            .to_string()
+            .contains("valid u16"));
+
+        let duplicate = vec![
+            "--name".to_owned(),
+            "demo".to_owned(),
+            "--name".to_owned(),
+            "other".to_owned(),
+        ];
+        assert!(parse_start(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("more than once"));
+
+        let unknown = vec![
+            "--name".to_owned(),
+            "demo".to_owned(),
+            "--bogus".to_owned(),
+            "value".to_owned(),
+        ];
+        assert!(parse_start(&unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("does not recognize"));
+    }
+
+    #[test]
+    fn registry_removal_does_not_delete_a_replacement_daemon() {
+        let mut registry = SessionRegistry {
+            sessions: BTreeMap::from([(
+                "demo".to_owned(),
+                SessionRecord {
+                    name: "demo".to_owned(),
+                    spawn_fingerprint: None,
+                    launch_request: None,
+                    correlation_id: None,
+                    pid: 22,
+                    socket: "demo.sock".to_owned(),
+                    shell: "shell".to_owned(),
+                    arguments: Vec::new(),
+                    working_directory: None,
+                    cols: 80,
+                    rows: 24,
+                    scrollback_limit_bytes: 1024,
+                    created_at_unix_ms: 2,
+                    attached: false,
+                    attached_by: None,
+                    attach_kinds: false,
+                    protocol_version: festerm_sessiond::PROTOCOL_VERSION,
+                    snapshot_schema_version: festerm_sessiond::RECOVERY_SNAPSHOT_SCHEMA_VERSION,
+                    helper_identity: None,
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let replacement = registry.sessions["demo"].clone();
+        let mut old = replacement.clone();
+        old.created_at_unix_ms = 1;
+        remove_registry_record_if_generation_matches(&mut registry, &old);
+        assert_eq!(registry.sessions["demo"].pid, 22);
+        remove_registry_record_if_generation_matches(&mut registry, &replacement);
+        assert!(!registry.sessions.contains_key("demo"));
+    }
+
+    /// A client that is gone must be retired so its worker can be joined.
+    #[test]
+    fn output_for_a_departed_client_is_retired_for_worker_join() {
+        let (output, receiver) = mpsc::sync_channel(1);
+        // The worker has ended, so nothing will ever receive again.
+        drop(receiver);
+        let mut active = Some(ActiveClient {
+            kind: AttachKind::Local,
+            generation: 1,
+            output,
+            stolen: Arc::new(AtomicBool::new(false)),
+            thread: thread::spawn(|| -> io::Result<()> {
+                panic!("test client worker panic");
+            }),
+        });
+        let mut retired = Vec::new();
+        let mut pending = PendingOutput::default();
+
+        send_to_active(&mut active, &mut retired, &mut pending, b"output".to_vec());
+
+        assert!(active.is_none());
+        assert!(!pending.is_pending());
+        assert_eq!(retired.len(), 1);
+        assert!(join_client_thread(retired.pop().unwrap()).is_err());
+    }
+
+    /// A client that is merely slow must keep its session.
+    ///
+    /// The GUI drains output on its frame loop, so a long frame fills the
+    /// bounded queue. Retiring the client there disconnected users in the
+    /// middle of an active session; the output has to wait instead.
+    #[test]
+    fn output_for_a_full_client_waits_instead_of_dropping_the_session() {
+        let (output, receiver) = mpsc::sync_channel(1);
+        let mut active = Some(ActiveClient {
+            kind: AttachKind::Local,
+            generation: 1,
+            output,
+            stolen: Arc::new(AtomicBool::new(false)),
+            thread: thread::spawn(|| -> io::Result<()> { Ok(()) }),
+        });
+        let mut retired = Vec::new();
+        let mut pending = PendingOutput::default();
+
+        send_to_active(&mut active, &mut retired, &mut pending, b"first".to_vec());
+        assert!(!pending.is_pending(), "the first chunk fits in the queue");
+
+        // The queue is now full, so this chunk has nowhere to go yet.
+        send_to_active(&mut active, &mut retired, &mut pending, b"second".to_vec());
+        assert!(pending.is_pending());
+        assert!(active.is_some(), "a slow client must keep its session");
+        assert!(retired.is_empty());
+
+        // Once the client reads, the parked chunk is delivered in order.
+        assert_eq!(
+            receiver.recv().unwrap(),
+            ClientOutput::Data(b"first".into())
+        );
+        flush_pending_output(&mut active, &mut retired, &mut pending);
+        assert!(!pending.is_pending());
+        assert_eq!(
+            receiver.recv().unwrap(),
+            ClientOutput::Data(b"second".into())
+        );
+    }
+
+    /// Output parked for a client that has since been replaced must be dropped:
+    /// the replacement receives a fresh recovery snapshot instead.
+    #[test]
+    fn output_parked_for_a_replaced_client_is_not_delivered_twice() {
+        let (output, receiver) = mpsc::sync_channel(1);
+        let mut active = Some(ActiveClient {
+            kind: AttachKind::Local,
+            generation: 1,
+            output,
+            stolen: Arc::new(AtomicBool::new(false)),
+            thread: thread::spawn(|| -> io::Result<()> { Ok(()) }),
+        });
+        let mut retired = Vec::new();
+        let mut pending = PendingOutput::default();
+
+        send_to_active(&mut active, &mut retired, &mut pending, b"first".to_vec());
+        send_to_active(&mut active, &mut retired, &mut pending, b"second".to_vec());
+        assert!(pending.is_pending());
+
+        let (replacement, replacement_receiver) = mpsc::sync_channel(4);
+        active = Some(ActiveClient {
+            kind: AttachKind::Local,
+            generation: 2,
+            output: replacement,
+            stolen: Arc::new(AtomicBool::new(false)),
+            thread: thread::spawn(|| -> io::Result<()> { Ok(()) }),
+        });
+
+        flush_pending_output(&mut active, &mut retired, &mut pending);
+
+        assert!(!pending.is_pending());
+        assert!(replacement_receiver.try_recv().is_err());
+        drop(receiver);
+    }
+
+    /// A write that times out is backpressure, not a broken client.
+    #[test]
+    fn a_client_write_that_times_out_resumes_where_it_stopped() {
+        #[derive(Default)]
+        struct StallingWriter {
+            written: Vec<u8>,
+            attempts: usize,
+        }
+
+        impl Write for StallingWriter {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                self.attempts += 1;
+                match self.attempts {
+                    // Accept a little, then stall twice, then accept the rest.
+                    1 => {
+                        self.written.extend_from_slice(&buffer[..2]);
+                        Ok(2)
+                    }
+                    2 => Err(io::Error::new(io::ErrorKind::TimedOut, "slow client")),
+                    3 => Err(io::Error::new(io::ErrorKind::WouldBlock, "slow client")),
+                    _ => {
+                        self.written.extend_from_slice(buffer);
+                        Ok(buffer.len())
+                    }
+                }
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = StallingWriter::default();
+        let stolen = AtomicBool::new(false);
+
+        let mut written = 0;
+        while !write_to_client(&mut writer, b"abcdef", &mut written, &stolen).unwrap() {}
+
+        assert_eq!(writer.written, b"abcdef", "no byte is written twice");
+        assert_eq!(written, 6);
+    }
+
+    #[test]
+    fn a_client_output_batch_yields_with_its_offset_intact() {
+        let data = vec![b'x'; MAX_CLIENT_FRAME_BYTES + 17];
+        let mut wire = Vec::new();
+        let mut written = 0;
+        let stolen = AtomicBool::new(false);
+        assert!(!write_to_client(&mut wire, &data, &mut written, &stolen).unwrap());
+        assert_eq!(written, MAX_CLIENT_FRAME_BYTES);
+        assert!(write_to_client(&mut wire, &data, &mut written, &stolen).unwrap());
+        assert_eq!(wire, data);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retired_windows_clients_finish_even_when_their_output_is_never_read() {
+        for index in 0..4 {
+            let name = format!(
+                r"\\.\pipe\festerm-retired-client-{}-{}-{index}",
+                process::id(),
+                now_ms()
+            );
+            let listener = create_secure_pipe_listener(&name, true).unwrap();
+            let mut client =
+                Pipe::connect(&name, Duration::from_secs(1), &AtomicBool::new(false)).unwrap();
+            let mut server = listener.accept(&AtomicBool::new(false)).unwrap();
+            client.set_read_timeout(Duration::from_secs(5));
+            client.set_write_timeout(CLIENT_WRITE_TIMEOUT);
+            server.set_read_timeout(CLIENT_POLL_INTERVAL);
+            server.set_write_timeout(CLIENT_WRITE_TIMEOUT);
+            let adoption = thread::spawn(move || {
+                read_recovery_terminal(&mut client);
+                acknowledge_recovery(&mut client);
+                client
+            });
+            let (input, _commands) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+            let mut active = None;
+            let mut retired = Vec::new();
+            let terminal = Terminal::new(Dimensions::new(80, 24).unwrap()).unwrap();
+            replace_active(&mut active, &mut retired, server, &terminal, input, &mut 1).unwrap();
+            let mut nonreading_client = adoption.join().unwrap();
+            active
+                .as_ref()
+                .unwrap()
+                .output
+                .send(ClientOutput::Data(vec![b'x'; MAX_CLIENT_FRAME_BYTES]))
+                .unwrap();
+            // Reading only the frame header proves delivery started while
+            // leaving the entire output payload undrained during retirement.
+            let mut header = [0; 9];
+            nonreading_client.read_exact(&mut header).unwrap();
+            assert_eq!(&header[..4], b"FSO1");
+            assert_eq!(header[4], 1);
+            retire_active(&mut active, &mut retired, true);
+            assert!(wait_for_thread(&retired[0], WORKER_JOIN_TIMEOUT));
+            reap_client_threads(&mut retired).unwrap();
+            assert!(retired.is_empty());
+        }
+    }
+
+    /// A takeover must not be blocked by a client that refuses to read.
+    #[test]
+    fn a_client_write_is_abandoned_once_the_session_is_stolen() {
+        struct NeverAcceptingWriter;
+
+        impl Write for NeverAcceptingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "wedged client"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let stolen = AtomicBool::new(true);
+
+        assert!(!write_to_client(&mut NeverAcceptingWriter, b"abcdef", &mut 0, &stolen).unwrap());
+    }
+
+    #[test]
+    fn valid_names_are_accepted() {
+        assert_eq!(validate_name("demo-01".to_owned()).unwrap(), "demo-01");
+        assert_eq!(validate_name("session_2".to_owned()).unwrap(), "session_2");
+    }
+
+    /// Shutdown used to join the pseudoterminal reader unconditionally. On
+    /// Windows that reader is parked in a blocking read on a ConPTY handle
+    /// that only releases when the pseudoconsole closes -- which cannot happen
+    /// until shutdown returns -- so the daemon hung forever with a live
+    /// registry record and no listener, and the Launcher kept offering a
+    /// session nothing could attach to.
+    #[test]
+    fn a_worker_that_never_finishes_is_detached_so_shutdown_cannot_hang() {
+        let (release, blocked) = mpsc::channel::<()>();
+        let worker = thread::spawn(move || -> io::Result<()> {
+            let _ = blocked.recv();
+            Ok(())
+        });
+
+        let started = Instant::now();
+        let result = join_io_thread_within(worker, Duration::from_millis(100));
+
+        assert!(result.is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown waited {:?} on a worker that never finishes",
+            started.elapsed()
+        );
+        drop(release);
+    }
+
+    #[test]
+    fn a_worker_that_finishes_in_time_still_reports_its_failure() {
+        let worker = thread::spawn(|| -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "worker failed"))
+        });
+
+        let error = join_io_thread_within(worker, Duration::from_secs(5)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn a_client_worker_that_never_finishes_is_detached_so_shutdown_cannot_hang() {
+        let (release, blocked) = mpsc::channel::<()>();
+        let worker = thread::spawn(move || -> io::Result<()> {
+            let _ = blocked.recv();
+            Ok(())
+        });
+
+        assert!(join_client_thread_within(worker, Duration::from_millis(100)).is_ok());
+        drop(release);
+    }
+
+    /// A client worker that fails its own I/O is expected: the client simply
+    /// went away. Only a panic is a daemon bug worth surfacing.
+    #[test]
+    fn a_client_worker_that_finishes_in_time_ignores_its_io_failure_but_not_a_panic() {
+        let failed = thread::spawn(|| -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "client went away",
+            ))
+        });
+        assert!(join_client_thread_within(failed, Duration::from_secs(5)).is_ok());
+
+        let panicked = thread::spawn(|| -> io::Result<()> {
+            panic!("test client worker panic");
+        });
+        assert!(join_client_thread_within(panicked, Duration::from_secs(5)).is_err());
+    }
+
+    #[test]
+    fn invalid_names_are_rejected() {
+        let err = validate_name("bad/name".to_owned()).unwrap_err();
+        assert!(err.to_string().contains("persistent session name"));
+    }
+
+    #[test]
+    fn kill_unattached_requires_a_complete_valid_generation_identity() {
+        let args: Vec<String> = [
+            "kill-unattached",
+            "--name",
+            "demo",
+            "--pid",
+            "123",
+            "--created-at",
+            "456",
+            "--endpoint",
+            "owned-endpoint",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let CommandSpec::KillUnattached { expected } = parse_args(args.clone()).unwrap() else {
+            panic!("expected generation-pinned termination");
+        };
+        assert_eq!(expected.name, "demo");
+        assert_eq!(expected.pid, 123);
+        assert_eq!(expected.created_at_unix_ms, 456);
+        assert_eq!(expected.endpoint, "owned-endpoint");
+        for count in 1..args.len() {
+            assert!(parse_args(args[..count].to_vec()).is_err());
+        }
+        for (index, invalid) in [
+            (2, "bad/name"),
+            (4, "0"),
+            (4, "invalid"),
+            (6, "-1"),
+            (8, ""),
+        ] {
+            let mut invalid_args = args.clone();
+            invalid_args[index] = invalid.into();
+            assert!(parse_args(invalid_args).is_err());
+        }
+        assert!(matches!(
+            parse_args(vec!["kill".into(), "--name".into(), "demo".into()]).unwrap(),
+            CommandSpec::Kill { .. }
+        ));
+    }
+
+    #[test]
+    fn kill_unattached_refuses_replaced_or_attached_generations_before_signalling() {
+        let fixture = GenerationFixture::new();
+        let record = fixture.record("demo", 1);
+        let _lease = fixture.artifacts(&record, true);
+        let expected = festerm_sessiond::NativeSessionIdentity {
+            name: record.name.clone(),
+            pid: record.pid,
+            created_at_unix_ms: record.created_at_unix_ms,
+            endpoint: record.socket.clone(),
+        };
+        for mismatch in 0..5 {
+            let mut current = record.clone();
+            match mismatch {
+                0 => current.pid += 1,
+                1 => current.created_at_unix_ms += 1,
+                2 => current.socket.push_str("-replacement"),
+                3 => current.attached = true,
+                _ => current.name = "different".into(),
+            }
+            let mut registry = SessionRegistry {
+                sessions: BTreeMap::from([("demo".into(), current)]),
+                ..Default::default()
+            };
+            assert!(kill_unattached_registered_session(
+                &fixture.0,
+                &mut registry,
+                &expected,
+                |_| panic!("a stale or attached discovery entry must never signal a process"),
+                Duration::ZERO,
+            )
+            .is_err());
+            assert!(registry.sessions.contains_key("demo"));
+            assert!(generation_lease_path(&fixture.0, &record).exists());
+        }
+        assert!(kill_unattached_registered_session(
+            &fixture.0,
+            &mut SessionRegistry::default(),
+            &expected,
+            |_| panic!("a missing discovery entry must never signal a process"),
+            Duration::ZERO,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn kill_unattached_cleans_only_the_confirmed_generation_and_retains_failed_retries() {
+        let fixture = GenerationFixture::new();
+        let record = fixture.record("demo", 1);
+        let lease = fixture.artifacts(&record, true);
+        let other = fixture.record("other", 2);
+        let _other_lease = fixture.artifacts(&other, true);
+        let expected = festerm_sessiond::NativeSessionIdentity {
+            name: record.name.clone(),
+            pid: record.pid,
+            created_at_unix_ms: record.created_at_unix_ms,
+            endpoint: record.socket.clone(),
+        };
+        let mut registry = SessionRegistry {
+            sessions: BTreeMap::from([
+                ("demo".into(), record.clone()),
+                ("other".into(), other.clone()),
+            ]),
+            ..Default::default()
+        };
+        assert!(kill_unattached_registered_session(
+            &fixture.0,
+            &mut registry,
+            &expected,
+            |_| Err("controlled denial".into()),
+            Duration::from_millis(20),
+        )
+        .is_err());
+        assert!(registry.sessions.contains_key("demo"));
+        kill_unattached_registered_session(
+            &fixture.0,
+            &mut registry,
+            &expected,
+            |pid| {
+                assert_eq!(pid, expected.pid);
+                FileExt::unlock(&lease)?;
+                Ok(())
+            },
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        fixture.assert_removed(&record);
+        assert!(!registry.sessions.contains_key("demo"));
+        assert!(registry.sessions.contains_key("other"));
+        assert!(generation_lease_path(&fixture.0, &other).exists());
+    }
+
+    #[test]
+    fn killing_a_session_retains_retry_identity_when_termination_fails() {
+        let fixture = GenerationFixture::new();
+        let record = fixture.record("demo", 1);
+        let lease = fixture.artifacts(&record, true);
+        let mut registry = SessionRegistry::default();
+        registry.sessions.insert("demo".into(), record.clone());
+
+        let error = kill_registered_session(
+            &fixture.0,
+            &mut registry,
+            "demo",
+            |_| Err("access is denied".to_owned().into()),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("access is denied"));
+        assert!(
+            registry.sessions.contains_key("demo"),
+            "failed termination must preserve the generation needed for cleanup retry"
+        );
+        assert!(generation_lease_path(&fixture.0, &record).exists());
+        kill_registered_session(
+            &fixture.0,
+            &mut registry,
+            "demo",
+            |pid| {
+                assert_eq!(pid, record.pid);
+                FileExt::unlock(&lease)?;
+                Ok(())
+            },
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        fixture.assert_removed(&record);
+        assert!(registry.sessions.is_empty());
+    }
+
+    #[test]
+    fn killing_an_unregistered_session_reports_that_it_is_not_registered() {
+        let mut registry = SessionRegistry::default();
+
+        let error = kill_registered_session(
+            Path::new("."),
+            &mut registry,
+            "missing",
+            |_| panic!("an unregistered session must not be terminated"),
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("is not registered"));
+    }
+
+    #[test]
+    fn killing_a_stale_generation_never_signals_a_reused_live_pid() {
+        let fixture = GenerationFixture::new();
+        let record = fixture.record("stale", 1);
+        let _lease = fixture.artifacts(&record, false);
+        let mut registry = SessionRegistry::default();
+        registry.sessions.insert("stale".into(), record.clone());
+        kill_registered_session(
+            &fixture.0,
+            &mut registry,
+            "stale",
+            |_| panic!("stale generation must not signal this live process"),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(registry.sessions.is_empty());
+        fixture.assert_removed(&record);
+    }
+
+    struct GenerationFixture(PathBuf);
+
+    impl GenerationFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let base = if cfg!(unix) {
+                PathBuf::from("/tmp")
+            } else {
+                env::temp_dir()
+            };
+            let path = base.join(format!(
+                "fsd-g-{}-{}-{}",
+                process::id(),
+                now_ms(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            set_dir_mode(&path, 0o700).unwrap();
+            Self(path)
+        }
+
+        fn record(&self, name: &str, generation: u128) -> SessionRecord {
+            generation_record(
+                &self.0,
+                GenerationRecordSpec {
+                    name: name.into(),
+                    pid: process::id(),
+                    generation,
+                    shell: &ShellSpec {
+                        executable: "owned-test-shell".into(),
+                        arguments: Vec::new(),
+                        working_directory: None,
+                    },
+                    cols: 80,
+                    rows: 24,
+                    scrollback_limit_bytes: 1024,
+                },
+            )
+            .unwrap()
+        }
+
+        fn artifacts(&self, record: &SessionRecord, locked: bool) -> fs::File {
+            let lease = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(generation_lease_path(&self.0, record))
+                .unwrap();
+            if locked {
+                lease.lock_exclusive().unwrap();
+            }
+            #[cfg(unix)]
+            drop(UnixListener::bind(&record.socket).unwrap());
+            lease
+        }
+
+        fn assert_removed(&self, record: &SessionRecord) {
+            assert!(!generation_lease_path(&self.0, record).exists());
+            #[cfg(unix)]
+            assert!(!Path::new(&record.socket).exists());
+        }
+    }
+
+    impl Drop for GenerationFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn generation_cleanup_preserves_live_replacement_and_unrelated_files() {
+        let fixture = GenerationFixture::new();
+        let old = fixture.record("same", 1);
+        let replacement = fixture.record("same", 2);
+        let _old = fixture.artifacts(&old, false);
+        let _replacement = fixture.artifacts(&replacement, true);
+        let sentinel = fixture.0.join("unrelated");
+        fs::write(&sentinel, b"preserve").unwrap();
+        cleanup_dead_generation(&fixture.0, &old, true).unwrap();
+        fixture.assert_removed(&old);
+        assert!(cleanup_dead_generation(&fixture.0, &replacement, true).is_err());
+        assert!(generation_lease_path(&fixture.0, &replacement).exists());
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn pruning_removes_dead_generation_artifacts_but_not_live_sessions() {
+        let fixture = GenerationFixture::new();
+        let dead = fixture.record("dead", 1);
+        let live = fixture.record("live", 2);
+        let _dead = fixture.artifacts(&dead, false);
+        let _live = fixture.artifacts(&live, true);
+        let mut registry = SessionRegistry {
+            sessions: BTreeMap::from([
+                ("dead".into(), dead.clone()),
+                ("live".into(), live.clone()),
+            ]),
+            ..Default::default()
+        };
+        prune_dead_records_in(&fixture.0, &mut registry).unwrap();
+        fixture.assert_removed(&dead);
+        assert_eq!(registry.sessions.len(), 1);
+        assert!(registry.sessions.contains_key("live"));
+        assert!(generation_lease_path(&fixture.0, &live).exists());
+    }
+
+    #[test]
+    fn kill_timeout_keeps_the_generation_and_artifacts_for_retry() {
+        let fixture = GenerationFixture::new();
+        let record = fixture.record("held", 1);
+        let _lease = fixture.artifacts(&record, true);
+        let mut registry = SessionRegistry {
+            sessions: BTreeMap::from([("held".into(), record.clone())]),
+            ..Default::default()
+        };
+        let error = kill_registered_session(
+            &fixture.0,
+            &mut registry,
+            "held",
+            |_| Ok(()),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("retained"));
+        assert!(registry.sessions.contains_key("held"));
+        assert!(generation_lease_path(&fixture.0, &record).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_cleanup_rejects_redirected_artifact_leaves_and_endpoints() {
+        let fixture = GenerationFixture::new();
+        let mut record = fixture.record("redirected", 1);
+        let sentinel = fixture.0.join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&sentinel, generation_lease_path(&fixture.0, &record)).unwrap();
+        assert!(cleanup_dead_generation(&fixture.0, &record, true).is_err());
+        record.socket = sentinel.to_string_lossy().into_owned();
+        assert!(cleanup_dead_generation(&fixture.0, &record, true).is_err());
+        assert_eq!(fs::read(sentinel).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn registry_round_trip_is_stable() {
+        let record = SessionRecord {
+            name: "demo".to_owned(),
+            spawn_fingerprint: None,
+            launch_request: None,
+            correlation_id: None,
+            pid: 1234,
+            socket: "/tmp/festerm-sessiond/demo.sock".to_owned(),
+            shell: "/bin/bash".to_owned(),
+            arguments: vec!["-l".to_owned()],
+            working_directory: Some("/tmp".to_owned()),
+            cols: 80,
+            rows: 24,
+            scrollback_limit_bytes: 1024,
+            created_at_unix_ms: 1_700_000_000_000,
+            attached: true,
+            attached_by: None,
+            attach_kinds: false,
+            protocol_version: festerm_sessiond::PROTOCOL_VERSION,
+            snapshot_schema_version: festerm_sessiond::RECOVERY_SNAPSHOT_SCHEMA_VERSION,
+            helper_identity: Some("festerm-sessiond-0.2.2.exe".to_owned()),
+        };
+        let registry = SessionRegistry {
+            sessions: BTreeMap::from([(record.name.clone(), record.clone())]),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_string(&registry).unwrap();
+        let parsed: SessionRegistry = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed.sessions.get("demo"), Some(&record));
+    }
+
+    #[test]
+    fn a_record_this_helper_cannot_read_survives_an_update_of_another_session() {
+        let document = serde_json::json!({
+            "sessions": {
+                "future": {
+                    "name": "future",
+                    "socket": { "transport": "quic" },
+                    "protocol_version": 9
+                }
+            }
+        });
+        let mut registry: SessionRegistry = serde_json::from_value(document.clone()).unwrap();
+        assert!(registry.sessions.is_empty());
+        assert_eq!(registry.foreign.len(), 1);
+
+        registry.sessions.insert(
+            "mine".to_owned(),
+            SessionRecord {
+                name: "mine".to_owned(),
+                spawn_fingerprint: None,
+                launch_request: None,
+                correlation_id: None,
+                pid: 7,
+                socket: "mine.sock".to_owned(),
+                shell: "/bin/sh".to_owned(),
+                arguments: Vec::new(),
+                working_directory: None,
+                cols: 80,
+                rows: 24,
+                scrollback_limit_bytes: 1024,
+                created_at_unix_ms: 1,
+                attached: false,
+                attached_by: None,
+                attach_kinds: false,
+                protocol_version: festerm_sessiond::PROTOCOL_VERSION,
+                snapshot_schema_version: festerm_sessiond::RECOVERY_SNAPSHOT_SCHEMA_VERSION,
+                helper_identity: None,
+            },
+        );
+
+        let written: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&registry).unwrap()).unwrap();
+        assert_eq!(
+            written["sessions"]["future"],
+            document["sessions"]["future"]
+        );
+        assert_eq!(written["sessions"]["mine"]["pid"], 7);
+    }
+
+    #[test]
+    fn killing_a_session_this_helper_cannot_read_reports_the_version_gap() {
+        let fixture = GenerationFixture::new();
+        let mut registry: SessionRegistry = serde_json::from_value(serde_json::json!({
+            "sessions": { "future": { "socket": { "transport": "quic" } } }
+        }))
+        .unwrap();
+        let error = kill_registered_session(
+            &fixture.0,
+            &mut registry,
+            "future",
+            |_| Ok(()),
+            Duration::from_millis(10),
+        )
+        .expect_err("an unreadable record must not be silently missing")
+        .to_string();
+        assert!(error.contains("newer festerm-sessiond"));
+        assert_eq!(registry.foreign.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_shell_honors_the_configured_working_directory() {
+        let directory = unique_test_directory("cwd");
+        fs::create_dir_all(&directory).unwrap();
+        let correlation = format!("fesTerm:{}:{}", process::id(), now_ms());
+        let mut spawned = spawn_shell(
+            &ShellSpec {
+                executable: "/bin/sh".to_owned(),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "pwd; printf '%s\\n' \"$FESTERM_SESSION_CORRELATION\"; read -r acknowledgement"
+                        .to_owned(),
+                ],
+                working_directory: Some(directory.to_string_lossy().into_owned()),
+            },
+            80,
+            24,
+            Some(&correlation),
+        )
+        .unwrap();
+        let reader = spawned.master().unwrap().try_clone_reader().unwrap();
+        let mut writer = spawned.master().unwrap().take_writer().unwrap();
+        let (output_tx, output_rx) = mpsc::sync_channel(1);
+        let reader_thread = thread::spawn(move || {
+            let mut reader = io::BufReader::new(reader);
+            let mut output = String::new();
+            let result = io::BufRead::read_line(&mut reader, &mut output)
+                .and_then(|_| io::BufRead::read_line(&mut reader, &mut output))
+                .map(|_| output);
+            let _ = output_tx.send(result);
+            io::copy(&mut reader, &mut io::sink()).map(|_| ())
+        });
+        let output = output_rx.recv_timeout(Duration::from_secs(5));
+        // Keep the slave alive until its output is read; macOS may discard
+        // unread PTY bytes when a short-lived child exits.
+        if matches!(&output, Ok(Ok(_))) {
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+        } else {
+            spawned.child.kill().unwrap();
+        }
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = spawned.child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= exit_deadline {
+                spawned.child.kill().unwrap();
+                break spawned.child.wait().unwrap();
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        reader_thread.join().unwrap().unwrap();
+        let output = output
+            .expect("working-directory output before deadline")
+            .unwrap();
+        assert!(status.success());
+        let mut lines = output.lines();
+        assert_eq!(
+            Path::new(lines.next().unwrap().trim()),
+            directory.canonicalize().unwrap().as_path()
+        );
+        assert_eq!(lines.next().unwrap().trim(), correlation);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn native_persistent_children_identify_festerm_and_drop_stale_terminal_session() {
+        let mut command = CommandBuilder::new("shell");
+        command.env("TERM", "stale");
+        command.env("TERM_PROGRAM", "tmux");
+        command.env("COLORTERM", "stale");
+        command.env("TERM_SESSION_ID", "stale-session");
+
+        command.env(
+            festerm_sessiond::SESSION_CORRELATION_ENV,
+            "stale-correlation",
+        );
+        apply_terminal_environment(&mut command, None);
+
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        assert_eq!(
+            command.get_env("TERM_PROGRAM"),
+            Some(std::ffi::OsStr::new("fesTerm"))
+        );
+        assert_eq!(
+            command.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new("truecolor"))
+        );
+        assert_eq!(command.get_env("TERM_SESSION_ID"), None);
+        assert_eq!(
+            command.get_env(festerm_sessiond::SESSION_CORRELATION_ENV),
+            None
+        );
+        apply_terminal_environment(&mut command, Some("fesTerm:123:456"));
+        assert_eq!(
+            command.get_env(festerm_sessiond::SESSION_CORRELATION_ENV),
+            Some(std::ffi::OsStr::new("fesTerm:123:456"))
+        );
+    }
+
+    #[cfg(unix)]
+    fn unique_test_directory(label: &str) -> PathBuf {
+        env::temp_dir().join(format!("fsd-{label}-{}-{}", process::id(), now_ms()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_client_stream_blocks_for_the_read_timeout_from_a_nonblocking_listener() {
+        let directory = unique_test_directory("blocking");
+        fs::create_dir_all(&directory).unwrap();
+        let socket_path = directory.join("sessiond.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _client = UnixStream::connect(&socket_path).unwrap();
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1))
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+
+        configure_accepted_client_stream(&stream).unwrap();
+
+        let started = Instant::now();
+        let error = (&stream).read(&mut [0u8; 1]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        // A nonblocking socket would fail immediately instead of waiting.
+        assert!(started.elapsed() >= CLIENT_POLL_INTERVAL / 2);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn attach_state_change_reports_only_on_transition() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut reported = None;
+        let events_clone = Rc::clone(&events);
+        let mut on_change = move |attached: Option<AttachKind>| {
+            events_clone.borrow_mut().push(attached);
+            true
+        };
+
+        let local = Some(AttachKind::Local);
+        let remote = Some(AttachKind::Remote);
+        report_attach_state_change(None, &mut reported, &mut on_change);
+        assert!(events.borrow().is_empty());
+
+        report_attach_state_change(local, &mut reported, &mut on_change);
+        assert_eq!(*events.borrow(), vec![local]);
+
+        report_attach_state_change(local, &mut reported, &mut on_change);
+        assert_eq!(*events.borrow(), vec![local]);
+
+        // A takeover keeps the session attached but changes who holds it.
+        report_attach_state_change(remote, &mut reported, &mut on_change);
+        assert_eq!(*events.borrow(), vec![local, remote]);
+
+        report_attach_state_change(None, &mut reported, &mut on_change);
+        assert_eq!(*events.borrow(), vec![local, remote, None]);
+    }
+
+    #[test]
+    fn failed_attachment_state_publication_is_retried_not_marked_complete() {
+        let mut reported = Some(AttachKind::Local);
+        report_attach_state_change(None, &mut reported, &mut |_| false);
+        assert!(
+            reported.is_some(),
+            "failed detach publication must remain pending"
+        );
+        report_attach_state_change(None, &mut reported, &mut |_| true);
+        assert!(reported.is_none());
+        report_attach_state_change(None, &mut reported, &mut |_| {
+            panic!("successful publication is not repeated")
+        });
+    }
+}

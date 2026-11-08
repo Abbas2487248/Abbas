@@ -1,0 +1,582 @@
+# ADR 0025: fesTerm-Owned Local Session Persistence via a Standalone `festerm-sessiond` Executable
+
+- **Status:** Proposed
+- **Date:** 2026-08-26
+- **Supersedes:** None
+
+## Context
+
+`PROF-06` (`docs/gui-action-graph.md`) already lets a saved **Local** profile
+enable `PersistenceProviderKind::{Tmux, Screen}` (ADR 0018), but that support
+is incidental rather than designed: a persistent Local profile simply runs
+`tmux`/`screen` as the shell command itself, on the local machine, and relies
+entirely on that external multiplexer's own daemon to keep the shell alive
+after the fesTerm window closes. This has two consequences that were
+acceptable for the SSH case ADR 0018 was written for, but are not acceptable
+as fesTerm's only answer for local sessions:
+
+- It requires an external binary that is not present on Windows in any
+  native, non-WSL form. There is no tmux/screen port that behaves
+  equivalently against a native `cmd.exe`/PowerShell/ConPTY shell, so
+  `PROF-06` today is Unix-only in practice despite being modeled as a
+  cross-platform capability in configuration.
+- It buys nothing fesTerm does not already get "for free" by shelling out to
+  any other command; there is no fesTerm-owned session state, IPC surface, or
+  lifecycle management involved. fesTerm cannot enumerate, reattach to, or
+  clean up these sessions except by asking the external tool.
+
+Architecturally, local sessions today (`festerm-pty`, `ARCHITECTURE.md`) run
+as an in-process worker thread owned directly by the running `app/festerm`
+process: a reader thread and a control thread share a `Shared` state struct
+behind bounded command/event queues, and shutdown is defined as killing the
+PTY's process group on Unix or terminating a `KILL_ON_JOB_CLOSE` Windows Job
+Object (`festerm-windows-job`) that the child was assigned to
+(`crates/festerm-pty/src/lib.rs`). That shutdown model exists specifically so
+an ordinary local session's whole process tree reliably dies when fesTerm
+does. A persistence layer is the deliberate exception to that invariant: it
+requires a shell (and its descendants) to keep running, and its output to
+keep being captured, in a process fesTerm does not own and after fesTerm has
+exited. This is exactly the class of change
+`docs/development-governance.md` calls out as requiring an ADR during the
+current 0.1 architecture-stability period ("introducing... multiplexing...
+into foundational code paths"), and it does not fit inside `festerm-pty`'s
+existing worker-thread model without inverting that model's central
+assumption.
+
+Windows adds a further constraint: there is no `fork()`, so "detach a copy of
+the current session into the background" is not an available primitive the
+way it is on Unix (`setsid`/double-fork/`nohup`-style patterns). Any
+persistent local session on Windows must originate as its own freshly
+launched process from the start, own its own ConPTY handle (loaded through
+the same trusted sidecar validation `festerm-windows-runtime` already
+performs), and must explicitly avoid being assigned to (or must break away
+from) any Job Object whose `KILL_ON_JOB_CLOSE` policy is scoped to fesTerm's
+own lifetime, or it will be torn down as a side effect of the very shutdown
+path it exists to survive.
+
+`REQ-SESS-001` and `REQ-SESS-002` already commit fesTerm to a common
+lifecycle/byte-stream abstraction across local and SSH sessions and to
+platform-appropriate local shell defaults; neither requirement currently
+implies or forbids a fesTerm-owned persistence mechanism, so this ADR is
+additive to, not in conflict with, existing requirements.
+
+## Decision
+
+fesTerm will pursue, as a deferred/opt-in capability, a new **standalone
+executable** — `festerm-sessiond` — built from a new crate of the same name,
+rather than an in-process thread or library the GUI process spawns
+internally. `festerm-sessiond` owns exactly one local shell session's PTY (or
+ConPTY) and exposes it over a local-only IPC channel, plus a small first-class
+CLI:
+
+- `festerm-sessiond start --name <id> --shell <cmd> --cols <n> --rows <n>` —
+  spawn detached, allocate the PTY, and begin serving that session.
+- `festerm-sessiond list` — enumerate this user's live sessions (reading a
+  registry the daemon(s) maintain; see below) without needing to already hold
+  a connection to any of them.
+- `festerm-sessiond attach --name <id>` — used internally by fesTerm as a
+  subprocess/library call path to obtain the socket/pipe endpoint and, for
+  protocol-v2 daemons, the bounded recovery snapshot prelude for a session;
+  also usable standalone for debugging.
+- `festerm-sessiond kill --name <id>` (and an implicit "last client detaches
+  and the shell has already exited" self-termination) — explicit teardown.
+
+This mirrors, rather than duplicates, the ADR 0018 provider model: fesTerm's
+app-level code already treats `tmux`/`screen` as opaque external
+attach-or-create providers it shells out to and never directly manages.
+`festerm-sessiond` becomes a third `PersistenceProviderKind` in that same
+shape — external from the GUI process's point of view — except fesTerm ships
+and owns it, so it can be a genuine peer of `festerm-pty`/`festerm-ssh`
+implementing `festerm-session`'s existing `Session` trait, instead of a
+special case. Concretely:
+
+- **A separate executable, not a library thread, because of Windows.**
+  Without `fork()`, "detach" only has one honest implementation on Windows:
+  start a brand new process. Making that the design on every platform (rather
+  than a Unix-only fast path with a Windows-only fallback) keeps one code
+  path instead of two, and matches the existing precedent in this codebase of
+  packaging platform-sensitive functionality as its own artifact (the
+  `festerm-windows-runtime` ConPTY sidecar, and the standalone
+  `festerm-pty-test-child` binary crate used by `festerm-pty`'s own tests).
+- **A real CLI, not just an IPC protocol,** because it gives the daemon a
+  stable, independently testable, independently scriptable surface — the same
+  reasoning that already justifies `tmux`/`screen` as understandable,
+  debuggable dependencies — and because fesTerm's own GUI process can then
+  drive the daemon exactly the way a developer or a future non-GUI fesTerm
+  frontend would, rather than through a bespoke internal API only the GUI
+  understands.
+- **IPC is local-only, one daemon per session, no multiplexing inside the
+  daemon.** fesTerm's tabs are already the session multiplexer at the UI
+  layer; `festerm-sessiond` does not need to reimplement tmux's own
+  window/pane model, only keep one PTY and its output buffer alive
+  independent of any attached client. This keeps its surface closer to
+  `dtach`/`abduco` than to tmux, and is deliberately the smallest useful
+  scope. Transport is a Unix domain socket (mode `0600`, in a `0700`
+  fesTerm-owned runtime directory) on Unix and a named pipe created with a
+  DACL granting access only to the current user SID on Windows;
+  `festerm-sessiond` never listens on a network-reachable port, on any
+  platform, as a hard invariant.
+- **Attach policy: single active client, steal-on-reconnect.** Unlike
+  tmux's default `attach -A` behavior — which silently multiplexes multiple
+  simultaneous clients onto one session, mirroring output and shrinking the
+  shared window to the smallest attached client's size with no user-visible
+  signal that another client is attached — `festerm-sessiond` allows at most
+  **one** attached client at a time. When a new `attach` connects to a
+  session that already has a client attached, the daemon **force-detaches
+  the previous client** (closing its stream after writing a final
+  `SESSION_STOLEN` framing marker/notice the previous client's fesTerm tab
+  can render, e.g. "reattached from another window") and hands the session
+  to the new client. This applies uniformly to every attach, including a
+  fesTerm tab reconnecting to a session it was itself previously attached to
+  (for example: closing a laptop, later reopening fesTerm, and reattaching
+  to the same still-running local session) — there is no special case for
+  "the same logical tab reconnecting" versus "a different client attaching";
+  the newest successfully adopted attach wins. Overload refusal does not
+  displace the active client. This is a deliberate departure from tmux's
+  multiplex default, chosen because fesTerm's GUI is a single-focus-window
+  model (one tab is either showing a session live or it is not) rather than
+  tmux's terminal-multiplexer philosophy of many simultaneous panes/clients
+  sharing one view; silently mirroring a session into two GUI windows with
+  no on-screen indication, and a shared resize side effect, would be
+  surprising rather than useful in that model. The daemon's `io_loop` must
+  therefore support closing/replacing its single active stream mid-flight
+  (rather than the current implementation's single one-shot `accept()`,
+  which must be corrected as part of implementing this policy — today a
+  second `attach` connects at the socket level but is never read from,
+  hanging indefinitely instead of stealing, multiplexing, or aborting).
+- **Manual reconnect resumes only an existing daemon.** A disconnected native
+  session offers Reconnect beside Open Diagnostics and Resume in the Inspector,
+  both through `AppCommand::ReconnectSession`. The attempt runs off the GUI
+  thread, keeps the tab identity, rejects duplicate attempts, and never starts
+  a replacement shell if the named daemon is unavailable. Pending input from
+  the previous connection is discarded instead of replayed after reattachment.
+- **Windows pipe lifetime stays inside the existing Win32 boundary.**
+  `festerm-windows-security` owns the native pipe handles as well as the
+  current-user DACL setup. The former `named_pipe` dependency could wait
+  indefinitely inside connection retries and flushed unread output in its
+  server destructor. A narrow safe adapter uses synchronous `PIPE_NOWAIT`
+  operations, explicit connection deadlines/cancellation, and owned-handle
+  teardown without waiting for peer consumption. This keeps raw Win32 and
+  unsafe ownership code out of the daemon and application crates.
+- **Windows attachment admission is bounded separately from command
+  backpressure.** Each daemon retains at most **16 waiting accepted pipes**.
+  The broker uses nonblocking admission and immediately closes an excess new
+  handle without a refusal write or flush; existing active ownership is
+  untouched. It reports the full queue through ordinary diagnostics and the
+  opt-in daemon trace. The frontend sees a recovery disconnect and offers
+  Reconnect/Resume guidance rather than a truncated snapshot or success.
+  Consuming a slot admits a later retry. This is a per-session backlog limit,
+  not a limit on open terminals, total live handles, kernel memory, or RSS.
+  The one terminal listener failure has its own bounded slot, so saturation
+  cannot hide listener loss. The daemon processes at most one candidate per
+  loop turn instead of draining a continuously replenished queue, and closes
+  queued handles at shutdown before output draining and worker joins. The
+  existing 15-second synchronous recovery-adoption deadline remains; this
+  does not make adoption asynchronous or establish a shorter responsiveness
+  bound. Successful adoption/takeover, owner-only IPC and protocol epochs are
+  unchanged.
+- **The attached byte stream is duplex and bounded at the session boundary.**
+  Shell output after the recovery prelude remains an unstructured byte stream
+  with fixed takeover/exit sentinels. Protocol-v2 attach begins with one
+  length-prefixed serialized `festerm-core::Terminal` recovery snapshot before
+  ordinary output bytes; protocol-v1 keeps the legacy no-snapshot path for
+  already-running older helpers. Client-to-daemon commands use a small
+  length-framed internal protocol for input, terminal resize, and
+  frontend-owned recovery-mirror control messages (scrollback limit,
+  embedder color scheme, clear, reset), each capped at 64 KiB. Snapshot
+  payloads are capped at 768 MiB, which is 3x the largest supported 256 MiB
+  scrollback preference and leaves bounded room for visible-screen and cell
+  serialization overhead. This lets the library target implement
+  `festerm-session::Session` directly without nesting a second PTY around the
+  standalone `attach` command.
+  A full daemon command queue is backpressure, not a disconnect: pending
+  input/resize commands must remain bounded and ordered while socket reads
+  pause until capacity returns. Output and newest-client takeover must remain
+  serviceable during that pause.
+  The daemon's recovery mirror continuously discards queued terminal replies,
+  queued frontend input, and their overflow flags after parsing output, so a
+  detached session never replays clipboard/device-query side effects and never
+  fabricates answers while no GUI owns the terminal.
+  The current internal PTY-reader channel is still unbounded; the client IPC
+  queue bounds do not imply a global daemon memory bound. Making that channel
+  bounded must also address synchronous PTY input writes to avoid circular
+  waits when both directions are saturated.
+- **Session identity reuses the existing validated name.** The same 1-64
+  byte session-name validation `PersistenceConfiguration`
+  (`festerm-config`) already enforces for `PROF-06`/`LAUNCH-08` is reused
+  as the daemon's session identifier, so a saved Local profile's persistence
+  name means the same thing regardless of provider.
+- **Lifecycle ownership is explicit and separate from fesTerm's own Job
+  Object/process-group shutdown.** On Unix, `festerm-sessiond` calls `setsid`
+  so it is not a member of any PTY's foreground process group fesTerm might
+  later tear down. On Windows, it must not be assigned into the calling
+  fesTerm process's `KILL_ON_JOB_CLOSE` Job Object (`festerm-windows-job`);
+  either it is spawned with `CREATE_BREAKAWAY_FROM_JOB`/`DETACHED_PROCESS`
+  before any job assignment happens, or it is simply never made a child of
+  fesTerm's job in the first place. fesTerm maintains a small on-disk
+  registry (session name, pid, socket/pipe path, creation time) so it can
+  list and offer to end background `festerm-sessiond` processes from its own
+  UI, and so it can detect and prune stale registry entries whose process no
+  longer exists on startup.
+- **Scope is local sessions only.** This does not change SSH's existing
+  ADR 0018 `SessionStrategy`/`RecoveryPolicy` split or its server-side
+  tmux/screen wrapping. `PersistenceProviderKind` (`festerm-config`) is
+  currently shared between `Local` and `Ssh` profiles; adding a
+  `PersistenceProviderKind::FestermSessiond`-style variant will need
+  profile-kind validation analogous to the existing
+  `PersistenceRequiresLocalOrSshProfile` rejection for Serial profiles, so
+  that an SSH profile cannot select a provider that only makes sense as a
+  local child process of the connecting machine.
+
+This ADR remains Proposed for merge governance while the implementation is
+evaluated. Implementation was explicitly authorized locally without changing
+that status; moving the ADR to Accepted remains a separate decision after
+cross-platform evidence and review.
+
+## Status update (2026-08-31)
+
+`festerm-sessiond` is now a workspace member built and shipped alongside the
+main executable in packaged releases (v0.1.6, v0.1.7), which is ahead of this
+ADR's own governance intent: the ADR explicitly requires cross-platform
+native evidence (`CP-11`) and a local-IPC security review before Accepted
+status, and the "Consequences" section above already flags this daemon as a
+first-class new attack surface needing that review. Shipping the executable
+while its own required evidence is incomplete is not itself a violation of
+that intent — the ADR was written knowing implementation would proceed in
+parallel — but the current concrete blocker is:
+
+- The Windows native-smoke test
+  (`native_daemon_survives_launcher_and_supports_input_replay_and_takeover`,
+  `crates/festerm-sessiond/tests/native_daemon.rs`) failed on CI's scheduled
+  Native Smoke workflow (Windows job only; Linux and macOS advisory smoke
+  passed). Tracked and **resolved** in
+  [#71](https://github.com/fes/fesTerm/issues/71): file-based daemon tracing
+  (gated behind `FESTERM_SESSIOND_TRACE_FILE`, see
+  `crates/festerm-sessiond/src/main.rs`) proved the daemon's own
+  accept/replay/forward path was correct; the test's Windows client used a
+  fixed 2s connect/read timeout that could legitimately be exceeded by
+  bundled-ConPTY-host cold-start latency on a GitHub Actions runner. Fixed by
+  raising that test timeout to 10s (`crates/festerm-sessiond/tests/native_daemon.rs`,
+  commit `60693cf`); confirmed passing on all three platforms in
+  [run 33477397740](https://github.com/fes/fesTerm/actions/runs/33477397740)
+  and locally.
+
+Precondition (a) below is now satisfied: the Windows native-smoke test passes
+reliably. `CP-11` evidence for all three platforms and the local-IPC security
+review remain outstanding, so this ADR stays **Proposed** and native local
+session persistence remains **experimental and unvalidated** as a supported
+capability until both are complete. It will move to Accepted only after
+(a) the Windows native-smoke test passes reliably — **done** — (b) `CP-11`
+evidence exists for all three platforms, and (c) the local-IPC security
+review called for above is complete. User-facing documentation (`README.md`,
+`docs/milestone-progress.md`) continues to describe this capability as
+experimental rather than as a validated feature until (b) and (c) close.
+
+## Status update (2026-09-10): the ConPTY end-of-file constraint
+
+The "shell has already exited" self-termination above is not something a
+Windows daemon can get for free by watching its pseudoterminal. A ConPTY
+keeps its pseudoconsole -- and the `conhost.exe`/`OpenConsole.exe` process
+behind it -- alive for as long as *this* process holds the master handle, so
+the reader half never reports end of file when the shell exits, and writes to
+a dead shell still succeed. `festerm-sessiond` originally relied on that end
+of file alone, so on Windows it never noticed its shell exiting: it kept
+running, kept its registry record, and `process_alive` kept saying yes, so the
+Launcher went on offering a session that could be attached but would never
+respond again.
+
+Two constraints follow for anyone changing the daemon's lifecycle:
+
+- **Poll the child, do not wait for the pseudoterminal.** The Windows client
+  loop calls `Child::try_wait` every iteration and treats shell exit as its
+  own shutdown trigger, draining any remaining output first.
+- **Never join the pseudoterminal reader unconditionally.** That thread is
+  parked in a blocking read on a handle that is only released when the
+  pseudoconsole closes, which cannot happen until the loop's caller drops the
+  master -- so joining it from inside the loop is a deadlock by construction.
+  Shutdown closes the pseudoconsole explicitly and joins every worker with a
+  bounded timeout, detaching stragglers, because the process is exiting anyway.
+
+The original shutdown correction deregistered before joining workers, including
+when `kill` failed. The discovery hardening below supersedes that removal policy:
+cleanup must retain an exact retry identity until termination and artifact
+removal succeed. Discovery independently excludes dead generation leases.
+
+## Discovery hardening (2026-09-15, issue #155)
+
+Running Sessions now reads metadata outside GUI rendering, with bounded registry
+lock acquisition, capped input and explicit failures. New daemon endpoints use
+PID/creation-time generations rather than reusable names and hold an owner-only
+generation lease file for their lifetime. Discovery and helper list/start/kill
+share that lease check: PID reuse alone cannot keep a new-format record live.
+Older named endpoints retain their legacy PID-based compatibility behavior;
+newly launched helpers receive generation-aware protection. A discovered resume
+checks the selected name/PID/creation-time/endpoint and refuses a replaced or
+already-attached record. Native connects are bounded on Unix as on Windows.
+The discovered tab's reconnect closure retains that generation and its explicit
+registry root. Manual reconnect may take over the same generation, but rejects a
+same-name replacement without touching its client; saved-profile named
+attach-or-create policy remains separate.
+
+Normal/error daemon shutdown releases its generation lease before acquiring the
+registry lock. Helper `kill` waits boundedly for lease release and removes only
+the exact dead generation's socket/lease before deregistration. Failed
+termination, timeout or artifact cleanup retains the registry retry identity and
+reports an error. Helper list/start pruning also cleans artifacts after forced
+termination bypasses the daemon epilogue. Startup assigns its generation before
+spawning the helper, so failure before registration can still clean precisely.
+Changed generations, live leases, unrelated files and redirected artifact paths
+are not cleanup targets. Legacy named endpoints retain compatibility but do not
+grant generation-safe artifact ownership. Per-name startup serialization locks
+are not generation artifacts and are not unlinked during this cleanup.
+
+Failed attachment-state publication remains pending and retries with a 500 ms
+backoff rather than permanently remembering a detach that was never saved.
+This is internal lifecycle/discovery hardening of the existing daemon contract,
+not a new provider, IPC protocol, terminal owner, or acceptance of CP-11.
+
+## Windows update continuity (2026-09-20)
+
+Windows prevents an installer from replacing an executable image used by a
+running process. Packaged releases historically launched the one
+installer-owned sibling `festerm-sessiond.exe` directly, so a detached session
+could block NSIS even though the session was otherwise compatible with the new
+fesTerm client.
+
+Each Windows package now installs its signed helper source under the immutable
+release identity `festerm-sessiond-<release>.exe`; the stable Cargo output name
+is not an installer payload. Before `start`, both fesTerm and the helper CLI
+copy that source into the private sessiond runtime directory under the release
+and target identity
+`helpers/festerm-sessiond-<release>-<architecture>/`; the detached daemon
+executes the copy in that directory. The pinned ConPTY sidecar is staged into
+the same directory so the helper resolves it the way ADR-0011 requires without
+holding the install directory's `conpty.dll` open; per-generation directories
+keep an upgrade from having to overwrite a DLL a live old daemon has mapped.
+The recorded helper identity remains the executable name, unchanged, so
+daemons staged by earlier releases as bare files stay recognisable — and
+therefore stay retained while they are alive. A later installer adds a
+different source name while old
+daemon generations continue from their prior images. New sessions use the
+current release copy. Old copies are deleted only when no live registry
+generation references their recorded helper identity; a locked but
+not-yet-registered startup remains preserved rather than blocking a new
+session.
+
+A release identity is not a content identity: a rebuilt or re-signed package
+can carry the same version with different bytes. When the staged copy differs
+from the packaged source, it is replaced whenever no live registry generation
+records that helper identity, and the start is refused only while a live
+generation still executes that image — the one case where replacing it would
+be both impossible and wrong.
+
+Registry records now also carry a protocol compatibility epoch independent of
+the application/helper release. Missing protocol metadata means epoch 1 for
+records created before this field existed, matching their `FSD1` framing.
+Clients and the helper CLI reject an unsupported epoch before attachment and
+preserve the daemon/session for a compatible fesTerm version. A release that
+introduces a new epoch must retain client adapters for every daemon version
+allowed to survive the supported upgrade window; it must not merely increment
+the constant and strand live sessions. Ordinary compatible releases keep the
+epoch unchanged.
+
+The epoch only helps if the record carrying it can still be read, so the
+registry file itself is parsed per record rather than as one typed document.
+A record this build cannot interpret costs its own session and nothing else:
+the client reports the version gap instead of "not registered", the helper
+refuses to start, attach or kill under that name rather than overwriting it,
+and any registry write preserves the foreign record verbatim. A future schema
+change therefore cannot strand the sessions of the release that is running.
+
+The first release with this layout deliberately omits the legacy stable helper
+from its payload. It can therefore install beside a locked helper used by
+0.2.0 through 0.2.2, whose `FSD1` protocol remains epoch 1 and whose registry
+records default to that epoch. The new client reattaches directly to those
+existing endpoints. Once the final legacy daemon exits, a later fesTerm launch
+removes its unreferenced stable image; reboot also releases the lock for normal
+installer/application cleanup.
+
+## Alternatives considered
+
+- **Do nothing; local persistence remains Unix-only via `tmux`/`screen`.**
+  Simplest, but leaves Windows local sessions with no persistence story at
+  all, and does not improve on today's "just shell out" non-design even on
+  Unix.
+- **Recommend WSL as the supported path on Windows.** Genuinely useful advice
+  for users who already work inside WSL, but it only covers shells running
+  inside WSL, not a user's native PowerShell/`cmd.exe` local profile, so it
+  does not close the gap this ADR is about.
+- **Wrap `dtach`/`abduco` instead of building `festerm-sessiond`.** Solves the
+  "smaller than tmux" scope observation cheaply on Unix, but both are
+  Unix-only tools with no Windows port, so this alternative still leaves
+  Windows unaddressed and would require a second, different implementation
+  there regardless — at which point building one small first-party daemon
+  for all three platforms is less total surface area than integrating a
+  Unix-only third-party tool plus a bespoke Windows-only mechanism.
+- **Make it an in-process library the GUI process spawns as a detached
+  thread/task instead of a separate executable.** Rejected primarily because
+  of the Windows `fork()` gap described above: a "detached thread" inside the
+  same process cannot outlive that process's own exit, which is the entire
+  point of this capability. A separate process is required on at least one
+  target platform, so it is simpler to make it the design everywhere rather
+  than a platform-conditional exception.
+- **Extend `festerm-pty`'s existing worker-thread model in place rather than
+  adding a new crate/executable.** Rejected because `festerm-pty`'s shutdown
+  contract (process-group/Job-Object teardown tied to the fesTerm process)
+  is the opposite of what persistence needs; folding both models into one
+  crate would make an already load-bearing invariant ("local sessions die
+  with fesTerm") conditional and harder to reason about.
+
+## Consequences
+
+- A new crate and shipped artifact (`festerm-sessiond`) must be built,
+  signed/packaged, and distributed alongside the main `festerm` binary for
+  every supported platform, adding to `cargo-packager` scope (ADR 0021).
+- Windows additionally retains one runtime helper copy per release that still
+  owns a live daemon generation. These copies are current-user state, not
+  installer-owned payloads, and are reclaimed after their final generation
+  exits.
+- fesTerm gains an operational surface it did not previously have: orphaned
+  background processes are now possible (e.g., if a user's machine restarts
+  uncleanly). The registry-and-prune design above is required, not optional,
+  to avoid silently accumulating dead entries or, worse, leaked live
+  processes a user cannot find or stop from the GUI.
+- Security review is required before this leaves Proposed status: even
+  though transport is local-only and permission-scoped to the owning user,
+  this is fesTerm's first first-party background process with its own
+  attack surface (a listening socket/pipe, however narrowly scoped), which is
+  qualitatively different from today's "fesTerm shells out to a pre-existing
+  external binary" persistence story.
+- Local and SSH persistence will present the same user-facing concept
+  (`PersistenceProviderKind`, a validated session name) through structurally
+  different backends; documentation and UI copy must not imply parity that
+  does not exist (e.g., a `festerm-sessiond` session is not intended to be
+  attachable from a plain terminal the way a `tmux` session is, at least not
+  in this ADR's scope).
+- This is additional, not urgent, scope: it does not block or change any
+  currently committed milestone, and should be tracked as its own future
+  milestone/issue rather than folded into in-flight persistence or
+  integration-testing work.
+
+## Validation impact
+
+- **Invariants introduced or changed:** The provisional implementation creates
+  one detached local daemon per reusable session identity, exposes it only
+  through owner-scoped local IPC, serializes registry mutation, retains a
+  daemon-owned authoritative terminal mirror plus bounded attach snapshots,
+  and gives the newest successfully adopted client exclusive ownership.
+  Windows waiting attachment admission is capped at 16 with explicit
+  refusal, independent listener-failure delivery and one adoption per loop
+  turn; overflow preserves the active client.
+- **GUI/action edges affected:** `PROF-06` now covers selecting the native
+  local provider, attach-or-create launch, Inspector facts, non-destructive
+  tab detach, replay, and newest-client takeover.
+  `LAUNCH-12` additionally covers asynchronous bounded discovery, eligible
+  provider counts, generation-aware attach-only resume, stale-click recovery,
+  and explicit Refresh (`LAUNCH-20`); `LAUNCH-21` covers offscreen row layout.
+- **Automated tests required:** `festerm-sessiond` covers argument and identity
+  validation, registry round trips and PID-safe removal, snapshot-length
+  bounds, split-marker client handling, an end-to-end Unix service-loop test
+  in which a second client steals the session from the first, and recovery-sync
+  tests proving that scrollback-limit changes, embedder color-scheme updates,
+  clear, and reset all survive reattach through the daemon mirror. Recovery
+  attach also rejects unsupported snapshot-schema versions before takeover,
+  rejects malformed serialized terminal state before adoption, and holds
+  frontend resizes until the recovered snapshot has actually replaced the
+  local terminal. Coalesced command bursts exceeding the daemon input queue
+  must retain input/resize order without disconnecting; pending input must not
+  prevent output or takeover.
+  Manual reconnect must preserve session identity, reject duplicate attempts,
+  avoid starting a missing daemon, and discard previous-connection input.
+  Windows admission regressions prove exact 16/17 refusal and immediate
+  ownership release, 1,024 refusal/consume/retry cycles, one-candidate
+  fairness under refill, fatal-listener priority, bounded failure storage
+  and shutdown disposal. The owned Windows-pipe test
+  `windows_attachment_queue_native_overflow_keeps_active_bytes_and_allows_retry`
+  exercises the production broker, preserves active bidirectional bytes at
+  saturation, fences retry admission and verifies queued-handle teardown.
+  `initial_recovery_eof_reports_retryable_disconnect_without_adoption`
+  proves lifecycle retry guidance without recovery adoption on every platform.
+  `native_recovery_disconnect_guidance_is_visible_beside_reconnect_and_resume`
+  proves the production GUI displays that guidance with Diagnostics closed in
+  both the viewport overlay and Inspector, dispatches same-tab recovery, and
+  removes stale guidance after retry. The primary UI does not promote arbitrary
+  backend error details.
+  `native_discovery_churn_preserves_process_and_rejects_replaced_generations`
+  verifies isolated batches, same-child PID after fresh post-reattach input,
+  natural exit removal and rejection of same-name replacements. Registry tests
+  distinguish absence, corruption, lock deadlines and stale generation leases.
+  Shared Running Sessions acceptance also checks that local multiplexer client
+  teardown retires reader/control workers without terminating the persistent
+  shell, and that a visible provider timeout can recover through a coalesced
+  explicit Refresh. These are internal lifecycle/discovery corrections, not a
+  change to daemon ownership, transport queues or this ADR's provisional status.
+  `native_start_reports_socket_depth_without_starting_a_shell` covers actionable
+  Unix address-limit diagnostics and refusal before shell launch. Optional churn
+  uses short private temporary namespaces, with long-checkout and failure-cleanup
+  regressions, rather than depending on a runner's checkout depth.
+  `native_discovery_churn_reconnect_pins_generation_and_explicit_registry`
+  proves fresh same-process/state continuity in a nondefault registry and refuses
+  A-to-same-name-B reconnect while B remains usable.
+  `native_discovery_churn_prunes_forcibly_terminated_generation_artifacts` and
+  `native_start_failure_removes_generation_artifacts_before_root_cleanup`
+  assert exact artifact removal before fixture deletion can hide leaks.
+  Deterministic kill/prune tests cover failure retention, retry, lease timeout
+  and preservation of live replacements. Isolated Screen churn additionally
+  delays/fails a new client while another remains attached, verifies Launcher
+  diagnostics and Refresh recovery, and challenges the unchanged server shell.
+  `dropping_a_pty_writer_does_not_send_input_to_a_retained_terminal` rejects
+  destructor-injected newline/EOF when a local multiplexer retains the terminal
+  after its frontend exits. The Unix client writer uses an owned safe descriptor;
+  no queue, process-tree ownership or native daemon transport contract changes.
+  Modern Screen confirmation uses its public quiet query and requires both
+  initial owned-terminal context and frontend PID, without inspecting a setgid
+  server's descriptors. Tests reject fallback display identities, denied/malformed
+  replies and legacy-inspection errors. Private query reply sockets are removed
+  after timeout without following the selected server symlink. Controlled local
+  clients test graceful hangup and bounded escalation, preserving process-group
+  ownership and default shell behavior.
+  `windows_helper_staging_is_versioned_and_prunes_only_unreferenced_builds`
+  proves that Windows launches an immutable release copy, retains a live
+  generation's older copy, and removes an unreferenced copy.
+  `native_windows_packaged_helper_can_be_replaced_while_staged_daemon_remains_usable`
+  launches through a package-shaped helper path, deletes and replaces that
+  source while the daemon remains alive, then verifies fresh input reaches the
+  same session.
+  `native_windows_versioned_helper_installs_beside_a_live_legacy_daemon`
+  reproduces the 0.2.0 layout and proves the new immutable package source can
+  be added while the legacy image is running and its session remains usable.
+  `windows_packaged_helper_cleanup_waits_for_legacy_daemon_exit` proves cleanup
+  retains the stable image while a legacy generation is live and removes it
+  after that generation disappears.
+  Windows package smoke upgrades an installed signed 0.2.0 package while its
+  stable-name daemon is live, verifies the process and registry survive, and
+  controls that session through the candidate's versioned helper before
+  uninstalling.
+  `incompatible_registry_record_is_rejected_before_connecting` proves protocol
+  incompatibility fails before IPC attachment with actionable version guidance;
+  legacy registry parsing defaults to the compatible `FSD1` epoch.
+  `an_unreadable_record_costs_only_its_own_session`,
+  `an_unreadable_record_without_an_epoch_still_explains_itself` and
+  `a_record_this_helper_cannot_read_survives_an_update_of_another_session`
+  prove a record from a future schema neither hides the sessions beside it nor
+  disappears when one of them is updated;
+  `killing_a_session_this_helper_cannot_read_reports_the_version_gap` proves
+  the helper refuses that name instead of reporting it missing.
+  `a_rebuilt_helper_replaces_an_unreferenced_staged_copy` and
+  `a_rebuilt_helper_is_refused_while_a_live_session_still_runs_the_staged_copy`
+  prove that same-version bytes are republished when safe and retained when a
+  live generation still needs them, and
+  `byte_identical_helpers_match_across_read_chunk_boundaries` proves the
+  comparison does not depend on how a read is chunked.
+- **Native/manual evidence required:** `CP-11` verifies packaged executable
+  presence, detach/reattach snapshot recovery, single-client stealing,
+  natural-exit and kill cleanup, lifecycle independence, Unix ownership modes,
+  and Windows named-pipe current-user isolation, Job Object breakaway,
+  compatible signed update continuity, new-session helper selection, and
+  post-exit old-copy cleanup.
+- **Coverage superseded:** None.
+
+The ADR remains Proposed while this implementation is evaluated.
+`validation/traceability.json` maps `PROF-06` to ADR-0025, deterministic
+coverage, and native scenario `CP-11`.

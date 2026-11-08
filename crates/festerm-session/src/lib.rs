@@ -1,0 +1,792 @@
+//! Runtime-independent session lifecycle and bounded transport contracts.
+//!
+//! A session backend owns process or connection I/O. It emits bytes and
+//! lifecycle events only; the application owns terminal-core mutation.
+
+mod automation_input;
+
+pub use automation_input::{
+    automation_input_slot, AutomationInputStatus, CommitAutomationInputError,
+    PendingAutomationInput, ReserveAutomationInputError, ReservedAutomationInput,
+};
+pub use festerm_admission::{
+    automation_admission_lock, try_automation_admission_lock, AutomationAdmissionGuard,
+    AutomationAdmissionTryError, AutomationEpoch,
+};
+
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+/// Maximum number of commands a backend accepts before reporting backpressure.
+pub const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 64;
+/// Maximum number of application events a backend retains before pausing reads.
+pub const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
+/// Maximum bytes in one input command or output event.
+pub const MAX_IO_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Identifies one application-created session.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionId(u64);
+
+impl SessionId {
+    /// Allocates a process-local, monotonically increasing session identifier.
+    pub fn next() -> Self {
+        static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// A terminal size expressed in cells, with optional pixel dimensions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalSize {
+    columns: u16,
+    rows: u16,
+    pixel_width: Option<u16>,
+    pixel_height: Option<u16>,
+}
+
+impl TerminalSize {
+    pub fn new(columns: u16, rows: u16) -> Result<Self, TerminalSizeError> {
+        if columns < 2 {
+            return Err(TerminalSizeError::TooFewColumns { columns });
+        }
+        if rows == 0 {
+            return Err(TerminalSizeError::ZeroRows);
+        }
+        Ok(Self {
+            columns,
+            rows,
+            pixel_width: None,
+            pixel_height: None,
+        })
+    }
+
+    pub fn with_pixels(
+        columns: u16,
+        rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<Self, TerminalSizeError> {
+        let mut size = Self::new(columns, rows)?;
+        size.pixel_width = Some(pixel_width);
+        size.pixel_height = Some(pixel_height);
+        Ok(size)
+    }
+
+    pub const fn columns(self) -> u16 {
+        self.columns
+    }
+
+    pub const fn rows(self) -> u16 {
+        self.rows
+    }
+
+    pub const fn pixel_width(self) -> Option<u16> {
+        self.pixel_width
+    }
+
+    pub const fn pixel_height(self) -> Option<u16> {
+        self.pixel_height
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalSizeError {
+    TooFewColumns { columns: u16 },
+    ZeroRows,
+}
+
+impl fmt::Display for TerminalSizeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooFewColumns { columns } => {
+                write!(
+                    formatter,
+                    "terminal requires at least 2 columns, received {columns}"
+                )
+            }
+            Self::ZeroRows => formatter.write_str("terminal requires at least 1 row, received 0"),
+        }
+    }
+}
+
+impl std::error::Error for TerminalSizeError {}
+
+/// A child or remote-process exit result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionExit {
+    exit_code: u32,
+    signal: Option<String>,
+}
+
+impl SessionExit {
+    pub const fn with_exit_code(exit_code: u32) -> Self {
+        Self {
+            exit_code,
+            signal: None,
+        }
+    }
+
+    pub fn with_signal(exit_code: u32, signal: impl Into<String>) -> Self {
+        Self {
+            exit_code,
+            signal: Some(signal.into()),
+        }
+    }
+
+    pub const fn exit_code(&self) -> u32 {
+        self.exit_code
+    }
+
+    pub fn signal(&self) -> Option<&str> {
+        self.signal.as_deref()
+    }
+
+    pub const fn success(&self) -> bool {
+        self.exit_code == 0 && self.signal.is_none()
+    }
+}
+
+/// Stable category for a backend failure without retaining private terminal data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionErrorKind {
+    Spawn,
+    Input,
+    Output,
+    Resize,
+    Shutdown,
+    Unsupported,
+    Internal,
+    /// The remote host rejected the credentials offered for this session
+    /// (wrong password, rejected key, etc). Distinguished from `Spawn` so a
+    /// password-authenticated SSH session can reprompt for a fresh password
+    /// in-tab instead of surfacing a raw failed session.
+    Authentication,
+}
+
+/// A user-displayable, content-free backend error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionError {
+    kind: SessionErrorKind,
+    message: String,
+}
+
+impl SessionError {
+    pub fn new(kind: SessionErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> SessionErrorKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+/// The externally observable lifecycle of a session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionLifecycle {
+    Starting,
+    Running,
+    Stopping,
+    /// Transport was lost unintentionally and no durable-session recovery
+    /// resumed it automatically (ADR 0018). This is deliberately distinct
+    /// from `Failed`: it is not terminal, and an explicit, user-initiated
+    /// reconnect remains available from this state.
+    Disconnected(SessionError),
+    Exited(SessionExit),
+    Failed(SessionError),
+    Stopped,
+}
+
+impl SessionLifecycle {
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Exited(_) | Self::Failed(_) | Self::Stopped)
+    }
+}
+
+/// Identifies the direction that reached a bounded queue limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowDirection {
+    Input,
+    Output,
+    Resize,
+    Control,
+}
+
+/// A content-free host-key verification request emitted by a remote session.
+///
+/// The public key itself remains in the SSH transport. The application may
+/// display this identity and fingerprint, then resolve the request through the
+/// transport-specific session API.
+///
+/// `previously_trusted_fingerprint` is `None` for an ordinary first-seen
+/// host. It is `Some(previous)` only when a persistent trust record already
+/// exists for this host:port and the presented fingerprint does not match
+/// it — a possible host impersonation or a legitimate host-key rotation,
+/// indistinguishable from this boundary alone. The application must treat
+/// this case with materially more friction than a first-seen prompt: it
+/// never offers a plain, low-friction accept for a changed key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostKeyPrompt {
+    host: String,
+    port: u16,
+    sha256_fingerprint: String,
+    previously_trusted_fingerprint: Option<String>,
+}
+
+impl HostKeyPrompt {
+    pub fn new(host: impl Into<String>, port: u16, sha256_fingerprint: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            sha256_fingerprint: sha256_fingerprint.into(),
+            previously_trusted_fingerprint: None,
+        }
+    }
+
+    /// Marks this prompt as a changed-key warning: `previous` is the
+    /// fingerprint a persistent trust record already names for this
+    /// host:port, which differs from [`Self::sha256_fingerprint`].
+    #[must_use]
+    pub fn with_previously_trusted_fingerprint(mut self, previous: impl Into<String>) -> Self {
+        self.previously_trusted_fingerprint = Some(previous.into());
+        self
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn sha256_fingerprint(&self) -> &str {
+        &self.sha256_fingerprint
+    }
+
+    /// The fingerprint a persistent trust record already names for this
+    /// host:port, if this prompt is a changed-key warning rather than an
+    /// ordinary first-seen host.
+    pub fn previously_trusted_fingerprint(&self) -> Option<&str> {
+        self.previously_trusted_fingerprint.as_deref()
+    }
+
+    /// Whether this prompt reports a mismatch against an existing persistent
+    /// trust record, rather than an ordinary first-seen host.
+    pub fn is_key_change(&self) -> bool {
+        self.previously_trusted_fingerprint.is_some()
+    }
+}
+
+/// A content-free interactive password request emitted by a remote session,
+/// mirroring [`HostKeyPrompt`]: the password itself never crosses this
+/// boundary, only the request to display an `ssh`-style prompt and resolve
+/// it through the transport-specific session API.
+///
+/// Distinct requests for the same connection attempt are distinguished by
+/// `attempt` (1-based), so a stale prompt can never be confused with a
+/// fresh one after a "Permission denied, please try again" retry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PasswordPrompt {
+    username: String,
+    host: String,
+    attempt: u8,
+    previous_attempt_failed: bool,
+}
+
+impl PasswordPrompt {
+    pub fn new(
+        username: impl Into<String>,
+        host: impl Into<String>,
+        attempt: u8,
+        previous_attempt_failed: bool,
+    ) -> Self {
+        Self {
+            username: username.into(),
+            host: host.into(),
+            attempt,
+            previous_attempt_failed,
+        }
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub const fn attempt(&self) -> u8 {
+        self.attempt
+    }
+
+    /// Whether this prompt follows a rejected attempt on the same
+    /// connection, so the UI can show `ssh`'s own "Permission denied,
+    /// please try again." line above the retry.
+    pub const fn previous_attempt_failed(&self) -> bool {
+        self.previous_attempt_failed
+    }
+}
+
+/// Which side of the SSH connection listens for a live port forward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshPortForwardDirection {
+    Local,
+    Remote,
+}
+
+/// Whether a live SSH port forward came from a saved profile or a live-only request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshPortForwardSource {
+    Profile,
+    Ephemeral,
+}
+
+/// Current worker-owned runtime state for one SSH port forward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshPortForwardState {
+    Active,
+    Failed,
+}
+
+/// Sanitized runtime details for one SSH port forward.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshPortForwardRuntime {
+    direction: SshPortForwardDirection,
+    bind_host: String,
+    bind_port: u16,
+    destination_host: String,
+    destination_port: u16,
+    source: SshPortForwardSource,
+    state: SshPortForwardState,
+    failure_reason: Option<String>,
+}
+
+impl SshPortForwardRuntime {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        direction: SshPortForwardDirection,
+        bind_host: impl Into<String>,
+        bind_port: u16,
+        destination_host: impl Into<String>,
+        destination_port: u16,
+        source: SshPortForwardSource,
+        state: SshPortForwardState,
+        failure_reason: Option<String>,
+    ) -> Self {
+        Self {
+            direction,
+            bind_host: bind_host.into(),
+            bind_port,
+            destination_host: destination_host.into(),
+            destination_port,
+            source,
+            state,
+            failure_reason,
+        }
+    }
+
+    pub const fn direction(&self) -> SshPortForwardDirection {
+        self.direction
+    }
+
+    pub fn bind_host(&self) -> &str {
+        &self.bind_host
+    }
+
+    pub const fn bind_port(&self) -> u16 {
+        self.bind_port
+    }
+
+    pub fn destination_host(&self) -> &str {
+        &self.destination_host
+    }
+
+    pub const fn destination_port(&self) -> u16 {
+        self.destination_port
+    }
+
+    pub const fn source(&self) -> SshPortForwardSource {
+        self.source
+    }
+
+    pub const fn state(&self) -> SshPortForwardState {
+        self.state
+    }
+
+    pub fn failure_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
+    }
+}
+
+/// Events emitted by a session backend for application coordination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionEvent {
+    Lifecycle(SessionLifecycle),
+    Output(Vec<u8>),
+    /// Authoritative terminal-state mutation emitted by a backend that owns a
+    /// recovery mirror. Unlike terminal output, this is not shell-controlled
+    /// byte stream content and must be applied in session order.
+    RecoverySync(Vec<u8>),
+    HostKeyVerification(HostKeyPrompt),
+    PasswordRequested(PasswordPrompt),
+    ResizeApplied(TerminalSize),
+    PortForwardsUpdated(Vec<SshPortForwardRuntime>),
+    Backpressure {
+        direction: FlowDirection,
+        queued: usize,
+        capacity: usize,
+    },
+    Error(SessionError),
+}
+
+/// Wakes an application's event loop after a session makes an event available.
+///
+/// Backends invoke this only after successfully enqueuing an event. The
+/// application supplies an event-loop-safe implementation, such as egui's
+/// repaint request, without coupling session I/O to a GUI toolkit.
+pub trait SessionEventNotifier: Send + Sync {
+    fn notify(&self);
+}
+
+/// The default notifier for callers without an event loop to wake.
+#[derive(Default)]
+pub struct NoopSessionEventNotifier;
+
+impl SessionEventNotifier for NoopSessionEventNotifier {
+    fn notify(&self) {}
+}
+
+/// Creates a notifier that intentionally performs no wake-up.
+pub fn noop_session_event_notifier() -> Arc<dyn SessionEventNotifier> {
+    Arc::new(NoopSessionEventNotifier)
+}
+
+/// Operation rejected by a bounded or closed session transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionOperation {
+    Input,
+    Resize,
+    Shutdown,
+}
+
+/// A failed nonblocking request to a session backend.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionSendError {
+    Closed {
+        operation: SessionOperation,
+    },
+    Full {
+        operation: SessionOperation,
+        capacity: usize,
+    },
+    TooLarge {
+        operation: SessionOperation,
+        maximum: usize,
+        actual: usize,
+    },
+}
+
+impl fmt::Display for SessionSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed { operation } => {
+                write!(formatter, "{operation:?} rejected: session closed")
+            }
+            Self::Full {
+                operation,
+                capacity,
+            } => write!(
+                formatter,
+                "{operation:?} rejected: bounded session queue is full ({capacity} entries)"
+            ),
+            Self::TooLarge {
+                operation,
+                maximum,
+                actual,
+            } => write!(
+                formatter,
+                "{operation:?} rejected: {actual} bytes exceeds the {maximum}-byte limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionSendError {}
+
+/// The result of a nonblocking event poll.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionTryReceiveError {
+    Empty,
+    Closed,
+}
+
+/// Content-free counters for diagnostics and flow-control visibility.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionMetrics {
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub resize_count: u64,
+    pub error_count: u64,
+    pub backpressure_count: u64,
+    pub event_queue_depth: usize,
+    pub event_queue_high_watermark: usize,
+    pub event_queue_capacity: usize,
+}
+
+/// A bounded shutdown result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownResult {
+    Stopped,
+    AlreadyStopped,
+}
+
+/// Failure to complete shutdown within the requested bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShutdownError {
+    Request(SessionSendError),
+    TimedOut { timeout: Duration },
+    Failed(SessionError),
+}
+
+impl fmt::Display for ShutdownError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request(error) => write!(formatter, "could not request shutdown: {error}"),
+            Self::TimedOut { timeout } => {
+                write!(
+                    formatter,
+                    "session shutdown exceeded {} ms",
+                    timeout.as_millis()
+                )
+            }
+            Self::Failed(error) => write!(formatter, "session shutdown failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ShutdownError {}
+
+/// Runtime-independent session boundary used by local and future remote backends.
+///
+/// Calls do not wait for transport I/O except [`Self::shutdown`], whose caller
+/// chooses a finite timeout. Lifecycle changes may wait for automation
+/// admission serialization. Events never mutate a terminal directly.
+pub trait Session: Send + Sync {
+    fn id(&self) -> SessionId;
+    fn lifecycle(&self) -> SessionLifecycle;
+    fn metrics(&self) -> SessionMetrics;
+    fn try_send_input(&self, bytes: &[u8]) -> Result<(), SessionSendError>;
+    /// Reserves a position in the ordinary ordered transport queue without
+    /// admitting automation input. `controller_instance` is the host-owned
+    /// identity of the controller making the reservation, never a client
+    /// claim. The backend binds its own attachment identity and generation.
+    /// Unsupported backends must refuse.
+    fn reserve_automation_input(
+        &self,
+        _controller_instance: u64,
+        _bytes: &[u8],
+    ) -> Result<ReservedAutomationInput, ReserveAutomationInputError> {
+        Err(ReserveAutomationInputError::Unsupported)
+    }
+    fn try_resize(&self, size: TerminalSize) -> Result<(), SessionSendError>;
+    fn try_shutdown(&self) -> Result<(), SessionSendError>;
+    fn try_recv_event(&self) -> Result<SessionEvent, SessionTryReceiveError>;
+
+    /// Returns the backend's live attachment identity, if it supports safe
+    /// automation observation. Implementations return the same shared epoch
+    /// for the backend's lifetime. `None` must not be treated as a grant.
+    fn automation_epoch(&self) -> Option<Arc<AutomationEpoch>> {
+        None
+    }
+
+    /// Whether this backend, rather than the frontend terminal instance,
+    /// answers terminal protocol replies generated while parsing output.
+    fn terminal_replies_owned_by_backend(&self) -> bool {
+        false
+    }
+    fn shutdown(&self, timeout: Duration) -> Result<ShutdownResult, ShutdownError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automation_epoch_invalidates_on_every_transition() {
+        let epoch = AutomationEpoch::default();
+        assert_eq!(epoch.capture(), None);
+        {
+            let _guard = automation_admission_lock().unwrap();
+            assert!(!epoch.is_current(0));
+        }
+
+        epoch.transition(true);
+        let first = epoch.capture().unwrap();
+        {
+            let _guard = automation_admission_lock().unwrap();
+            assert!(epoch.is_current(first));
+        }
+
+        epoch.transition(false);
+        assert_eq!(epoch.capture(), None);
+        {
+            let _guard = automation_admission_lock().unwrap();
+            assert!(!epoch.is_current(first));
+        }
+
+        epoch.transition(true);
+        let replacement = epoch.capture().unwrap();
+        assert!(replacement > first);
+        {
+            let _guard = automation_admission_lock().unwrap();
+            assert!(!epoch.is_current(first));
+            assert!(epoch.is_current(replacement));
+        }
+
+        epoch.transition(true);
+        let next = epoch.capture().unwrap();
+        assert!(next > replacement);
+        let _guard = automation_admission_lock().unwrap();
+        assert!(!epoch.is_current(replacement));
+        assert!(epoch.is_current(next));
+    }
+
+    #[test]
+    fn automation_epoch_transitions_serialize_with_admission() {
+        let epoch = Arc::new(AutomationEpoch::new());
+        epoch.transition(true);
+        let generation = epoch.capture().unwrap();
+        let guard = automation_admission_lock().unwrap();
+        let (started, start_receiver) = std::sync::mpsc::sync_channel(0);
+        let (finished, finish_receiver) = std::sync::mpsc::sync_channel(1);
+        let worker_epoch = Arc::clone(&epoch);
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            worker_epoch.transition(false);
+            finished.send(()).unwrap();
+        });
+        start_receiver.recv().unwrap();
+        assert!(finish_receiver.try_recv().is_err());
+        assert!(epoch.is_current(generation));
+        drop(guard);
+        finish_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(epoch.capture(), None);
+        let _guard = automation_admission_lock().unwrap();
+        assert!(!epoch.is_current(generation));
+    }
+
+    #[test]
+    fn automation_try_admission_reports_contention_without_waiting() {
+        let held = automation_admission_lock().unwrap();
+        let worker = std::thread::spawn(|| {
+            matches!(
+                try_automation_admission_lock(),
+                Err(AutomationAdmissionTryError::Busy)
+            )
+        });
+        assert!(worker.join().unwrap());
+        drop(held);
+    }
+
+    #[test]
+    fn automation_admission_poison_permanently_fails_closed() {
+        const CHILD: &str = "FESTERM_AUTOMATION_ADMISSION_POISON_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::automation_admission_poison_permanently_fails_closed",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated poison test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let epoch = AutomationEpoch::new();
+        epoch.transition(true);
+        assert!(epoch.capture().is_some());
+        assert!(std::thread::spawn(|| {
+            let _guard = automation_admission_lock().unwrap();
+            panic!("poison the admission lock in this isolated test process");
+        })
+        .join()
+        .is_err());
+        assert!(automation_admission_lock().is_none());
+        assert!(matches!(
+            try_automation_admission_lock(),
+            Err(AutomationAdmissionTryError::Poisoned)
+        ));
+        assert_eq!(epoch.capture(), None);
+        epoch.transition(true);
+        assert_eq!(epoch.capture(), None);
+        let fresh = AutomationEpoch::new();
+        fresh.transition(true);
+        assert_eq!(fresh.capture(), None);
+    }
+
+    #[test]
+    fn terminal_size_requires_a_real_grid() {
+        assert_eq!(
+            TerminalSize::new(1, 24),
+            Err(TerminalSizeError::TooFewColumns { columns: 1 })
+        );
+        assert_eq!(TerminalSize::new(80, 0), Err(TerminalSizeError::ZeroRows));
+        assert_eq!(
+            TerminalSize::with_pixels(80, 24, 800, 480)
+                .unwrap()
+                .columns(),
+            80
+        );
+    }
+
+    #[test]
+    fn lifecycle_terminal_states_are_explicit() {
+        assert!(!SessionLifecycle::Running.is_terminal());
+        assert!(SessionLifecycle::Exited(SessionExit::with_exit_code(0)).is_terminal());
+        assert!(SessionLifecycle::Stopped.is_terminal());
+    }
+}

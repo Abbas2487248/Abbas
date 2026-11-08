@@ -1,0 +1,9678 @@
+//! Native SSH transport policy and bounded `russh` session lifecycle.
+
+mod decision_gate;
+mod openssh_config;
+mod port_forward;
+mod sftp;
+mod sftp_input;
+mod sftp_planning;
+mod sftp_transfer;
+
+use std::{
+    collections::VecDeque,
+    fmt,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
+        Arc, Mutex,
+    },
+    thread,
+    time::Duration,
+};
+
+use festerm_secret_store::{SecretBytes, SecretReference, SecretStore, SecretStoreError};
+use festerm_session::{
+    automation_input_slot, noop_session_event_notifier, try_automation_admission_lock,
+    AutomationAdmissionTryError, AutomationEpoch, AutomationInputStatus, FlowDirection,
+    PendingAutomationInput, ReserveAutomationInputError, ReservedAutomationInput, Session,
+    SessionError, SessionErrorKind, SessionEvent, SessionEventNotifier, SessionId,
+    SessionLifecycle, SessionMetrics, SessionOperation, SessionSendError, SessionTryReceiveError,
+    ShutdownError, ShutdownResult, SshPortForwardDirection, SshPortForwardSource, TerminalSize,
+    DEFAULT_COMMAND_QUEUE_CAPACITY, DEFAULT_EVENT_QUEUE_CAPACITY, MAX_IO_CHUNK_BYTES,
+};
+use ssh_key::Certificate as OpenSshCertificate;
+use zeroize::Zeroize;
+use zeroize::Zeroizing;
+
+use decision_gate::{DecisionGate, DecisionResolutionError, DecisionWaiter};
+pub use openssh_config::{
+    import_openssh_config, OpenSshConfigDiagnostic, OpenSshConfigDiagnosticKind,
+    OpenSshConfigDiagnosticSeverity, OpenSshConfigImportReport,
+};
+use port_forward::{
+    apply_port_forward, collect_requested_port_forwards, emit_port_forward_snapshot,
+    handle_forwarded_tcpip_connection, handle_local_forward_connection, remove_port_forward,
+    report_port_forward_error, requested_port_forward, teardown_port_forwards,
+    AcceptedLocalForwardConnection, AdmittedPortForward, ForwardedTcpIpConnection,
+    PortForwardAdmissions, PortForwardAttemptLimiter, PortForwardBindingKey, PortForwardInventory,
+    RequestedSshPortForward,
+};
+pub use port_forward::{
+    SshPortForwardConfigurationError, SshPortForwardRequestError, SshPortForwardSpec,
+    MAX_SSH_PORT_FORWARD_ENTRIES,
+};
+use sftp::GuiSftpConnectionKeepAlive;
+pub use sftp::{
+    parse_sftp_command, read_local_directory_snapshot_sync, SftpCommand, SftpCommandOutcome,
+    SftpCommandParseError, SftpDirectoryEntry, SftpEntryType, SftpSession, SftpSessionError,
+    SftpTransportKeepAlive, SFTP_CANCELLATION_CLEANUP_TIMEOUT,
+};
+use sftp_input::{SftpInputAction, SftpInputBuffer};
+pub use sftp_transfer::{
+    SftpCollision, SftpCollisionDecision, SftpCollisionId, SftpCollisionResolution,
+    SftpCollisionScope, SftpDirectoryItem, SftpDirectorySnapshot, SftpLocation, SftpPath,
+    SftpPathMetadata, SftpQueuedTransferBatch, SftpTransferBatchId, SftpTransferDirection,
+    SftpTransferEvent, SftpTransferId, SftpTransferItemSnapshot, SftpTransferManager,
+    SftpTransferManagerError, SftpTransferQueueSnapshot, SftpTransferRequest, SftpTransferState,
+};
+
+/// Canonical SSH destination identity used for trust decisions.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HostIdentity {
+    host: String,
+    port: u16,
+}
+
+impl HostIdentity {
+    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, HostIdentityError> {
+        let host = host.into();
+        let host = host.trim();
+        if host.is_empty() {
+            return Err(HostIdentityError::EmptyHost);
+        }
+        if host.chars().any(char::is_whitespace) {
+            return Err(HostIdentityError::Whitespace);
+        }
+        if port == 0 {
+            return Err(HostIdentityError::ZeroPort);
+        }
+        Ok(Self {
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostIdentityError {
+    EmptyHost,
+    Whitespace,
+    ZeroPort,
+}
+
+impl fmt::Display for HostIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyHost => formatter.write_str("SSH host must not be empty"),
+            Self::Whitespace => formatter.write_str("SSH host must not contain whitespace"),
+            Self::ZeroPort => formatter.write_str("SSH port must not be zero"),
+        }
+    }
+}
+
+impl std::error::Error for HostIdentityError {}
+
+/// Application response to a host-key verification prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostTrustDecision {
+    Reject,
+    AcceptOnce,
+    AcceptAndPersist,
+}
+
+/// Authentication selected for one new SSH session.
+///
+/// Authentication material is moved into the worker and never belongs in a
+/// connection profile or imported OpenSSH metadata. Public keys supplied here
+/// are parsed in memory before the session starts. Agents, key-file references,
+/// and persisted/UI profile integration are deliberately deferred.
+pub enum SshAuthentication {
+    Password(SshPassword),
+    StoredPassword(StoredPasswordAuthentication),
+    PublicKey(SshPrivateKey),
+    Certificate(SshCertificateAuthentication),
+    StoredPrivateKey(StoredPrivateKeyAuthentication),
+    /// No credential is supplied upfront. The worker connects and verifies
+    /// the host key first (exactly as it would for any other credential),
+    /// then requests a password from the application only once the
+    /// connection actually needs one — mirroring `ssh`'s own ordering
+    /// (host-key confirmation, then `user@host's password:`) instead of
+    /// collecting a password blind before a connection even exists. A
+    /// rejected password is retried in place, on the same connection, up to
+    /// [`MAX_INTERACTIVE_PASSWORD_ATTEMPTS`].
+    Interactive,
+}
+
+impl SshAuthentication {
+    /// Selects password authentication for this session.
+    ///
+    /// The password is moved directly to the worker and is never exposed
+    /// through this API, persisted, or included in debug output. An explicit
+    /// reconnect policy retains it in that worker for its bounded fresh
+    /// authentication attempts only.
+    pub fn password(password: impl Into<String>) -> Self {
+        Self::Password(SshPassword {
+            password: Zeroizing::new(password.into()),
+        })
+    }
+
+    /// Selects a password held by the platform native secure store.
+    ///
+    /// The reference is copied only into the SSH worker's authentication
+    /// source. Its secret is resolved there immediately before each
+    /// authentication attempt; neither the UI nor the connection profile can
+    /// retrieve it. This M8 variant represents an SSH password only, not a
+    /// private key, passphrase, agent response, or arbitrary credential.
+    pub fn stored_password(store: Arc<dyn SecretStore>, reference: &SecretReference) -> Self {
+        Self::StoredPassword(StoredPasswordAuthentication {
+            store,
+            reference: reference.duplicate_for_transport(),
+        })
+    }
+
+    /// Selects a private key + optional passphrase held by the platform
+    /// native secure store, encoded together by
+    /// [`encode_stored_private_key`].
+    ///
+    /// The reference is copied only into the SSH worker's authentication
+    /// source. Its secret is resolved and parsed there immediately before
+    /// each authentication attempt; neither the UI nor the connection
+    /// profile can retrieve it. This mirrors [`Self::stored_password`] but
+    /// for private-key material instead of a password.
+    pub fn stored_private_key(store: Arc<dyn SecretStore>, reference: &SecretReference) -> Self {
+        Self::StoredPrivateKey(StoredPrivateKeyAuthentication {
+            store,
+            reference: reference.duplicate_for_transport(),
+        })
+    }
+
+    /// Selects public-key authentication for this session.
+    ///
+    /// `private_key` is moved directly to the worker. An explicit reconnect
+    /// policy retains only its parsed key in that worker for bounded fresh
+    /// authentication attempts.
+    pub fn public_key(private_key: SshPrivateKey) -> Self {
+        Self::PublicKey(private_key)
+    }
+
+    /// Selects OpenSSH certificate authentication for this session.
+    ///
+    /// Both the private key and its signed certificate are moved directly to
+    /// the worker. An explicit reconnect policy retains only their parsed
+    /// forms in that worker for bounded fresh authentication attempts.
+    pub fn certificate(private_key: SshPrivateKey, certificate: SshCertificate) -> Self {
+        Self::Certificate(SshCertificateAuthentication::new(private_key, certificate))
+    }
+
+    /// Selects interactive password authentication: no credential is
+    /// supplied upfront, so the worker prompts for one (through
+    /// [`SessionEvent::PasswordRequested`]) only after the host key has
+    /// already been verified.
+    pub const fn interactive() -> Self {
+        Self::Interactive
+    }
+
+    /// Duplicates this credential source for a second SSH/SFTP transport in
+    /// the same process without exposing its secret material to callers.
+    pub fn duplicate_for_transport(&self) -> Self {
+        match self {
+            Self::Password(_) => Self::Interactive,
+            Self::StoredPassword(authentication) => {
+                Self::StoredPassword(StoredPasswordAuthentication {
+                    store: Arc::clone(&authentication.store),
+                    reference: authentication.reference.duplicate_for_transport(),
+                })
+            }
+            Self::PublicKey(key) => Self::PublicKey(key.clone()),
+            Self::Certificate(authentication) => {
+                Self::Certificate(SshCertificateAuthentication::new(
+                    authentication.key.clone(),
+                    authentication.certificate.clone(),
+                ))
+            }
+            Self::StoredPrivateKey(authentication) => {
+                Self::StoredPrivateKey(StoredPrivateKeyAuthentication {
+                    store: Arc::clone(&authentication.store),
+                    reference: authentication.reference.duplicate_for_transport(),
+                })
+            }
+            Self::Interactive => Self::Interactive,
+        }
+    }
+
+    fn into_worker_authentication(self) -> WorkerAuthentication {
+        match self {
+            Self::Password(password) => WorkerAuthentication::Password(password.password),
+            Self::StoredPassword(password) => WorkerAuthentication::StoredPassword(password),
+            Self::PublicKey(private_key) => WorkerAuthentication::PublicKey(private_key.key),
+            Self::Certificate(authentication) => {
+                WorkerAuthentication::Certificate(WorkerCertificateAuthentication {
+                    key: authentication.key.key,
+                    certificate: authentication.certificate.certificate,
+                })
+            }
+            Self::StoredPrivateKey(private_key) => {
+                WorkerAuthentication::StoredPrivateKey(private_key)
+            }
+            Self::Interactive => WorkerAuthentication::Interactive,
+        }
+    }
+}
+
+impl fmt::Debug for SshAuthentication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Password(_) => formatter.write_str("SshAuthentication::Password([REDACTED])"),
+            Self::StoredPassword(_) => {
+                formatter.write_str("SshAuthentication::StoredPassword([REDACTED])")
+            }
+            Self::PublicKey(_) => formatter.write_str("SshAuthentication::PublicKey([REDACTED])"),
+            Self::Certificate(_) => {
+                formatter.write_str("SshAuthentication::Certificate([REDACTED])")
+            }
+            Self::StoredPrivateKey(_) => {
+                formatter.write_str("SshAuthentication::StoredPrivateKey([REDACTED])")
+            }
+            Self::Interactive => formatter.write_str("SshAuthentication::Interactive"),
+        }
+    }
+}
+
+/// Password material consumed by [`SshAuthentication`] by the worker.
+///
+/// This type intentionally has no getter, `Clone`, or derived `Debug`
+/// implementation. It is not a persistent connection-profile field.
+pub struct SshPassword {
+    password: Zeroizing<String>,
+}
+
+/// Opaque native-store password source consumed only by the SSH worker.
+///
+/// It intentionally has no accessors or `Debug` implementation. The stored
+/// credential is constrained to SSH password authentication by
+/// [`SshAuthentication::stored_password`].
+pub struct StoredPasswordAuthentication {
+    store: Arc<dyn SecretStore>,
+    reference: SecretReference,
+}
+
+/// Opaque native-store private-key source consumed only by the SSH worker.
+///
+/// It intentionally has no accessors or `Debug` implementation. The stored
+/// bytes are constrained to SSH public-key authentication by
+/// [`SshAuthentication::stored_private_key`] and are encoded/decoded by
+/// [`encode_stored_private_key`]/[`decode_stored_private_key`].
+pub struct StoredPrivateKeyAuthentication {
+    store: Arc<dyn SecretStore>,
+    reference: SecretReference,
+}
+
+/// Parsed OpenSSH certificate authentication material consumed by
+/// [`SshAuthentication`] only through the worker.
+///
+/// This type intentionally has no getters or derived `Debug`
+/// implementation. The accompanying private key remains secret, and the
+/// certificate is only meaningful together with that key.
+pub struct SshCertificateAuthentication {
+    key: SshPrivateKey,
+    certificate: SshCertificate,
+}
+
+impl SshCertificateAuthentication {
+    fn new(key: SshPrivateKey, certificate: SshCertificate) -> Self {
+        Self { key, certificate }
+    }
+}
+
+impl fmt::Debug for SshCertificateAuthentication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SshCertificateAuthentication([REDACTED])")
+    }
+}
+
+/// Encodes an OpenSSH private key and its optional passphrase into one
+/// [`SecretBytes`] blob for storage under a single [`SecretReference`].
+///
+/// Format: a 4-byte little-endian passphrase length, followed by the raw
+/// passphrase bytes (empty when there is no passphrase), followed by the
+/// OpenSSH private-key text. A length prefix (rather than a delimiter byte)
+/// is used so the key text's own bytes never need to be constrained.
+pub fn encode_stored_private_key(key_text: &str, passphrase: Option<&str>) -> SecretBytes {
+    let passphrase = passphrase.unwrap_or("");
+    let mut bytes = Zeroizing::new(Vec::with_capacity(4 + passphrase.len() + key_text.len()));
+    bytes.extend_from_slice(&(passphrase.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(passphrase.as_bytes());
+    bytes.extend_from_slice(key_text.as_bytes());
+    SecretBytes::copy_from_slice(&bytes)
+}
+
+fn decode_stored_private_key(
+    bytes: &[u8],
+) -> Result<(String, String), StoredPrivateKeyResolutionError> {
+    if bytes.len() < 4 {
+        return Err(StoredPrivateKeyResolutionError::InvalidEncoding);
+    }
+    let (length_prefix, remainder) = bytes.split_at(4);
+    let passphrase_length =
+        u32::from_le_bytes(length_prefix.try_into().expect("checked length")) as usize;
+    if remainder.len() < passphrase_length {
+        return Err(StoredPrivateKeyResolutionError::InvalidEncoding);
+    }
+    let (passphrase, key_text) = remainder.split_at(passphrase_length);
+    let passphrase = std::str::from_utf8(passphrase)
+        .map_err(|_| StoredPrivateKeyResolutionError::InvalidEncoding)?
+        .to_owned();
+    let key_text = std::str::from_utf8(key_text)
+        .map_err(|_| StoredPrivateKeyResolutionError::InvalidEncoding)?
+        .to_owned();
+    Ok((key_text, passphrase))
+}
+
+/// Content-free failures while resolving a native stored SSH private key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoredPrivateKeyResolutionError {
+    Missing,
+    LockedOrUnavailable,
+    BackendFailure,
+    InvalidEncoding,
+    InvalidKey,
+}
+
+impl StoredPrivateKeyResolutionError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Missing => {
+                "stored SSH private key is missing; replace it for this saved profile and try again"
+            }
+            Self::LockedOrUnavailable => {
+                "native secure storage is locked or unavailable; unlock it and try again"
+            }
+            Self::BackendFailure => {
+                "native secure storage could not read the stored SSH private key; try again or replace it"
+            }
+            Self::InvalidEncoding | Self::InvalidKey => {
+                "stored SSH private key could not be read; replace it for this saved profile and try again"
+            }
+        }
+    }
+}
+
+impl fmt::Display for StoredPrivateKeyResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for StoredPrivateKeyResolutionError {}
+
+fn resolve_stored_private_key(
+    authentication: &StoredPrivateKeyAuthentication,
+) -> Result<Arc<russh::keys::PrivateKey>, StoredPrivateKeyResolutionError> {
+    let secret = authentication
+        .store
+        .get(&authentication.reference)
+        .map_err(|error| match error {
+            SecretStoreError::Missing => StoredPrivateKeyResolutionError::Missing,
+            SecretStoreError::LockedOrUnavailable | SecretStoreError::Unsupported => {
+                StoredPrivateKeyResolutionError::LockedOrUnavailable
+            }
+            SecretStoreError::BackendFailure
+            | SecretStoreError::InvalidReference
+            | SecretStoreError::TooLarge => StoredPrivateKeyResolutionError::BackendFailure,
+        })?;
+    let (key_text, passphrase) = secret.with_bytes(decode_stored_private_key)?;
+    let parsed = if passphrase.is_empty() {
+        SshPrivateKey::from_openssh(key_text.as_bytes())
+    } else {
+        SshPrivateKey::from_openssh(key_text.as_bytes()).or_else(|_| {
+            SshPrivateKey::from_encrypted_openssh(
+                key_text.as_bytes(),
+                SshKeyPassphrase::new(passphrase),
+            )
+        })
+    }
+    .map_err(|_| StoredPrivateKeyResolutionError::InvalidKey)?;
+    Ok(parsed.key)
+}
+
+impl fmt::Debug for SshPassword {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SshPassword([REDACTED])")
+    }
+}
+
+/// Transient passphrase consumed while parsing an encrypted OpenSSH private key.
+///
+/// This type intentionally has no getter, `Clone`, or derived `Debug`
+/// implementation. [`SshPrivateKey::from_encrypted_openssh`] consumes it while
+/// parsing, and the resulting private key retains no passphrase.
+pub struct SshKeyPassphrase {
+    passphrase: Zeroizing<String>,
+}
+
+impl SshKeyPassphrase {
+    /// Creates a transient passphrase for one encrypted-key parse attempt.
+    pub fn new(passphrase: impl Into<String>) -> Self {
+        Self {
+            passphrase: Zeroizing::new(passphrase.into()),
+        }
+    }
+}
+
+impl fmt::Debug for SshKeyPassphrase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SshKeyPassphrase([REDACTED])")
+    }
+}
+
+/// Parsed private key material consumed by [`SshAuthentication`] by the worker.
+///
+/// This type intentionally has no getter, `Clone`, or derived `Debug`
+/// implementation. It retains only the parsed private key; input encodings and
+/// encrypted-key passphrases are not retained.
+#[derive(Clone)]
+pub struct SshPrivateKey {
+    key: Arc<russh::keys::PrivateKey>,
+}
+
+impl SshPrivateKey {
+    /// Parses an unencrypted in-memory OpenSSH private key.
+    ///
+    /// The supplied bytes are validated immediately and are not retained after
+    /// parsing. Encrypted keys must use [`Self::from_encrypted_openssh`] so
+    /// passphrase handling is explicit at the call site.
+    pub fn from_openssh(encoded: impl AsRef<[u8]>) -> Result<Self, SshPrivateKeyError> {
+        let encoded = openssh_private_key_text(encoded.as_ref())?;
+        let key = russh::keys::decode_secret_key(encoded, None).map_err(|error| match error {
+            russh::keys::Error::KeyIsEncrypted => SshPrivateKeyError::Encrypted,
+            _ => SshPrivateKeyError::InvalidKey,
+        })?;
+        Ok(Self { key: Arc::new(key) })
+    }
+
+    /// Parses an encrypted in-memory OpenSSH private key with a transient passphrase.
+    ///
+    /// The bytes and `passphrase` are consumed during this call. On success,
+    /// this type retains only the parsed private key. Unencrypted keys must use
+    /// [`Self::from_openssh`] instead.
+    pub fn from_encrypted_openssh(
+        encoded: impl AsRef<[u8]>,
+        passphrase: SshKeyPassphrase,
+    ) -> Result<Self, SshPrivateKeyError> {
+        let encoded = openssh_private_key_text(encoded.as_ref())?;
+        match russh::keys::decode_secret_key(encoded, None) {
+            Err(russh::keys::Error::KeyIsEncrypted) => {}
+            Ok(_) => return Err(SshPrivateKeyError::Unencrypted),
+            Err(_) => return Err(SshPrivateKeyError::InvalidKey),
+        }
+        let key = russh::keys::decode_secret_key(encoded, Some(&passphrase.passphrase))
+            .map_err(|_| SshPrivateKeyError::InvalidKey)?;
+        Ok(Self { key: Arc::new(key) })
+    }
+}
+
+fn openssh_private_key_text(encoded: &[u8]) -> Result<&str, SshPrivateKeyError> {
+    let encoded = std::str::from_utf8(encoded).map_err(|_| SshPrivateKeyError::InvalidEncoding)?;
+    if !encoded
+        .trim_start()
+        .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
+    {
+        return Err(SshPrivateKeyError::NotOpenSsh);
+    }
+    Ok(encoded)
+}
+
+impl fmt::Debug for SshPrivateKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SshPrivateKey([REDACTED])")
+    }
+}
+
+/// Failure to accept an in-memory OpenSSH private key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshPrivateKeyError {
+    InvalidEncoding,
+    NotOpenSsh,
+    Encrypted,
+    Unencrypted,
+    InvalidKey,
+}
+
+impl fmt::Display for SshPrivateKeyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEncoding => formatter.write_str("SSH private key is not valid UTF-8"),
+            Self::NotOpenSsh => formatter.write_str("SSH private key is not in OpenSSH format"),
+            Self::Encrypted => formatter
+                .write_str("encrypted SSH private keys require an explicit transient passphrase"),
+            Self::Unencrypted => formatter
+                .write_str("unencrypted SSH private keys must use the unencrypted OpenSSH parser"),
+            Self::InvalidKey => formatter.write_str("SSH private key is invalid or unsupported"),
+        }
+    }
+}
+
+impl std::error::Error for SshPrivateKeyError {}
+
+/// Parsed OpenSSH certificate material consumed by certificate-based SSH
+/// authentication.
+///
+/// This type intentionally has no getter or derived `Debug` implementation.
+/// The parsed certificate is retained only in memory for the worker.
+#[derive(Clone)]
+pub struct SshCertificate {
+    certificate: Arc<OpenSshCertificate>,
+}
+
+impl SshCertificate {
+    /// Parses an in-memory OpenSSH certificate (the usual `-cert.pub` text).
+    ///
+    /// The supplied bytes are validated immediately and are not retained after
+    /// parsing.
+    pub fn from_openssh(encoded: impl AsRef<[u8]>) -> Result<Self, SshCertificateError> {
+        let encoded = openssh_certificate_text(encoded.as_ref())?;
+        let certificate = OpenSshCertificate::from_openssh(encoded)
+            .map_err(|_| SshCertificateError::InvalidCertificate)?;
+        Ok(Self {
+            certificate: Arc::new(certificate),
+        })
+    }
+}
+
+fn openssh_certificate_text(encoded: &[u8]) -> Result<&str, SshCertificateError> {
+    let encoded = std::str::from_utf8(encoded).map_err(|_| SshCertificateError::InvalidEncoding)?;
+    let Some(kind) = encoded.split_whitespace().next() else {
+        return Err(SshCertificateError::NotOpenSsh);
+    };
+    if !kind.ends_with("-cert-v01@openssh.com") {
+        return Err(SshCertificateError::NotOpenSsh);
+    }
+    Ok(encoded)
+}
+
+impl fmt::Debug for SshCertificate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SshCertificate([REDACTED])")
+    }
+}
+
+/// Failure to accept an in-memory OpenSSH certificate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshCertificateError {
+    InvalidEncoding,
+    NotOpenSsh,
+    InvalidCertificate,
+}
+
+impl fmt::Display for SshCertificateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEncoding => formatter.write_str("SSH certificate is not valid UTF-8"),
+            Self::NotOpenSsh => {
+                formatter.write_str("SSH certificate is not in OpenSSH certificate format")
+            }
+            Self::InvalidCertificate => {
+                formatter.write_str("SSH certificate is invalid or unsupported")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SshCertificateError {}
+
+enum WorkerAuthentication {
+    Password(Zeroizing<String>),
+    StoredPassword(StoredPasswordAuthentication),
+    PublicKey(Arc<russh::keys::PrivateKey>),
+    Certificate(WorkerCertificateAuthentication),
+    StoredPrivateKey(StoredPrivateKeyAuthentication),
+    Interactive,
+}
+
+struct WorkerCertificateAuthentication {
+    key: Arc<russh::keys::PrivateKey>,
+    certificate: Arc<OpenSshCertificate>,
+}
+
+/// Content-free failures while resolving a native stored SSH password.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoredPasswordResolutionError {
+    Missing,
+    LockedOrUnavailable,
+    BackendFailure,
+    InvalidPasswordEncoding,
+}
+
+impl StoredPasswordResolutionError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Missing => {
+                "stored SSH password is missing; replace it for this saved profile and try again"
+            }
+            Self::LockedOrUnavailable => {
+                "native secure storage is locked or unavailable; unlock it and try again"
+            }
+            Self::BackendFailure => {
+                "native secure storage could not read the stored SSH password; try again or replace it"
+            }
+            Self::InvalidPasswordEncoding => {
+                "stored SSH password could not be read; replace it for this saved profile and try again"
+            }
+        }
+    }
+}
+
+impl fmt::Display for StoredPasswordResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for StoredPasswordResolutionError {}
+
+fn resolve_stored_password(
+    authentication: &StoredPasswordAuthentication,
+) -> Result<String, StoredPasswordResolutionError> {
+    let secret = authentication
+        .store
+        .get(&authentication.reference)
+        .map_err(|error| match error {
+            SecretStoreError::Missing => StoredPasswordResolutionError::Missing,
+            SecretStoreError::LockedOrUnavailable | SecretStoreError::Unsupported => {
+                StoredPasswordResolutionError::LockedOrUnavailable
+            }
+            SecretStoreError::BackendFailure
+            | SecretStoreError::InvalidReference
+            | SecretStoreError::TooLarge => StoredPasswordResolutionError::BackendFailure,
+        })?;
+    secret.with_bytes(|bytes| {
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| StoredPasswordResolutionError::InvalidPasswordEncoding)
+    })
+}
+
+/// Validated, secret-free connection inputs for a future interactive SSH PTY.
+///
+/// Authentication material is intentionally absent. In particular, callers
+/// must not put passwords, private-key data, or agent responses in this type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshConnectionProfile {
+    identity: HostIdentity,
+    username: String,
+    terminal_type: String,
+    initial_size: TerminalSize,
+}
+
+impl SshConnectionProfile {
+    pub const DEFAULT_TERMINAL_TYPE: &'static str = "xterm-256color";
+    const MAX_USERNAME_BYTES: usize = 255;
+    const MAX_TERMINAL_TYPE_BYTES: usize = 64;
+
+    pub fn new(
+        identity: HostIdentity,
+        username: impl Into<String>,
+        terminal_type: impl Into<String>,
+        initial_size: TerminalSize,
+    ) -> Result<Self, SshConnectionProfileError> {
+        let username = username.into();
+        validate_username(&username)?;
+        let terminal_type = terminal_type.into();
+        validate_terminal_type(&terminal_type)?;
+        Ok(Self {
+            identity,
+            username,
+            terminal_type,
+            initial_size,
+        })
+    }
+
+    pub fn identity(&self) -> &HostIdentity {
+        &self.identity
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn terminal_type(&self) -> &str {
+        &self.terminal_type
+    }
+
+    pub const fn initial_size(&self) -> TerminalSize {
+        self.initial_size
+    }
+}
+
+fn validate_username(username: &str) -> Result<(), SshConnectionProfileError> {
+    if username.is_empty() {
+        return Err(SshConnectionProfileError::EmptyUsername);
+    }
+    if username.len() > SshConnectionProfile::MAX_USERNAME_BYTES {
+        return Err(SshConnectionProfileError::UsernameTooLong {
+            maximum: SshConnectionProfile::MAX_USERNAME_BYTES,
+            actual: username.len(),
+        });
+    }
+    if username.chars().any(char::is_whitespace) {
+        return Err(SshConnectionProfileError::UsernameWhitespace);
+    }
+    if username.chars().any(char::is_control) {
+        return Err(SshConnectionProfileError::UsernameControlCharacter);
+    }
+    Ok(())
+}
+
+fn validate_terminal_type(terminal_type: &str) -> Result<(), SshConnectionProfileError> {
+    if terminal_type.is_empty() {
+        return Err(SshConnectionProfileError::EmptyTerminalType);
+    }
+    if terminal_type.len() > SshConnectionProfile::MAX_TERMINAL_TYPE_BYTES {
+        return Err(SshConnectionProfileError::TerminalTypeTooLong {
+            maximum: SshConnectionProfile::MAX_TERMINAL_TYPE_BYTES,
+            actual: terminal_type.len(),
+        });
+    }
+    if !terminal_type
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
+    {
+        return Err(SshConnectionProfileError::InvalidTerminalType);
+    }
+    Ok(())
+}
+
+/// Failure to validate non-secret SSH connection inputs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshConnectionProfileError {
+    EmptyUsername,
+    UsernameWhitespace,
+    UsernameControlCharacter,
+    UsernameTooLong { maximum: usize, actual: usize },
+    EmptyTerminalType,
+    InvalidTerminalType,
+    TerminalTypeTooLong { maximum: usize, actual: usize },
+}
+
+impl fmt::Display for SshConnectionProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyUsername => formatter.write_str("SSH username must not be empty"),
+            Self::UsernameWhitespace => {
+                formatter.write_str("SSH username must not contain whitespace")
+            }
+            Self::UsernameControlCharacter => {
+                formatter.write_str("SSH username must not contain control characters")
+            }
+            Self::UsernameTooLong { maximum, actual } => {
+                write!(
+                    formatter,
+                    "SSH username is {actual} bytes; maximum is {maximum}"
+                )
+            }
+            Self::EmptyTerminalType => formatter.write_str("SSH terminal type must not be empty"),
+            Self::InvalidTerminalType => {
+                formatter.write_str("SSH terminal type contains unsupported characters")
+            }
+            Self::TerminalTypeTooLong { maximum, actual } => {
+                write!(
+                    formatter,
+                    "SSH terminal type is {actual} bytes; maximum is {maximum}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SshConnectionProfileError {}
+
+/// Bounded automatic reconnect behavior owned by the application.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReconnectPolicy {
+    maximum_attempts: u8,
+    initial_delay: Duration,
+    maximum_delay: Duration,
+}
+
+impl ReconnectPolicy {
+    pub fn new(
+        maximum_attempts: u8,
+        initial_delay: Duration,
+        maximum_delay: Duration,
+    ) -> Result<Self, ReconnectPolicyError> {
+        if maximum_attempts == 0 {
+            return Err(ReconnectPolicyError::ZeroAttempts);
+        }
+        if initial_delay.is_zero() {
+            return Err(ReconnectPolicyError::ZeroInitialDelay);
+        }
+        if maximum_delay < initial_delay {
+            return Err(ReconnectPolicyError::MaximumBeforeInitial);
+        }
+        Ok(Self {
+            maximum_attempts,
+            initial_delay,
+            maximum_delay,
+        })
+    }
+
+    pub const fn maximum_attempts(self) -> u8 {
+        self.maximum_attempts
+    }
+
+    /// A conservative default bounded-exponential backoff for automatic
+    /// recovery, offered so a user opting a persistent session into
+    /// automatic recovery (ADR 0018 requires that opt-in itself) is not also
+    /// required to choose numeric backoff parameters. This intentionally
+    /// matches the cadence fesTerm already uses when retrying a
+    /// user-initiated manual reconnect after a transient failure.
+    pub fn default_automatic() -> Self {
+        Self::new(
+            MANUAL_RECONNECT_MAX_ATTEMPTS,
+            MANUAL_RECONNECT_INITIAL_DELAY,
+            MANUAL_RECONNECT_MAX_DELAY,
+        )
+        .expect("the default automatic-recovery policy's fixed parameters are valid")
+    }
+}
+
+/// A remote durable-session provider fesTerm can attach to or create for a
+/// [`SessionStrategy::Persistent`] session (ADR 0018).
+///
+/// A provider's contract is deliberately small: report a user-displayable
+/// name, provide the command used to lazily and explicitly probe for its
+/// remote executable, and construct the command that attaches to (or
+/// creates, if absent) the durable session in place of an interactive login
+/// shell. There is no public plugin system; this enum is the whole boundary
+/// until multiple real implementations justify more abstraction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistenceProvider {
+    Tmux,
+    Screen,
+}
+
+impl PersistenceProvider {
+    /// A short, user-displayable name for this provider.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Tmux => "tmux",
+            Self::Screen => "GNU Screen",
+        }
+    }
+
+    /// The remote command used to lazily and explicitly probe for this
+    /// provider's executable. fesTerm never runs this speculatively or in
+    /// the background; it only runs when a user opts a profile into
+    /// persistence (ADR 0018).
+    pub const fn capability_probe_command(self) -> &'static str {
+        match self {
+            Self::Tmux => "command -v tmux",
+            Self::Screen => "command -v screen",
+        }
+    }
+
+    /// The remote command fesTerm execs, in place of an interactive login
+    /// shell, to attach to the durable session named by `session_name`, or
+    /// create it if it does not yet exist.
+    ///
+    /// Both commands are idempotent/re-entrant: running them again after an
+    /// unintentional transport loss reattaches to the same durable session
+    /// rather than creating a second one, which is what makes this strategy
+    /// safe to pair with [`RecoveryPolicy::Automatic`].
+    fn attach_or_create_command(
+        self,
+        session_name: &PersistentSessionName,
+        initial_size: TerminalSize,
+    ) -> String {
+        match self {
+            Self::Tmux => format!(
+                "exec tmux new-session -A -s {} -x {} -y {} \\; set-option -t {} status off \
+                 \\; set-window-option -t {} window-size latest",
+                session_name.as_str(),
+                initial_size.columns(),
+                initial_size.rows(),
+                session_name.as_str(),
+                session_name.as_str(),
+            ),
+            Self::Screen => format!("exec screen -c /dev/null -xRR {}", session_name.as_str()),
+        }
+    }
+}
+
+/// A validated remote durable-session name for a [`PersistenceProvider`].
+///
+/// This is deliberately restricted to a conservative, shell-metacharacter-free
+/// character set: the name is interpolated directly into a remote command
+/// string (see [`PersistenceProvider::attach_or_create_command`]), and
+/// fesTerm has no reliable, portable way to shell-quote a value for whatever
+/// login shell the remote host happens to run. Restricting the input
+/// character set by construction is simpler and safer than trying to escape
+/// it after the fact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentSessionName(String);
+
+impl PersistentSessionName {
+    const MAXIMUM_BYTES: usize = 64;
+
+    /// Validates and wraps a candidate durable-session name.
+    pub fn new(name: impl Into<String>) -> Result<Self, PersistentSessionNameError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(PersistentSessionNameError::Empty);
+        }
+        if name.len() > Self::MAXIMUM_BYTES {
+            return Err(PersistentSessionNameError::TooLong {
+                maximum: Self::MAXIMUM_BYTES,
+                actual: name.len(),
+            });
+        }
+        if !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        }) {
+            return Err(PersistentSessionNameError::InvalidCharacter);
+        }
+        Ok(Self(name))
+    }
+
+    /// Returns the validated name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A rejected candidate [`PersistentSessionName`].
+///
+/// This error intentionally contains no part of the rejected name itself, so
+/// applications can present it safely even though the name may have come
+/// from untrusted input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistentSessionNameError {
+    Empty,
+    TooLong { maximum: usize, actual: usize },
+    InvalidCharacter,
+}
+
+impl fmt::Display for PersistentSessionNameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("a persistent session name must not be empty"),
+            Self::TooLong { maximum, actual } => write!(
+                formatter,
+                "a persistent session name must be at most {maximum} bytes, got {actual}"
+            ),
+            Self::InvalidCharacter => formatter.write_str(
+                "a persistent session name may only contain ASCII letters, digits, '-', '_', or '.'",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PersistentSessionNameError {}
+
+/// The kind of remote session fesTerm creates or attaches to for a live SSH
+/// connection (ADR 0018).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum SessionStrategy {
+    /// An ordinary remote shell with no durable-session provider attached.
+    /// Losing the transport always loses that shell, so there is nothing to
+    /// safely recover without an explicit user action.
+    #[default]
+    PlainShell,
+    /// A durable remote session created by, or attached to via, `provider`
+    /// and identified by `session_name`. Losing the transport does not lose
+    /// this remote session: reattaching (manually, or, once explicitly
+    /// opted in, automatically) recovers it (ADR 0018).
+    Persistent {
+        provider: PersistenceProvider,
+        session_name: PersistentSessionName,
+    },
+}
+
+impl SessionStrategy {
+    /// Whether this strategy can safely recover durable remote state after an
+    /// unintentional transport loss, and so may be paired with
+    /// [`RecoveryPolicy::Automatic`] (ADR 0018).
+    ///
+    /// A plain shell cannot: it is not attached to anything but the dead
+    /// transport, so an automatic reconnect could only create a new,
+    /// unrelated shell rather than recover the old one. A persistent
+    /// strategy's whole point is that reattaching is safe and idempotent.
+    pub const fn supports_automatic_recovery(&self) -> bool {
+        match self {
+            Self::PlainShell => false,
+            Self::Persistent { .. } => true,
+        }
+    }
+}
+
+/// Whether a live SSH session may replace its transport without an explicit
+/// user action after an unintentional connection loss (ADR 0018).
+///
+/// A user-requested manual reconnect is always available regardless of this
+/// policy; it governs only *unintentional*-loss retries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecoveryPolicy {
+    /// The only reconnect that happens is an explicit, user-requested one.
+    #[default]
+    Manual,
+    /// An unintentional transport loss may schedule bounded, cancellable
+    /// reconnect attempts using the given policy. Only valid for a
+    /// [`SessionStrategy`] that reports
+    /// [`SessionStrategy::supports_automatic_recovery`].
+    Automatic(ReconnectPolicy),
+}
+
+/// A [`RecoveryPolicy::Automatic`] policy paired with a [`SessionStrategy`]
+/// that cannot safely support it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryPolicyError;
+
+impl fmt::Display for RecoveryPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "automatic recovery requires a session strategy that can safely recover durable state",
+        )
+    }
+}
+
+impl std::error::Error for RecoveryPolicyError {}
+
+/// Explicit optional behavior for a live [`SshSession`].
+///
+/// A user-requested manual reconnect is always available regardless of these
+/// options (ADR 0018): only automatic, unintentional-loss retry is governed
+/// here, and only a [`SessionStrategy`] that can safely recover durable state
+/// may enable it. Every reconnect, manual or automatic, is a new SSH
+/// transport, channel, PTY, and shell; remote process state and unsent or
+/// in-flight input are never restored.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SshSessionOptions {
+    strategy: SessionStrategy,
+    recovery: RecoveryPolicy,
+    known_host_fingerprint: Option<String>,
+    profile_port_forwards: Vec<RequestedSshPortForward>,
+}
+
+impl SshSessionOptions {
+    /// Creates options for an ordinary plain-shell session with manual-only
+    /// recovery — the only combination valid before ADR 0018's persistent
+    /// strategies existed, and still the default today.
+    pub const fn new() -> Self {
+        Self {
+            strategy: SessionStrategy::PlainShell,
+            recovery: RecoveryPolicy::Manual,
+            known_host_fingerprint: None,
+            profile_port_forwards: Vec::new(),
+        }
+    }
+
+    /// Builds options from an explicit strategy/recovery pair, rejecting an
+    /// automatic policy the strategy cannot safely support (ADR 0018).
+    pub fn with_recovery_policy(
+        strategy: SessionStrategy,
+        recovery: RecoveryPolicy,
+    ) -> Result<Self, RecoveryPolicyError> {
+        if matches!(recovery, RecoveryPolicy::Automatic(_))
+            && !strategy.supports_automatic_recovery()
+        {
+            return Err(RecoveryPolicyError);
+        }
+        Ok(Self {
+            strategy,
+            recovery,
+            known_host_fingerprint: None,
+            profile_port_forwards: Vec::new(),
+        })
+    }
+
+    /// Attaches a persistent-trust-store fingerprint the application already
+    /// has on file for this destination (ADR 0020). When the server presents
+    /// this exact fingerprint, the worker accepts it without prompting,
+    /// mirroring `ssh`'s own already-in-`known_hosts` behavior; when it
+    /// presents any other fingerprint, the worker still prompts, but flags
+    /// the request as a changed-key warning rather than a first-seen host.
+    #[must_use]
+    pub fn with_known_host_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.known_host_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Returns the session strategy in effect.
+    pub fn strategy(&self) -> SessionStrategy {
+        self.strategy.clone()
+    }
+
+    /// Returns the selected automatic reconnect policy, if automatic
+    /// recovery is on. `None` means every reconnect is manual/explicit.
+    pub const fn reconnect_policy(&self) -> Option<ReconnectPolicy> {
+        match self.recovery {
+            RecoveryPolicy::Automatic(policy) => Some(policy),
+            RecoveryPolicy::Manual => None,
+        }
+    }
+
+    /// Returns the persistent-trust-store fingerprint attached to these
+    /// options, if any (ADR 0020).
+    pub fn known_host_fingerprint(&self) -> Option<&str> {
+        self.known_host_fingerprint.as_deref()
+    }
+
+    /// Attaches validated saved-profile port forwards for this fresh launch.
+    ///
+    /// These mappings apply only to the session's first successful
+    /// connection. A later reconnect does not silently reapply them.
+    pub fn with_profile_port_forwards<I>(
+        mut self,
+        port_forwards: I,
+    ) -> Result<Self, SshPortForwardConfigurationError>
+    where
+        I: IntoIterator,
+        I::Item: SshPortForwardSpec,
+    {
+        self.profile_port_forwards =
+            collect_requested_port_forwards(port_forwards, SshPortForwardSource::Profile)?;
+        Ok(self)
+    }
+
+    fn profile_port_forwards(&self) -> &[RequestedSshPortForward] {
+        &self.profile_port_forwards
+    }
+
+    /// Builds options for `strategy` with manual-only recovery.
+    ///
+    /// Manual recovery is always valid for any [`SessionStrategy`] (ADR
+    /// 0018: a persistent-session strategy makes automatic recovery *safe
+    /// enough to offer*, it does not enable it by itself), so this
+    /// constructor is infallible, unlike [`Self::with_recovery_policy`].
+    /// Callers that resolve a strategy from saved profile metadata without
+    /// yet exposing an automatic-recovery opt-in should use this.
+    pub const fn manual_recovery(strategy: SessionStrategy) -> Self {
+        Self {
+            strategy,
+            recovery: RecoveryPolicy::Manual,
+            known_host_fingerprint: None,
+            profile_port_forwards: Vec::new(),
+        }
+    }
+}
+
+/// A rejected nonblocking request to reconnect a live SSH session.
+///
+/// This error intentionally contains no destination, credential, terminal,
+/// or protocol data, so applications can present it safely.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshReconnectError {
+    NotRunning,
+    AlreadyRequested,
+    QueueFull,
+    Closed,
+}
+
+impl fmt::Display for SshReconnectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRunning => {
+                formatter.write_str("SSH reconnect is only available while connected")
+            }
+            Self::AlreadyRequested => formatter.write_str("an SSH reconnect is already pending"),
+            Self::QueueFull => formatter.write_str("SSH reconnect request queue is full"),
+            Self::Closed => {
+                formatter.write_str("SSH reconnect request was rejected: session closed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SshReconnectError {}
+
+/// A rejected nonblocking request to actively verify a live SSH session's
+/// transport (ADR 0018's liveness probe).
+///
+/// Like [`SshReconnectError`], this intentionally contains no destination,
+/// credential, terminal, or protocol data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshLivenessCheckError {
+    NotRunning,
+    AlreadyRequested,
+}
+
+impl fmt::Display for SshLivenessCheckError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRunning => {
+                formatter.write_str("an SSH liveness probe is only available while connected")
+            }
+            Self::AlreadyRequested => {
+                formatter.write_str("an SSH liveness probe is already pending")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SshLivenessCheckError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconnectPolicyError {
+    ZeroAttempts,
+    ZeroInitialDelay,
+    MaximumBeforeInitial,
+}
+
+impl fmt::Display for ReconnectPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroAttempts => formatter.write_str("reconnect requires at least one attempt"),
+            Self::ZeroInitialDelay => formatter.write_str("reconnect delay must be nonzero"),
+            Self::MaximumBeforeInitial => {
+                formatter.write_str("maximum reconnect delay must not precede initial delay")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReconnectPolicyError {}
+
+/// The result of one deterministic reconnect-planning transition.
+///
+/// This planner never starts a timer or a network operation. Its caller owns
+/// waiting for [`Self::ScheduleAttempt`] and creating a new session for
+/// [`Self::StartFreshConnection`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconnectAction {
+    None,
+    ScheduleAttempt {
+        attempt: u8,
+        delay: Duration,
+    },
+    StartFreshConnection {
+        attempt: u8,
+        host_verification: FreshHostVerification,
+    },
+    Exhausted,
+    Cancelled,
+    Reset,
+}
+
+/// Host-trust work required before every reconnect attempt.
+///
+/// A reconnect is always a new transport, PTY, and remote shell. This type
+/// deliberately provides no state-restoration action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FreshHostVerification {
+    Required,
+}
+
+/// Observable state of a [`ReconnectPlanner`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconnectState {
+    Idle,
+    Waiting { attempt: u8, delay: Duration },
+    Connecting { attempt: u8 },
+    Exhausted,
+    Cancelled,
+}
+
+/// Pure, bounded planner for application-owned SSH reconnect behavior.
+///
+/// The application reports disconnects, elapsed waits, and connection results
+/// to this type. It must perform each returned action itself; in particular,
+/// every [`ReconnectAction::StartFreshConnection`] requires a fresh host-key
+/// verification and creates no claim that a prior remote shell was restored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReconnectPlanner {
+    policy: ReconnectPolicy,
+    state: ReconnectState,
+}
+
+impl ReconnectPlanner {
+    pub const fn new(policy: ReconnectPolicy) -> Self {
+        Self {
+            policy,
+            state: ReconnectState::Idle,
+        }
+    }
+
+    pub const fn state(&self) -> ReconnectState {
+        self.state
+    }
+
+    /// Schedules the first bounded reconnect attempt after a disconnect.
+    pub fn disconnected(&mut self) -> ReconnectAction {
+        if !matches!(self.state, ReconnectState::Idle) {
+            return ReconnectAction::None;
+        }
+        self.schedule_attempt(1)
+    }
+
+    /// Advances a caller-owned elapsed reconnect delay.
+    pub fn delay_elapsed(&mut self) -> ReconnectAction {
+        let ReconnectState::Waiting { attempt, .. } = self.state else {
+            return ReconnectAction::None;
+        };
+        self.state = ReconnectState::Connecting { attempt };
+        ReconnectAction::StartFreshConnection {
+            attempt,
+            host_verification: FreshHostVerification::Required,
+        }
+    }
+
+    /// Records that the fresh connection attempt did not establish a session.
+    pub fn connection_failed(&mut self) -> ReconnectAction {
+        let ReconnectState::Connecting { attempt } = self.state else {
+            return ReconnectAction::None;
+        };
+        if attempt >= self.policy.maximum_attempts {
+            self.state = ReconnectState::Exhausted;
+            ReconnectAction::Exhausted
+        } else {
+            self.schedule_attempt(attempt.saturating_add(1))
+        }
+    }
+
+    /// Stops planning after a fresh connection has established.
+    pub fn connection_established(&mut self) -> ReconnectAction {
+        if !matches!(self.state, ReconnectState::Connecting { .. }) {
+            return ReconnectAction::None;
+        }
+        self.state = ReconnectState::Idle;
+        ReconnectAction::None
+    }
+
+    /// Cancels a pending wait or connection attempt without scheduling more.
+    pub fn cancel(&mut self) -> ReconnectAction {
+        if matches!(
+            self.state,
+            ReconnectState::Waiting { .. } | ReconnectState::Connecting { .. }
+        ) {
+            self.state = ReconnectState::Cancelled;
+            ReconnectAction::Cancelled
+        } else {
+            ReconnectAction::None
+        }
+    }
+
+    /// Clears cancellation or exhaustion before a user-directed new cycle.
+    pub fn reset(&mut self) -> ReconnectAction {
+        if matches!(self.state, ReconnectState::Idle) {
+            return ReconnectAction::None;
+        }
+        self.state = ReconnectState::Idle;
+        ReconnectAction::Reset
+    }
+
+    fn schedule_attempt(&mut self, attempt: u8) -> ReconnectAction {
+        let delay = self.delay_for_attempt(attempt);
+        self.state = ReconnectState::Waiting { attempt, delay };
+        ReconnectAction::ScheduleAttempt { attempt, delay }
+    }
+
+    fn delay_for_attempt(&self, attempt: u8) -> Duration {
+        let mut delay = self.policy.initial_delay;
+        for _ in 1..attempt {
+            if delay >= self.policy.maximum_delay {
+                return self.policy.maximum_delay;
+            }
+            delay = delay
+                .checked_mul(2)
+                .unwrap_or(self.policy.maximum_delay)
+                .min(self.policy.maximum_delay);
+        }
+        delay
+    }
+}
+
+/// A secret-free `IdentityFile` path copied literally from OpenSSH metadata.
+///
+/// The importer neither expands this string nor reads the referenced file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityFileMetadata {
+    path: String,
+}
+
+impl IdentityFileMetadata {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+/// Secret-free connection metadata imported from one exact OpenSSH `Host`.
+///
+/// This is not a persisted profile and does not contain authentication
+/// material. An [`IdentityFileMetadata`] is only an uninterpreted path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedSshProfile {
+    host_alias: String,
+    identity: HostIdentity,
+    username: Option<String>,
+    identity_file: Option<IdentityFileMetadata>,
+}
+
+impl ImportedSshProfile {
+    pub fn host_alias(&self) -> &str {
+        &self.host_alias
+    }
+
+    pub fn identity(&self) -> &HostIdentity {
+        &self.identity
+    }
+
+    pub fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
+
+    pub fn identity_file(&self) -> Option<&IdentityFileMetadata> {
+        self.identity_file.as_ref()
+    }
+}
+
+/// Resolves the single pending host-key request for one future SSH session.
+///
+/// This handle contains no host-key material. The GUI can call it from its
+/// event handler; the future network worker, not the GUI thread, awaits it.
+#[derive(Clone)]
+pub struct HostKeyDecisionResolver {
+    gate: Arc<HostKeyDecisionGate>,
+}
+
+impl HostKeyDecisionResolver {
+    pub fn resolve(
+        &self,
+        prompt: &festerm_session::HostKeyPrompt,
+        decision: HostTrustDecision,
+    ) -> Result<(), HostKeyDecisionResolutionError> {
+        self.gate.resolve(prompt, decision)
+    }
+
+    /// Cancels the current prompt. Cancellation always rejects the host key.
+    pub fn cancel(
+        &self,
+        prompt: &festerm_session::HostKeyPrompt,
+    ) -> Result<(), HostKeyDecisionResolutionError> {
+        self.gate.cancel(prompt)
+    }
+}
+
+impl fmt::Debug for HostKeyDecisionResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HostKeyDecisionResolver")
+    }
+}
+
+/// A rejected or stale attempt to resolve host-key trust.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostKeyDecisionResolutionError {
+    NoPendingPrompt,
+    AlreadyResolved,
+    PromptMismatch,
+}
+
+impl From<DecisionResolutionError> for HostKeyDecisionResolutionError {
+    fn from(error: DecisionResolutionError) -> Self {
+        match error {
+            DecisionResolutionError::NoPendingPrompt => Self::NoPendingPrompt,
+            DecisionResolutionError::AlreadyResolved => Self::AlreadyResolved,
+            DecisionResolutionError::PromptMismatch => Self::PromptMismatch,
+        }
+    }
+}
+
+impl fmt::Display for HostKeyDecisionResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPendingPrompt => formatter.write_str("no host-key prompt is pending"),
+            Self::AlreadyResolved => formatter.write_str("host-key prompt is already resolved"),
+            Self::PromptMismatch => {
+                formatter.write_str("host-key decision does not match the pending prompt")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HostKeyDecisionResolutionError {}
+
+/// Pauses an SSH worker immediately before host-key verification and resumes
+/// it once the application supplies (or cancels) a trust decision.
+///
+/// This is a thin wrapper around the generic [`DecisionGate`]; see that type
+/// for the shared synchronisation behaviour.
+#[allow(dead_code)]
+struct HostKeyDecisionGate {
+    inner: DecisionGate<festerm_session::HostKeyPrompt, HostTrustDecision>,
+}
+
+#[allow(dead_code)]
+impl HostKeyDecisionGate {
+    fn new() -> Self {
+        Self {
+            inner: DecisionGate::new(),
+        }
+    }
+
+    fn begin(
+        &self,
+        prompt: festerm_session::HostKeyPrompt,
+    ) -> Result<HostKeyDecisionWaiter, HostKeyDecisionResolutionError> {
+        self.inner
+            .begin(prompt)
+            .map(|inner| HostKeyDecisionWaiter { inner })
+            .map_err(Into::into)
+    }
+
+    fn resolve(
+        &self,
+        prompt: &festerm_session::HostKeyPrompt,
+        decision: HostTrustDecision,
+    ) -> Result<(), HostKeyDecisionResolutionError> {
+        self.inner.resolve(prompt, decision).map_err(Into::into)
+    }
+
+    fn cancel(
+        &self,
+        prompt: &festerm_session::HostKeyPrompt,
+    ) -> Result<(), HostKeyDecisionResolutionError> {
+        self.inner.cancel(prompt).map_err(Into::into)
+    }
+
+    fn wait_for_decision(&self, timeout: Duration) -> HostTrustDecision {
+        self.inner
+            .wait_for_decision(timeout)
+            .unwrap_or(HostTrustDecision::Reject)
+    }
+
+    fn reject_pending(&self) {
+        self.inner.reject_pending();
+    }
+
+    /// True while the user is reviewing a host key. That time is theirs, so
+    /// connection deadlines must not count it.
+    fn is_waiting(&self) -> bool {
+        self.inner.is_waiting()
+    }
+
+    async fn wait_for_decision_async(&self, timeout: Duration) -> HostTrustDecision {
+        self.inner
+            .wait_for_decision_async(timeout)
+            .await
+            .unwrap_or(HostTrustDecision::Reject)
+    }
+}
+
+/// Worker-only proof that a prompt has been emitted and may now be awaited.
+#[allow(dead_code)]
+struct HostKeyDecisionWaiter {
+    inner: DecisionWaiter<festerm_session::HostKeyPrompt>,
+}
+
+#[allow(dead_code)]
+impl HostKeyDecisionWaiter {
+    fn prompt(&self) -> &festerm_session::HostKeyPrompt {
+        self.inner.prompt()
+    }
+
+    fn wait(self, gate: &HostKeyDecisionGate, timeout: Duration) -> HostTrustDecision {
+        self.inner
+            .wait(&gate.inner, timeout)
+            .unwrap_or(HostTrustDecision::Reject)
+    }
+
+    async fn wait_async(self, gate: &HostKeyDecisionGate, timeout: Duration) -> HostTrustDecision {
+        self.inner
+            .wait_async(&gate.inner, timeout)
+            .await
+            .unwrap_or(HostTrustDecision::Reject)
+    }
+}
+
+/// Resolves the single pending interactive password request for one SSH
+/// session, mirroring [`HostKeyDecisionResolver`]. This handle contains no
+/// password material: the GUI supplies one from its event handler, and only
+/// the future network worker awaits and consumes it.
+#[derive(Clone)]
+pub struct PasswordDecisionResolver {
+    gate: Arc<PasswordDecisionGate>,
+}
+
+impl PasswordDecisionResolver {
+    pub fn resolve(
+        &self,
+        prompt: &festerm_session::PasswordPrompt,
+        password: String,
+    ) -> Result<(), PasswordDecisionResolutionError> {
+        self.gate.resolve(prompt, password)
+    }
+
+    /// Cancels the current prompt. Cancellation always ends the connection
+    /// attempt, exactly as closing the tab mid-prompt would.
+    pub fn cancel(
+        &self,
+        prompt: &festerm_session::PasswordPrompt,
+    ) -> Result<(), PasswordDecisionResolutionError> {
+        self.gate.cancel(prompt)
+    }
+}
+
+impl fmt::Debug for PasswordDecisionResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PasswordDecisionResolver")
+    }
+}
+
+/// A rejected or stale attempt to resolve an interactive password prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasswordDecisionResolutionError {
+    NoPendingPrompt,
+    AlreadyResolved,
+    PromptMismatch,
+}
+
+impl From<DecisionResolutionError> for PasswordDecisionResolutionError {
+    fn from(error: DecisionResolutionError) -> Self {
+        match error {
+            DecisionResolutionError::NoPendingPrompt => Self::NoPendingPrompt,
+            DecisionResolutionError::AlreadyResolved => Self::AlreadyResolved,
+            DecisionResolutionError::PromptMismatch => Self::PromptMismatch,
+        }
+    }
+}
+
+impl fmt::Display for PasswordDecisionResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPendingPrompt => formatter.write_str("no password prompt is pending"),
+            Self::AlreadyResolved => formatter.write_str("password prompt is already resolved"),
+            Self::PromptMismatch => {
+                formatter.write_str("password does not match the pending prompt")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PasswordDecisionResolutionError {}
+
+/// Pauses an SSH worker immediately before password authentication and
+/// resumes it once the application supplies (or cancels) one, mirroring
+/// [`HostKeyDecisionGate`]'s pause-and-resolve pattern.
+///
+/// This is a thin wrapper around the generic [`DecisionGate`]; see that type
+/// for the shared synchronisation behaviour.
+#[allow(dead_code)]
+struct PasswordDecisionGate {
+    inner: DecisionGate<festerm_session::PasswordPrompt, String>,
+}
+
+#[allow(dead_code)]
+impl PasswordDecisionGate {
+    fn new() -> Self {
+        Self {
+            inner: DecisionGate::new(),
+        }
+    }
+
+    fn begin(
+        &self,
+        prompt: festerm_session::PasswordPrompt,
+    ) -> Result<PasswordDecisionWaiter, PasswordDecisionResolutionError> {
+        self.inner
+            .begin(prompt)
+            .map(|inner| PasswordDecisionWaiter { inner })
+            .map_err(Into::into)
+    }
+
+    fn resolve(
+        &self,
+        prompt: &festerm_session::PasswordPrompt,
+        password: String,
+    ) -> Result<(), PasswordDecisionResolutionError> {
+        self.inner.resolve(prompt, password).map_err(Into::into)
+    }
+
+    fn cancel(
+        &self,
+        prompt: &festerm_session::PasswordPrompt,
+    ) -> Result<(), PasswordDecisionResolutionError> {
+        self.inner.cancel(prompt).map_err(Into::into)
+    }
+
+    fn wait_for_decision(&self, timeout: Duration) -> Option<String> {
+        self.inner.wait_for_decision(timeout)
+    }
+
+    fn reject_pending(&self) {
+        self.inner.reject_pending();
+    }
+
+    async fn wait_for_decision_async(&self, timeout: Duration) -> Option<String> {
+        self.inner.wait_for_decision_async(timeout).await
+    }
+}
+
+/// Worker-only proof that a prompt has been emitted and may now be awaited.
+#[allow(dead_code)]
+struct PasswordDecisionWaiter {
+    inner: DecisionWaiter<festerm_session::PasswordPrompt>,
+}
+
+#[allow(dead_code)]
+impl PasswordDecisionWaiter {
+    fn prompt(&self) -> &festerm_session::PasswordPrompt {
+        self.inner.prompt()
+    }
+
+    fn wait(self, gate: &PasswordDecisionGate, timeout: Duration) -> Option<String> {
+        self.inner.wait(&gate.inner, timeout)
+    }
+
+    async fn wait_async(self, gate: &PasswordDecisionGate, timeout: Duration) -> Option<String> {
+        self.inner.wait_async(&gate.inner, timeout).await
+    }
+}
+
+enum WorkerCommand {
+    Input(Vec<u8>),
+    AutomationInput(PendingAutomationInput),
+    Resize(TerminalSize),
+    ReadRemoteFile {
+        path: String,
+        max_bytes: usize,
+        generation: u64,
+        result_sender: SyncSender<Result<RemoteFileSnapshot, RemoteFileReadError>>,
+    },
+    ApplyPortForwards(Vec<AdmittedPortForward>),
+    AddPortForward(AdmittedPortForward),
+    RemovePortForward(PortForwardBindingKey, u64),
+    QueryPortForwards,
+    Reconnect,
+    Shutdown,
+}
+
+const MAX_DISCARDED_AUTOMATION_INPUTS_PER_POLL: usize = 32;
+
+/// Private receiver handed to the dedicated SSH worker.
+struct WorkerCommandReceiver {
+    receiver: Receiver<WorkerCommand>,
+    pending_input: Mutex<Option<PendingAutomationInput>>,
+    shared: Arc<WorkerShared>,
+}
+
+impl WorkerCommandReceiver {
+    fn new(receiver: Receiver<WorkerCommand>, shared: Arc<WorkerShared>) -> Self {
+        Self {
+            receiver,
+            pending_input: Mutex::new(None),
+            shared,
+        }
+    }
+
+    fn try_recv(&self) -> Result<WorkerCommand, TryRecvError> {
+        let mut pending_input = self
+            .pending_input
+            .lock()
+            .expect("SSH pending input lock is not poisoned");
+        let mut discarded = 0;
+        loop {
+            if let Some(pending) = pending_input.as_mut() {
+                if pending.is_cancelled() {
+                    *pending_input = None;
+                } else {
+                    let status = match try_automation_admission_lock() {
+                        Ok(guard) if pending.attachment_is_current(&guard) => Some(pending.poll()),
+                        Ok(_) | Err(AutomationAdmissionTryError::Poisoned) => None,
+                        Err(AutomationAdmissionTryError::Busy) => return Err(TryRecvError::Empty),
+                    };
+                    match status {
+                        Some(AutomationInputStatus::Pending) => return Err(TryRecvError::Empty),
+                        Some(AutomationInputStatus::Ready(bytes)) => {
+                            *pending_input = None;
+                            return Ok(WorkerCommand::Input(bytes.to_vec()));
+                        }
+                        Some(AutomationInputStatus::Cancelled) => *pending_input = None,
+                        None => {
+                            *pending_input = None;
+                            let _ = self.shared.try_emit(SessionEvent::Error(SessionError::new(
+                                SessionErrorKind::Input,
+                                "SSH automation input was canceled because its attachment or admission is no longer valid",
+                            )));
+                        }
+                    }
+                }
+                discarded += 1;
+                if discarded == MAX_DISCARDED_AUTOMATION_INPUTS_PER_POLL {
+                    return Err(TryRecvError::Empty);
+                }
+                continue;
+            }
+            match self.receiver.try_recv()? {
+                WorkerCommand::AutomationInput(pending) => {
+                    *pending_input = Some(pending);
+                }
+                command => return Ok(command),
+            }
+        }
+    }
+}
+
+struct WorkerShared {
+    id: SessionId,
+    automation_epoch: Arc<AutomationEpoch>,
+    lifecycle_transition: Mutex<()>,
+    lifecycle: Mutex<SessionLifecycle>,
+    desired_terminal_size: Mutex<TerminalSize>,
+    pre_running_resize_pending: AtomicBool,
+    reconnecting: AtomicBool,
+    reconnect_requested: AtomicBool,
+    liveness_check_requested: AtomicBool,
+    shutdown_requested: AtomicBool,
+    verified_host_key_fingerprint: Mutex<Option<String>>,
+    transport_generation: AtomicU64,
+    port_forward_admissions: PortForwardAdmissions,
+    metrics: Mutex<SessionMetrics>,
+    event_sender: SyncSender<SessionEvent>,
+    event_notifier: Arc<dyn SessionEventNotifier>,
+}
+
+impl WorkerShared {
+    fn begin_transport(&self) {
+        let _transition = self
+            .lifecycle_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.automation_epoch.transition(false);
+        let generation = self
+            .transport_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.port_forward_admissions.reset(generation);
+        self.clear_verified_host_key_fingerprint();
+    }
+
+    fn reserve_profile_port_forwards(
+        &self,
+        forwards: Vec<RequestedSshPortForward>,
+    ) -> Vec<AdmittedPortForward> {
+        let generation = self.transport_generation.load(Ordering::Acquire);
+        forwards
+            .into_iter()
+            .map(|forward| {
+                self.port_forward_admissions
+                    .reserve(forward, generation)
+                    .expect("validated profile forwards fit a fresh transport inventory")
+            })
+            .collect()
+    }
+
+    fn desired_terminal_size(&self) -> TerminalSize {
+        *self
+            .desired_terminal_size
+            .lock()
+            .expect("SSH desired terminal size lock is not poisoned")
+    }
+
+    fn retain_pre_running_resize(&self, size: TerminalSize) {
+        *self
+            .desired_terminal_size
+            .lock()
+            .expect("SSH desired terminal size lock is not poisoned") = size;
+        self.pre_running_resize_pending
+            .store(true, Ordering::Release);
+    }
+
+    fn record_running_resize(&self, size: TerminalSize) {
+        *self
+            .desired_terminal_size
+            .lock()
+            .expect("SSH desired terminal size lock is not poisoned") = size;
+        self.record_resize_applied(size);
+    }
+
+    fn take_pre_running_resize(&self) -> Option<TerminalSize> {
+        self.pre_running_resize_pending
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.desired_terminal_size())
+    }
+
+    fn lifecycle(&self) -> SessionLifecycle {
+        self.lifecycle
+            .lock()
+            .expect("SSH lifecycle lock is not poisoned")
+            .clone()
+    }
+
+    fn set_lifecycle(&self, lifecycle: SessionLifecycle) {
+        {
+            let transition = self.lifecycle_transition.lock();
+            let healthy = transition.is_ok();
+            let _transition = transition.unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.automation_epoch.transition(
+                healthy
+                    && matches!(&lifecycle, SessionLifecycle::Running)
+                    && !self.shutdown_requested(),
+            );
+            *self
+                .lifecycle
+                .lock()
+                .expect("SSH lifecycle lock is not poisoned") = lifecycle.clone();
+        }
+        let _ = self.try_emit(SessionEvent::Lifecycle(lifecycle));
+    }
+
+    fn invalidate_automation_epoch(&self) {
+        let _transition = self
+            .lifecycle_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.automation_epoch.transition(false);
+    }
+
+    fn set_reconnecting(&self, reconnecting: bool) {
+        self.reconnecting.store(reconnecting, Ordering::Release);
+    }
+
+    fn is_reconnecting(&self) -> bool {
+        self.reconnecting.load(Ordering::Acquire)
+    }
+
+    fn request_reconnect(&self) -> bool {
+        self.reconnect_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn clear_reconnect_request(&self) {
+        self.reconnect_requested.store(false, Ordering::Release);
+    }
+
+    fn reconnect_requested(&self) -> bool {
+        self.reconnect_requested.load(Ordering::Acquire)
+    }
+
+    /// Coalesces one pending on-demand liveness-probe request (ADR 0018):
+    /// a future wake/network-change hook, or an explicit application
+    /// request, sets this without blocking on network I/O; the worker
+    /// consumes it via [`Self::take_liveness_check_requested`]. Returns
+    /// `false` if a request is already pending.
+    fn request_liveness_check(&self) -> bool {
+        self.liveness_check_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Consumes a pending on-demand liveness-probe request, if any.
+    fn take_liveness_check_requested(&self) -> bool {
+        self.liveness_check_requested.swap(false, Ordering::AcqRel)
+    }
+
+    fn request_shutdown(&self) {
+        let _transition = self
+            .lifecycle_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.automation_epoch.transition(false);
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    fn verified_host_key_fingerprint(&self) -> Option<String> {
+        self.verified_host_key_fingerprint
+            .lock()
+            .expect("SSH verified fingerprint lock is not poisoned")
+            .clone()
+    }
+
+    fn set_verified_host_key_fingerprint(&self, fingerprint: String) {
+        *self
+            .verified_host_key_fingerprint
+            .lock()
+            .expect("SSH verified fingerprint lock is not poisoned") = Some(fingerprint);
+    }
+
+    fn clear_verified_host_key_fingerprint(&self) {
+        *self
+            .verified_host_key_fingerprint
+            .lock()
+            .expect("SSH verified fingerprint lock is not poisoned") = None;
+    }
+
+    fn metrics(&self) -> SessionMetrics {
+        *self
+            .metrics
+            .lock()
+            .expect("SSH metrics lock is not poisoned")
+    }
+
+    fn try_emit(&self, event: SessionEvent) -> bool {
+        self.try_emit_retaining(event).is_ok()
+    }
+
+    fn try_emit_retaining(&self, event: SessionEvent) -> Result<(), SessionEvent> {
+        let output_bytes = match &event {
+            SessionEvent::Output(bytes) if bytes.len() <= MAX_IO_CHUNK_BYTES => bytes.len(),
+            SessionEvent::Output(_) => return Err(event),
+            _ => 0,
+        };
+        let is_error = matches!(&event, SessionEvent::Error(_));
+        let mut metrics = self
+            .metrics
+            .lock()
+            .expect("SSH metrics lock is not poisoned");
+        match self.event_sender.try_send(event) {
+            Ok(()) => {
+                metrics.output_bytes = metrics.output_bytes.saturating_add(output_bytes as u64);
+                if is_error {
+                    metrics.error_count = metrics.error_count.saturating_add(1);
+                }
+                metrics.event_queue_depth = metrics.event_queue_depth.saturating_add(1);
+                metrics.event_queue_high_watermark = metrics
+                    .event_queue_high_watermark
+                    .max(metrics.event_queue_depth);
+                drop(metrics);
+                self.event_notifier.notify();
+                Ok(())
+            }
+            Err(TrySendError::Full(event)) => {
+                metrics.backpressure_count = metrics.backpressure_count.saturating_add(1);
+                Err(event)
+            }
+            Err(TrySendError::Disconnected(event)) => Err(event),
+        }
+    }
+
+    fn record_input_sent(&self, bytes: usize) {
+        let mut metrics = self
+            .metrics
+            .lock()
+            .expect("SSH metrics lock is not poisoned");
+        metrics.input_bytes = metrics.input_bytes.saturating_add(bytes as u64);
+    }
+
+    fn record_resize_applied(&self, size: TerminalSize) {
+        let mut metrics = self
+            .metrics
+            .lock()
+            .expect("SSH metrics lock is not poisoned");
+        metrics.resize_count = metrics.resize_count.saturating_add(1);
+        drop(metrics);
+        let _ = self.try_emit(SessionEvent::ResizeApplied(size));
+    }
+
+    #[cfg(test)]
+    fn record_output(&self, bytes: Vec<u8>) -> bool {
+        self.try_emit(SessionEvent::Output(bytes))
+    }
+
+    fn report_backpressure(&self, direction: FlowDirection, queued: usize, capacity: usize) {
+        {
+            let mut metrics = self
+                .metrics
+                .lock()
+                .expect("SSH metrics lock is not poisoned");
+            metrics.backpressure_count = metrics.backpressure_count.saturating_add(1);
+        }
+        let _ = self.try_emit(SessionEvent::Backpressure {
+            direction,
+            queued,
+            capacity,
+        });
+    }
+}
+
+/// Bounded coordination owned by one SSH worker.
+struct SshWorkerFoundation {
+    #[cfg(test)]
+    profile: SshConnectionProfile,
+    shared: Arc<WorkerShared>,
+    command_sender: SyncSender<WorkerCommand>,
+    command_capacity: usize,
+    event_receiver: Mutex<Receiver<SessionEvent>>,
+    host_key_gate: Arc<HostKeyDecisionGate>,
+    password_gate: Arc<PasswordDecisionGate>,
+}
+
+impl SshWorkerFoundation {
+    #[cfg(test)]
+    fn new(
+        profile: SshConnectionProfile,
+    ) -> (
+        Self,
+        WorkerCommandReceiver,
+        HostKeyDecisionResolver,
+        PasswordDecisionResolver,
+    ) {
+        Self::new_with_capacities(
+            profile,
+            DEFAULT_COMMAND_QUEUE_CAPACITY,
+            DEFAULT_EVENT_QUEUE_CAPACITY,
+            noop_session_event_notifier(),
+        )
+    }
+
+    fn new_with_capacities(
+        profile: SshConnectionProfile,
+        command_capacity: usize,
+        event_capacity: usize,
+        event_notifier: Arc<dyn SessionEventNotifier>,
+    ) -> (
+        Self,
+        WorkerCommandReceiver,
+        HostKeyDecisionResolver,
+        PasswordDecisionResolver,
+    ) {
+        let initial_size = profile.initial_size();
+        #[cfg(not(test))]
+        let _ = &profile;
+        assert!(
+            command_capacity > 0,
+            "SSH command queue capacity must be nonzero"
+        );
+        assert!(
+            event_capacity > 0,
+            "SSH event queue capacity must be nonzero"
+        );
+        let (command_sender, command_receiver) = mpsc::sync_channel(command_capacity);
+        let (event_sender, event_receiver) = mpsc::sync_channel(event_capacity);
+        let host_key_gate = Arc::new(HostKeyDecisionGate::new());
+        let password_gate = Arc::new(PasswordDecisionGate::new());
+        let shared = Arc::new(WorkerShared {
+            id: SessionId::next(),
+            automation_epoch: Arc::new(AutomationEpoch::new()),
+            lifecycle_transition: Mutex::new(()),
+            lifecycle: Mutex::new(SessionLifecycle::Starting),
+            desired_terminal_size: Mutex::new(initial_size),
+            pre_running_resize_pending: AtomicBool::new(false),
+            reconnecting: AtomicBool::new(false),
+            reconnect_requested: AtomicBool::new(false),
+            liveness_check_requested: AtomicBool::new(false),
+            shutdown_requested: AtomicBool::new(false),
+            verified_host_key_fingerprint: Mutex::new(None),
+            transport_generation: AtomicU64::new(0),
+            port_forward_admissions: PortForwardAdmissions::default(),
+            metrics: Mutex::new(SessionMetrics {
+                event_queue_capacity: event_capacity,
+                ..SessionMetrics::default()
+            }),
+            event_sender,
+            event_notifier,
+        });
+        shared.set_lifecycle(SessionLifecycle::Starting);
+        (
+            Self {
+                #[cfg(test)]
+                profile,
+                shared: Arc::clone(&shared),
+                command_sender,
+                command_capacity,
+                event_receiver: Mutex::new(event_receiver),
+                host_key_gate: Arc::clone(&host_key_gate),
+                password_gate: Arc::clone(&password_gate),
+            },
+            WorkerCommandReceiver::new(command_receiver, Arc::clone(&shared)),
+            HostKeyDecisionResolver {
+                gate: host_key_gate,
+            },
+            PasswordDecisionResolver {
+                gate: password_gate,
+            },
+        )
+    }
+
+    fn id(&self) -> SessionId {
+        self.shared.id
+    }
+
+    fn verified_host_key_fingerprint(&self) -> Option<String> {
+        self.shared.verified_host_key_fingerprint()
+    }
+
+    fn live_remote_file_requestor(&self) -> LiveRemoteFileRequestor {
+        LiveRemoteFileRequestor {
+            generation: self.shared.transport_generation.load(Ordering::Acquire),
+            session_id: self.id(),
+            shared: Arc::clone(&self.shared),
+            command_sender: self.command_sender.clone(),
+        }
+    }
+
+    fn lifecycle(&self) -> SessionLifecycle {
+        self.shared.lifecycle()
+    }
+
+    fn metrics(&self) -> SessionMetrics {
+        self.shared.metrics()
+    }
+
+    #[cfg(test)]
+    fn set_running(&self) {
+        self.shared.set_lifecycle(SessionLifecycle::Running);
+    }
+
+    #[cfg(test)]
+    fn set_disconnected(&self) {
+        self.shared
+            .set_lifecycle(SessionLifecycle::Disconnected(SessionError::new(
+                SessionErrorKind::Spawn,
+                "test transport loss",
+            )));
+    }
+
+    fn try_send_input(&self, bytes: &[u8]) -> Result<(), SessionSendError> {
+        if bytes.len() > MAX_IO_CHUNK_BYTES {
+            return Err(SessionSendError::TooLarge {
+                operation: SessionOperation::Input,
+                maximum: MAX_IO_CHUNK_BYTES,
+                actual: bytes.len(),
+            });
+        }
+        if self.shared.is_reconnecting() {
+            return Err(SessionSendError::Closed {
+                operation: SessionOperation::Input,
+            });
+        }
+        self.try_send_command(
+            WorkerCommand::Input(bytes.to_vec()),
+            SessionOperation::Input,
+        )
+    }
+
+    fn reserve_automation_input(
+        &self,
+        controller_instance: u64,
+        bytes: &[u8],
+    ) -> Result<ReservedAutomationInput, ReserveAutomationInputError> {
+        let (reservation, pending) = automation_input_slot(
+            bytes,
+            controller_instance,
+            Arc::clone(&self.shared.automation_epoch),
+        )?;
+        if self.shared.is_reconnecting() {
+            return Err(ReserveAutomationInputError::Rejected(
+                SessionSendError::Closed {
+                    operation: SessionOperation::Input,
+                },
+            ));
+        }
+        self.try_send_command(
+            WorkerCommand::AutomationInput(pending),
+            SessionOperation::Input,
+        )
+        .map_err(ReserveAutomationInputError::Rejected)?;
+        Ok(reservation)
+    }
+
+    fn try_resize(&self, size: TerminalSize) -> Result<(), SessionSendError> {
+        if self.shared.is_reconnecting() {
+            return Err(SessionSendError::Closed {
+                operation: SessionOperation::Resize,
+            });
+        }
+        self.try_send_command(WorkerCommand::Resize(size), SessionOperation::Resize)
+    }
+
+    fn try_shutdown(&self) -> Result<(), SessionSendError> {
+        self.shared.request_shutdown();
+        self.try_send_command(WorkerCommand::Shutdown, SessionOperation::Shutdown)
+    }
+
+    fn reconnect_available(&self) -> bool {
+        reconnect_request_is_available(
+            &self.lifecycle(),
+            self.shared.is_reconnecting() || self.shared.reconnect_requested(),
+        )
+    }
+
+    fn try_reconnect(&self) -> Result<(), SshReconnectError> {
+        // A session remains reconnect-eligible both while still connected
+        // (a proactive, user-initiated reconnect) and after an unintentional
+        // transport loss has moved it to `Disconnected` (ADR 0018's
+        // "disconnected/recovery-eligible state"). Any other lifecycle
+        // (Starting, Stopping, Failed for a non-transport reason, Exited,
+        // Stopped) is not reconnect-eligible.
+        if !matches!(
+            self.lifecycle(),
+            SessionLifecycle::Running | SessionLifecycle::Disconnected(_)
+        ) {
+            return Err(SshReconnectError::NotRunning);
+        }
+        if !self.shared.request_reconnect() {
+            return Err(SshReconnectError::AlreadyRequested);
+        }
+        match self.command_sender.try_send(WorkerCommand::Reconnect) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.shared.clear_reconnect_request();
+                Err(SshReconnectError::QueueFull)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.shared.clear_reconnect_request();
+                Err(SshReconnectError::Closed)
+            }
+        }
+    }
+
+    /// Coalesces an on-demand liveness-probe request. Unlike
+    /// [`Self::try_reconnect`] this never queues a worker command: the
+    /// worker itself notices the flag at its next command-poll tick
+    /// (typically within [`COMMAND_POLL_INTERVAL`]) and performs the probe,
+    /// so there is no queue to fill or close out from under the caller.
+    fn try_check_liveness(&self) -> Result<(), SshLivenessCheckError> {
+        // Only a live transport has anything to probe; a session that is
+        // `Disconnected`/terminal has no handle to send a keepalive over
+        // (ADR 0018 distinguishes the liveness probe itself from the
+        // recovery that follows a probe failure).
+        if !matches!(self.lifecycle(), SessionLifecycle::Running) {
+            return Err(SshLivenessCheckError::NotRunning);
+        }
+        if !self.shared.request_liveness_check() {
+            return Err(SshLivenessCheckError::AlreadyRequested);
+        }
+        Ok(())
+    }
+
+    fn try_add_port_forward(
+        &self,
+        forward: RequestedSshPortForward,
+    ) -> Result<(), SshPortForwardRequestError> {
+        let generation = self.shared.transport_generation.load(Ordering::Acquire);
+        if !matches!(self.lifecycle(), SessionLifecycle::Running)
+            || self.shared.reconnecting.load(Ordering::Acquire)
+            || self.shared.shutdown_requested()
+        {
+            return Err(SshPortForwardRequestError::NotRunning);
+        }
+        let forward = self
+            .shared
+            .port_forward_admissions
+            .reserve(forward, generation)?;
+        match self
+            .command_sender
+            .try_send(WorkerCommand::AddPortForward(forward))
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SshPortForwardRequestError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(SshPortForwardRequestError::Closed),
+        }
+    }
+
+    fn try_remove_port_forward(
+        &self,
+        direction: SshPortForwardDirection,
+        bind_host: impl Into<String>,
+        bind_port: u16,
+    ) -> Result<(), SshPortForwardRequestError> {
+        let generation = self.shared.transport_generation.load(Ordering::Acquire);
+        if !matches!(self.lifecycle(), SessionLifecycle::Running)
+            || self.shared.reconnecting.load(Ordering::Acquire)
+            || self.shared.shutdown_requested()
+        {
+            return Err(SshPortForwardRequestError::NotRunning);
+        }
+        if bind_port == 0 {
+            return Err(SshPortForwardRequestError::InvalidConfiguration(
+                SshPortForwardConfigurationError::ZeroPort,
+            ));
+        }
+        match self
+            .command_sender
+            .try_send(WorkerCommand::RemovePortForward(
+                PortForwardBindingKey {
+                    direction,
+                    bind_host: bind_host.into(),
+                    bind_port,
+                },
+                generation,
+            )) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SshPortForwardRequestError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(SshPortForwardRequestError::Closed),
+        }
+    }
+
+    fn try_query_port_forwards(&self) -> Result<(), SshPortForwardRequestError> {
+        if self.lifecycle().is_terminal() {
+            return Err(SshPortForwardRequestError::Closed);
+        }
+        match self
+            .command_sender
+            .try_send(WorkerCommand::QueryPortForwards)
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SshPortForwardRequestError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(SshPortForwardRequestError::Closed),
+        }
+    }
+
+    fn try_send_command(
+        &self,
+        command: WorkerCommand,
+        operation: SessionOperation,
+    ) -> Result<(), SessionSendError> {
+        match self.command_sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.shared.report_backpressure(
+                    match operation {
+                        SessionOperation::Input => FlowDirection::Input,
+                        SessionOperation::Resize => FlowDirection::Resize,
+                        SessionOperation::Shutdown => FlowDirection::Control,
+                    },
+                    self.command_capacity,
+                    self.command_capacity,
+                );
+                Err(SessionSendError::Full {
+                    operation,
+                    capacity: self.command_capacity,
+                })
+            }
+            Err(TrySendError::Disconnected(_)) => Err(SessionSendError::Closed { operation }),
+        }
+    }
+
+    fn try_recv_event(&self) -> Result<SessionEvent, SessionTryReceiveError> {
+        match self
+            .event_receiver
+            .lock()
+            .expect("SSH event receiver lock is not poisoned")
+            .try_recv()
+        {
+            Ok(event) => {
+                let mut metrics = self
+                    .shared
+                    .metrics
+                    .lock()
+                    .expect("SSH metrics lock is not poisoned");
+                metrics.event_queue_depth = metrics.event_queue_depth.saturating_sub(1);
+                Ok(event)
+            }
+            Err(TryRecvError::Empty) => Err(SessionTryReceiveError::Empty),
+            Err(TryRecvError::Disconnected) => Err(SessionTryReceiveError::Closed),
+        }
+    }
+
+    #[cfg(test)]
+    fn request_host_key_verification(
+        &self,
+        sha256_fingerprint: &str,
+    ) -> Result<HostKeyDecisionWaiter, HostKeyVerificationRequestError> {
+        request_host_key_verification(
+            &self.profile.identity,
+            &self.shared,
+            &self.host_key_gate,
+            sha256_fingerprint,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn request_password_verification(
+        &self,
+        attempt: u8,
+        previous_attempt_failed: bool,
+    ) -> Result<PasswordDecisionWaiter, PasswordVerificationRequestError> {
+        request_password_verification(
+            &self.profile,
+            &self.shared,
+            &self.password_gate,
+            attempt,
+            previous_attempt_failed,
+        )
+    }
+}
+
+fn request_host_key_verification(
+    identity: &HostIdentity,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+    sha256_fingerprint: &str,
+    previously_trusted_fingerprint: Option<&str>,
+) -> Result<HostKeyDecisionWaiter, HostKeyVerificationRequestError> {
+    if !is_sha256_fingerprint(sha256_fingerprint) {
+        return Err(HostKeyVerificationRequestError::InvalidFingerprint);
+    }
+    let mut prompt =
+        festerm_session::HostKeyPrompt::new(identity.host(), identity.port(), sha256_fingerprint);
+    if let Some(previous) = previously_trusted_fingerprint {
+        prompt = prompt.with_previously_trusted_fingerprint(previous);
+    }
+    let waiter = host_key_gate
+        .begin(prompt.clone())
+        .map_err(HostKeyVerificationRequestError::Resolution)?;
+    if shared.try_emit(SessionEvent::HostKeyVerification(prompt.clone())) {
+        Ok(waiter)
+    } else {
+        let _ = host_key_gate.cancel(&prompt);
+        // No waiter escaped on this path, so reset the rejection before a
+        // future reconnect retries host verification.
+        let _ = host_key_gate.wait_for_decision(Duration::ZERO);
+        Err(HostKeyVerificationRequestError::EventQueueFull)
+    }
+}
+
+/// Validates the canonical `SHA256:<base64>` fingerprint format this crate
+/// emits and expects, without asserting the fingerprint names a specific
+/// key. Exposed so callers that persist trusted fingerprints (outside this
+/// crate's own worker/host-key-gate path) can validate them the same way.
+pub fn is_sha256_fingerprint(fingerprint: &str) -> bool {
+    let Some(encoded) = fingerprint.strip_prefix("SHA256:") else {
+        return false;
+    };
+    !encoded.is_empty()
+        && encoded.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'=')
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum HostKeyVerificationRequestError {
+    InvalidFingerprint,
+    EventQueueFull,
+    Resolution(HostKeyDecisionResolutionError),
+}
+
+/// Requests an interactive password prompt through `password_gate`,
+/// mirroring [`request_host_key_verification`]. `attempt` is 1-based;
+/// `previous_attempt_failed` lets the UI show `ssh`'s own "Permission
+/// denied, please try again." line above a retry.
+fn request_password_verification(
+    profile: &SshConnectionProfile,
+    shared: &WorkerShared,
+    password_gate: &PasswordDecisionGate,
+    attempt: u8,
+    previous_attempt_failed: bool,
+) -> Result<PasswordDecisionWaiter, PasswordVerificationRequestError> {
+    let prompt = festerm_session::PasswordPrompt::new(
+        profile.username(),
+        profile.identity.host(),
+        attempt,
+        previous_attempt_failed,
+    );
+    let waiter = password_gate
+        .begin(prompt.clone())
+        .map_err(PasswordVerificationRequestError::Resolution)?;
+    if shared.try_emit(SessionEvent::PasswordRequested(prompt.clone())) {
+        Ok(waiter)
+    } else {
+        let _ = password_gate.cancel(&prompt);
+        // No waiter escaped on this path, so reset the rejection before a
+        // future retry attempt reprompts.
+        let _ = password_gate.wait_for_decision(Duration::ZERO);
+        Err(PasswordVerificationRequestError::EventQueueFull)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum PasswordVerificationRequestError {
+    EventQueueFull,
+    Resolution(PasswordDecisionResolutionError),
+}
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Restarts the connect deadline while the user reviews a host key, so a slow
+/// review is bounded by `HOST_KEY_DECISION_TIMEOUT` instead of the connect
+/// timeout.
+fn hold_connect_deadline_while_reviewing(
+    deadline: std::pin::Pin<&mut tokio::time::Sleep>,
+    host_key_gate: &HostKeyDecisionGate,
+) {
+    if host_key_gate.is_waiting() {
+        deadline.reset(tokio::time::Instant::now() + CONNECT_TIMEOUT);
+    }
+}
+const HOST_KEY_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an interactive password prompt waits for the application to
+/// resolve it. Generous relative to [`HOST_KEY_DECISION_TIMEOUT`] since
+/// typing a password (unlike clicking Accept/Reject) can reasonably take a
+/// while.
+const PASSWORD_DECISION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Maximum number of interactive password prompts on one connection before
+/// giving up, matching `ssh`'s own default `NumberOfPasswordPrompts`.
+pub const MAX_INTERACTIVE_PASSWORD_ATTEMPTS: u8 = 3;
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+// Only completed control work advances this deadline, never incoming messages.
+struct CommandPoll {
+    deadline: tokio::time::Instant,
+}
+
+impl CommandPoll {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            deadline: now + COMMAND_POLL_INTERVAL,
+        }
+    }
+
+    fn due(&self, now: tokio::time::Instant, shutdown_requested: bool) -> bool {
+        shutdown_requested || now >= self.deadline
+    }
+
+    fn processed(&mut self, now: tokio::time::Instant) {
+        self.deadline = now + COMMAND_POLL_INTERVAL;
+    }
+}
+
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const PORT_FORWARD_PENDING_CONNECTION_CAPACITY: usize = 32;
+const MAX_IN_FLIGHT_PORT_FORWARD_CONNECTIONS: usize = 32;
+/// Ordinary SSH liveness/keepalive cadence (ADR 0018): how often a running
+/// session actively verifies its transport even without an explicit
+/// wake/network-change trigger or on-demand [`SshSession::try_check_liveness`]
+/// request.
+///
+/// This is a deliberate default (issue #55), not an unexamined leftover
+/// constant:
+/// - It stays enabled by default because network-interface/route-change
+///   detection is not yet implemented on any platform (#48), so the
+///   automatic cadence is currently the only way a genuinely idle session
+///   (no user input, no wake event) ever notices a black-holed connection
+///   and moves to `Disconnected`.
+/// - 60 seconds balances that detection latency against the network/NAT
+///   keepalive traffic and desktop battery cost of a periodic probe; it is
+///   in the same range commonly used for interactive SSH client keepalive
+///   (`ServerAliveInterval`-style) settings.
+/// - It is intentionally a non-configurable implementation constant for
+///   0.1 rather than a global/profile setting: per ADR 0018's own
+///   constraints, low-level keepalive knobs are not exposed without a
+///   concrete product requirement, and a probe failure never grants
+///   permission to auto-reconnect regardless of cadence, so the product
+///   risk of a fixed default is low. Revisit if #48 lands reliable
+///   network-change detection on all platforms, or if a concrete
+///   battery/network complaint justifies a setting.
+const LIVENESS_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+/// Bound on how long a single liveness probe waits for the remote peer to
+/// reply before the transport is treated as unresponsive.
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Bounded, cancellable backoff for retries that follow one explicit
+/// reconnect request (ADR 0018).
+///
+/// This is independent of any [`ReconnectPolicy`] the session may have: that
+/// policy only governs whether an *unintentional* transport loss retries on
+/// its own. A user-requested reconnect is a repeatable action regardless of
+/// that policy — if the fresh attempt it triggers only hits a transient
+/// transport problem (for example, the host briefly unreachable right after
+/// the user asked to reconnect), it keeps retrying with this bounded
+/// backoff before giving up and returning to `Disconnected` for another
+/// explicit user action, rather than requiring the user to notice the
+/// failure and click reconnect again for every transient hiccup.
+const MANUAL_RECONNECT_MAX_ATTEMPTS: u8 = 8;
+const MANUAL_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const MANUAL_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(4);
+
+/// Doubling backoff delay before the given 1-based manual-reconnect retry
+/// attempt, capped at [`MANUAL_RECONNECT_MAX_DELAY`].
+fn manual_reconnect_delay(attempt: u8) -> Duration {
+    let mut delay = MANUAL_RECONNECT_INITIAL_DELAY;
+    for _ in 1..attempt {
+        if delay >= MANUAL_RECONNECT_MAX_DELAY {
+            return MANUAL_RECONNECT_MAX_DELAY;
+        }
+        delay = delay
+            .checked_mul(2)
+            .unwrap_or(MANUAL_RECONNECT_MAX_DELAY)
+            .min(MANUAL_RECONNECT_MAX_DELAY);
+    }
+    delay
+}
+
+/// Failure to create the dedicated SSH worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SshSessionStartError;
+
+impl fmt::Display for SshSessionStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("could not start SSH worker thread")
+    }
+}
+
+impl std::error::Error for SshSessionStartError {}
+
+/// Failure to create the dedicated SFTP worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SftpTerminalSessionStartError;
+
+impl fmt::Display for SftpTerminalSessionStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("could not start SFTP worker thread")
+    }
+}
+
+impl std::error::Error for SftpTerminalSessionStartError {}
+
+/// A live text-mode SFTP session rendered through the terminal transcript.
+///
+/// Like [`SshSession`], each instance owns one dedicated worker thread and
+/// one current-thread Tokio runtime. The worker authenticates over SSH,
+/// opens the `"sftp"` subsystem, formats text-mode command output, and emits
+/// it through the ordinary bounded `SessionEvent::Output` queue.
+pub struct SftpTerminalSession {
+    foundation: SshWorkerFoundation,
+    host_key_resolver: HostKeyDecisionResolver,
+    host_key_gate: Arc<HostKeyDecisionGate>,
+    password_resolver: PasswordDecisionResolver,
+    password_gate: Arc<PasswordDecisionGate>,
+    working_directories: Arc<Mutex<Option<SftpWorkingDirectories>>>,
+    completion_receiver: Mutex<Receiver<Result<ShutdownResult, SessionError>>>,
+    completion: Mutex<Option<Result<ShutdownResult, SessionError>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SftpWorkingDirectories {
+    remote: String,
+    local: PathBuf,
+}
+
+impl SftpWorkingDirectories {
+    pub fn remote(&self) -> &str {
+        &self.remote
+    }
+
+    pub fn local(&self) -> &Path {
+        &self.local
+    }
+}
+
+const REMOTE_FILE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_REMOTE_FILE_READS: usize = 2;
+
+#[derive(Default)]
+struct RemoteFileReads {
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl RemoteFileReads {
+    fn reap(&mut self) {
+        while let Some(result) = self.tasks.try_join_next() {
+            if let Err(error) = result {
+                eprintln!("fesTerm remote file task failed: {error}");
+            }
+        }
+    }
+
+    fn start(
+        &mut self,
+        handle: Arc<russh::client::Handle<SshClientHandler>>,
+        shared: Arc<WorkerShared>,
+        path: String,
+        max_bytes: usize,
+        generation: u64,
+        result_sender: SyncSender<Result<RemoteFileSnapshot, RemoteFileReadError>>,
+    ) {
+        self.reap();
+        if generation != shared.transport_generation.load(Ordering::Acquire) {
+            let _ = result_sender.send(Err(RemoteFileReadError::Closed));
+            return;
+        }
+        if self.tasks.len() >= MAX_REMOTE_FILE_READS {
+            let _ = result_sender.send(Err(RemoteFileReadError::QueueFull));
+            return;
+        }
+        self.tasks.spawn(async move {
+            let result = tokio::time::timeout(
+                REMOTE_FILE_READ_TIMEOUT,
+                read_remote_file_snapshot_from_handle(handle.as_ref(), &path, max_bytes),
+            )
+            .await
+            .unwrap_or(Err(RemoteFileReadError::TimedOut));
+            let result = if generation != shared.transport_generation.load(Ordering::Acquire)
+                || shared.lifecycle() != SessionLifecycle::Running
+            {
+                Err(RemoteFileReadError::Closed)
+            } else {
+                result
+            };
+            let _ = result_sender.send(result);
+        });
+    }
+}
+
+async fn stop_handle_after_remote_reads(
+    handle: Arc<russh::client::Handle<SshClientHandler>>,
+    reads: &mut RemoteFileReads,
+    shared: &WorkerShared,
+) -> Result<ShutdownResult, SessionError> {
+    reads.tasks.shutdown().await;
+    let handle = Arc::try_unwrap(handle)
+        .unwrap_or_else(|_| panic!("background channel tasks must release the SSH handle"));
+    stop_handle(handle, shared).await
+}
+
+/// One bounded remote-file snapshot captured from a live SSH/SFTP transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteFileSnapshot {
+    metadata: SftpPathMetadata,
+    bytes: Vec<u8>,
+}
+
+impl RemoteFileSnapshot {
+    pub fn metadata(&self) -> &SftpPathMetadata {
+        &self.metadata
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_parts(self) -> (SftpPathMetadata, Vec<u8>) {
+        (self.metadata, self.bytes)
+    }
+}
+
+/// Failure to capture a bounded remote-file snapshot from a live transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemoteFileReadError {
+    NotRunning,
+    QueueFull,
+    Closed,
+    TimedOut,
+    InvalidRequest,
+    Missing {
+        path: String,
+    },
+    NotFile {
+        path: String,
+        file_type: SftpEntryType,
+    },
+    Sftp(SftpSessionError),
+}
+
+impl fmt::Display for RemoteFileReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRunning => formatter.write_str("the remote session is not running"),
+            Self::QueueFull => formatter.write_str("the remote session is busy"),
+            Self::Closed => formatter.write_str("the remote session is closed"),
+            Self::TimedOut => formatter.write_str("the remote file request timed out"),
+            Self::InvalidRequest => {
+                formatter.write_str("the remote file request exceeds its bounds")
+            }
+            Self::Missing { path } => write!(formatter, "remote path does not exist: {path}"),
+            Self::NotFile { path, .. } => write!(formatter, "remote path is not a file: {path}"),
+            Self::Sftp(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RemoteFileReadError {}
+
+/// Cloneable request handle for reading remote files through one live session.
+#[derive(Clone)]
+pub struct LiveRemoteFileRequestor {
+    generation: u64,
+    session_id: SessionId,
+    shared: Arc<WorkerShared>,
+    command_sender: SyncSender<WorkerCommand>,
+}
+
+impl LiveRemoteFileRequestor {
+    pub fn transport_generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn is_current(&self) -> bool {
+        self.generation == self.shared.transport_generation.load(Ordering::Acquire)
+            && self.shared.lifecycle() == SessionLifecycle::Running
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn verified_host_key_fingerprint(&self) -> Option<String> {
+        self.is_current()
+            .then(|| self.shared.verified_host_key_fingerprint())
+            .flatten()
+    }
+
+    pub fn read_remote_file_snapshot(
+        &self,
+        path: impl Into<String>,
+        max_bytes: usize,
+    ) -> Result<RemoteFileSnapshot, RemoteFileReadError> {
+        if !self.is_current() {
+            return Err(RemoteFileReadError::NotRunning);
+        }
+        let path = path.into();
+        if !path.starts_with('/')
+            || path.contains('\0')
+            || path.len() > 32 * 1024
+            || max_bytes == 0
+            || max_bytes > 4 * 1024 * 1024
+        {
+            return Err(RemoteFileReadError::InvalidRequest);
+        }
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        match self.command_sender.try_send(WorkerCommand::ReadRemoteFile {
+            path,
+            max_bytes,
+            generation: self.generation,
+            result_sender,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(RemoteFileReadError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(RemoteFileReadError::Closed),
+        }
+        let result = result_receiver
+            .recv_timeout(REMOTE_FILE_READ_TIMEOUT + Duration::from_secs(1))
+            .map_err(|error| match error {
+                RecvTimeoutError::Timeout => RemoteFileReadError::TimedOut,
+                RecvTimeoutError::Disconnected => RemoteFileReadError::Closed,
+            })?;
+        if !self.is_current() {
+            return Err(RemoteFileReadError::Closed);
+        }
+        result
+    }
+}
+
+impl fmt::Debug for LiveRemoteFileRequestor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LiveRemoteFileRequestor")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SftpTerminalSession {
+    /// Starts a text-mode SFTP session with the default no-op event notifier.
+    pub fn start(
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        local_working_directory: Option<PathBuf>,
+        known_host_fingerprint: Option<String>,
+    ) -> Result<Self, SftpTerminalSessionStartError> {
+        Self::start_with_notifier(
+            profile,
+            authentication,
+            local_working_directory,
+            known_host_fingerprint,
+            noop_session_event_notifier(),
+        )
+    }
+
+    /// Starts a text-mode SFTP session and wakes `event_notifier` after
+    /// every queued event.
+    pub fn start_with_notifier(
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        local_working_directory: Option<PathBuf>,
+        known_host_fingerprint: Option<String>,
+        event_notifier: Arc<dyn SessionEventNotifier>,
+    ) -> Result<Self, SftpTerminalSessionStartError> {
+        let (foundation, command_receiver, host_key_resolver, password_resolver) =
+            SshWorkerFoundation::new_with_capacities(
+                profile.clone(),
+                DEFAULT_COMMAND_QUEUE_CAPACITY,
+                DEFAULT_EVENT_QUEUE_CAPACITY,
+                event_notifier,
+            );
+        let shared = Arc::clone(&foundation.shared);
+        let host_key_gate = Arc::clone(&foundation.host_key_gate);
+        let password_gate = Arc::clone(&foundation.password_gate);
+        let worker_host_key_gate = Arc::clone(&host_key_gate);
+        let worker_password_gate = Arc::clone(&password_gate);
+        let working_directories = Arc::new(Mutex::new(None));
+        let worker_working_directories = Arc::clone(&working_directories);
+        let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name(format!("festerm-sftp-{}", foundation.id()))
+            .spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .map_err(|_| sftp_failure(&shared, "SFTP runtime could not start"))
+                    .and_then(|runtime| {
+                        Self::run_sftp_worker_runtime(
+                            runtime,
+                            sftp_worker(
+                                profile,
+                                authentication,
+                                local_working_directory,
+                                known_host_fingerprint,
+                                worker_working_directories,
+                                shared,
+                                command_receiver,
+                                worker_host_key_gate,
+                                worker_password_gate,
+                            ),
+                        )
+                    });
+                let _ = completion_sender.send(result);
+            })
+            .map_err(|_| SftpTerminalSessionStartError)?;
+
+        Ok(Self {
+            foundation,
+            host_key_resolver,
+            host_key_gate,
+            password_resolver,
+            password_gate,
+            working_directories,
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        })
+    }
+
+    fn run_sftp_worker_runtime<T>(
+        runtime: tokio::runtime::Runtime,
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
+        let result = runtime.block_on(work);
+        // A dropped filesystem future can leave a blocking call running.
+        runtime.shutdown_background();
+        result
+    }
+
+    /// Returns a resolver for the current host-key verification request.
+    pub fn host_key_decision_resolver(&self) -> HostKeyDecisionResolver {
+        self.host_key_resolver.clone()
+    }
+
+    /// Returns a resolver for the current interactive password request.
+    pub fn password_decision_resolver(&self) -> PasswordDecisionResolver {
+        self.password_resolver.clone()
+    }
+
+    pub fn verified_host_key_fingerprint(&self) -> Option<String> {
+        self.foundation.verified_host_key_fingerprint()
+    }
+
+    pub fn remote_file_requestor(&self) -> LiveRemoteFileRequestor {
+        self.foundation.live_remote_file_requestor()
+    }
+
+    pub fn working_directories(&self) -> Option<SftpWorkingDirectories> {
+        self.working_directories
+            .lock()
+            .expect("SFTP working-directory lock is not poisoned")
+            .clone()
+    }
+
+    fn await_completion(&self, timeout: Duration) -> Result<ShutdownResult, ShutdownError> {
+        let mut completion = self
+            .completion
+            .lock()
+            .expect("SFTP completion lock is not poisoned");
+        if let Some(result) = completion.clone() {
+            return result.map_err(ShutdownError::Failed);
+        }
+
+        match self
+            .completion_receiver
+            .lock()
+            .expect("SFTP completion receiver lock is not poisoned")
+            .recv_timeout(timeout)
+        {
+            Ok(result) => {
+                *completion = Some(result.clone());
+                result.map_err(ShutdownError::Failed)
+            }
+            Err(RecvTimeoutError::Timeout) => Err(ShutdownError::TimedOut { timeout }),
+            Err(RecvTimeoutError::Disconnected) => Err(ShutdownError::Failed(SessionError::new(
+                SessionErrorKind::Shutdown,
+                "SFTP worker ended without reporting shutdown completion",
+            ))),
+        }
+    }
+}
+
+/// A live SSH transport session with bounded application-facing queues.
+///
+/// Each instance owns exactly one dedicated OS thread and one current-thread
+/// Tokio runtime. The runtime is created once at session start, never per
+/// command, and is stopped when the worker completes. This is an interim
+/// crate-local boundary until application runtime ownership is available.
+///
+/// The worker performs TCP connection, strict host-key verification, selected
+/// transient authentication, and interactive session-channel setup.
+pub struct SshSession {
+    foundation: SshWorkerFoundation,
+    host_key_resolver: HostKeyDecisionResolver,
+    host_key_gate: Arc<HostKeyDecisionGate>,
+    password_resolver: PasswordDecisionResolver,
+    password_gate: Arc<PasswordDecisionGate>,
+    completion_receiver: Mutex<Receiver<Result<ShutdownResult, SessionError>>>,
+    completion: Mutex<Option<Result<ShutdownResult, SessionError>>>,
+}
+
+impl SshSession {
+    /// Starts a session with the default no-op event notifier.
+    pub fn start(
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+    ) -> Result<Self, SshSessionStartError> {
+        Self::start_with_options(profile, authentication, SshSessionOptions::new())
+    }
+
+    /// Starts a session with explicit optional live-session behavior.
+    pub fn start_with_options(
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        options: SshSessionOptions,
+    ) -> Result<Self, SshSessionStartError> {
+        Self::start_with_notifier_and_options(
+            profile,
+            authentication,
+            options,
+            noop_session_event_notifier(),
+        )
+    }
+
+    /// Starts a session and wakes `event_notifier` after every queued event.
+    pub fn start_with_notifier(
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        event_notifier: Arc<dyn SessionEventNotifier>,
+    ) -> Result<Self, SshSessionStartError> {
+        Self::start_with_notifier_and_options(
+            profile,
+            authentication,
+            SshSessionOptions::new(),
+            event_notifier,
+        )
+    }
+
+    /// Starts a session with an event notifier and explicit live-session behavior.
+    pub fn start_with_notifier_and_options(
+        profile: SshConnectionProfile,
+        authentication: SshAuthentication,
+        options: SshSessionOptions,
+        event_notifier: Arc<dyn SessionEventNotifier>,
+    ) -> Result<Self, SshSessionStartError> {
+        let (foundation, command_receiver, host_key_resolver, password_resolver) =
+            SshWorkerFoundation::new_with_capacities(
+                profile.clone(),
+                DEFAULT_COMMAND_QUEUE_CAPACITY,
+                DEFAULT_EVENT_QUEUE_CAPACITY,
+                event_notifier,
+            );
+        let shared = Arc::clone(&foundation.shared);
+        let host_key_gate = Arc::clone(&foundation.host_key_gate);
+        let password_gate = Arc::clone(&foundation.password_gate);
+        let worker_host_key_gate = Arc::clone(&host_key_gate);
+        let worker_password_gate = Arc::clone(&password_gate);
+        let profile_port_forwards = options.profile_port_forwards().to_vec();
+        let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name(format!("festerm-ssh-{}", foundation.id()))
+            .spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .map_err(|_| ssh_failure(&shared, "SSH runtime could not start"))
+                    .and_then(|runtime| {
+                        runtime.block_on(ssh_worker(
+                            profile,
+                            authentication,
+                            options.strategy(),
+                            options.reconnect_policy(),
+                            options.known_host_fingerprint().map(str::to_owned),
+                            profile_port_forwards,
+                            shared,
+                            command_receiver,
+                            worker_host_key_gate,
+                            worker_password_gate,
+                        ))
+                    });
+                let _ = completion_sender.send(result);
+            })
+            .map_err(|_| SshSessionStartError)?;
+
+        Ok(Self {
+            foundation,
+            host_key_resolver,
+            host_key_gate,
+            password_resolver,
+            password_gate,
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        })
+    }
+
+    /// Returns a resolver for the current host-key verification request.
+    pub fn host_key_decision_resolver(&self) -> HostKeyDecisionResolver {
+        self.host_key_resolver.clone()
+    }
+
+    /// Returns a resolver for the current interactive password request.
+    pub fn password_decision_resolver(&self) -> PasswordDecisionResolver {
+        self.password_resolver.clone()
+    }
+
+    pub fn verified_host_key_fingerprint(&self) -> Option<String> {
+        self.foundation.verified_host_key_fingerprint()
+    }
+
+    pub fn remote_file_requestor(&self) -> LiveRemoteFileRequestor {
+        self.foundation.live_remote_file_requestor()
+    }
+
+    /// Returns whether this connected session can accept one reconnect request.
+    ///
+    /// A manual reconnect is always available for a running session,
+    /// independent of any automatic recovery policy (ADR 0018). It does not
+    /// block on network I/O.
+    pub fn reconnect_available(&self) -> bool {
+        self.foundation.reconnect_available()
+    }
+
+    /// Asks the worker to replace the current SSH transport with a fresh one.
+    ///
+    /// This is nonblocking and always honored once requested, independent of
+    /// any automatic recovery policy: an explicit reconnect is a deliberate
+    /// user action, not an unintentional-loss retry. A successful request
+    /// only queues worker work; the normal lifecycle and host-key event paths
+    /// report its result. The fresh connection re-verifies host trust and has
+    /// a new PTY and shell, with no remote-state restoration.
+    pub fn try_reconnect(&self) -> Result<(), SshReconnectError> {
+        self.foundation.try_reconnect()
+    }
+
+    /// Actively verifies the current SSH transport is still responsive
+    /// (ADR 0018's liveness probe), independent of ordinary read/write
+    /// activity.
+    ///
+    /// This is nonblocking: it only requests that the worker perform a
+    /// benign SSH-level probe (a keepalive/ping) at its next opportunity,
+    /// typically within tens of milliseconds. Intended for callers that
+    /// detect a plausible network-assumption change (system wake, network
+    /// interface/route change, Wi-Fi reconnect) and want to confirm the
+    /// transport promptly rather than wait for the next failed write or the
+    /// ordinary keepalive cadence.
+    ///
+    /// A probe success is silent and leaves the session unchanged. A probe
+    /// failure is reported through the same lifecycle path as any other
+    /// unintentional transport loss: the session moves to `Disconnected`
+    /// (or, if an automatic recovery policy applies, attempts bounded
+    /// recovery) exactly as ADR 0018 requires — this method never reconnects
+    /// by itself.
+    pub fn try_check_liveness(&self) -> Result<(), SshLivenessCheckError> {
+        self.foundation.try_check_liveness()
+    }
+
+    /// Adds one live-only SSH port forward to the current authenticated session.
+    pub fn try_add_port_forward(
+        &self,
+        forward: impl SshPortForwardSpec,
+    ) -> Result<(), SshPortForwardRequestError> {
+        let forward = requested_port_forward(forward, SshPortForwardSource::Ephemeral)
+            .map_err(SshPortForwardRequestError::InvalidConfiguration)?;
+        self.foundation.try_add_port_forward(forward)
+    }
+
+    /// Removes one active SSH port forward identified by its listening side and bind address.
+    pub fn try_remove_port_forward(
+        &self,
+        direction: SshPortForwardDirection,
+        bind_host: impl Into<String>,
+        bind_port: u16,
+    ) -> Result<(), SshPortForwardRequestError> {
+        self.foundation
+            .try_remove_port_forward(direction, bind_host, bind_port)
+    }
+
+    /// Requests a fresh snapshot of the worker's current SSH port-forward state.
+    pub fn try_query_port_forwards(&self) -> Result<(), SshPortForwardRequestError> {
+        self.foundation.try_query_port_forwards()
+    }
+
+    fn await_completion(&self, timeout: Duration) -> Result<ShutdownResult, ShutdownError> {
+        let mut completion = self
+            .completion
+            .lock()
+            .expect("SSH completion lock is not poisoned");
+        if let Some(result) = completion.clone() {
+            return result.map_err(ShutdownError::Failed);
+        }
+
+        match self
+            .completion_receiver
+            .lock()
+            .expect("SSH completion receiver lock is not poisoned")
+            .recv_timeout(timeout)
+        {
+            Ok(result) => {
+                *completion = Some(result.clone());
+                result.map_err(ShutdownError::Failed)
+            }
+            Err(RecvTimeoutError::Timeout) => Err(ShutdownError::TimedOut { timeout }),
+            Err(RecvTimeoutError::Disconnected) => Err(ShutdownError::Failed(SessionError::new(
+                SessionErrorKind::Shutdown,
+                "SSH worker ended without reporting shutdown completion",
+            ))),
+        }
+    }
+}
+
+fn reconnect_request_is_available(lifecycle: &SessionLifecycle, request_pending: bool) -> bool {
+    matches!(
+        lifecycle,
+        SessionLifecycle::Running | SessionLifecycle::Disconnected(_)
+    ) && !request_pending
+}
+
+impl Session for SshSession {
+    fn id(&self) -> SessionId {
+        self.foundation.id()
+    }
+
+    fn lifecycle(&self) -> SessionLifecycle {
+        self.foundation.lifecycle()
+    }
+
+    fn automation_epoch(&self) -> Option<Arc<AutomationEpoch>> {
+        Some(Arc::clone(&self.foundation.shared.automation_epoch))
+    }
+
+    fn metrics(&self) -> SessionMetrics {
+        self.foundation.metrics()
+    }
+
+    fn try_send_input(&self, bytes: &[u8]) -> Result<(), SessionSendError> {
+        self.foundation.try_send_input(bytes)
+    }
+
+    fn reserve_automation_input(
+        &self,
+        controller_instance: u64,
+        bytes: &[u8],
+    ) -> Result<ReservedAutomationInput, ReserveAutomationInputError> {
+        self.foundation
+            .reserve_automation_input(controller_instance, bytes)
+    }
+
+    fn try_resize(&self, size: TerminalSize) -> Result<(), SessionSendError> {
+        self.foundation.try_resize(size)
+    }
+
+    fn try_shutdown(&self) -> Result<(), SessionSendError> {
+        self.host_key_gate.reject_pending();
+        self.password_gate.reject_pending();
+        self.foundation.try_shutdown()
+    }
+
+    fn try_recv_event(&self) -> Result<SessionEvent, SessionTryReceiveError> {
+        self.foundation.try_recv_event()
+    }
+
+    fn shutdown(&self, timeout: Duration) -> Result<ShutdownResult, ShutdownError> {
+        let _ = self.try_shutdown();
+        self.await_completion(timeout)
+    }
+}
+
+impl Drop for SshSession {
+    fn drop(&mut self) {
+        // Explicit `Session::shutdown` performs the caller-bounded wait. This
+        // destructor only wakes the worker and never blocks application exit.
+        self.host_key_gate.reject_pending();
+        self.password_gate.reject_pending();
+        let _ = self.foundation.try_shutdown();
+    }
+}
+
+impl Session for SftpTerminalSession {
+    fn id(&self) -> SessionId {
+        self.foundation.id()
+    }
+
+    fn lifecycle(&self) -> SessionLifecycle {
+        self.foundation.lifecycle()
+    }
+
+    // The text SFTP worker can remain running after transport loss. Until loss
+    // detection is qualified, the default automation_epoch() must return None.
+    fn metrics(&self) -> SessionMetrics {
+        self.foundation.metrics()
+    }
+
+    fn try_send_input(&self, bytes: &[u8]) -> Result<(), SessionSendError> {
+        self.foundation.try_send_input(bytes)
+    }
+
+    fn try_resize(&self, size: TerminalSize) -> Result<(), SessionSendError> {
+        self.foundation.try_resize(size)
+    }
+
+    fn try_shutdown(&self) -> Result<(), SessionSendError> {
+        self.host_key_gate.reject_pending();
+        self.password_gate.reject_pending();
+        self.foundation.try_shutdown()
+    }
+
+    fn try_recv_event(&self) -> Result<SessionEvent, SessionTryReceiveError> {
+        self.foundation.try_recv_event()
+    }
+
+    fn shutdown(&self, timeout: Duration) -> Result<ShutdownResult, ShutdownError> {
+        let _ = self.try_shutdown();
+        self.await_completion(timeout)
+    }
+}
+
+impl Drop for SftpTerminalSession {
+    fn drop(&mut self) {
+        self.host_key_gate.reject_pending();
+        self.password_gate.reject_pending();
+        let _ = self.foundation.try_shutdown();
+    }
+}
+
+/// Why opening a raw GUI SFTP session failed before a terminal-backed
+/// `SftpTerminalSession` was involved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuiSftpSessionConnectError {
+    InteractiveAuthenticationUnsupported,
+    HostKeyRejected,
+    Cancelled,
+    /// A GUI SFTP session could not be established, carrying a short,
+    /// human-readable detail (e.g. "connection refused", "SSH shell request
+    /// was rejected", "authentication failed") so the UI can surface a
+    /// diagnosable message instead of a generic one.
+    ConnectionFailed(String),
+}
+
+impl fmt::Display for GuiSftpSessionConnectError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InteractiveAuthenticationUnsupported => formatter.write_str(
+                "GUI SFTP currently requires an explicit password, private key, or stored credential",
+            ),
+            Self::HostKeyRejected => formatter.write_str("SSH host key was rejected"),
+            Self::Cancelled => formatter.write_str("GUI SFTP connection was cancelled"),
+            Self::ConnectionFailed(detail) => {
+                write!(formatter, "could not establish GUI SFTP session: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GuiSftpSessionConnectError {}
+
+struct GuiSftpConnectCompletion<T> {
+    task: Option<tokio::task::JoinHandle<Result<T, GuiSftpSessionConnectError>>>,
+    cancellation: Option<GuiSftpConnectCancellation>,
+}
+
+struct GuiSftpConnectCancellation {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    shared: Arc<WorkerShared>,
+    host_key_gate: Arc<HostKeyDecisionGate>,
+}
+
+impl Drop for GuiSftpConnectCancellation {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            self.shared.request_shutdown();
+            self.host_key_gate.reject_pending();
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+impl<T> GuiSftpConnectCompletion<T> {
+    const fn new(task: tokio::task::JoinHandle<Result<T, GuiSftpSessionConnectError>>) -> Self {
+        Self {
+            task: Some(task),
+            cancellation: None,
+        }
+    }
+
+    async fn wait(mut self) -> Result<T, GuiSftpSessionConnectError> {
+        let result = self
+            .task
+            .as_mut()
+            .expect("GUI SFTP completion handle must still be present")
+            .await;
+        self.finish(result)
+    }
+
+    fn finish(
+        &mut self,
+        result: Result<Result<T, GuiSftpSessionConnectError>, tokio::task::JoinError>,
+    ) -> Result<T, GuiSftpSessionConnectError> {
+        self.task.take();
+        if result.is_ok() {
+            if let Some(mut cancellation) = self.cancellation.take() {
+                cancellation.shutdown.take();
+            }
+        }
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(GuiSftpSessionConnectError::ConnectionFailed(
+                "the connect task panicked before finishing".to_owned(),
+            )),
+        }
+    }
+}
+
+impl<T> Drop for GuiSftpConnectCompletion<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+enum GuiSftpConnectOutcome<T> {
+    Connected(T),
+    NeedsHostKeyDecision {
+        prompt: festerm_session::HostKeyPrompt,
+        resolver: HostKeyDecisionResolver,
+        completion: GuiSftpConnectCompletion<T>,
+    },
+}
+
+/// Awaitable completion for a GUI SFTP connect attempt paused on host trust.
+pub struct GuiSftpSessionConnectCompletion {
+    inner: GuiSftpConnectCompletion<SftpSession>,
+}
+
+impl GuiSftpSessionConnectCompletion {
+    /// Waits for the paused connect attempt to finish after the GUI resolves
+    /// the pending host-key prompt.
+    ///
+    /// Dropping this completion or its wait cancels the owned connect attempt.
+    pub async fn wait(self) -> Result<SftpSession, GuiSftpSessionConnectError> {
+        self.inner.wait().await
+    }
+}
+
+impl fmt::Debug for GuiSftpSessionConnectCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GuiSftpSessionConnectCompletion")
+    }
+}
+
+/// The initial observable state of a GUI SFTP connect attempt.
+pub enum GuiSftpSessionConnectOutcome {
+    Connected(SftpSession),
+    NeedsHostKeyDecision {
+        prompt: festerm_session::HostKeyPrompt,
+        resolver: HostKeyDecisionResolver,
+        completion: GuiSftpSessionConnectCompletion,
+    },
+}
+
+impl fmt::Debug for GuiSftpSessionConnectOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connected(_) => formatter.write_str("GuiSftpSessionConnectOutcome::Connected"),
+            Self::NeedsHostKeyDecision {
+                prompt,
+                resolver: _,
+                completion: _,
+            } => formatter
+                .debug_struct("GuiSftpSessionConnectOutcome::NeedsHostKeyDecision")
+                .field("prompt", prompt)
+                .finish(),
+        }
+    }
+}
+
+struct GuiSftpConnectTaskConfig {
+    profile: SshConnectionProfile,
+    authentication: WorkerAuthentication,
+    local_working_directory: Option<PathBuf>,
+    shared: Arc<WorkerShared>,
+    command_receiver: WorkerCommandReceiver,
+    host_key_gate: Arc<HostKeyDecisionGate>,
+    password_gate: Arc<PasswordDecisionGate>,
+    known_host_fingerprint: Option<String>,
+}
+
+async fn establish_gui_sftp_session(
+    config: GuiSftpConnectTaskConfig,
+) -> Result<SftpSession, GuiSftpSessionConnectError> {
+    let GuiSftpConnectTaskConfig {
+        profile,
+        authentication,
+        local_working_directory,
+        shared,
+        command_receiver,
+        host_key_gate,
+        password_gate,
+        known_host_fingerprint,
+    } = config;
+    let handle = match establish_authenticated_handle(
+        &profile,
+        &authentication,
+        known_host_fingerprint.as_deref(),
+        &shared,
+        &command_receiver,
+        &host_key_gate,
+        &password_gate,
+    )
+    .await
+    {
+        AuthenticatedHandleAttempt::Established(handle) => handle,
+        AuthenticatedHandleAttempt::Permanent(ConnectionFailure::HostTrust, _)
+        | AuthenticatedHandleAttempt::Retryable(ConnectionFailure::HostTrust, _) => {
+            return Err(GuiSftpSessionConnectError::HostKeyRejected);
+        }
+        AuthenticatedHandleAttempt::Retryable(_, detail)
+        | AuthenticatedHandleAttempt::Permanent(_, detail) => {
+            return Err(GuiSftpSessionConnectError::ConnectionFailed(
+                detail.to_owned(),
+            ));
+        }
+        AuthenticatedHandleAttempt::Shutdown => {
+            return Err(GuiSftpSessionConnectError::ConnectionFailed(
+                "the connection was shut down before it finished".to_owned(),
+            ));
+        }
+    };
+
+    match local_working_directory {
+        Some(path) => sftp::SftpSession::connect_with_local_directory(&handle, path)
+            .await
+            .map_err(|error| GuiSftpSessionConnectError::ConnectionFailed(error.to_string())),
+        None => sftp::SftpSession::connect(&handle)
+            .await
+            .map_err(|error| GuiSftpSessionConnectError::ConnectionFailed(error.to_string())),
+    }
+}
+
+async fn observe_gui_sftp_connect<T>(
+    event_receiver: Receiver<SessionEvent>,
+    resolver: HostKeyDecisionResolver,
+    connect_task: tokio::task::JoinHandle<Result<T, GuiSftpSessionConnectError>>,
+    cancellation: Option<GuiSftpConnectCancellation>,
+) -> Result<GuiSftpConnectOutcome<T>, GuiSftpSessionConnectError>
+where
+    T: Send + 'static,
+{
+    let mut connect_task = GuiSftpConnectCompletion::new(connect_task);
+    connect_task.cancellation = cancellation;
+    let prompt_listener = tokio::task::spawn_blocking(move || loop {
+        match event_receiver.recv() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) => return Some(prompt),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    });
+    tokio::pin!(prompt_listener);
+
+    tokio::select! {
+        result = connect_task.task.as_mut().expect("connect task is present") => {
+            connect_task.finish(result).map(GuiSftpConnectOutcome::Connected)
+        },
+        prompt = &mut prompt_listener => match prompt {
+            Ok(Some(prompt)) => Ok(GuiSftpConnectOutcome::NeedsHostKeyDecision {
+                prompt,
+                resolver,
+                completion: connect_task,
+            }),
+            Ok(None) | Err(_) => connect_task.wait().await.map(GuiSftpConnectOutcome::Connected),
+        },
+    }
+}
+
+/// Opens one raw [`SftpSession`] for the GUI file manager.
+///
+/// Unlike [`SftpTerminalSession`], this does not own a transcript, event
+/// queue, or password prompt surface. It is intended for application-owned GUI
+/// workflows that already have an explicit credential, and that may need to
+/// pause on an inline host-key trust prompt before the SFTP session opens.
+pub async fn connect_gui_sftp_session(
+    profile: SshConnectionProfile,
+    authentication: SshAuthentication,
+    local_working_directory: Option<PathBuf>,
+    known_host_fingerprint: Option<String>,
+) -> Result<GuiSftpSessionConnectOutcome, GuiSftpSessionConnectError> {
+    if matches!(authentication, SshAuthentication::Interactive) {
+        return Err(GuiSftpSessionConnectError::InteractiveAuthenticationUnsupported);
+    }
+
+    struct NoopNotifier;
+    impl SessionEventNotifier for NoopNotifier {
+        fn notify(&self) {}
+    }
+
+    let (event_sender, event_receiver) = mpsc::sync_channel(DEFAULT_EVENT_QUEUE_CAPACITY);
+    let (command_sender, receiver) = mpsc::sync_channel(DEFAULT_COMMAND_QUEUE_CAPACITY);
+    let shared = Arc::new(WorkerShared {
+        id: SessionId::next(),
+        automation_epoch: Arc::new(AutomationEpoch::new()),
+        lifecycle_transition: Mutex::new(()),
+        lifecycle: Mutex::new(SessionLifecycle::Starting),
+        desired_terminal_size: Mutex::new(
+            TerminalSize::new(80, 24).expect("default GUI SFTP terminal size is valid"),
+        ),
+        pre_running_resize_pending: AtomicBool::new(false),
+        reconnecting: AtomicBool::new(false),
+        reconnect_requested: AtomicBool::new(false),
+        liveness_check_requested: AtomicBool::new(false),
+        shutdown_requested: AtomicBool::new(false),
+        verified_host_key_fingerprint: Mutex::new(None),
+        transport_generation: AtomicU64::new(0),
+        port_forward_admissions: PortForwardAdmissions::default(),
+        metrics: Mutex::new(SessionMetrics::default()),
+        event_sender,
+        event_notifier: Arc::new(NoopNotifier),
+    });
+    let host_key_gate = Arc::new(HostKeyDecisionGate::new());
+    let password_gate = Arc::new(PasswordDecisionGate::new());
+    let command_receiver = WorkerCommandReceiver::new(receiver, Arc::clone(&shared));
+    let authentication = authentication.into_worker_authentication();
+    let resolver = HostKeyDecisionResolver {
+        gate: Arc::clone(&host_key_gate),
+    };
+    let connect_id = shared.id;
+    // Bridge a dedicated OS thread's result into an awaitable
+    // `JoinHandle`, so the rest of the connect machinery below
+    // (`observe_gui_sftp_connect`'s host-key-prompt race,
+    // `GuiSftpConnectCompletion`, etc.) is unaffected by *how* the connect
+    // itself runs.
+    //
+    // This can't just be a plain `spawn_blocking` closure that builds a
+    // throw-away runtime, `block_on`s the connect, and returns the result
+    // directly (as this used to do): `russh::client::connect` spawns the
+    // connection's entire read/write dispatch loop via `tokio::spawn` onto
+    // whatever runtime is ambient at connect time, and returning drops that
+    // throw-away runtime immediately, which cancels the just-spawned
+    // dispatch task -- silently killing the connection a few moments after
+    // it reported "connected". The dedicated thread below instead keeps
+    // driving its runtime (via a second `block_on`) for as long as the
+    // resulting session's `GuiSftpConnectionKeepAlive` guard lives, so the
+    // dispatch task keeps making progress until the caller is actually done
+    // with the session.
+    let (result_sender, result_receiver) =
+        mpsc::sync_channel::<Result<SftpSession, GuiSftpSessionConnectError>>(1);
+    let (shutdown, cancelled) = tokio::sync::oneshot::channel();
+    let cancellation = GuiSftpConnectCancellation {
+        shutdown: Some(shutdown),
+        shared: Arc::clone(&shared),
+        host_key_gate: Arc::clone(&host_key_gate),
+    };
+    let thread_spawned = thread::Builder::new()
+        .name(format!("festerm-gui-sftp-connect-{connect_id}"))
+        .spawn(move || {
+            // Keep `command_sender` alive for the lifetime of the connect
+            // phase rather than dropping it immediately: see the matching
+            // comment on `GuiSftpConnectionKeepAlive` and
+            // `probe_remote_persistence_provider` for why a dropped sender
+            // makes `process_commands_before_running` abort the connect
+            // before it ever reaches the network.
+            let _command_sender_guard = command_sender;
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(_) => {
+                    let _ = result_sender.send(Err(GuiSftpSessionConnectError::ConnectionFailed(
+                        "GUI SFTP connect runtime could not start".to_owned(),
+                    )));
+                    return;
+                }
+            };
+            let connect_result = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = cancelled => Err(GuiSftpSessionConnectError::Cancelled),
+                    result = establish_gui_sftp_session(GuiSftpConnectTaskConfig {
+                    profile,
+                    authentication,
+                    local_working_directory,
+                    shared,
+                    command_receiver,
+                    host_key_gate,
+                    password_gate,
+                    known_host_fingerprint,
+                    }) => result,
+                }
+            });
+            match connect_result {
+                Ok(session) => {
+                    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+                    let session = session
+                        .with_runtime_keepalive(GuiSftpConnectionKeepAlive::new(shutdown_sender));
+                    if result_sender.send(Ok(session)).is_err() {
+                        // The caller already gave up (e.g. the connect
+                        // future was dropped); nothing left to keep alive.
+                        return;
+                    }
+                    runtime.block_on(async move {
+                        let _ = shutdown_receiver.await;
+                    });
+                }
+                Err(error) => {
+                    let _ = result_sender.send(Err(error));
+                }
+            }
+            // Do not wait indefinitely for a cancelled blocking filesystem call.
+            runtime.shutdown_background();
+        });
+    if thread_spawned.is_err() {
+        return Err(GuiSftpSessionConnectError::ConnectionFailed(
+            "could not start the GUI SFTP connect thread".to_owned(),
+        ));
+    }
+    let connect_task = tokio::task::spawn_blocking(move || {
+        result_receiver.recv().unwrap_or_else(|_| {
+            Err(GuiSftpSessionConnectError::ConnectionFailed(
+                "the GUI SFTP connect thread ended before finishing".to_owned(),
+            ))
+        })
+    });
+
+    match observe_gui_sftp_connect(
+        event_receiver,
+        resolver.clone(),
+        connect_task,
+        Some(cancellation),
+    )
+    .await?
+    {
+        GuiSftpConnectOutcome::Connected(session) => {
+            Ok(GuiSftpSessionConnectOutcome::Connected(session))
+        }
+        GuiSftpConnectOutcome::NeedsHostKeyDecision {
+            prompt,
+            resolver,
+            completion,
+        } => Ok(GuiSftpSessionConnectOutcome::NeedsHostKeyDecision {
+            prompt,
+            resolver,
+            completion: GuiSftpSessionConnectCompletion { inner: completion },
+        }),
+    }
+}
+
+/// Best-effort availability result for an application-owned remote
+/// persistence-provider probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistenceProviderProbeAvailability {
+    /// The provider executable was successfully probed and is present.
+    Available,
+    /// The probe completed and the provider should be treated as unavailable
+    /// for default-selection purposes.
+    Unavailable,
+    /// fesTerm could not safely complete the probe at all (for example
+    /// because no persisted host trust exists yet, or because the UI only
+    /// has interactive authentication available), so callers should leave any
+    /// existing selection unchanged.
+    Indeterminate,
+}
+
+/// Runs one best-effort remote capability probe for `provider`, using the
+/// existing authenticated-connection path but never surfacing host-key or
+/// password prompts.
+///
+/// This is intended for background UI defaulting rather than for launch-time
+/// enforcement. A missing persisted host-trust record or an interactive-only
+/// authentication mode therefore returns
+/// [`PersistenceProviderProbeAvailability::Indeterminate`] instead of
+/// blocking for user input.
+pub async fn probe_remote_persistence_provider(
+    profile: SshConnectionProfile,
+    authentication: SshAuthentication,
+    known_host_fingerprint: Option<String>,
+    provider: PersistenceProvider,
+) -> PersistenceProviderProbeAvailability {
+    if known_host_fingerprint.is_none() || matches!(authentication, SshAuthentication::Interactive)
+    {
+        return PersistenceProviderProbeAvailability::Indeterminate;
+    }
+
+    struct NoopNotifier;
+    impl SessionEventNotifier for NoopNotifier {
+        fn notify(&self) {}
+    }
+
+    let (event_sender, _event_receiver) = mpsc::sync_channel(DEFAULT_EVENT_QUEUE_CAPACITY);
+    let (_command_sender_guard, receiver) = mpsc::sync_channel(DEFAULT_COMMAND_QUEUE_CAPACITY);
+    // Keep `command_sender` alive for this function's whole body (see the
+    // matching comment in `connect_gui_sftp_session`): dropping it
+    // immediately made the receiver look permanently disconnected, which
+    // `process_commands_before_running` treats identically to an explicit
+    // shutdown request, aborting the probe before it ever reached the
+    // network.
+    let shared = Arc::new(WorkerShared {
+        id: SessionId::next(),
+        automation_epoch: Arc::new(AutomationEpoch::new()),
+        lifecycle_transition: Mutex::new(()),
+        lifecycle: Mutex::new(SessionLifecycle::Starting),
+        desired_terminal_size: Mutex::new(
+            TerminalSize::new(80, 24).expect("default probe terminal size is valid"),
+        ),
+        pre_running_resize_pending: AtomicBool::new(false),
+        reconnecting: AtomicBool::new(false),
+        reconnect_requested: AtomicBool::new(false),
+        liveness_check_requested: AtomicBool::new(false),
+        shutdown_requested: AtomicBool::new(false),
+        verified_host_key_fingerprint: Mutex::new(None),
+        transport_generation: AtomicU64::new(0),
+        port_forward_admissions: PortForwardAdmissions::default(),
+        metrics: Mutex::new(SessionMetrics::default()),
+        event_sender,
+        event_notifier: Arc::new(NoopNotifier),
+    });
+    let host_key_gate = Arc::new(HostKeyDecisionGate::new());
+    let password_gate = Arc::new(PasswordDecisionGate::new());
+    let command_receiver = WorkerCommandReceiver::new(receiver, Arc::clone(&shared));
+    let authentication = authentication.into_worker_authentication();
+
+    let handle = match establish_authenticated_handle(
+        &profile,
+        &authentication,
+        known_host_fingerprint.as_deref(),
+        &shared,
+        &command_receiver,
+        &host_key_gate,
+        &password_gate,
+    )
+    .await
+    {
+        AuthenticatedHandleAttempt::Established(handle) => handle,
+        AuthenticatedHandleAttempt::Retryable(_, _)
+        | AuthenticatedHandleAttempt::Permanent(_, _)
+        | AuthenticatedHandleAttempt::Shutdown => {
+            return PersistenceProviderProbeAvailability::Indeterminate;
+        }
+    };
+
+    let availability = match probe_persistence_provider(
+        &handle,
+        provider,
+        &command_receiver,
+        &shared,
+        &host_key_gate,
+    )
+    .await
+    {
+        ProviderProbeOutcome::Available => PersistenceProviderProbeAvailability::Available,
+        ProviderProbeOutcome::Unavailable | ProviderProbeOutcome::ProbeFailed => {
+            PersistenceProviderProbeAvailability::Unavailable
+        }
+        ProviderProbeOutcome::Shutdown => PersistenceProviderProbeAvailability::Indeterminate,
+    };
+    let _ = stop_handle(handle, &shared).await;
+    availability
+}
+
+fn sftp_prompt() -> &'static str {
+    "sftp> "
+}
+
+fn sftp_title(profile: &SshConnectionProfile, remote: &str, local: &Path) -> String {
+    format!(
+        "SFTP · {}@{}:{} · {} · {}",
+        profile.username(),
+        profile.identity().host(),
+        profile.identity().port(),
+        remote,
+        local.display()
+    )
+}
+
+fn sftp_title_sequence(profile: &SshConnectionProfile, remote: &str, local: &Path) -> String {
+    format!("\x1b]0;{}\x07", sftp_title(profile, remote, local))
+}
+
+fn format_sftp_outcome(outcome: &sftp::SftpCommandOutcome) -> String {
+    use sftp::SftpCommandOutcome as Outcome;
+
+    match outcome {
+        Outcome::Help { text } => format!("{}\r\n", text.replace('\n', "\r\n")),
+        Outcome::WorkingDirectory { path } => format!("Remote working directory: {path}\r\n"),
+        Outcome::LocalWorkingDirectory { path } => {
+            format!("Local working directory: {}\r\n", path.display())
+        }
+        Outcome::ChangedDirectory { path } => format!("Remote directory changed to {path}\r\n"),
+        Outcome::ChangedLocalDirectory { path } => {
+            format!("Local directory changed to {}\r\n", path.display())
+        }
+        Outcome::DirectoryListing { path, entries } => {
+            format_sftp_directory_listing(&format!("Listing for {path}:"), entries)
+        }
+        Outcome::LocalDirectoryListing { path, entries } => format_sftp_directory_listing(
+            &format!("Local listing for {}:", path.display()),
+            entries,
+        ),
+        Outcome::CreatedDirectory { path } => format!("Created remote directory {path}\r\n"),
+        Outcome::RemovedDirectory { path } => format!("Removed remote directory {path}\r\n"),
+        Outcome::RemovedFile { path } => format!("Removed remote file {path}\r\n"),
+        Outcome::Renamed {
+            source,
+            destination,
+        } => format!("Renamed {source} to {destination}\r\n"),
+        Outcome::PermissionsChanged { path, mode } => {
+            format!("Changed permissions on {path} to {mode:04o}\r\n")
+        }
+        Outcome::Downloaded {
+            remote_path,
+            local_path,
+            byte_count,
+        } => format!(
+            "Downloaded {remote_path} to {} ({byte_count} bytes)\r\n",
+            local_path.display()
+        ),
+        Outcome::Uploaded {
+            local_path,
+            remote_path,
+            byte_count,
+        } => format!(
+            "Uploaded {} to {remote_path} ({byte_count} bytes)\r\n",
+            local_path.display()
+        ),
+        Outcome::SessionClosed => "SFTP session closed.\r\n".to_owned(),
+    }
+}
+
+fn format_sftp_directory_listing(heading: &str, entries: &[sftp::SftpDirectoryEntry]) -> String {
+    let mut output = format!("{heading}\r\n");
+    if entries.is_empty() {
+        output.push_str("(empty)\r\n");
+        return output;
+    }
+    for entry in entries {
+        output.push_str(&format_sftp_directory_entry(entry));
+    }
+    output
+}
+
+fn format_sftp_directory_entry(entry: &sftp::SftpDirectoryEntry) -> String {
+    let kind = match entry.file_type {
+        sftp::SftpEntryType::Directory => "dir ",
+        sftp::SftpEntryType::File => "file",
+        sftp::SftpEntryType::Symlink => "link",
+        sftp::SftpEntryType::Other => "other",
+    };
+    let permissions = entry
+        .permissions
+        .map(|permissions| format!("{permissions:04o}"))
+        .unwrap_or_else(|| "----".to_owned());
+    let size = entry
+        .size
+        .map(|size| size.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    format!("{kind} {permissions:>4} {size:>10} {}\r\n", entry.name)
+}
+
+fn emit_sftp_output(shared: &WorkerShared, text: impl AsRef<str>) {
+    let _ = shared.try_emit(SessionEvent::Output(text.as_ref().as_bytes().to_vec()));
+}
+
+fn emit_sftp_outcome(shared: &WorkerShared, outcome: &sftp::SftpCommandOutcome) {
+    match outcome {
+        sftp::SftpCommandOutcome::DirectoryListing { path, entries } => {
+            emit_sftp_directory_listing(shared, &format!("Listing for {path}:"), entries);
+        }
+        sftp::SftpCommandOutcome::LocalDirectoryListing { path, entries } => {
+            emit_sftp_directory_listing(
+                shared,
+                &format!("Local listing for {}:", path.display()),
+                entries,
+            );
+        }
+        _ => emit_sftp_output(shared, format_sftp_outcome(outcome)),
+    }
+}
+
+fn emit_sftp_directory_listing(
+    shared: &WorkerShared,
+    heading: &str,
+    entries: &[sftp::SftpDirectoryEntry],
+) {
+    let mut chunk = format!("{heading}\r\n");
+    if entries.is_empty() {
+        chunk.push_str("(empty)\r\n");
+        emit_sftp_output(shared, chunk);
+        return;
+    }
+
+    for entry in entries {
+        let line = format_sftp_directory_entry(entry);
+        if chunk.len() + line.len() > MAX_IO_CHUNK_BYTES {
+            emit_sftp_output(shared, std::mem::take(&mut chunk));
+        }
+        chunk.push_str(&line);
+    }
+
+    if !chunk.is_empty() {
+        emit_sftp_output(shared, chunk);
+    }
+}
+
+fn emit_sftp_prompt(
+    shared: &WorkerShared,
+    profile: &SshConnectionProfile,
+    session: &sftp::SftpSession,
+) {
+    emit_sftp_output(
+        shared,
+        format!(
+            "{}{}",
+            sftp_title_sequence(
+                profile,
+                session.remote_working_directory(),
+                session.local_working_directory()
+            ),
+            sftp_prompt()
+        ),
+    );
+}
+
+fn emit_sftp_startup_banner(
+    shared: &WorkerShared,
+    profile: &SshConnectionProfile,
+    session: &sftp::SftpSession,
+) {
+    emit_sftp_output(
+        shared,
+        format!(
+            "{}Connected SFTP session to {}@{}:{}.\r\nRemote working directory: {}\r\nLocal working directory: {}\r\n",
+            sftp_title_sequence(
+                profile,
+                session.remote_working_directory(),
+                session.local_working_directory()
+            ),
+            profile.username(),
+            profile.identity().host(),
+            profile.identity().port(),
+            session.remote_working_directory(),
+            session.local_working_directory().display(),
+        ),
+    );
+}
+
+fn update_sftp_working_directories(
+    working_directories: &Arc<Mutex<Option<SftpWorkingDirectories>>>,
+    session: &sftp::SftpSession,
+) {
+    *working_directories
+        .lock()
+        .expect("SFTP working-directory lock is not poisoned") = Some(SftpWorkingDirectories {
+        remote: session.remote_working_directory().to_owned(),
+        local: session.local_working_directory().to_path_buf(),
+    });
+}
+
+struct SshClientHandler {
+    identity: HostIdentity,
+    shared: Arc<WorkerShared>,
+    host_key_gate: Arc<HostKeyDecisionGate>,
+    host_key_rejected: Arc<AtomicBool>,
+    forwarded_tcpip_sender: tokio::sync::mpsc::Sender<ForwardedTcpIpConnection>,
+    /// A persistent-trust-store fingerprint already on file for this
+    /// destination (ADR 0020), if any. An exact match is accepted silently,
+    /// mirroring `ssh`'s own already-in-`known_hosts` behavior; any other
+    /// presented key still prompts, flagged as a changed-key warning.
+    expected_fingerprint: Option<String>,
+}
+
+impl russh::client::Handler for SshClientHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &russh::keys::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        let fingerprint = sha256_fingerprint(server_public_key);
+        if self
+            .expected_fingerprint
+            .as_deref()
+            .is_some_and(|expected| expected == fingerprint)
+        {
+            self.shared
+                .set_verified_host_key_fingerprint(fingerprint.clone());
+            return Ok(true);
+        }
+        let previously_trusted = self.expected_fingerprint.as_deref();
+        let waiter = match request_host_key_verification(
+            &self.identity,
+            &self.shared,
+            &self.host_key_gate,
+            &fingerprint,
+            previously_trusted,
+        ) {
+            Ok(waiter) => waiter,
+            Err(_) => {
+                self.host_key_rejected.store(true, Ordering::Release);
+                return Ok(false);
+            }
+        };
+        let accepted = matches!(
+            waiter
+                .wait_async(&self.host_key_gate, HOST_KEY_DECISION_TIMEOUT)
+                .await,
+            HostTrustDecision::AcceptOnce | HostTrustDecision::AcceptAndPersist
+        );
+        if !accepted {
+            self.shared.clear_verified_host_key_fingerprint();
+            self.host_key_rejected.store(true, Ordering::Release);
+        } else {
+            self.shared.set_verified_host_key_fingerprint(fingerprint);
+        }
+        Ok(accepted)
+    }
+
+    fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut russh::client::Session,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        let forwarded_tcpip_sender = self.forwarded_tcpip_sender.clone();
+        let shared = Arc::clone(&self.shared);
+        let key = PortForwardBindingKey {
+            direction: SshPortForwardDirection::Remote,
+            bind_host: connected_address.to_owned(),
+            bind_port: connected_port.try_into().unwrap_or(u16::MAX),
+        };
+        let incarnation = shared.port_forward_admissions.incarnation(&key);
+        async move {
+            reply.accept().await;
+            let Some(incarnation) = incarnation else {
+                report_port_forward_error(
+                    &shared,
+                    "SSH remote forwarded connection has no registered mapping",
+                );
+                let _ = channel.close().await;
+                return Ok(());
+            };
+            match forwarded_tcpip_sender.try_send(ForwardedTcpIpConnection {
+                key,
+                incarnation,
+                channel,
+            }) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(forwarded)) => {
+                    report_port_forward_error(
+                        &shared,
+                        format!(
+                            "SSH remote port forward on {}:{} rejected a forwarded connection because {} connections were already pending",
+                            forwarded.key.bind_host,
+                            forwarded.key.bind_port,
+                            PORT_FORWARD_PENDING_CONNECTION_CAPACITY,
+                        ),
+                    );
+                    let _ = forwarded.channel.close().await;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(forwarded)) => {
+                    let _ = forwarded.channel.close().await;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Runs the worker's connection/reconnect loop for one session's lifetime.
+/// Bundling `host_key_gate`/`password_gate` into a shared struct isn't worth
+/// it here: every other worker helper (`wait_for_ssh_operation`,
+/// `process_commands_before_running`, `wait_for_manual_recovery`, ...)
+/// already threads `host_key_gate` alone, and this is the only site that
+/// additionally needs `password_gate`.
+#[allow(clippy::too_many_arguments)]
+async fn ssh_worker(
+    profile: SshConnectionProfile,
+    authentication: SshAuthentication,
+    strategy: SessionStrategy,
+    reconnect_policy: Option<ReconnectPolicy>,
+    known_host_fingerprint: Option<String>,
+    profile_port_forwards: Vec<RequestedSshPortForward>,
+    shared: Arc<WorkerShared>,
+    command_receiver: WorkerCommandReceiver,
+    host_key_gate: Arc<HostKeyDecisionGate>,
+    password_gate: Arc<PasswordDecisionGate>,
+) -> Result<ShutdownResult, SessionError> {
+    let authentication = authentication.into_worker_authentication();
+    let mut planner = reconnect_policy.map(ReconnectPlanner::new);
+    let mut initial_profile_port_forwards = Some(profile_port_forwards);
+    // Counts the *next* `establish_connection` attempt below as the Nth
+    // attempt (1-based) directly following an explicit, user-initiated
+    // reconnect (as opposed to the session's very first connection attempt,
+    // or an automatic-policy attempt); `0` means no manual-reconnect episode
+    // is in progress. A manual reconnect that itself fails to transiently
+    // reach the host retries with a bounded backoff (see
+    // `manual_reconnect_delay`) rather than returning to `Disconnected` or
+    // ending the session outright on the very first failure (ADR 0018:
+    // explicit reconnect is a repeatable user action, not a one-shot
+    // attempt) - first connections keep their existing fail-outright
+    // behavior.
+    let mut manual_recovery_attempts: u8 = 0;
+
+    loop {
+        shared.begin_transport();
+        match establish_connection(
+            &profile,
+            &authentication,
+            &strategy,
+            known_host_fingerprint.as_deref(),
+            &shared,
+            &command_receiver,
+            &host_key_gate,
+            &password_gate,
+        )
+        .await
+        {
+            ConnectionAttempt::Established(handle, channel, forwarded_tcpip_receiver) => {
+                manual_recovery_attempts = 0;
+                if let Some(planner) = planner.as_mut() {
+                    let _ = planner.connection_established();
+                }
+                let initial_port_forwards = shared.reserve_profile_port_forwards(
+                    initial_profile_port_forwards.take().unwrap_or_default(),
+                );
+                shared.set_reconnecting(false);
+                shared.set_lifecycle(SessionLifecycle::Running);
+                match run_authenticated_channel(
+                    Arc::new(handle),
+                    channel,
+                    forwarded_tcpip_receiver,
+                    initial_port_forwards,
+                    &command_receiver,
+                    &shared,
+                    &host_key_gate,
+                )
+                .await
+                {
+                    RunningOutcome::Shutdown(result) => return Ok(result),
+                    RunningOutcome::Exited(exit) => {
+                        shared.set_lifecycle(SessionLifecycle::Exited(exit));
+                        return Ok(ShutdownResult::AlreadyStopped);
+                    }
+                    RunningOutcome::ConnectionLost(reason) => {
+                        match schedule_reconnect(
+                            &mut planner,
+                            ConnectionFailure::Transport,
+                            &command_receiver,
+                            &shared,
+                            &host_key_gate,
+                        )
+                        .await
+                        {
+                            ReconnectSchedule::Reconnect => continue,
+                            ReconnectSchedule::Shutdown => return Ok(ShutdownResult::Stopped),
+                            ReconnectSchedule::Unavailable => {}
+                        }
+                        // No automatic recovery resumed the connection (either
+                        // there is no durable-session policy, or its bounded
+                        // backoff was exhausted). Per ADR 0018, unintentional
+                        // transport loss must never be terminal by itself: the
+                        // session moves to a disconnected/recovery-eligible
+                        // state and waits here for the user to either request
+                        // an explicit reconnect or shut the session down.
+                        shared.set_lifecycle(SessionLifecycle::Disconnected(SessionError::new(
+                            SessionErrorKind::Spawn,
+                            reason,
+                        )));
+                        match wait_for_manual_recovery(&command_receiver, &shared, &host_key_gate)
+                            .await
+                        {
+                            ManualRecoveryOutcome::Reconnect => {
+                                if let Some(planner) = planner.as_mut() {
+                                    let _ = planner.connection_established();
+                                }
+                                manual_recovery_attempts = 1;
+                                shared.set_reconnecting(true);
+                                shared.clear_reconnect_request();
+                                shared.set_lifecycle(SessionLifecycle::Starting);
+                                continue;
+                            }
+                            ManualRecoveryOutcome::Shutdown => {
+                                shared.set_lifecycle(SessionLifecycle::Stopped);
+                                return Ok(ShutdownResult::Stopped);
+                            }
+                        }
+                    }
+                    RunningOutcome::ReconnectRequested => {
+                        // A manual reconnect is always honored once explicitly
+                        // requested: it is a deliberate user action, not an
+                        // unintentional-loss retry, so it does not consult
+                        // (and is never blocked by) any automatic recovery
+                        // policy (ADR 0018). Best-effort reset the planner's
+                        // own bookkeeping so a subsequent unintentional loss
+                        // starts its bounded backoff from a clean state.
+                        if let Some(planner) = planner.as_mut() {
+                            let _ = planner.connection_established();
+                        }
+                        manual_recovery_attempts = 1;
+                        shared.set_reconnecting(true);
+                        shared.clear_reconnect_request();
+                        shared.set_lifecycle(SessionLifecycle::Starting);
+                        continue;
+                    }
+                }
+            }
+            ConnectionAttempt::Retryable(failure, message) => {
+                match schedule_reconnect(
+                    &mut planner,
+                    failure,
+                    &command_receiver,
+                    &shared,
+                    &host_key_gate,
+                )
+                .await
+                {
+                    ReconnectSchedule::Reconnect => continue,
+                    ReconnectSchedule::Shutdown => return Ok(ShutdownResult::Stopped),
+                    ReconnectSchedule::Unavailable => {}
+                }
+                // An explicit reconnect is a repeatable user action (ADR
+                // 0018): if the fresh attempt it triggered hit only a
+                // transient transport problem (e.g. the host briefly
+                // unreachable right after the reconnect was requested),
+                // retry with a short bounded backoff before falling back to
+                // `Disconnected`, instead of giving up on the first failure.
+                if manual_recovery_attempts > 0 && failure == ConnectionFailure::Transport {
+                    if manual_recovery_attempts < MANUAL_RECONNECT_MAX_ATTEMPTS {
+                        let delay = manual_reconnect_delay(manual_recovery_attempts);
+                        manual_recovery_attempts += 1;
+                        if wait_for_reconnect_delay(
+                            delay,
+                            &command_receiver,
+                            &shared,
+                            &host_key_gate,
+                        )
+                        .await
+                        {
+                            shared.set_lifecycle(SessionLifecycle::Stopped);
+                            return Ok(ShutdownResult::Stopped);
+                        }
+                        // Stay in the reconnecting state across retries; the
+                        // user only sees `Disconnected` once the whole
+                        // bounded retry budget is exhausted below.
+                        continue;
+                    }
+                    shared.set_lifecycle(SessionLifecycle::Disconnected(SessionError::new(
+                        SessionErrorKind::Spawn,
+                        message,
+                    )));
+                    match wait_for_manual_recovery(&command_receiver, &shared, &host_key_gate).await
+                    {
+                        ManualRecoveryOutcome::Reconnect => {
+                            manual_recovery_attempts = 1;
+                            shared.set_reconnecting(true);
+                            shared.clear_reconnect_request();
+                            shared.set_lifecycle(SessionLifecycle::Starting);
+                            continue;
+                        }
+                        ManualRecoveryOutcome::Shutdown => {
+                            shared.set_lifecycle(SessionLifecycle::Stopped);
+                            return Ok(ShutdownResult::Stopped);
+                        }
+                    }
+                }
+                return Err(ssh_failure_with_kind(
+                    &shared,
+                    session_error_kind_for_failure(failure),
+                    message,
+                ));
+            }
+            ConnectionAttempt::Permanent(failure, message) => {
+                debug_assert!(!reconnect_is_eligible(planner.is_some(), failure));
+                return Err(ssh_failure_with_kind(
+                    &shared,
+                    session_error_kind_for_failure(failure),
+                    message,
+                ));
+            }
+            ConnectionAttempt::Shutdown => {
+                shared.set_reconnecting(false);
+                shared.set_lifecycle(SessionLifecycle::Stopped);
+                return Ok(ShutdownResult::Stopped);
+            }
+        }
+    }
+}
+
+/// These categories deliberately retry only network loss. Host-trust
+/// rejection, authentication failure, and PTY/shell setup failures are
+/// security, credential, or configuration outcomes and never retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionFailure {
+    Transport,
+    HostTrust,
+    Authentication,
+    Setup,
+    /// A persistent strategy's provider capability probe found the
+    /// configured provider missing (or could not be run at all) on the
+    /// remote host. This is a stable, non-transient condition: retrying the
+    /// same transport will not make an absent executable appear, so
+    /// [`reconnect_is_eligible`] never retries it (ADR 0018, Issue #49).
+    ProviderUnavailable,
+}
+
+fn reconnect_is_eligible(policy_enabled: bool, failure: ConnectionFailure) -> bool {
+    policy_enabled && matches!(failure, ConnectionFailure::Transport)
+}
+
+/// Maps a connection-establishment failure to the generic, content-free
+/// category the application layer can react to. Only `Authentication` is
+/// distinguished today: it lets the UI reprompt for a password in-tab
+/// (mimicking `ssh`'s own retry) instead of showing a raw failed session.
+const fn session_error_kind_for_failure(failure: ConnectionFailure) -> SessionErrorKind {
+    match failure {
+        ConnectionFailure::Authentication => SessionErrorKind::Authentication,
+        ConnectionFailure::Transport
+        | ConnectionFailure::HostTrust
+        | ConnectionFailure::Setup
+        | ConnectionFailure::ProviderUnavailable => SessionErrorKind::Spawn,
+    }
+}
+
+enum ConnectionAttempt {
+    Established(
+        russh::client::Handle<SshClientHandler>,
+        russh::Channel<russh::client::Msg>,
+        tokio::sync::mpsc::Receiver<ForwardedTcpIpConnection>,
+    ),
+    Retryable(ConnectionFailure, &'static str),
+    Permanent(ConnectionFailure, &'static str),
+    Shutdown,
+}
+
+enum ReconnectSchedule {
+    Reconnect,
+    Unavailable,
+    Shutdown,
+}
+
+async fn schedule_reconnect(
+    planner: &mut Option<ReconnectPlanner>,
+    failure: ConnectionFailure,
+    command_receiver: &WorkerCommandReceiver,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+) -> ReconnectSchedule {
+    let action = reconnect_action_for_failure(planner, failure);
+    let ReconnectAction::ScheduleAttempt { delay, .. } = action else {
+        return ReconnectSchedule::Unavailable;
+    };
+    shared.set_reconnecting(true);
+    shared.clear_reconnect_request();
+    shared.set_lifecycle(SessionLifecycle::Starting);
+    if wait_for_reconnect_delay(delay, command_receiver, shared, host_key_gate).await {
+        if let Some(planner) = planner.as_mut() {
+            let _ = planner.cancel();
+        }
+        shared.set_reconnecting(false);
+        shared.set_lifecycle(SessionLifecycle::Stopped);
+        return ReconnectSchedule::Shutdown;
+    }
+    let Some(planner) = planner.as_mut() else {
+        return ReconnectSchedule::Unavailable;
+    };
+    if matches!(
+        planner.delay_elapsed(),
+        ReconnectAction::StartFreshConnection {
+            host_verification: FreshHostVerification::Required,
+            ..
+        }
+    ) {
+        ReconnectSchedule::Reconnect
+    } else {
+        ReconnectSchedule::Unavailable
+    }
+}
+
+fn reconnect_action_for_failure(
+    planner: &mut Option<ReconnectPlanner>,
+    failure: ConnectionFailure,
+) -> ReconnectAction {
+    if !reconnect_is_eligible(planner.is_some(), failure) {
+        return ReconnectAction::None;
+    }
+    let planner = planner
+        .as_mut()
+        .expect("enabled reconnect policy must have a planner");
+    match planner.state() {
+        ReconnectState::Idle => planner.disconnected(),
+        ReconnectState::Connecting { .. } => planner.connection_failed(),
+        _ => ReconnectAction::None,
+    }
+}
+
+async fn wait_for_reconnect_delay(
+    delay: Duration,
+    command_receiver: &WorkerCommandReceiver,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+) -> bool {
+    let elapsed = tokio::time::sleep(delay);
+    tokio::pin!(elapsed);
+    loop {
+        tokio::select! {
+            _ = &mut elapsed => return false,
+            _ = tokio::time::sleep(COMMAND_POLL_INTERVAL) => {
+                if process_commands_before_running(command_receiver, shared, host_key_gate) {
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+/// Establishes one fresh transport. Every invocation creates a new handler;
+/// its host-key callback begins a new gate sequence and emits a new prompt.
+#[allow(clippy::too_many_arguments)]
+async fn establish_connection(
+    profile: &SshConnectionProfile,
+    authentication: &WorkerAuthentication,
+    strategy: &SessionStrategy,
+    known_host_fingerprint: Option<&str>,
+    shared: &Arc<WorkerShared>,
+    command_receiver: &WorkerCommandReceiver,
+    host_key_gate: &Arc<HostKeyDecisionGate>,
+    password_gate: &Arc<PasswordDecisionGate>,
+) -> ConnectionAttempt {
+    if process_commands_before_running(command_receiver, shared, host_key_gate) {
+        return ConnectionAttempt::Shutdown;
+    }
+    let config = Arc::new(russh::client::Config {
+        nodelay: true,
+        ..Default::default()
+    });
+    let host_key_rejected = Arc::new(AtomicBool::new(false));
+    let (forwarded_tcpip_sender, forwarded_tcpip_receiver) =
+        tokio::sync::mpsc::channel(PORT_FORWARD_PENDING_CONNECTION_CAPACITY);
+    let handler = SshClientHandler {
+        identity: profile.identity.clone(),
+        shared: Arc::clone(shared),
+        host_key_gate: Arc::clone(host_key_gate),
+        host_key_rejected: Arc::clone(&host_key_rejected),
+        forwarded_tcpip_sender,
+        expected_fingerprint: known_host_fingerprint.map(str::to_owned),
+    };
+    let connection = russh::client::connect(
+        config,
+        (profile.identity.host(), profile.identity.port()),
+        handler,
+    );
+    tokio::pin!(connection);
+    let connection_timeout = tokio::time::sleep(CONNECT_TIMEOUT);
+    tokio::pin!(connection_timeout);
+
+    let mut handle = loop {
+        tokio::select! {
+            result = &mut connection => match result {
+                Ok(handle) => break handle,
+                Err(_) if host_key_rejected.load(Ordering::Acquire) => {
+                    return ConnectionAttempt::Permanent(
+                        ConnectionFailure::HostTrust,
+                        "SSH host key was rejected",
+                    );
+                }
+                Err(_) => {
+                    return ConnectionAttempt::Retryable(
+                        ConnectionFailure::Transport,
+                        "SSH connection failed",
+                    )
+                }
+            },
+            _ = &mut connection_timeout => return ConnectionAttempt::Retryable(
+                ConnectionFailure::Transport,
+                "SSH connection timed out",
+            ),
+            _ = tokio::time::sleep(COMMAND_POLL_INTERVAL) => {
+                hold_connect_deadline_while_reviewing(connection_timeout.as_mut(), host_key_gate);
+                if process_commands_before_running(command_receiver, shared, host_key_gate) {
+                    return ConnectionAttempt::Shutdown;
+                }
+            }
+        }
+    };
+
+    let authentication_result = match authentication {
+        WorkerAuthentication::Password(password) => {
+            wait_for_ssh_operation(
+                handle.authenticate_password_zeroizing(profile.username(), password.clone()),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+        WorkerAuthentication::StoredPassword(authentication) => {
+            // Resolve only after the transport and host-key gate are ready,
+            // immediately before password authentication on this worker.
+            let mut password = match resolve_stored_password(authentication) {
+                Ok(password) => password,
+                Err(error) => {
+                    return ConnectionAttempt::Permanent(
+                        ConnectionFailure::Authentication,
+                        error.message(),
+                    );
+                }
+            };
+            let result = wait_for_ssh_operation(
+                handle.authenticate_password(profile.username(), &password),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await;
+            password.zeroize();
+            result
+        }
+        WorkerAuthentication::PublicKey(private_key) => {
+            let hash_algorithm = match wait_for_ssh_operation(
+                handle.best_supported_rsa_hash(),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+            {
+                WorkerWait::Completed(Ok(hash_algorithm)) => hash_algorithm.flatten(),
+                WorkerWait::Completed(Err(_)) => {
+                    return ConnectionAttempt::Permanent(
+                        ConnectionFailure::Authentication,
+                        "SSH public-key authentication could not select a signature algorithm",
+                    );
+                }
+                WorkerWait::Shutdown => {
+                    let _ = stop_handle(handle, shared).await;
+                    return ConnectionAttempt::Shutdown;
+                }
+            };
+            wait_for_ssh_operation(
+                handle.authenticate_publickey(
+                    profile.username(),
+                    russh::keys::PrivateKeyWithHashAlg::new(
+                        Arc::clone(private_key),
+                        hash_algorithm,
+                    ),
+                ),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+        WorkerAuthentication::Certificate(authentication) => {
+            wait_for_ssh_operation(
+                handle.authenticate_openssh_cert(
+                    profile.username(),
+                    Arc::clone(&authentication.key),
+                    authentication.certificate.as_ref().clone(),
+                ),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+        WorkerAuthentication::StoredPrivateKey(authentication) => {
+            // Resolve and parse only after the transport and host-key gate
+            // are ready, immediately before public-key authentication on
+            // this worker (mirrors `StoredPassword` above).
+            let private_key = match resolve_stored_private_key(authentication) {
+                Ok(private_key) => private_key,
+                Err(error) => {
+                    return ConnectionAttempt::Permanent(
+                        ConnectionFailure::Authentication,
+                        error.message(),
+                    );
+                }
+            };
+            let hash_algorithm = match wait_for_ssh_operation(
+                handle.best_supported_rsa_hash(),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+            {
+                WorkerWait::Completed(Ok(hash_algorithm)) => hash_algorithm.flatten(),
+                WorkerWait::Completed(Err(_)) => {
+                    return ConnectionAttempt::Permanent(
+                        ConnectionFailure::Authentication,
+                        "SSH public-key authentication could not select a signature algorithm",
+                    );
+                }
+                WorkerWait::Shutdown => {
+                    let _ = stop_handle(handle, shared).await;
+                    return ConnectionAttempt::Shutdown;
+                }
+            };
+            wait_for_ssh_operation(
+                handle.authenticate_publickey(
+                    profile.username(),
+                    russh::keys::PrivateKeyWithHashAlg::new(private_key, hash_algorithm),
+                ),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+        WorkerAuthentication::Interactive => {
+            // No credential was supplied upfront: the host key has already
+            // been verified above (via `check_server_key`, exactly like any
+            // other credential), so this is the first moment a password is
+            // actually needed — matching `ssh`'s own ordering instead of
+            // collecting one blind before a connection even exists. A wrong
+            // password is retried in place, on this same connection, up to
+            // `MAX_INTERACTIVE_PASSWORD_ATTEMPTS`.
+            let mut attempt: u8 = 1;
+            let mut previous_attempt_failed = false;
+            loop {
+                let waiter = match request_password_verification(
+                    profile,
+                    shared,
+                    password_gate,
+                    attempt,
+                    previous_attempt_failed,
+                ) {
+                    Ok(waiter) => waiter,
+                    Err(_) => {
+                        let _ = stop_handle(handle, shared).await;
+                        return ConnectionAttempt::Shutdown;
+                    }
+                };
+                let mut password = match waiter
+                    .wait_async(password_gate, PASSWORD_DECISION_TIMEOUT)
+                    .await
+                {
+                    Some(password) => password,
+                    None => {
+                        let _ = stop_handle(handle, shared).await;
+                        return ConnectionAttempt::Shutdown;
+                    }
+                };
+                let result = wait_for_ssh_operation(
+                    handle.authenticate_password(profile.username(), &password),
+                    command_receiver,
+                    shared,
+                    host_key_gate,
+                )
+                .await;
+                password.zeroize();
+                let retry_exhausted = attempt >= MAX_INTERACTIVE_PASSWORD_ATTEMPTS;
+                match &result {
+                    WorkerWait::Completed(Ok(auth)) if auth.success() => break result,
+                    WorkerWait::Completed(Ok(_)) | WorkerWait::Completed(Err(_))
+                        if !retry_exhausted =>
+                    {
+                        attempt += 1;
+                        previous_attempt_failed = true;
+                    }
+                    WorkerWait::Completed(_) | WorkerWait::Shutdown => break result,
+                }
+            }
+        }
+    };
+
+    match authentication_result {
+        WorkerWait::Completed(Ok(result)) if result.success() => {}
+        WorkerWait::Completed(Ok(_)) | WorkerWait::Completed(Err(_)) => {
+            return ConnectionAttempt::Permanent(
+                ConnectionFailure::Authentication,
+                "SSH authentication failed",
+            );
+        }
+        WorkerWait::Shutdown => {
+            let _ = stop_handle(handle, shared).await;
+            return ConnectionAttempt::Shutdown;
+        }
+    }
+
+    // A persistent strategy's capability is probed lazily, immediately
+    // before it would otherwise be relied on, and never speculatively or in
+    // the background (ADR 0018, Issue #49 "run the provider capability
+    // probe lazily and surface unavailable-provider errors clearly"). This
+    // uses its own throwaway channel so a missing provider is reported
+    // distinctly from an ordinary shell/exec setup failure, without ever
+    // touching the PTY channel opened below.
+    if let SessionStrategy::Persistent { provider, .. } = strategy {
+        match probe_persistence_provider(
+            &handle,
+            *provider,
+            command_receiver,
+            shared,
+            host_key_gate,
+        )
+        .await
+        {
+            ProviderProbeOutcome::Available => {}
+            ProviderProbeOutcome::Unavailable => {
+                return ConnectionAttempt::Permanent(
+                    ConnectionFailure::ProviderUnavailable,
+                    "the configured durable-session provider is not available on the remote host",
+                );
+            }
+            ProviderProbeOutcome::ProbeFailed => {
+                return ConnectionAttempt::Permanent(
+                    ConnectionFailure::ProviderUnavailable,
+                    "the durable-session provider could not be probed on the remote host",
+                );
+            }
+            ProviderProbeOutcome::Shutdown => {
+                let _ = stop_handle(handle, shared).await;
+                return ConnectionAttempt::Shutdown;
+            }
+        }
+    }
+
+    let channel = match wait_for_ssh_operation(
+        handle.channel_open_session(),
+        command_receiver,
+        shared,
+        host_key_gate,
+    )
+    .await
+    {
+        WorkerWait::Completed(Ok(channel)) => channel,
+        WorkerWait::Completed(Err(_)) => {
+            return ConnectionAttempt::Permanent(
+                ConnectionFailure::Setup,
+                "SSH session channel could not open",
+            );
+        }
+        WorkerWait::Shutdown => {
+            let _ = stop_handle(handle, shared).await;
+            return ConnectionAttempt::Shutdown;
+        }
+    };
+    let mut channel = channel;
+    let initial_size = shared.desired_terminal_size();
+    let dimensions = ssh_terminal_dimensions(initial_size);
+    match wait_for_ssh_operation(
+        channel.request_pty(
+            true,
+            profile.terminal_type(),
+            dimensions.0,
+            dimensions.1,
+            dimensions.2,
+            dimensions.3,
+            &[],
+        ),
+        command_receiver,
+        shared,
+        host_key_gate,
+    )
+    .await
+    {
+        WorkerWait::Completed(Ok(())) => {}
+        WorkerWait::Completed(Err(_)) => {
+            return ConnectionAttempt::Permanent(ConnectionFailure::Setup, "SSH PTY request failed")
+        }
+        WorkerWait::Shutdown => {
+            let _ = stop_handle(handle, shared).await;
+            return ConnectionAttempt::Shutdown;
+        }
+    }
+    match wait_for_channel_request_reply(&mut channel, command_receiver, shared, host_key_gate)
+        .await
+    {
+        ChannelRequestReply::Accepted => {}
+        ChannelRequestReply::Rejected => {
+            return ConnectionAttempt::Permanent(
+                ConnectionFailure::Setup,
+                "SSH PTY request was rejected",
+            );
+        }
+        ChannelRequestReply::Shutdown => {
+            let _ = stop_handle(handle, shared).await;
+            return ConnectionAttempt::Shutdown;
+        }
+    }
+
+    let shell_launch_result = match strategy {
+        SessionStrategy::PlainShell => {
+            wait_for_ssh_operation(
+                channel.request_shell(true),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+        SessionStrategy::Persistent {
+            provider,
+            session_name,
+        } => {
+            let attach_size = shared.desired_terminal_size();
+            wait_for_ssh_operation(
+                channel.exec(
+                    true,
+                    provider.attach_or_create_command(session_name, attach_size),
+                ),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+    };
+    match shell_launch_result {
+        WorkerWait::Completed(Ok(())) => {}
+        WorkerWait::Completed(Err(_)) => {
+            return ConnectionAttempt::Permanent(
+                ConnectionFailure::Setup,
+                "SSH shell request failed",
+            )
+        }
+        WorkerWait::Shutdown => {
+            let _ = stop_handle(handle, shared).await;
+            return ConnectionAttempt::Shutdown;
+        }
+    }
+    match wait_for_channel_request_reply(&mut channel, command_receiver, shared, host_key_gate)
+        .await
+    {
+        ChannelRequestReply::Accepted => {
+            let mut applied_size = initial_size;
+            while let Some(latest_size) = shared.take_pre_running_resize() {
+                if latest_size != applied_size {
+                    let dimensions = ssh_terminal_dimensions(latest_size);
+                    match wait_for_ssh_operation(
+                        channel.window_change(
+                            dimensions.0,
+                            dimensions.1,
+                            dimensions.2,
+                            dimensions.3,
+                        ),
+                        command_receiver,
+                        shared,
+                        host_key_gate,
+                    )
+                    .await
+                    {
+                        WorkerWait::Completed(Ok(())) => {}
+                        WorkerWait::Completed(Err(_)) => {
+                            return ConnectionAttempt::Permanent(
+                                ConnectionFailure::Setup,
+                                "SSH initial resize failed",
+                            );
+                        }
+                        WorkerWait::Shutdown => {
+                            let _ = stop_handle(handle, shared).await;
+                            return ConnectionAttempt::Shutdown;
+                        }
+                    }
+                }
+                applied_size = latest_size;
+                shared.record_resize_applied(latest_size);
+            }
+            ConnectionAttempt::Established(handle, channel, forwarded_tcpip_receiver)
+        }
+        ChannelRequestReply::Rejected => {
+            ConnectionAttempt::Permanent(ConnectionFailure::Setup, "SSH shell request was rejected")
+        }
+        ChannelRequestReply::Shutdown => {
+            let _ = stop_handle(handle, shared).await;
+            ConnectionAttempt::Shutdown
+        }
+    }
+}
+
+enum AuthenticatedHandleAttempt {
+    Established(russh::client::Handle<SshClientHandler>),
+    Retryable(ConnectionFailure, &'static str),
+    Permanent(ConnectionFailure, &'static str),
+    Shutdown,
+}
+
+async fn establish_authenticated_handle(
+    profile: &SshConnectionProfile,
+    authentication: &WorkerAuthentication,
+    known_host_fingerprint: Option<&str>,
+    shared: &Arc<WorkerShared>,
+    command_receiver: &WorkerCommandReceiver,
+    host_key_gate: &Arc<HostKeyDecisionGate>,
+    password_gate: &Arc<PasswordDecisionGate>,
+) -> AuthenticatedHandleAttempt {
+    if process_commands_before_running(command_receiver, shared, host_key_gate) {
+        return AuthenticatedHandleAttempt::Shutdown;
+    }
+    let config = Arc::new(russh::client::Config {
+        nodelay: true,
+        ..Default::default()
+    });
+    let host_key_rejected = Arc::new(AtomicBool::new(false));
+    let (forwarded_tcpip_sender, _) =
+        tokio::sync::mpsc::channel(PORT_FORWARD_PENDING_CONNECTION_CAPACITY);
+    let handler = SshClientHandler {
+        identity: profile.identity.clone(),
+        shared: Arc::clone(shared),
+        host_key_gate: Arc::clone(host_key_gate),
+        host_key_rejected: Arc::clone(&host_key_rejected),
+        forwarded_tcpip_sender,
+        expected_fingerprint: known_host_fingerprint.map(str::to_owned),
+    };
+    let connection = russh::client::connect(
+        config,
+        (profile.identity.host(), profile.identity.port()),
+        handler,
+    );
+    tokio::pin!(connection);
+    let connection_timeout = tokio::time::sleep(CONNECT_TIMEOUT);
+    tokio::pin!(connection_timeout);
+
+    let mut handle = loop {
+        tokio::select! {
+            result = &mut connection => match result {
+                Ok(handle) => break handle,
+                Err(_) if host_key_rejected.load(Ordering::Acquire) => {
+                    return AuthenticatedHandleAttempt::Permanent(
+                        ConnectionFailure::HostTrust,
+                        "SSH host key was rejected",
+                    );
+                }
+                Err(_) => {
+                    return AuthenticatedHandleAttempt::Retryable(
+                        ConnectionFailure::Transport,
+                        "SSH connection failed",
+                    )
+                }
+            },
+            _ = &mut connection_timeout => return AuthenticatedHandleAttempt::Retryable(
+                ConnectionFailure::Transport,
+                "SSH connection timed out",
+            ),
+            _ = tokio::time::sleep(COMMAND_POLL_INTERVAL) => {
+                hold_connect_deadline_while_reviewing(connection_timeout.as_mut(), host_key_gate);
+                if process_commands_before_running(command_receiver, shared, host_key_gate) {
+                    return AuthenticatedHandleAttempt::Shutdown;
+                }
+            }
+        }
+    };
+
+    let authentication_result = match authentication {
+        WorkerAuthentication::Password(password) => {
+            wait_for_ssh_operation(
+                handle.authenticate_password_zeroizing(profile.username(), password.clone()),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+        WorkerAuthentication::StoredPassword(authentication) => {
+            let mut password = match resolve_stored_password(authentication) {
+                Ok(password) => password,
+                Err(error) => {
+                    return AuthenticatedHandleAttempt::Permanent(
+                        ConnectionFailure::Authentication,
+                        error.message(),
+                    );
+                }
+            };
+            let result = wait_for_ssh_operation(
+                handle.authenticate_password(profile.username(), &password),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await;
+            password.zeroize();
+            result
+        }
+        WorkerAuthentication::PublicKey(private_key) => {
+            let hash_algorithm = match wait_for_ssh_operation(
+                handle.best_supported_rsa_hash(),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+            {
+                WorkerWait::Completed(Ok(hash_algorithm)) => hash_algorithm.flatten(),
+                WorkerWait::Completed(Err(_)) => {
+                    return AuthenticatedHandleAttempt::Permanent(
+                        ConnectionFailure::Authentication,
+                        "SSH public-key authentication could not select a signature algorithm",
+                    );
+                }
+                WorkerWait::Shutdown => {
+                    let _ = stop_handle(handle, shared).await;
+                    return AuthenticatedHandleAttempt::Shutdown;
+                }
+            };
+            wait_for_ssh_operation(
+                handle.authenticate_publickey(
+                    profile.username(),
+                    russh::keys::PrivateKeyWithHashAlg::new(
+                        Arc::clone(private_key),
+                        hash_algorithm,
+                    ),
+                ),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+        WorkerAuthentication::Certificate(authentication) => {
+            wait_for_ssh_operation(
+                handle.authenticate_openssh_cert(
+                    profile.username(),
+                    Arc::clone(&authentication.key),
+                    authentication.certificate.as_ref().clone(),
+                ),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+        WorkerAuthentication::StoredPrivateKey(authentication) => {
+            let private_key = match resolve_stored_private_key(authentication) {
+                Ok(private_key) => private_key,
+                Err(error) => {
+                    return AuthenticatedHandleAttempt::Permanent(
+                        ConnectionFailure::Authentication,
+                        error.message(),
+                    );
+                }
+            };
+            let hash_algorithm = match wait_for_ssh_operation(
+                handle.best_supported_rsa_hash(),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+            {
+                WorkerWait::Completed(Ok(hash_algorithm)) => hash_algorithm.flatten(),
+                WorkerWait::Completed(Err(_)) => {
+                    return AuthenticatedHandleAttempt::Permanent(
+                        ConnectionFailure::Authentication,
+                        "SSH public-key authentication could not select a signature algorithm",
+                    );
+                }
+                WorkerWait::Shutdown => {
+                    let _ = stop_handle(handle, shared).await;
+                    return AuthenticatedHandleAttempt::Shutdown;
+                }
+            };
+            wait_for_ssh_operation(
+                handle.authenticate_publickey(
+                    profile.username(),
+                    russh::keys::PrivateKeyWithHashAlg::new(private_key, hash_algorithm),
+                ),
+                command_receiver,
+                shared,
+                host_key_gate,
+            )
+            .await
+        }
+        WorkerAuthentication::Interactive => {
+            let mut attempt: u8 = 1;
+            let mut previous_attempt_failed = false;
+            loop {
+                let waiter = match request_password_verification(
+                    profile,
+                    shared,
+                    password_gate,
+                    attempt,
+                    previous_attempt_failed,
+                ) {
+                    Ok(waiter) => waiter,
+                    Err(_) => {
+                        let _ = stop_handle(handle, shared).await;
+                        return AuthenticatedHandleAttempt::Shutdown;
+                    }
+                };
+                let mut password = match waiter
+                    .wait_async(password_gate, PASSWORD_DECISION_TIMEOUT)
+                    .await
+                {
+                    Some(password) => password,
+                    None => {
+                        let _ = stop_handle(handle, shared).await;
+                        return AuthenticatedHandleAttempt::Shutdown;
+                    }
+                };
+                let result = wait_for_ssh_operation(
+                    handle.authenticate_password(profile.username(), &password),
+                    command_receiver,
+                    shared,
+                    host_key_gate,
+                )
+                .await;
+                password.zeroize();
+                let retry_exhausted = attempt >= MAX_INTERACTIVE_PASSWORD_ATTEMPTS;
+                match &result {
+                    WorkerWait::Completed(Ok(auth)) if auth.success() => break result,
+                    WorkerWait::Completed(Ok(_)) | WorkerWait::Completed(Err(_))
+                        if !retry_exhausted =>
+                    {
+                        attempt += 1;
+                        previous_attempt_failed = true;
+                    }
+                    WorkerWait::Completed(_) | WorkerWait::Shutdown => break result,
+                }
+            }
+        }
+    };
+
+    match authentication_result {
+        WorkerWait::Completed(Ok(result)) if result.success() => {
+            AuthenticatedHandleAttempt::Established(handle)
+        }
+        WorkerWait::Completed(Ok(_)) | WorkerWait::Completed(Err(_)) => {
+            AuthenticatedHandleAttempt::Permanent(
+                ConnectionFailure::Authentication,
+                "SSH authentication failed",
+            )
+        }
+        WorkerWait::Shutdown => {
+            let _ = stop_handle(handle, shared).await;
+            AuthenticatedHandleAttempt::Shutdown
+        }
+    }
+}
+
+async fn wait_for_sftp_operation<T, F>(
+    operation: F,
+    command_receiver: &WorkerCommandReceiver,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+) -> WorkerWait<Result<T, sftp::SftpSessionError>>
+where
+    F: std::future::Future<Output = Result<T, sftp::SftpSessionError>>,
+{
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            result = &mut operation => return WorkerWait::Completed(Ok(result)),
+            _ = tokio::time::sleep(COMMAND_POLL_INTERVAL) => {
+                if process_commands_before_running(command_receiver, shared, host_key_gate) {
+                    return WorkerWait::Shutdown;
+                }
+            }
+        }
+    }
+}
+
+const SFTP_INPUT_REFUSAL_MESSAGE: &str =
+    "One or more SFTP command lines exceeded the 256 KiB (262144-byte) limit and were not executed. Remaining bytes are ignored until a line ending or Ctrl+C; then enter a new command.";
+
+#[derive(Default)]
+struct SftpInputNotice {
+    pending: Option<SessionEvent>,
+}
+
+impl SftpInputNotice {
+    fn refuse(&mut self, shared: &WorkerShared) {
+        tracing::warn!(
+            target: "festerm::sftp",
+            "SFTP command input exceeded the 256 KiB limit; entire line refused"
+        );
+        if self.pending.is_none() {
+            self.pending = Some(SessionEvent::Error(SessionError::new(
+                SessionErrorKind::Input,
+                SFTP_INPUT_REFUSAL_MESSAGE,
+            )));
+        }
+        self.flush(shared);
+    }
+
+    fn flush(&mut self, shared: &WorkerShared) {
+        if let Some(event) = self.pending.take() {
+            self.pending = shared.try_emit_retaining(event).err();
+        }
+    }
+
+    fn finish(&mut self, shared: &WorkerShared) {
+        self.flush(shared);
+        if self.pending.take().is_some() {
+            eprintln!("fesTerm: {SFTP_INPUT_REFUSAL_MESSAGE}");
+        }
+    }
+}
+
+impl Drop for SftpInputNotice {
+    fn drop(&mut self) {
+        if self.pending.is_some() {
+            eprintln!("fesTerm: {SFTP_INPUT_REFUSAL_MESSAGE}");
+        }
+    }
+}
+
+async fn execute_sftp_input_line(
+    profile: &SshConnectionProfile,
+    line: Vec<u8>,
+    session: &mut sftp::SftpSession,
+    working_directories: &Arc<Mutex<Option<SftpWorkingDirectories>>>,
+    shared: &WorkerShared,
+    input_notice: &mut SftpInputNotice,
+) -> Result<bool, SessionError> {
+    let line =
+        String::from_utf8(line).map_err(|_| sftp_failure(shared, "SFTP input must be UTF-8"))?;
+    let outcome = wait_for_sftp_owner_operation(session.execute_line(&line), shared, || {
+        input_notice.flush(shared);
+    })
+    .await;
+    let SftpOwnerOperation::Completed(outcome) = outcome else {
+        finish_sftp_cancellation(session, shared).await;
+        return Ok(true);
+    };
+    match outcome {
+        Ok(outcome) => {
+            update_sftp_working_directories(working_directories, session);
+            emit_sftp_outcome(shared, &outcome);
+            if !matches!(outcome, sftp::SftpCommandOutcome::SessionClosed) {
+                emit_sftp_prompt(shared, profile, session);
+                return Ok(false);
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            emit_sftp_output(shared, format!("{error}\r\n"));
+            emit_sftp_prompt(shared, profile, session);
+            Ok(false)
+        }
+    }
+}
+
+enum SftpOwnerOperation<T> {
+    Completed(T),
+    Cancelled,
+}
+
+async fn wait_for_sftp_owner_operation<T>(
+    operation: impl std::future::Future<Output = T>,
+    shared: &WorkerShared,
+    mut on_tick: impl FnMut(),
+) -> SftpOwnerOperation<T> {
+    tokio::pin!(operation);
+    loop {
+        if shared.shutdown_requested() {
+            return SftpOwnerOperation::Cancelled;
+        }
+        tokio::select! {
+            result = &mut operation => return SftpOwnerOperation::Completed(result),
+            _ = tokio::time::sleep(COMMAND_POLL_INTERVAL) => on_tick(),
+        }
+    }
+}
+
+async fn finish_sftp_cancellation(session: &mut SftpSession, shared: &WorkerShared) {
+    shared.set_lifecycle(SessionLifecycle::Stopping);
+    let result = tokio::time::timeout(SFTP_CANCELLATION_CLEANUP_TIMEOUT, async {
+        session.cleanup_interrupted_transfer().await?;
+        session.close().await.map(|_| ())
+    })
+    .await;
+    let error = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error,
+        Err(_) => SftpSessionError::CancellationCleanupTimedOut,
+    };
+    let error = SessionError::new(SessionErrorKind::Shutdown, error.to_string());
+    tracing::warn!(
+        target: "festerm::sftp",
+        "text SFTP cancellation cleanup failed; partial output may remain"
+    );
+    if !shared.try_emit(SessionEvent::Error(error.clone())) {
+        eprintln!("fesTerm: SFTP cancellation cleanup failed: {error}");
+    }
+}
+
+async fn process_sftp_input_bytes(
+    profile: &SshConnectionProfile,
+    bytes: Vec<u8>,
+    input_buffer: &mut SftpInputBuffer,
+    session: &mut sftp::SftpSession,
+    working_directories: &Arc<Mutex<Option<SftpWorkingDirectories>>>,
+    shared: &WorkerShared,
+    input_notice: &mut SftpInputNotice,
+) -> Result<bool, SessionError> {
+    let byte_count = bytes.len();
+    let mut echo = Vec::with_capacity(byte_count);
+    for byte in bytes {
+        let action = input_buffer.push(byte);
+        if let SftpInputAction::Echo(byte) = action {
+            echo.push(byte);
+            continue;
+        }
+        if !echo.is_empty() {
+            input_notice.flush(shared);
+            let _ = shared.try_emit(SessionEvent::Output(std::mem::take(&mut echo)));
+        }
+        input_notice.flush(shared);
+        match action {
+            SftpInputAction::Submit(line) => {
+                emit_sftp_output(shared, "\r\n");
+                if execute_sftp_input_line(
+                    profile,
+                    line,
+                    session,
+                    working_directories,
+                    shared,
+                    input_notice,
+                )
+                .await?
+                {
+                    shared.record_input_sent(byte_count);
+                    return Ok(true);
+                }
+            }
+            SftpInputAction::Erase => {
+                emit_sftp_output(shared, "\u{8} \u{8}");
+            }
+            SftpInputAction::Cancel => {
+                emit_sftp_output(shared, "^C\r\n");
+                emit_sftp_prompt(shared, profile, session);
+            }
+            SftpInputAction::Refuse => input_notice.refuse(shared),
+            SftpInputAction::RefusedLineEnded => {
+                emit_sftp_output(shared, "\r\n");
+                emit_sftp_prompt(shared, profile, session);
+            }
+            SftpInputAction::Ignore => {}
+            SftpInputAction::Echo(_) => unreachable!("echo bytes are accumulated before controls"),
+        }
+    }
+    if !echo.is_empty() {
+        input_notice.flush(shared);
+        let _ = shared.try_emit(SessionEvent::Output(echo));
+    }
+    shared.record_input_sent(byte_count);
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sftp_worker(
+    profile: SshConnectionProfile,
+    authentication: SshAuthentication,
+    local_working_directory: Option<PathBuf>,
+    known_host_fingerprint: Option<String>,
+    working_directories: Arc<Mutex<Option<SftpWorkingDirectories>>>,
+    shared: Arc<WorkerShared>,
+    command_receiver: WorkerCommandReceiver,
+    host_key_gate: Arc<HostKeyDecisionGate>,
+    password_gate: Arc<PasswordDecisionGate>,
+) -> Result<ShutdownResult, SessionError> {
+    shared.begin_transport();
+    let authentication = authentication.into_worker_authentication();
+    let handle = match establish_authenticated_handle(
+        &profile,
+        &authentication,
+        known_host_fingerprint.as_deref(),
+        &shared,
+        &command_receiver,
+        &host_key_gate,
+        &password_gate,
+    )
+    .await
+    {
+        AuthenticatedHandleAttempt::Established(handle) => handle,
+        AuthenticatedHandleAttempt::Retryable(failure, message)
+        | AuthenticatedHandleAttempt::Permanent(failure, message) => {
+            return Err(sftp_failure_with_kind(
+                &shared,
+                session_error_kind_for_failure(failure),
+                message,
+            ));
+        }
+        AuthenticatedHandleAttempt::Shutdown => {
+            shared.set_lifecycle(SessionLifecycle::Stopped);
+            return Ok(ShutdownResult::Stopped);
+        }
+    };
+
+    let handle = Arc::new(handle);
+    let mut remote_reads = RemoteFileReads::default();
+    let connect = async {
+        match local_working_directory {
+            Some(path) => {
+                sftp::SftpSession::connect_with_local_directory(handle.as_ref(), path).await
+            }
+            None => sftp::SftpSession::connect(handle.as_ref()).await,
+        }
+    };
+    let mut session =
+        match wait_for_sftp_operation(connect, &command_receiver, &shared, &host_key_gate).await {
+            WorkerWait::Completed(Ok(Ok(session))) => session,
+            WorkerWait::Completed(Ok(Err(error))) => {
+                let _ = stop_handle_after_remote_reads(handle, &mut remote_reads, &shared).await;
+                return Err(sftp_failure(
+                    &shared,
+                    format!("SFTP session failed to start: {error}"),
+                ));
+            }
+            WorkerWait::Completed(Err(_)) => unreachable!("SFTP worker wraps its result in Ok"),
+            WorkerWait::Shutdown => {
+                let _ = stop_handle_after_remote_reads(handle, &mut remote_reads, &shared).await;
+                shared.set_lifecycle(SessionLifecycle::Stopped);
+                return Ok(ShutdownResult::Stopped);
+            }
+        };
+
+    shared.set_lifecycle(SessionLifecycle::Running);
+    update_sftp_working_directories(&working_directories, &session);
+    emit_sftp_startup_banner(&shared, &profile, &session);
+    emit_sftp_prompt(&shared, &profile, &session);
+
+    let mut input_buffer = SftpInputBuffer::default();
+    let mut input_notice = SftpInputNotice::default();
+    loop {
+        input_notice.flush(&shared);
+        remote_reads.reap();
+        if shared.shutdown_requested() {
+            input_notice.finish(&shared);
+            shared.set_lifecycle(SessionLifecycle::Stopping);
+            finish_sftp_cancellation(&mut session, &shared).await;
+            let result = stop_handle_after_remote_reads(handle, &mut remote_reads, &shared)
+                .await
+                .unwrap_or(ShutdownResult::Stopped);
+            shared.set_lifecycle(SessionLifecycle::Stopped);
+            return Ok(result);
+        }
+        match command_receiver.try_recv() {
+            Ok(WorkerCommand::Input(bytes)) => {
+                if process_sftp_input_bytes(
+                    &profile,
+                    bytes,
+                    &mut input_buffer,
+                    &mut session,
+                    &working_directories,
+                    &shared,
+                    &mut input_notice,
+                )
+                .await?
+                {
+                    input_notice.finish(&shared);
+                    shared.set_lifecycle(SessionLifecycle::Stopping);
+                    let result = stop_handle_after_remote_reads(handle, &mut remote_reads, &shared)
+                        .await
+                        .unwrap_or(ShutdownResult::Stopped);
+                    shared.set_lifecycle(SessionLifecycle::Stopped);
+                    return Ok(result);
+                }
+            }
+            Ok(WorkerCommand::AutomationInput(_)) => {
+                unreachable!("the command receiver resolves automation input")
+            }
+            Ok(WorkerCommand::Resize(size)) => shared.record_running_resize(size),
+            Ok(WorkerCommand::ReadRemoteFile {
+                path,
+                max_bytes,
+                generation,
+                result_sender,
+            }) => {
+                remote_reads.start(
+                    Arc::clone(&handle),
+                    Arc::clone(&shared),
+                    path,
+                    max_bytes,
+                    generation,
+                    result_sender,
+                );
+            }
+            Ok(WorkerCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
+                input_notice.finish(&shared);
+                shared.set_lifecycle(SessionLifecycle::Stopping);
+                finish_sftp_cancellation(&mut session, &shared).await;
+                let result = stop_handle_after_remote_reads(handle, &mut remote_reads, &shared)
+                    .await
+                    .unwrap_or(ShutdownResult::Stopped);
+                shared.set_lifecycle(SessionLifecycle::Stopped);
+                return Ok(result);
+            }
+            Ok(
+                WorkerCommand::ApplyPortForwards(_)
+                | WorkerCommand::AddPortForward(_)
+                | WorkerCommand::RemovePortForward(..)
+                | WorkerCommand::QueryPortForwards
+                | WorkerCommand::Reconnect,
+            ) => {}
+            Err(TryRecvError::Empty) => {
+                tokio::time::sleep(COMMAND_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
+enum WorkerWait<T> {
+    Completed(Result<T, russh::Error>),
+    Shutdown,
+}
+
+async fn wait_for_ssh_operation<T, F>(
+    operation: F,
+    command_receiver: &WorkerCommandReceiver,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+) -> WorkerWait<T>
+where
+    F: std::future::Future<Output = Result<T, russh::Error>>,
+{
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            result = &mut operation => return WorkerWait::Completed(result),
+            _ = tokio::time::sleep(COMMAND_POLL_INTERVAL) => {
+                if process_commands_before_running(command_receiver, shared, host_key_gate) {
+                    return WorkerWait::Shutdown;
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_running_ssh_operation<T, F>(
+    operation: F,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+) -> WorkerWait<T>
+where
+    F: std::future::Future<Output = Result<T, russh::Error>>,
+{
+    tokio::pin!(operation);
+    loop {
+        if shared.shutdown_requested() {
+            host_key_gate.reject_pending();
+            shared.set_lifecycle(SessionLifecycle::Stopping);
+            return WorkerWait::Shutdown;
+        }
+        tokio::select! {
+            result = &mut operation => return WorkerWait::Completed(result),
+            _ = tokio::time::sleep(COMMAND_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+enum ChannelRequestReply {
+    Accepted,
+    Rejected,
+    Shutdown,
+}
+
+async fn wait_for_channel_request_reply(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    command_receiver: &WorkerCommandReceiver,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+) -> ChannelRequestReply {
+    let mut command_poll = CommandPoll::new(tokio::time::Instant::now());
+    loop {
+        if command_poll.due(tokio::time::Instant::now(), shared.shutdown_requested()) {
+            if process_commands_before_running(command_receiver, shared, host_key_gate) {
+                return ChannelRequestReply::Shutdown;
+            }
+            command_poll.processed(tokio::time::Instant::now());
+        }
+        tokio::select! {
+            message = channel.wait() => match message {
+                Some(russh::ChannelMsg::Success) => return ChannelRequestReply::Accepted,
+                Some(russh::ChannelMsg::Data { data }) => emit_channel_output(shared, data.as_ref()),
+                Some(russh::ChannelMsg::Failure | russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => return ChannelRequestReply::Rejected,
+                Some(_) => {}
+            },
+            _ = tokio::time::sleep_until(command_poll.deadline) => {}
+        }
+    }
+}
+
+/// The result of lazily probing whether `provider` is available on the
+/// remote host, run only immediately before a persistent strategy would
+/// otherwise rely on it (ADR 0018, Issue #49). This never runs
+/// speculatively, in the background, or for a plain shell.
+enum ProviderProbeOutcome {
+    /// `provider`'s capability-probe command exited zero: it is present.
+    Available,
+    /// `provider`'s capability-probe command exited non-zero: it is
+    /// missing, so the caller must not attempt to attach or create a
+    /// durable session with it.
+    Unavailable,
+    /// The probe command itself could not be run to completion (the probe
+    /// channel failed to open, the exec request was rejected, or the
+    /// remote end closed the channel before an exit status arrived). This
+    /// is distinct from `Unavailable`: the host may or may not have the
+    /// provider, but fesTerm could not find out.
+    ProbeFailed,
+    Shutdown,
+}
+
+/// Runs `provider`'s capability-probe command on a throwaway channel and
+/// waits for its exit status. Probe output is discarded rather than routed
+/// to the terminal: this channel never becomes the session's PTY.
+async fn probe_persistence_provider(
+    handle: &russh::client::Handle<SshClientHandler>,
+    provider: PersistenceProvider,
+    command_receiver: &WorkerCommandReceiver,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+) -> ProviderProbeOutcome {
+    let mut channel = match wait_for_ssh_operation(
+        handle.channel_open_session(),
+        command_receiver,
+        shared,
+        host_key_gate,
+    )
+    .await
+    {
+        WorkerWait::Completed(Ok(channel)) => channel,
+        WorkerWait::Completed(Err(_)) => return ProviderProbeOutcome::ProbeFailed,
+        WorkerWait::Shutdown => return ProviderProbeOutcome::Shutdown,
+    };
+    match wait_for_ssh_operation(
+        channel.exec(true, provider.capability_probe_command()),
+        command_receiver,
+        shared,
+        host_key_gate,
+    )
+    .await
+    {
+        WorkerWait::Completed(Ok(())) => {}
+        WorkerWait::Completed(Err(_)) => return ProviderProbeOutcome::ProbeFailed,
+        WorkerWait::Shutdown => return ProviderProbeOutcome::Shutdown,
+    }
+    let mut command_poll = CommandPoll::new(tokio::time::Instant::now());
+    loop {
+        if command_poll.due(tokio::time::Instant::now(), shared.shutdown_requested()) {
+            if process_commands_before_running(command_receiver, shared, host_key_gate) {
+                return ProviderProbeOutcome::Shutdown;
+            }
+            command_poll.processed(tokio::time::Instant::now());
+        }
+        tokio::select! {
+            message = channel.wait() => match message {
+                Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                    return if exit_status == 0 {
+                        ProviderProbeOutcome::Available
+                    } else {
+                        ProviderProbeOutcome::Unavailable
+                    };
+                }
+                Some(russh::ChannelMsg::ExitSignal { .. }) => return ProviderProbeOutcome::ProbeFailed,
+                // `Eof` alone must not end the probe: servers are not
+                // required to send the exit-status channel request before
+                // eof, and for a near-instant command like a capability
+                // probe it is common to observe eof arrive first. Only a
+                // fully closed channel that never delivered an exit status
+                // is a genuine probe failure.
+                Some(russh::ChannelMsg::Eof) => {}
+                Some(russh::ChannelMsg::Close) | None => {
+                    return ProviderProbeOutcome::ProbeFailed;
+                }
+                // The probe's own stdout/stderr is deliberately discarded:
+                // this channel is never the session's PTY, so its output
+                // must never reach the terminal.
+                Some(_) => {}
+            },
+            _ = tokio::time::sleep_until(command_poll.deadline) => {}
+        }
+    }
+}
+
+enum RunningOutcome {
+    Shutdown(ShutdownResult),
+    Exited(festerm_session::SessionExit),
+    ConnectionLost(&'static str),
+    ReconnectRequested,
+}
+
+/// Sends a benign SSH-level liveness probe (ADR 0018: "a supported SSH-level
+/// keepalive/global request... whose only purpose is to determine whether
+/// the existing transport still responds") and waits up to
+/// [`LIVENESS_PROBE_TIMEOUT`] for the remote peer's reply.
+///
+/// Returns `true` only if the reply arrived in time. A dead transport
+/// typically fails fast (the underlying send fails once the connection task
+/// has already noticed the loss); a merely slow or partially-black-holed
+/// path is treated as failed once the bound elapses, since ADR 0018 defines
+/// liveness as "still responds", not "may eventually respond".
+async fn probe_liveness(handle: &russh::client::Handle<SshClientHandler>) -> bool {
+    matches!(
+        tokio::time::timeout(LIVENESS_PROBE_TIMEOUT, handle.send_ping()).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Pure decision for whether an automatic/on-demand liveness probe is due
+/// right now, extracted from the main connection loop so the cadence policy
+/// (ADR 0018, issue #55) can be exercised in tests against synthetic
+/// `Instant`s instead of real wall-clock sleeps.
+///
+/// A probe is due if either an on-demand request is pending (wake hook or
+/// `SshSession::try_check_liveness`) or the automatic cadence deadline has
+/// elapsed. Setting `next_probe` far in the future (e.g. `now + Duration::MAX`)
+/// models a "disabled" automatic cadence while still allowing on-demand
+/// requests to fire, which is how tests cover both halves of #55's
+/// acceptance criteria without an always-enabled/always-disabled setting.
+fn liveness_probe_due(
+    now: tokio::time::Instant,
+    next_probe: tokio::time::Instant,
+    on_demand_requested: bool,
+) -> bool {
+    on_demand_requested || now >= next_probe
+}
+
+async fn run_authenticated_channel(
+    handle: Arc<russh::client::Handle<SshClientHandler>>,
+    mut channel: russh::Channel<russh::client::Msg>,
+    mut forwarded_tcpip_receiver: tokio::sync::mpsc::Receiver<ForwardedTcpIpConnection>,
+    initial_profile_port_forwards: Vec<AdmittedPortForward>,
+    command_receiver: &WorkerCommandReceiver,
+    shared: &Arc<WorkerShared>,
+    host_key_gate: &Arc<HostKeyDecisionGate>,
+) -> RunningOutcome {
+    // Tracks the next *automatic* liveness probe (ADR 0018's "ordinary SSH
+    // liveness/keepalive cadence"), independent of any on-demand request a
+    // caller makes via `SshSession::try_check_liveness`/
+    // `WorkerShared::request_liveness_check` (e.g. a future wake/network-
+    // change hook), which is checked on every tick regardless of this
+    // deadline.
+    let mut next_liveness_probe = tokio::time::Instant::now() + LIVENESS_PROBE_INTERVAL;
+    let (local_forward_sender, mut local_forward_receiver) =
+        tokio::sync::mpsc::channel(PORT_FORWARD_PENDING_CONNECTION_CAPACITY);
+    let mut local_forward_receiver_closed = false;
+    let mut forwarded_tcpip_receiver_closed = false;
+    let mut active_port_forwards = PortForwardInventory::default();
+    let mut pending_commands = VecDeque::new();
+    let attempt_limiter = PortForwardAttemptLimiter::new(MAX_IN_FLIGHT_PORT_FORWARD_CONNECTIONS);
+    let mut port_forward_attempts = tokio::task::JoinSet::new();
+    let mut remote_reads = RemoteFileReads::default();
+    if !initial_profile_port_forwards.is_empty() {
+        pending_commands.push_back(WorkerCommand::ApplyPortForwards(
+            initial_profile_port_forwards,
+        ));
+    }
+    let mut command_poll = CommandPoll::new(tokio::time::Instant::now());
+    loop {
+        if command_poll.due(tokio::time::Instant::now(), shared.shutdown_requested()) {
+            match process_authenticated_commands(
+                &handle,
+                &mut channel,
+                &mut pending_commands,
+                &mut active_port_forwards,
+                &local_forward_sender,
+                command_receiver,
+                shared,
+                host_key_gate,
+                &mut remote_reads,
+            )
+            .await
+            {
+                Ok(AuthenticatedCommandOutcome::Continue) => {}
+                Ok(AuthenticatedCommandOutcome::Shutdown) => {
+                    teardown_port_forwards(
+                        Some(handle.as_ref()),
+                        &mut active_port_forwards,
+                        &mut port_forward_attempts,
+                        shared,
+                    )
+                    .await;
+                    return RunningOutcome::Shutdown(
+                        stop_handle_after_remote_reads(handle, &mut remote_reads, shared)
+                            .await
+                            .unwrap_or(ShutdownResult::Stopped),
+                    );
+                }
+                Ok(AuthenticatedCommandOutcome::Reconnect) => {
+                    shared.invalidate_automation_epoch();
+                    teardown_port_forwards(
+                        Some(handle.as_ref()),
+                        &mut active_port_forwards,
+                        &mut port_forward_attempts,
+                        shared,
+                    )
+                    .await;
+                    let _ = stop_handle_after_remote_reads(handle, &mut remote_reads, shared).await;
+                    return RunningOutcome::ReconnectRequested;
+                }
+                Err(_) => {
+                    shared.invalidate_automation_epoch();
+                    teardown_port_forwards(
+                        Some(handle.as_ref()),
+                        &mut active_port_forwards,
+                        &mut port_forward_attempts,
+                        shared,
+                    )
+                    .await;
+                    return RunningOutcome::ConnectionLost("SSH connection ended unexpectedly");
+                }
+            }
+            command_poll.processed(tokio::time::Instant::now());
+        }
+        remote_reads.reap();
+        let probe_due = liveness_probe_due(
+            tokio::time::Instant::now(),
+            next_liveness_probe,
+            shared.take_liveness_check_requested(),
+        );
+        if probe_due {
+            if !probe_liveness(handle.as_ref()).await {
+                shared.invalidate_automation_epoch();
+                teardown_port_forwards(
+                    Some(handle.as_ref()),
+                    &mut active_port_forwards,
+                    &mut port_forward_attempts,
+                    shared,
+                )
+                .await;
+                return RunningOutcome::ConnectionLost(
+                    "SSH liveness probe did not receive a response",
+                );
+            }
+            next_liveness_probe = tokio::time::Instant::now() + LIVENESS_PROBE_INTERVAL;
+        }
+        tokio::select! {
+            result = port_forward_attempts.join_next(), if !port_forward_attempts.is_empty() => {
+                let _ = result;
+            }
+            message = channel.wait() => match message {
+                Some(russh::ChannelMsg::Data { data }) => emit_channel_output(shared, data.as_ref()),
+                Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
+                    shared.invalidate_automation_epoch();
+                    teardown_port_forwards(
+                        Some(handle.as_ref()),
+                        &mut active_port_forwards,
+                        &mut port_forward_attempts,
+                        shared,
+                    ).await;
+                    return RunningOutcome::Exited(festerm_session::SessionExit::with_exit_code(exit_status));
+                }
+                Some(russh::ChannelMsg::ExitSignal { .. }) => {
+                    shared.invalidate_automation_epoch();
+                    teardown_port_forwards(
+                        Some(handle.as_ref()),
+                        &mut active_port_forwards,
+                        &mut port_forward_attempts,
+                        shared,
+                    ).await;
+                    return RunningOutcome::Exited(festerm_session::SessionExit::with_signal(0, "remote signal"));
+                }
+                Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => {
+                    shared.invalidate_automation_epoch();
+                    teardown_port_forwards(
+                        Some(handle.as_ref()),
+                        &mut active_port_forwards,
+                        &mut port_forward_attempts,
+                        shared,
+                    ).await;
+                    return RunningOutcome::ConnectionLost("SSH connection ended unexpectedly");
+                }
+                Some(_) => {}
+            },
+            accepted = local_forward_receiver.recv(), if !local_forward_receiver_closed => match accepted {
+                Some(accepted) => {
+                    handle_local_forward_connection(
+                        &handle,
+                        accepted,
+                        &active_port_forwards,
+                        shared,
+                        &attempt_limiter,
+                        &mut port_forward_attempts,
+                    );
+                }
+                None => local_forward_receiver_closed = true,
+            },
+            forwarded = forwarded_tcpip_receiver.recv(), if !forwarded_tcpip_receiver_closed => match forwarded {
+                Some(forwarded) => {
+                    handle_forwarded_tcpip_connection(
+                        forwarded,
+                        &active_port_forwards,
+                        shared,
+                        &attempt_limiter,
+                        &mut port_forward_attempts,
+                    );
+                }
+                None => forwarded_tcpip_receiver_closed = true,
+            },
+            _ = tokio::time::sleep_until(command_poll.deadline) => {}
+        }
+    }
+}
+
+enum AuthenticatedCommandOutcome {
+    Continue,
+    Shutdown,
+    Reconnect,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_authenticated_commands(
+    handle: &Arc<russh::client::Handle<SshClientHandler>>,
+    channel: &mut russh::Channel<russh::client::Msg>,
+    pending_commands: &mut VecDeque<WorkerCommand>,
+    active_port_forwards: &mut PortForwardInventory,
+    local_forward_sender: &tokio::sync::mpsc::Sender<AcceptedLocalForwardConnection>,
+    command_receiver: &WorkerCommandReceiver,
+    shared: &Arc<WorkerShared>,
+    host_key_gate: &HostKeyDecisionGate,
+    remote_reads: &mut RemoteFileReads,
+) -> Result<AuthenticatedCommandOutcome, SessionError> {
+    loop {
+        if shared.shutdown_requested() {
+            host_key_gate.reject_pending();
+            shared.set_lifecycle(SessionLifecycle::Stopping);
+            return Ok(AuthenticatedCommandOutcome::Shutdown);
+        }
+        let command = if let Some(command) = pending_commands.pop_front() {
+            Ok(command)
+        } else {
+            command_receiver.try_recv()
+        };
+        match command {
+            Ok(WorkerCommand::Input(bytes)) => {
+                let byte_count = bytes.len();
+                match wait_for_running_ssh_operation(
+                    channel.data_bytes(bytes),
+                    shared,
+                    host_key_gate,
+                )
+                .await
+                {
+                    WorkerWait::Completed(Ok(())) => shared.record_input_sent(byte_count),
+                    WorkerWait::Completed(Err(_)) => {
+                        return Err(ssh_failure_with_kind(
+                            shared,
+                            SessionErrorKind::Input,
+                            "SSH input failed",
+                        ));
+                    }
+                    WorkerWait::Shutdown => return Ok(AuthenticatedCommandOutcome::Shutdown),
+                }
+            }
+            Ok(WorkerCommand::AutomationInput(_)) => {
+                unreachable!("the command receiver resolves automation input")
+            }
+            Ok(WorkerCommand::Resize(size)) => {
+                let dimensions = ssh_terminal_dimensions(size);
+                match wait_for_running_ssh_operation(
+                    channel.window_change(dimensions.0, dimensions.1, dimensions.2, dimensions.3),
+                    shared,
+                    host_key_gate,
+                )
+                .await
+                {
+                    WorkerWait::Completed(Ok(())) => shared.record_running_resize(size),
+                    WorkerWait::Completed(Err(_)) => {
+                        return Err(ssh_failure_with_kind(
+                            shared,
+                            SessionErrorKind::Resize,
+                            "SSH resize failed",
+                        ));
+                    }
+                    WorkerWait::Shutdown => return Ok(AuthenticatedCommandOutcome::Shutdown),
+                }
+            }
+            Ok(WorkerCommand::ReadRemoteFile {
+                path,
+                max_bytes,
+                generation,
+                result_sender,
+            }) => {
+                remote_reads.start(
+                    Arc::clone(handle),
+                    Arc::clone(shared),
+                    path,
+                    max_bytes,
+                    generation,
+                    result_sender,
+                );
+            }
+            Ok(WorkerCommand::ApplyPortForwards(port_forwards)) => {
+                for forward in port_forwards {
+                    if shared.shutdown_requested() {
+                        host_key_gate.reject_pending();
+                        shared.set_lifecycle(SessionLifecycle::Stopping);
+                        return Ok(AuthenticatedCommandOutcome::Shutdown);
+                    }
+                    apply_port_forward(
+                        handle,
+                        forward,
+                        active_port_forwards,
+                        local_forward_sender,
+                        shared,
+                    )
+                    .await;
+                }
+            }
+            Ok(WorkerCommand::AddPortForward(forward)) => {
+                apply_port_forward(
+                    handle,
+                    forward,
+                    active_port_forwards,
+                    local_forward_sender,
+                    shared,
+                )
+                .await;
+            }
+            Ok(WorkerCommand::RemovePortForward(key, generation)) => {
+                if generation == shared.transport_generation.load(Ordering::Acquire) {
+                    remove_port_forward(handle, &key, active_port_forwards, shared).await;
+                } else {
+                    report_port_forward_error(
+                        shared,
+                        "SSH port-forward removal was canceled because its connection ended",
+                    );
+                }
+            }
+            Ok(WorkerCommand::QueryPortForwards) => {}
+            Ok(WorkerCommand::Reconnect) => {
+                return Ok(AuthenticatedCommandOutcome::Reconnect);
+            }
+            Ok(WorkerCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
+                host_key_gate.reject_pending();
+                shared.set_lifecycle(SessionLifecycle::Stopping);
+                return Ok(AuthenticatedCommandOutcome::Shutdown);
+            }
+            Err(TryRecvError::Empty) => {
+                emit_port_forward_snapshot(shared, active_port_forwards);
+                return Ok(AuthenticatedCommandOutcome::Continue);
+            }
+        }
+        emit_port_forward_snapshot(shared, active_port_forwards);
+    }
+}
+
+/// Outcome of waiting in the `Disconnected` (recovery-eligible) state after
+/// an unintentional transport loss for a session with no automatic recovery
+/// resuming it (ADR 0018).
+enum ManualRecoveryOutcome {
+    /// The user explicitly requested a reconnect via [`WorkerCommand::Reconnect`].
+    Reconnect,
+    /// The user shut the session down while it was disconnected.
+    Shutdown,
+}
+
+/// Waits, polling at [`COMMAND_POLL_INTERVAL`], for the user to either
+/// explicitly request a reconnect or shut down a session that is currently
+/// `Disconnected`. Input and resize commands are reported as unsupported
+/// (there is no live channel to apply them to) without ending the wait.
+async fn wait_for_manual_recovery(
+    command_receiver: &WorkerCommandReceiver,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+) -> ManualRecoveryOutcome {
+    loop {
+        if shared.shutdown_requested() {
+            host_key_gate.reject_pending();
+            return ManualRecoveryOutcome::Shutdown;
+        }
+        match command_receiver.try_recv() {
+            Ok(WorkerCommand::Input(bytes)) => {
+                let _ = bytes.len();
+                report_unsupported(shared, "SSH input is not available");
+            }
+            Ok(WorkerCommand::AutomationInput(_)) => {
+                unreachable!("the command receiver resolves automation input")
+            }
+            Ok(WorkerCommand::Resize(size)) => {
+                let _ = size.columns();
+                report_unsupported(shared, "SSH resize is not available");
+            }
+            Ok(WorkerCommand::ReadRemoteFile { result_sender, .. }) => {
+                let _ = result_sender.send(Err(RemoteFileReadError::Closed));
+            }
+            Ok(
+                WorkerCommand::ApplyPortForwards(_)
+                | WorkerCommand::AddPortForward(_)
+                | WorkerCommand::RemovePortForward(..)
+                | WorkerCommand::QueryPortForwards,
+            ) => {
+                report_unsupported(shared, "SSH port forwarding is not available");
+            }
+            Ok(WorkerCommand::Reconnect) => {
+                shared.clear_reconnect_request();
+                return ManualRecoveryOutcome::Reconnect;
+            }
+            Ok(WorkerCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
+                host_key_gate.reject_pending();
+                return ManualRecoveryOutcome::Shutdown;
+            }
+            Err(TryRecvError::Empty) => {
+                tokio::time::sleep(COMMAND_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
+fn process_commands_before_running(
+    command_receiver: &WorkerCommandReceiver,
+    shared: &WorkerShared,
+    host_key_gate: &HostKeyDecisionGate,
+) -> bool {
+    if shared.shutdown_requested() {
+        host_key_gate.reject_pending();
+        shared.set_lifecycle(SessionLifecycle::Stopping);
+        return true;
+    }
+    loop {
+        match command_receiver.try_recv() {
+            Ok(WorkerCommand::Input(bytes)) => {
+                let _ = bytes.len();
+                report_unsupported(shared, "SSH input is not available");
+            }
+            Ok(WorkerCommand::AutomationInput(_)) => {
+                unreachable!("the command receiver resolves automation input")
+            }
+            Ok(WorkerCommand::Resize(size)) => {
+                shared.retain_pre_running_resize(size);
+            }
+            Ok(WorkerCommand::ReadRemoteFile { result_sender, .. }) => {
+                let _ = result_sender.send(Err(RemoteFileReadError::Closed));
+            }
+            Ok(
+                WorkerCommand::ApplyPortForwards(_)
+                | WorkerCommand::AddPortForward(_)
+                | WorkerCommand::RemovePortForward(..)
+                | WorkerCommand::QueryPortForwards,
+            ) => report_unsupported(shared, "SSH port forwarding is not available"),
+            Ok(WorkerCommand::Reconnect) => {
+                shared.clear_reconnect_request();
+                report_unsupported(shared, "SSH reconnect is not available")
+            }
+            Ok(WorkerCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
+                host_key_gate.reject_pending();
+                shared.set_lifecycle(SessionLifecycle::Stopping);
+                return true;
+            }
+            Err(TryRecvError::Empty) => return false,
+        }
+    }
+}
+
+async fn read_remote_file_snapshot_from_handle<H>(
+    handle: &russh::client::Handle<H>,
+    path: &str,
+    max_bytes: usize,
+) -> Result<RemoteFileSnapshot, RemoteFileReadError>
+where
+    H: russh::client::Handler + Send + 'static,
+{
+    let mut session = sftp::SftpSession::connect(handle)
+        .await
+        .map_err(RemoteFileReadError::Sftp)?;
+    let result = read_remote_file_snapshot_from_session(&mut session, path, max_bytes).await;
+    let _ = session.close().await;
+    result
+}
+
+async fn read_remote_file_snapshot_from_session(
+    session: &mut sftp::SftpSession,
+    path: &str,
+    max_bytes: usize,
+) -> Result<RemoteFileSnapshot, RemoteFileReadError> {
+    let Some(metadata) = session
+        .remote_path_metadata_exact(path)
+        .await
+        .map_err(RemoteFileReadError::Sftp)?
+    else {
+        return Err(RemoteFileReadError::Missing {
+            path: path.to_owned(),
+        });
+    };
+    if metadata.file_type != SftpEntryType::File {
+        return Err(RemoteFileReadError::NotFile {
+            path: metadata.path.display(),
+            file_type: metadata.file_type,
+        });
+    }
+    let bytes = session
+        .read_file_snapshot_exact(path, max_bytes)
+        .await
+        .map_err(RemoteFileReadError::Sftp)?;
+    Ok(RemoteFileSnapshot { metadata, bytes })
+}
+
+async fn stop_handle(
+    mut handle: russh::client::Handle<SshClientHandler>,
+    shared: &WorkerShared,
+) -> Result<ShutdownResult, SessionError> {
+    let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, async {
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "fesTerm shutdown", "")
+            .await;
+        let _ = (&mut handle).await;
+    })
+    .await;
+    shared.set_lifecycle(SessionLifecycle::Stopped);
+    Ok(ShutdownResult::Stopped)
+}
+
+fn report_unsupported(shared: &WorkerShared, message: &'static str) {
+    let _ = shared.try_emit(SessionEvent::Error(SessionError::new(
+        SessionErrorKind::Unsupported,
+        message,
+    )));
+}
+
+fn ssh_failure(shared: &WorkerShared, message: &'static str) -> SessionError {
+    ssh_failure_with_kind(shared, SessionErrorKind::Spawn, message)
+}
+
+fn sftp_failure(shared: &WorkerShared, message: impl Into<String>) -> SessionError {
+    sftp_failure_with_kind(shared, SessionErrorKind::Spawn, message)
+}
+
+fn ssh_failure_with_kind(
+    shared: &WorkerShared,
+    kind: SessionErrorKind,
+    message: &'static str,
+) -> SessionError {
+    let error = SessionError::new(kind, message);
+    let _ = shared.try_emit(SessionEvent::Error(error.clone()));
+    shared.set_lifecycle(SessionLifecycle::Failed(error.clone()));
+    error
+}
+
+fn sftp_failure_with_kind(
+    shared: &WorkerShared,
+    kind: SessionErrorKind,
+    message: impl Into<String>,
+) -> SessionError {
+    let error = SessionError::new(kind, message);
+    let _ = shared.try_emit(SessionEvent::Error(error.clone()));
+    shared.set_lifecycle(SessionLifecycle::Failed(error.clone()));
+    error
+}
+
+fn ssh_terminal_dimensions(size: TerminalSize) -> (u32, u32, u32, u32) {
+    (
+        u32::from(size.columns()),
+        u32::from(size.rows()),
+        u32::from(size.pixel_width().unwrap_or(0)),
+        u32::from(size.pixel_height().unwrap_or(0)),
+    )
+}
+
+fn emit_channel_output(shared: &WorkerShared, data: &[u8]) {
+    for chunk in data.chunks(MAX_IO_CHUNK_BYTES) {
+        if !shared.try_emit(SessionEvent::Output(chunk.to_vec())) {
+            break;
+        }
+    }
+}
+
+fn sha256_fingerprint(public_key: &russh::keys::PublicKey) -> String {
+    public_key
+        .fingerprint(russh::keys::HashAlg::Sha256)
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::TcpListener,
+        sync::atomic::{AtomicUsize, Ordering},
+        thread,
+        time::Instant,
+    };
+
+    use super::*;
+    use festerm_secret_store::{MemorySecretStore, SecretBytes, SecretStore};
+    use festerm_session::{SshPortForwardRuntime, SshPortForwardState};
+    use russh::client::Handler as _;
+
+    fn profile() -> SshConnectionProfile {
+        SshConnectionProfile::new(
+            HostIdentity::new("Example.COM", 22).unwrap(),
+            "alice",
+            SshConnectionProfile::DEFAULT_TERMINAL_TYPE,
+            TerminalSize::new(80, 24).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn session_error_kind_for_failure_distinguishes_only_authentication() {
+        assert_eq!(
+            session_error_kind_for_failure(ConnectionFailure::Authentication),
+            SessionErrorKind::Authentication,
+            "a rejected credential must be classified distinctly so the UI can reprompt in-tab"
+        );
+        for other in [
+            ConnectionFailure::Transport,
+            ConnectionFailure::HostTrust,
+            ConnectionFailure::Setup,
+            ConnectionFailure::ProviderUnavailable,
+        ] {
+            assert_eq!(
+                session_error_kind_for_failure(other),
+                SessionErrorKind::Spawn,
+                "every other connection failure must keep the prior generic classification"
+            );
+        }
+    }
+
+    #[test]
+    fn sftp_directory_listings_are_rendered_as_terminal_transcript_lines() {
+        let output = format_sftp_outcome(&sftp::SftpCommandOutcome::DirectoryListing {
+            path: "/remote".to_owned(),
+            entries: vec![
+                sftp::SftpDirectoryEntry {
+                    name: "docs".to_owned(),
+                    path: "/remote/docs".to_owned(),
+                    file_type: sftp::SftpEntryType::Directory,
+                    size: None,
+                    permissions: Some(0o755),
+                },
+                sftp::SftpDirectoryEntry {
+                    name: "readme.txt".to_owned(),
+                    path: "/remote/readme.txt".to_owned(),
+                    file_type: sftp::SftpEntryType::File,
+                    size: Some(42),
+                    permissions: Some(0o644),
+                },
+            ],
+        });
+
+        assert!(output.starts_with("Listing for /remote:\r\n"));
+        assert!(output.contains("dir  0755          - docs\r\n"));
+        assert!(output.contains("file 0644         42 readme.txt\r\n"));
+    }
+
+    #[test]
+    fn sftp_help_uses_carriage_return_line_feed_for_every_line() {
+        let output = format_sftp_outcome(&sftp::SftpCommandOutcome::Help {
+            text: "Supported commands:\n  help\n  lls",
+        });
+
+        assert_eq!(output, "Supported commands:\r\n  help\r\n  lls\r\n");
+    }
+
+    #[test]
+    fn local_sftp_directory_listings_use_the_terminal_transcript_format() {
+        let output = format_sftp_outcome(&sftp::SftpCommandOutcome::LocalDirectoryListing {
+            path: PathBuf::from("/local"),
+            entries: vec![sftp::SftpDirectoryEntry {
+                name: "notes.txt".to_owned(),
+                path: "/local/notes.txt".to_owned(),
+                file_type: sftp::SftpEntryType::File,
+                size: Some(42),
+                permissions: Some(0o644),
+            }],
+        });
+
+        assert_eq!(
+            output,
+            "Local listing for /local:\r\nfile 0644         42 notes.txt\r\n"
+        );
+    }
+
+    #[test]
+    fn large_sftp_directory_listings_are_emitted_without_dropping_lines() {
+        let (worker, _receiver, _resolver, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            4,
+            512,
+            noop_session_event_notifier(),
+        );
+        let entries = (0..5000)
+            .map(|index| sftp::SftpDirectoryEntry {
+                name: format!("entry-{index:04}.txt"),
+                path: format!("/remote/entry-{index:04}.txt"),
+                file_type: sftp::SftpEntryType::File,
+                size: Some(index as u64),
+                permissions: Some(0o644),
+            })
+            .collect::<Vec<_>>();
+        let outcome = sftp::SftpCommandOutcome::DirectoryListing {
+            path: "/remote".to_owned(),
+            entries,
+        };
+        let expected = format_sftp_outcome(&outcome);
+
+        emit_sftp_outcome(&worker.shared, &outcome);
+
+        let mut chunk_count = 0;
+        let mut actual = Vec::new();
+        loop {
+            match worker.try_recv_event() {
+                Ok(SessionEvent::Output(bytes)) => {
+                    chunk_count += 1;
+                    assert!(
+                        bytes.len() <= MAX_IO_CHUNK_BYTES,
+                        "chunked SFTP output must stay within the session output bound"
+                    );
+                    actual.extend_from_slice(&bytes);
+                }
+                Ok(_) => {}
+                Err(SessionTryReceiveError::Empty | SessionTryReceiveError::Closed) => break,
+            }
+        }
+
+        assert!(
+            chunk_count > 1,
+            "large listings should be split into multiple chunks"
+        );
+        assert_eq!(String::from_utf8(actual).unwrap(), expected);
+    }
+
+    #[test]
+    fn sftp_session_closed_outcome_renders_a_terminal_message() {
+        assert_eq!(
+            format_sftp_outcome(&sftp::SftpCommandOutcome::SessionClosed),
+            "SFTP session closed.\r\n"
+        );
+    }
+
+    #[test]
+    fn manual_reconnect_delay_doubles_and_caps_at_the_maximum() {
+        assert_eq!(manual_reconnect_delay(1), MANUAL_RECONNECT_INITIAL_DELAY);
+        assert_eq!(
+            manual_reconnect_delay(2),
+            MANUAL_RECONNECT_INITIAL_DELAY * 2
+        );
+        assert_eq!(
+            manual_reconnect_delay(3),
+            MANUAL_RECONNECT_INITIAL_DELAY * 4
+        );
+        // Keeps doubling until it reaches the cap, then stays there rather
+        // than overflowing or exceeding it, even for attempt counts well
+        // past `MANUAL_RECONNECT_MAX_ATTEMPTS`.
+        assert_eq!(manual_reconnect_delay(20), MANUAL_RECONNECT_MAX_DELAY);
+        assert!(MANUAL_RECONNECT_MAX_DELAY >= MANUAL_RECONNECT_INITIAL_DELAY);
+    }
+
+    #[test]
+    fn host_identity_normalizes_and_rejects_ambiguous_input() {
+        let host = HostIdentity::new(" Example.COM ", 22).unwrap();
+        assert_eq!(host.host(), "example.com");
+        assert_eq!(host.port(), 22);
+        assert_eq!(
+            HostIdentity::new(" ", 22),
+            Err(HostIdentityError::EmptyHost)
+        );
+        assert_eq!(
+            HostIdentity::new("example host", 22),
+            Err(HostIdentityError::Whitespace)
+        );
+        assert_eq!(
+            HostIdentity::new("example.com", 0),
+            Err(HostIdentityError::ZeroPort)
+        );
+    }
+
+    #[test]
+    fn connection_profile_validates_safe_non_secret_inputs() {
+        let profile = profile();
+        assert_eq!(profile.identity().host(), "example.com");
+        assert_eq!(profile.username(), "alice");
+        assert_eq!(profile.terminal_type(), "xterm-256color");
+        assert_eq!(profile.initial_size().columns(), 80);
+
+        let identity = HostIdentity::new("example.com", 22).unwrap();
+        assert_eq!(
+            SshConnectionProfile::new(
+                identity.clone(),
+                "",
+                "xterm-256color",
+                TerminalSize::new(80, 24).unwrap()
+            ),
+            Err(SshConnectionProfileError::EmptyUsername)
+        );
+        assert_eq!(
+            SshConnectionProfile::new(
+                identity.clone(),
+                "alice admin",
+                "xterm-256color",
+                TerminalSize::new(80, 24).unwrap()
+            ),
+            Err(SshConnectionProfileError::UsernameWhitespace)
+        );
+        assert_eq!(
+            SshConnectionProfile::new(
+                identity.clone(),
+                "alice\u{7f}",
+                "xterm-256color",
+                TerminalSize::new(80, 24).unwrap()
+            ),
+            Err(SshConnectionProfileError::UsernameControlCharacter)
+        );
+        assert_eq!(
+            SshConnectionProfile::new(
+                identity.clone(),
+                "alice",
+                "xterm 256color",
+                TerminalSize::new(80, 24).unwrap()
+            ),
+            Err(SshConnectionProfileError::InvalidTerminalType)
+        );
+        assert!(matches!(
+            SshConnectionProfile::new(
+                identity,
+                "alice",
+                "t".repeat(SshConnectionProfile::MAX_TERMINAL_TYPE_BYTES + 1),
+                TerminalSize::new(80, 24).unwrap()
+            ),
+            Err(SshConnectionProfileError::TerminalTypeTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn password_authentication_redacts_the_secret() {
+        let authentication = SshAuthentication::password("not-for-debug-output");
+
+        assert_eq!(
+            format!("{authentication:?}"),
+            "SshAuthentication::Password([REDACTED])"
+        );
+    }
+
+    #[test]
+    fn stored_password_authentication_resolves_only_through_the_worker_source() {
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let password = "stored-password-not-for-debug-output";
+        let reference = store
+            .put(&SecretBytes::copy_from_slice(password.as_bytes()))
+            .expect("memory store accepts test password");
+        let authentication = SshAuthentication::stored_password(Arc::clone(&store), &reference);
+
+        assert_eq!(
+            format!("{authentication:?}"),
+            "SshAuthentication::StoredPassword([REDACTED])"
+        );
+        assert!(!format!("{authentication:?}").contains(password));
+        assert!(!format!("{authentication:?}").contains(&reference.to_persisted_string()));
+
+        let WorkerAuthentication::StoredPassword(source) =
+            authentication.into_worker_authentication()
+        else {
+            panic!("stored password must retain the worker-only source");
+        };
+        assert_eq!(
+            resolve_stored_password(&source).expect("memory password resolves"),
+            password
+        );
+    }
+
+    #[test]
+    fn stored_password_resolution_errors_are_actionable_and_redacted() {
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let reference = SecretReference::generate();
+        let error = resolve_stored_password(&StoredPasswordAuthentication {
+            store,
+            reference: reference.duplicate_for_transport(),
+        })
+        .expect_err("unstored reference must be missing");
+
+        assert_eq!(error, StoredPasswordResolutionError::Missing);
+        assert!(error.to_string().contains("replace"));
+        assert!(!error.to_string().contains(&reference.to_persisted_string()));
+    }
+
+    fn generated_private_key_text() -> String {
+        let mut random = russh::keys::key::safe_rng();
+        let key = russh::keys::PrivateKey::random(&mut random, russh::keys::Algorithm::Ed25519)
+            .expect("could not generate test SSH key");
+        key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .expect("could not encode test SSH key")
+            .to_string()
+    }
+
+    #[test]
+    fn stored_private_key_authentication_resolves_only_through_the_worker_source() {
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let key_text = generated_private_key_text();
+        let secret = encode_stored_private_key(&key_text, None);
+        let reference = store
+            .put(&secret)
+            .expect("memory store accepts test private key");
+        let authentication = SshAuthentication::stored_private_key(Arc::clone(&store), &reference);
+
+        assert_eq!(
+            format!("{authentication:?}"),
+            "SshAuthentication::StoredPrivateKey([REDACTED])"
+        );
+        assert!(!format!("{authentication:?}").contains(&key_text));
+        assert!(!format!("{authentication:?}").contains(&reference.to_persisted_string()));
+
+        let WorkerAuthentication::StoredPrivateKey(source) =
+            authentication.into_worker_authentication()
+        else {
+            panic!("stored private key must retain the worker-only source");
+        };
+        assert!(resolve_stored_private_key(&source).is_ok());
+    }
+
+    #[test]
+    fn stored_private_key_round_trips_with_a_passphrase() {
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let mut random = russh::keys::key::safe_rng();
+        let key = russh::keys::PrivateKey::random(&mut random, russh::keys::Algorithm::Ed25519)
+            .expect("could not generate test SSH key");
+        let encrypted = key
+            .encrypt(&mut random, "correct horse battery staple")
+            .expect("could not encrypt test SSH key")
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .expect("could not encode encrypted test SSH key");
+        let secret = encode_stored_private_key(&encrypted, Some("correct horse battery staple"));
+        let reference = store
+            .put(&secret)
+            .expect("memory store accepts test private key");
+        let authentication = SshAuthentication::stored_private_key(store, &reference);
+        let WorkerAuthentication::StoredPrivateKey(source) =
+            authentication.into_worker_authentication()
+        else {
+            panic!("stored private key must retain the worker-only source");
+        };
+        assert!(resolve_stored_private_key(&source).is_ok());
+    }
+
+    #[test]
+    fn stored_private_key_resolution_errors_are_actionable_and_redacted() {
+        let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let reference = SecretReference::generate();
+        let error = resolve_stored_private_key(&StoredPrivateKeyAuthentication {
+            store,
+            reference: reference.duplicate_for_transport(),
+        })
+        .expect_err("unstored reference must be missing");
+
+        assert_eq!(error, StoredPrivateKeyResolutionError::Missing);
+        assert!(error.to_string().contains("replace"));
+        assert!(!error.to_string().contains(&reference.to_persisted_string()));
+    }
+
+    fn generated_private_key() -> SshPrivateKey {
+        let mut random = russh::keys::key::safe_rng();
+        let key = russh::keys::PrivateKey::random(&mut random, russh::keys::Algorithm::Ed25519)
+            .expect("could not generate test SSH key");
+        let encoded = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .expect("could not encode test SSH key");
+        SshPrivateKey::from_openssh(encoded.as_bytes()).expect("could not parse test SSH key")
+    }
+
+    fn generated_certificate_text() -> &'static str {
+        concat!(
+            "ssh-ed25519-cert-v01@openssh.com ",
+            "AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIP4NAgsSLiXrpfby",
+            "oGxrF9cZN7UiLq2EJ80DswScilD2AAAAIHRw0uaN2ad8NjeXNK5BLHkiXmMpuUjwYVr5",
+            "+9/9Rnz2AAAAAAAAAAAAAAABAAAACXRlc3QtY2VydAAAAA0AAAAJdGVzdC11c2VyAAAA",
+            "AAAAAAD//////////wAAAAAAAACCAAAAFXBlcm1pdC1YMTEtZm9yd2FyZGluZwAAAAAA",
+            "AAAXcGVybWl0LWFnZW50LWZvcndhcmRpbmcAAAAAAAAAFnBlcm1pdC1wb3J0LWZvcndh",
+            "cmRpbmcAAAAAAAAACnBlcm1pdC1wdHkAAAAAAAAADnBlcm1pdC11c2VyLXJjAAAAAAAA",
+            "AAAAAAAzAAAAC3NzaC1lZDI1NTE5AAAAINmASn24MXIM7yAjzI0wX348PDFGJo5lhB0F",
+            "6R99e8jvAAAAUwAAAAtzc2gtZWQyNTUxOQAAAECrYKMa8P+MB7+swJDRQ2t0++H73Vih",
+            "OwvkL2nqJ+N2JIo9WVnInnZvEr81Pi1q9LTcupbTegAQCgFqhB34vrMK",
+            " fes@fes-m4.feslabs.com"
+        )
+    }
+
+    #[allow(dead_code)]
+    struct TestPortForwardSpec {
+        direction: SshPortForwardDirection,
+        bind_host: &'static str,
+        bind_port: u16,
+        destination_host: &'static str,
+        destination_port: u16,
+    }
+
+    impl SshPortForwardSpec for TestPortForwardSpec {
+        fn direction(&self) -> SshPortForwardDirection {
+            self.direction
+        }
+
+        fn bind_host(&self) -> &str {
+            self.bind_host
+        }
+
+        fn bind_port(&self) -> u16 {
+            self.bind_port
+        }
+
+        fn destination_host(&self) -> &str {
+            self.destination_host
+        }
+
+        fn destination_port(&self) -> u16 {
+            self.destination_port
+        }
+    }
+
+    #[test]
+    fn public_key_authentication_redacts_and_dispatches_the_parsed_key() {
+        let private_key = generated_private_key();
+        assert_eq!(format!("{private_key:?}"), "SshPrivateKey([REDACTED])");
+
+        let authentication = SshAuthentication::public_key(private_key);
+        assert_eq!(
+            format!("{authentication:?}"),
+            "SshAuthentication::PublicKey([REDACTED])"
+        );
+        assert!(matches!(
+            authentication.into_worker_authentication(),
+            WorkerAuthentication::PublicKey(_)
+        ));
+    }
+
+    #[test]
+    fn public_key_parser_rejects_invalid_and_non_openssh_material_without_echoing_it() {
+        assert!(matches!(
+            SshPrivateKey::from_openssh([0xff]),
+            Err(SshPrivateKeyError::InvalidEncoding)
+        ));
+        assert!(matches!(
+            SshPrivateKey::from_openssh("-----BEGIN PRIVATE KEY-----\ninvalid"),
+            Err(SshPrivateKeyError::NotOpenSsh)
+        ));
+        let malformed = "-----BEGIN OPENSSH PRIVATE KEY-----\nmalformed-private-material";
+        let error = SshPrivateKey::from_openssh(malformed)
+            .expect_err("malformed OpenSSH private key must not parse");
+        assert_eq!(error, SshPrivateKeyError::InvalidKey);
+        assert!(!error.to_string().contains(malformed));
+    }
+
+    #[test]
+    fn certificate_authentication_redacts_and_dispatches_the_parsed_material() {
+        let private_key = generated_private_key();
+        let certificate =
+            SshCertificate::from_openssh(generated_certificate_text().as_bytes()).unwrap();
+
+        assert_eq!(format!("{certificate:?}"), "SshCertificate([REDACTED])");
+
+        let authentication = SshAuthentication::certificate(private_key, certificate);
+        assert_eq!(
+            format!("{authentication:?}"),
+            "SshAuthentication::Certificate([REDACTED])"
+        );
+        assert!(matches!(
+            authentication.into_worker_authentication(),
+            WorkerAuthentication::Certificate(_)
+        ));
+    }
+
+    #[test]
+    fn certificate_parser_accepts_valid_and_rejects_invalid_openssh_material_without_echoing_it() {
+        let certificate = SshCertificate::from_openssh(generated_certificate_text().as_bytes())
+            .expect("valid OpenSSH certificate must parse");
+        assert_eq!(format!("{certificate:?}"), "SshCertificate([REDACTED])");
+
+        assert!(matches!(
+            SshCertificate::from_openssh([0xff]),
+            Err(SshCertificateError::InvalidEncoding)
+        ));
+        assert!(matches!(
+            SshCertificate::from_openssh("ssh-ed25519 AAAA not-a-certificate"),
+            Err(SshCertificateError::NotOpenSsh)
+        ));
+
+        let malformed = "ssh-ed25519-cert-v01@openssh.com definitely-not-a-certificate";
+        let error = SshCertificate::from_openssh(malformed)
+            .expect_err("malformed OpenSSH certificate must not parse");
+        assert_eq!(error, SshCertificateError::InvalidCertificate);
+        assert!(!error.to_string().contains(malformed));
+    }
+
+    fn encrypted_private_key_fixture() -> String {
+        let mut random = russh::keys::key::safe_rng();
+        let key = russh::keys::PrivateKey::random(&mut random, russh::keys::Algorithm::Ed25519)
+            .expect("could not generate encrypted-key test input");
+        let encrypted = key
+            .encrypt(&mut random, "test encrypted-key passphrase")
+            .expect("could not encrypt test SSH key");
+        encrypted
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .expect("could not encode encrypted test SSH key")
+            .to_string()
+    }
+
+    #[test]
+    fn public_key_parser_rejects_encrypted_openssh_keys_without_a_passphrase() {
+        let encoded = encrypted_private_key_fixture();
+
+        assert!(matches!(
+            SshPrivateKey::from_openssh(encoded.as_bytes()),
+            Err(SshPrivateKeyError::Encrypted)
+        ));
+    }
+
+    #[test]
+    fn encrypted_private_key_parser_consumes_and_redacts_its_passphrase() {
+        let encoded = encrypted_private_key_fixture();
+        let passphrase = "test encrypted-key passphrase";
+        let secret = SshKeyPassphrase::new(passphrase);
+        assert_eq!(format!("{secret:?}"), "SshKeyPassphrase([REDACTED])");
+
+        let private_key = SshPrivateKey::from_encrypted_openssh(encoded.as_bytes(), secret)
+            .expect("could not parse encrypted test SSH key");
+        assert_eq!(format!("{private_key:?}"), "SshPrivateKey([REDACTED])");
+
+        let error = SshPrivateKey::from_encrypted_openssh(
+            encoded.as_bytes(),
+            SshKeyPassphrase::new("wrong encrypted-key passphrase"),
+        )
+        .expect_err("wrong passphrase must not parse an encrypted SSH key");
+        assert_eq!(error, SshPrivateKeyError::InvalidKey);
+        assert!(!error.to_string().contains(passphrase));
+        assert!(!error.to_string().contains("wrong encrypted-key passphrase"));
+        assert!(!error.to_string().contains(encoded.trim()));
+    }
+
+    #[test]
+    fn encrypted_private_key_parser_rejects_unencrypted_keys() {
+        let mut random = russh::keys::key::safe_rng();
+        let key = russh::keys::PrivateKey::random(&mut random, russh::keys::Algorithm::Ed25519)
+            .expect("could not generate test SSH key");
+        let encoded = key
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .expect("could not encode test SSH key");
+
+        assert!(matches!(
+            SshPrivateKey::from_encrypted_openssh(
+                encoded.as_bytes(),
+                SshKeyPassphrase::new("unused passphrase")
+            ),
+            Err(SshPrivateKeyError::Unencrypted)
+        ));
+    }
+
+    #[test]
+    fn terminal_size_converts_to_ssh_pty_dimensions() {
+        assert_eq!(
+            ssh_terminal_dimensions(TerminalSize::new(80, 24).unwrap()),
+            (80, 24, 0, 0)
+        );
+        assert_eq!(
+            ssh_terminal_dimensions(TerminalSize::with_pixels(120, 40, 1200, 800).unwrap()),
+            (120, 40, 1200, 800)
+        );
+    }
+
+    #[test]
+    fn reconnect_policy_requires_finite_ordered_bounds() {
+        assert_eq!(
+            ReconnectPolicy::new(0, Duration::from_secs(1), Duration::from_secs(2)),
+            Err(ReconnectPolicyError::ZeroAttempts)
+        );
+        assert_eq!(
+            ReconnectPolicy::new(1, Duration::ZERO, Duration::from_secs(2)),
+            Err(ReconnectPolicyError::ZeroInitialDelay)
+        );
+        assert_eq!(
+            ReconnectPolicy::new(1, Duration::from_secs(2), Duration::from_secs(1)),
+            Err(ReconnectPolicyError::MaximumBeforeInitial)
+        );
+    }
+
+    #[test]
+    fn default_automatic_reconnect_policy_is_bounded_and_valid() {
+        let policy = ReconnectPolicy::default_automatic();
+
+        assert!(policy.maximum_attempts() > 0);
+    }
+
+    #[test]
+    fn reconnect_options_default_to_manual_plain_shell_recovery() {
+        let policy =
+            ReconnectPolicy::new(2, Duration::from_millis(10), Duration::from_millis(20)).unwrap();
+
+        assert_eq!(SshSessionOptions::new().reconnect_policy(), None);
+        assert_eq!(
+            SshSessionOptions::new().strategy(),
+            SessionStrategy::PlainShell
+        );
+        assert_eq!(
+            SshSessionOptions::with_recovery_policy(
+                SessionStrategy::PlainShell,
+                RecoveryPolicy::Automatic(policy)
+            ),
+            Err(RecoveryPolicyError),
+            "a plain shell cannot safely support automatic recovery (ADR 0018)"
+        );
+        assert_eq!(
+            SshSessionOptions::with_recovery_policy(
+                SessionStrategy::PlainShell,
+                RecoveryPolicy::Manual
+            )
+            .expect("manual recovery is always valid")
+            .reconnect_policy(),
+            None
+        );
+    }
+
+    #[test]
+    fn profile_port_forwards_are_collected_with_profile_source() {
+        let options = SshSessionOptions::new()
+            .with_profile_port_forwards([
+                TestPortForwardSpec {
+                    direction: SshPortForwardDirection::Local,
+                    bind_host: "127.0.0.1",
+                    bind_port: 15432,
+                    destination_host: "db.internal",
+                    destination_port: 5432,
+                },
+                TestPortForwardSpec {
+                    direction: SshPortForwardDirection::Remote,
+                    bind_host: "127.0.0.1",
+                    bind_port: 18080,
+                    destination_host: "127.0.0.1",
+                    destination_port: 8080,
+                },
+            ])
+            .expect("valid profile port forwards must collect");
+
+        assert_eq!(options.profile_port_forwards().len(), 2);
+        assert_eq!(
+            options.profile_port_forwards()[0].runtime(SshPortForwardState::Active, None),
+            SshPortForwardRuntime::new(
+                SshPortForwardDirection::Local,
+                "127.0.0.1",
+                15432,
+                "db.internal",
+                5432,
+                SshPortForwardSource::Profile,
+                SshPortForwardState::Active,
+                None,
+            )
+        );
+        assert_eq!(
+            options.profile_port_forwards()[1].runtime(SshPortForwardState::Active, None),
+            SshPortForwardRuntime::new(
+                SshPortForwardDirection::Remote,
+                "127.0.0.1",
+                18080,
+                "127.0.0.1",
+                8080,
+                SshPortForwardSource::Profile,
+                SshPortForwardState::Active,
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn profile_port_forward_inventory_accepts_128_and_rejects_129() {
+        let specs = |count| {
+            (1..=count).map(|bind_port| TestPortForwardSpec {
+                direction: SshPortForwardDirection::Local,
+                bind_host: "127.0.0.1",
+                bind_port,
+                destination_host: "127.0.0.1",
+                destination_port: 9000,
+            })
+        };
+        let accepted = SshSessionOptions::new()
+            .with_profile_port_forwards(specs(128))
+            .expect("128 unique profile mappings fit the live inventory");
+        assert_eq!(accepted.profile_port_forwards().len(), 128);
+        assert_eq!(
+            SshSessionOptions::new()
+                .with_profile_port_forwards(specs(129))
+                .expect_err("a 129th profile mapping must be refused"),
+            SshPortForwardConfigurationError::InventoryLimit,
+        );
+    }
+
+    #[test]
+    fn pending_port_forward_inventory_refuses_a_129th_request() {
+        let (worker, receiver, _resolver, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            1,
+            DEFAULT_EVENT_QUEUE_CAPACITY,
+            noop_session_event_notifier(),
+        );
+        worker.set_running();
+        let request = |bind_port| RequestedSshPortForward {
+            direction: SshPortForwardDirection::Local,
+            bind_host: "127.0.0.1".to_owned(),
+            bind_port,
+            destination_host: "127.0.0.1".to_owned(),
+            destination_port: 9000,
+            source: SshPortForwardSource::Ephemeral,
+        };
+        let mut pending = Vec::new();
+        for bind_port in 1..=128 {
+            worker
+                .try_add_port_forward(request(bind_port))
+                .expect("the first 128 pending mappings must be admitted");
+            pending.push(receiver.try_recv().expect("admitted request is queued"));
+        }
+        assert_eq!(
+            worker.try_add_port_forward(request(129)),
+            Err(SshPortForwardRequestError::InventoryFull),
+        );
+        assert_eq!(pending.len(), 128);
+    }
+
+    #[test]
+    fn port_forward_command_refusal_and_cancellation_release_admission() {
+        let (worker, receiver, _resolver, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            1,
+            DEFAULT_EVENT_QUEUE_CAPACITY,
+            noop_session_event_notifier(),
+        );
+        worker.set_running();
+        let request = |bind_port| RequestedSshPortForward {
+            direction: SshPortForwardDirection::Local,
+            bind_host: "127.0.0.1".to_owned(),
+            bind_port,
+            destination_host: "127.0.0.1".to_owned(),
+            destination_port: 9000,
+            source: SshPortForwardSource::Ephemeral,
+        };
+        worker.try_add_port_forward(request(1)).unwrap();
+        assert_eq!(
+            worker.try_add_port_forward(request(2)),
+            Err(SshPortForwardRequestError::QueueFull)
+        );
+        let first = receiver.try_recv().unwrap();
+        worker.try_add_port_forward(request(2)).unwrap();
+        drop(receiver.try_recv().unwrap());
+        worker.try_add_port_forward(request(2)).unwrap();
+        drop(receiver.try_recv().unwrap());
+        drop(first);
+        worker.try_add_port_forward(request(1)).unwrap();
+        drop(receiver);
+        for _ in 0..256 {
+            assert_eq!(
+                worker.try_add_port_forward(request(1)),
+                Err(SshPortForwardRequestError::Closed)
+            );
+        }
+    }
+
+    #[test]
+    fn initial_profile_and_live_forward_requests_share_admission_before_running() {
+        let (worker, receiver, _resolver, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            1,
+            DEFAULT_EVENT_QUEUE_CAPACITY,
+            noop_session_event_notifier(),
+        );
+        let request = |bind_port, source| RequestedSshPortForward {
+            direction: SshPortForwardDirection::Local,
+            bind_host: "127.0.0.1".to_owned(),
+            bind_port,
+            destination_host: "127.0.0.1".to_owned(),
+            destination_port: 9000,
+            source,
+        };
+        let mut initial = worker.shared.reserve_profile_port_forwards(
+            (1..=96)
+                .map(|port| request(port, SshPortForwardSource::Profile))
+                .collect(),
+        );
+        worker.set_running();
+        let mut pending = Vec::new();
+        for port in 97..=128 {
+            worker
+                .try_add_port_forward(request(port, SshPortForwardSource::Ephemeral))
+                .unwrap();
+            pending.push(receiver.try_recv().unwrap());
+        }
+        assert_eq!(
+            worker.try_add_port_forward(request(129, SshPortForwardSource::Ephemeral)),
+            Err(SshPortForwardRequestError::InventoryFull)
+        );
+        drop(initial.pop());
+        worker
+            .try_add_port_forward(request(129, SshPortForwardSource::Ephemeral))
+            .unwrap();
+        assert_eq!(pending.len(), 32);
+    }
+
+    #[test]
+    fn queued_forward_removal_records_the_transport_generation() {
+        let (worker, receiver, _resolver, _) = SshWorkerFoundation::new(profile());
+        worker.shared.begin_transport();
+        worker.set_running();
+        worker
+            .try_remove_port_forward(SshPortForwardDirection::Local, "127.0.0.1", 1)
+            .unwrap();
+        let WorkerCommand::RemovePortForward(key, generation) = receiver.try_recv().unwrap() else {
+            panic!("removal must carry its transport generation");
+        };
+        worker.shared.begin_transport();
+        assert_eq!(key.bind_port, 1);
+        assert_ne!(
+            generation,
+            worker.shared.transport_generation.load(Ordering::Acquire)
+        );
+        worker.shared.set_reconnecting(true);
+        assert_eq!(
+            worker.try_remove_port_forward(SshPortForwardDirection::Local, "127.0.0.1", 1),
+            Err(SshPortForwardRequestError::NotRunning)
+        );
+    }
+
+    #[test]
+    fn duplicate_port_forward_bindings_are_rejected() {
+        let error = SshSessionOptions::new()
+            .with_profile_port_forwards([
+                TestPortForwardSpec {
+                    direction: SshPortForwardDirection::Local,
+                    bind_host: "127.0.0.1",
+                    bind_port: 19000,
+                    destination_host: "one.internal",
+                    destination_port: 9000,
+                },
+                TestPortForwardSpec {
+                    direction: SshPortForwardDirection::Local,
+                    bind_host: "127.0.0.1",
+                    bind_port: 19000,
+                    destination_host: "two.internal",
+                    destination_port: 9001,
+                },
+            ])
+            .expect_err("duplicate port-forward bindings must be rejected");
+
+        assert_eq!(error, SshPortForwardConfigurationError::DuplicateBinding);
+    }
+
+    #[test]
+    fn port_forward_request_validation_rejects_empty_and_zero_values() {
+        let empty_host = requested_port_forward(
+            TestPortForwardSpec {
+                direction: SshPortForwardDirection::Local,
+                bind_host: "",
+                bind_port: 19001,
+                destination_host: "127.0.0.1",
+                destination_port: 9000,
+            },
+            SshPortForwardSource::Ephemeral,
+        )
+        .expect_err("empty bind host must be rejected");
+        assert_eq!(empty_host, SshPortForwardConfigurationError::EmptyHost);
+
+        let zero_port = requested_port_forward(
+            TestPortForwardSpec {
+                direction: SshPortForwardDirection::Remote,
+                bind_host: "127.0.0.1",
+                bind_port: 19002,
+                destination_host: "127.0.0.1",
+                destination_port: 0,
+            },
+            SshPortForwardSource::Ephemeral,
+        )
+        .expect_err("zero destination port must be rejected");
+        assert_eq!(zero_port, SshPortForwardConfigurationError::ZeroPort);
+    }
+
+    #[test]
+    fn port_forward_live_requests_are_limited_to_running_sessions() {
+        let (worker, _receiver, _resolver, _) = SshWorkerFoundation::new(profile());
+        let forward = RequestedSshPortForward {
+            direction: SshPortForwardDirection::Local,
+            bind_host: "127.0.0.1".to_owned(),
+            bind_port: 19003,
+            destination_host: "127.0.0.1".to_owned(),
+            destination_port: 9000,
+            source: SshPortForwardSource::Ephemeral,
+        };
+
+        assert_eq!(
+            worker.try_add_port_forward(forward.clone()),
+            Err(SshPortForwardRequestError::NotRunning)
+        );
+        worker.set_running();
+        assert_eq!(worker.try_add_port_forward(forward), Ok(()));
+        worker.set_disconnected();
+        assert_eq!(
+            worker.try_remove_port_forward(SshPortForwardDirection::Local, "127.0.0.1", 19003,),
+            Err(SshPortForwardRequestError::NotRunning)
+        );
+    }
+
+    #[test]
+    fn port_forward_attempt_limit_rejects_excess_in_flight_connections() {
+        let limiter = PortForwardAttemptLimiter::new(1);
+        let first = limiter
+            .try_acquire()
+            .expect("first in-flight connection should reserve the only permit");
+
+        assert!(
+            limiter.try_acquire().is_none(),
+            "once the limit is reached, new forwarded connections must be rejected instead of growing unbounded state"
+        );
+
+        drop(first);
+        assert!(
+            limiter.try_acquire().is_some(),
+            "releasing an in-flight attempt should make room for the next one"
+        );
+    }
+
+    #[test]
+    fn persistent_session_name_accepts_a_conservative_character_set() {
+        assert_eq!(
+            PersistentSessionName::new("main-session_1.local")
+                .unwrap()
+                .as_str(),
+            "main-session_1.local"
+        );
+    }
+
+    #[test]
+    fn persistent_session_name_rejects_empty_names() {
+        assert_eq!(
+            PersistentSessionName::new(""),
+            Err(PersistentSessionNameError::Empty)
+        );
+    }
+
+    #[test]
+    fn persistent_session_name_rejects_names_over_the_byte_limit() {
+        let too_long = "a".repeat(65);
+        assert_eq!(
+            PersistentSessionName::new(too_long),
+            Err(PersistentSessionNameError::TooLong {
+                maximum: 64,
+                actual: 65
+            })
+        );
+    }
+
+    #[test]
+    fn persistent_session_name_rejects_shell_metacharacters() {
+        for candidate in ["a b", "a;b", "a$b", "a`b`", "a&&b", "../etc", "a\"b"] {
+            assert_eq!(
+                PersistentSessionName::new(candidate),
+                Err(PersistentSessionNameError::InvalidCharacter),
+                "expected {candidate:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn persistence_provider_commands_embed_the_session_name_and_stay_re_entrant() {
+        let name = PersistentSessionName::new("work").unwrap();
+
+        assert_eq!(
+            PersistenceProvider::Tmux
+                .attach_or_create_command(&name, TerminalSize::new(132, 43).unwrap()),
+            "exec tmux new-session -A -s work -x 132 -y 43 \\; set-option -t work status off \
+             \\; set-window-option -t work window-size latest"
+        );
+        assert_eq!(
+            PersistenceProvider::Screen
+                .attach_or_create_command(&name, TerminalSize::new(132, 43).unwrap()),
+            "exec screen -c /dev/null -xRR work"
+        );
+        assert_eq!(
+            PersistenceProvider::Tmux.capability_probe_command(),
+            "command -v tmux"
+        );
+        assert_eq!(
+            PersistenceProvider::Screen.capability_probe_command(),
+            "command -v screen"
+        );
+    }
+
+    #[test]
+    fn a_missing_persistence_provider_is_never_retried() {
+        // A missing remote executable is a stable condition (ADR 0018,
+        // Issue #49): retrying the same transport can never make it
+        // appear, unlike an ordinary transient transport loss.
+        assert!(!reconnect_is_eligible(
+            true,
+            ConnectionFailure::ProviderUnavailable
+        ));
+    }
+
+    #[test]
+    fn only_persistent_strategies_support_automatic_recovery() {
+        let persistent = SessionStrategy::Persistent {
+            provider: PersistenceProvider::Tmux,
+            session_name: PersistentSessionName::new("work").unwrap(),
+        };
+
+        assert!(!SessionStrategy::PlainShell.supports_automatic_recovery());
+        assert!(persistent.supports_automatic_recovery());
+    }
+
+    #[test]
+    fn automatic_recovery_is_valid_for_a_persistent_strategy() {
+        let policy =
+            ReconnectPolicy::new(2, Duration::from_millis(10), Duration::from_millis(20)).unwrap();
+        let persistent = SessionStrategy::Persistent {
+            provider: PersistenceProvider::Screen,
+            session_name: PersistentSessionName::new("work").unwrap(),
+        };
+
+        let options =
+            SshSessionOptions::with_recovery_policy(persistent, RecoveryPolicy::Automatic(policy))
+                .expect("a persistent strategy can safely support automatic recovery (ADR 0018)");
+
+        assert_eq!(options.reconnect_policy(), Some(policy));
+    }
+
+    #[test]
+    fn reconnect_request_is_limited_to_running_sessions() {
+        assert!(reconnect_request_is_available(
+            &SessionLifecycle::Running,
+            false
+        ));
+        assert!(!reconnect_request_is_available(
+            &SessionLifecycle::Starting,
+            false
+        ));
+        assert!(!reconnect_request_is_available(
+            &SessionLifecycle::Running,
+            true
+        ));
+    }
+
+    #[test]
+    fn reconnect_request_is_available_after_unintentional_transport_loss() {
+        // ADR 0018: unintentional transport loss moves a plain SSH session
+        // to `Disconnected`, not directly to a terminal state, and an
+        // explicit reconnect must remain available from there.
+        let disconnected = SessionLifecycle::Disconnected(SessionError::new(
+            SessionErrorKind::Spawn,
+            "test transport loss",
+        ));
+        assert!(reconnect_request_is_available(&disconnected, false));
+        assert!(!reconnect_request_is_available(&disconnected, true));
+        assert!(!disconnected.is_terminal());
+    }
+
+    #[test]
+    fn reconnect_request_errors_are_content_free() {
+        for error in [
+            SshReconnectError::NotRunning,
+            SshReconnectError::AlreadyRequested,
+            SshReconnectError::QueueFull,
+            SshReconnectError::Closed,
+        ] {
+            assert!(!error.to_string().contains("password"));
+            assert!(!error.to_string().contains("private"));
+        }
+    }
+
+    #[test]
+    fn reconnect_request_queues_once_for_a_running_session() {
+        let (foundation, command_receiver, _, _) = SshWorkerFoundation::new(profile());
+
+        assert_eq!(
+            foundation.try_reconnect(),
+            Err(SshReconnectError::NotRunning)
+        );
+
+        foundation.set_running();
+        assert!(foundation.reconnect_available());
+        assert_eq!(foundation.try_reconnect(), Ok(()));
+        assert!(!foundation.reconnect_available());
+        assert_eq!(
+            foundation.try_reconnect(),
+            Err(SshReconnectError::AlreadyRequested)
+        );
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Ok(WorkerCommand::Reconnect)
+        ));
+    }
+
+    #[test]
+    fn reconnect_request_queues_once_for_a_disconnected_session() {
+        // ADR 0018: a plain session left `Disconnected` by an unintentional
+        // transport loss must still accept exactly one explicit reconnect
+        // request, the same as a still-`Running` session.
+        let (foundation, command_receiver, _, _) = SshWorkerFoundation::new(profile());
+
+        foundation.set_disconnected();
+        assert!(foundation.reconnect_available());
+        assert_eq!(foundation.try_reconnect(), Ok(()));
+        assert!(!foundation.reconnect_available());
+        assert_eq!(
+            foundation.try_reconnect(),
+            Err(SshReconnectError::AlreadyRequested)
+        );
+        assert!(matches!(
+            command_receiver.try_recv(),
+            Ok(WorkerCommand::Reconnect)
+        ));
+    }
+
+    #[test]
+    fn liveness_check_is_limited_to_running_sessions() {
+        // Unlike a manual reconnect, an on-demand liveness probe has no
+        // transport to probe once a session is `Disconnected` (ADR 0018
+        // treats the probe and the recovery it may lead to as separate
+        // steps): only `Running` is eligible.
+        let (foundation, _command_receiver, _, _) = SshWorkerFoundation::new(profile());
+
+        assert_eq!(
+            foundation.try_check_liveness(),
+            Err(SshLivenessCheckError::NotRunning)
+        );
+
+        foundation.set_disconnected();
+        assert_eq!(
+            foundation.try_check_liveness(),
+            Err(SshLivenessCheckError::NotRunning)
+        );
+
+        foundation.set_running();
+        assert_eq!(foundation.try_check_liveness(), Ok(()));
+    }
+
+    #[test]
+    fn liveness_check_coalesces_a_single_pending_request() {
+        let (foundation, _command_receiver, _, _) = SshWorkerFoundation::new(profile());
+        foundation.set_running();
+
+        assert_eq!(foundation.try_check_liveness(), Ok(()));
+        assert_eq!(
+            foundation.try_check_liveness(),
+            Err(SshLivenessCheckError::AlreadyRequested)
+        );
+
+        // The worker consuming the pending request (as it does once per
+        // command-poll tick) frees the next caller to request another probe.
+        assert!(foundation.shared.take_liveness_check_requested());
+        assert_eq!(foundation.try_check_liveness(), Ok(()));
+    }
+
+    #[test]
+    fn liveness_check_errors_are_content_free() {
+        for error in [
+            SshLivenessCheckError::NotRunning,
+            SshLivenessCheckError::AlreadyRequested,
+        ] {
+            assert!(!error.to_string().contains("password"));
+            assert!(!error.to_string().contains("private"));
+        }
+    }
+
+    #[test]
+    fn liveness_probe_due_fires_on_demand_regardless_of_automatic_deadline() {
+        // Issue #55 / ADR 0018: an on-demand request (wake hook or
+        // `SshSession::try_check_liveness`) must fire immediately even while
+        // the automatic cadence deadline is far in the future - the two
+        // triggers are independent. Uses synthetic `Instant`s rather than a
+        // real sleep, per #55's acceptance criteria.
+        let now = tokio::time::Instant::now();
+        let far_future_deadline = now + Duration::from_secs(3600);
+
+        assert!(liveness_probe_due(now, far_future_deadline, true));
+    }
+
+    #[test]
+    fn command_poll_deadline_survives_continuously_ready_output() {
+        let start = tokio::time::Instant::now();
+        let poll = CommandPoll::new(start);
+        for microseconds in 0..10_000 {
+            let now = start + Duration::from_micros(microseconds);
+            assert!(!poll.due(now, false));
+            assert_eq!(poll.deadline, start + COMMAND_POLL_INTERVAL);
+        }
+        assert!(poll.due(start + COMMAND_POLL_INTERVAL, false));
+    }
+
+    #[test]
+    fn command_poll_shutdown_preempts_output_before_the_deadline() {
+        let now = tokio::time::Instant::now();
+        let poll = CommandPoll::new(now);
+        assert!(!poll.due(now, false));
+        assert!(poll.due(now, true));
+    }
+
+    #[test]
+    fn command_poll_progress_does_not_require_the_sleep_branch_to_win() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let poll = CommandPoll::new(tokio::time::Instant::now());
+                loop {
+                    if poll.due(tokio::time::Instant::now(), false) {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = std::future::ready(()) => tokio::task::yield_now().await,
+                        _ = tokio::time::sleep_until(poll.deadline) => {
+                            panic!("continuously ready traffic always wins this synthetic select");
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("control becomes due even when output always wins the select");
+        });
+    }
+
+    #[test]
+    fn command_poll_reschedules_only_after_control_processing() {
+        let start = tokio::time::Instant::now();
+        let mut poll = CommandPoll::new(start);
+        let processed = start + COMMAND_POLL_INTERVAL;
+        assert!(poll.due(processed, false));
+        poll.processed(processed);
+        assert!(!poll.due(processed, false));
+        assert!(!poll.due(
+            processed + COMMAND_POLL_INTERVAL - Duration::from_nanos(1),
+            false
+        ));
+        assert!(poll.due(processed + COMMAND_POLL_INTERVAL, false));
+    }
+
+    #[test]
+    fn command_poll_skips_missed_ticks_without_a_busy_catch_up_loop() {
+        let start = tokio::time::Instant::now();
+        let mut poll = CommandPoll::new(start);
+        let completed = start + Duration::from_secs(60);
+        assert!(poll.due(completed, false));
+        poll.processed(completed);
+        assert_eq!(poll.deadline, completed + COMMAND_POLL_INTERVAL);
+        assert!(!poll.due(completed, false));
+    }
+
+    #[test]
+    fn liveness_probe_due_fires_once_the_automatic_cadence_deadline_elapses() {
+        // The documented always-enabled default (#55): once the automatic
+        // deadline has passed, a probe is due even with no on-demand
+        // request pending.
+        let deadline = tokio::time::Instant::now();
+        let after_deadline = deadline + Duration::from_millis(1);
+
+        assert!(liveness_probe_due(after_deadline, deadline, false));
+        assert!(liveness_probe_due(deadline, deadline, false));
+    }
+
+    #[test]
+    fn liveness_probe_due_stays_false_before_the_deadline_without_a_request() {
+        let now = tokio::time::Instant::now();
+        let future_deadline = now + Duration::from_secs(1);
+
+        assert!(!liveness_probe_due(now, future_deadline, false));
+    }
+
+    #[test]
+    fn liveness_probe_due_models_a_disabled_automatic_cadence() {
+        // Setting the automatic deadline far in the future (as if the
+        // cadence were disabled) must not suppress on-demand requests, and
+        // must not spuriously fire on its own - this is how #55's "disabled"
+        // half of "tests cover disabled/enabled cadence behavior" is
+        // exercised without an actual disable setting existing in 0.1.
+        let now = tokio::time::Instant::now();
+        let effectively_disabled = now + Duration::from_secs(u64::from(u32::MAX));
+
+        assert!(!liveness_probe_due(now, effectively_disabled, false));
+        assert!(liveness_probe_due(now, effectively_disabled, true));
+    }
+
+    #[test]
+    fn only_transport_failures_wire_a_policy_into_planner_actions() {
+        let policy =
+            ReconnectPolicy::new(2, Duration::from_secs(1), Duration::from_secs(2)).unwrap();
+        let mut disabled = None;
+        assert_eq!(
+            reconnect_action_for_failure(&mut disabled, ConnectionFailure::Transport),
+            ReconnectAction::None
+        );
+
+        let mut planner = Some(ReconnectPlanner::new(policy));
+        assert_eq!(
+            reconnect_action_for_failure(&mut planner, ConnectionFailure::HostTrust),
+            ReconnectAction::None
+        );
+        assert_eq!(
+            reconnect_action_for_failure(&mut planner, ConnectionFailure::Authentication),
+            ReconnectAction::None
+        );
+        assert_eq!(
+            reconnect_action_for_failure(&mut planner, ConnectionFailure::Setup),
+            ReconnectAction::None
+        );
+        assert_eq!(
+            reconnect_action_for_failure(&mut planner, ConnectionFailure::Transport),
+            ReconnectAction::ScheduleAttempt {
+                attempt: 1,
+                delay: Duration::from_secs(1),
+            }
+        );
+        assert!(matches!(
+            planner.as_mut().unwrap().delay_elapsed(),
+            ReconnectAction::StartFreshConnection {
+                host_verification: FreshHostVerification::Required,
+                ..
+            }
+        ));
+        assert_eq!(
+            reconnect_action_for_failure(&mut planner, ConnectionFailure::Transport),
+            ReconnectAction::ScheduleAttempt {
+                attempt: 2,
+                delay: Duration::from_secs(2),
+            }
+        );
+    }
+
+    #[test]
+    fn reconnect_planner_schedules_bounded_exponential_attempts() {
+        let policy =
+            ReconnectPolicy::new(3, Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+        let mut planner = ReconnectPlanner::new(policy);
+
+        assert_eq!(
+            planner.disconnected(),
+            ReconnectAction::ScheduleAttempt {
+                attempt: 1,
+                delay: Duration::from_secs(1),
+            }
+        );
+        assert_eq!(
+            planner.delay_elapsed(),
+            ReconnectAction::StartFreshConnection {
+                attempt: 1,
+                host_verification: FreshHostVerification::Required,
+            }
+        );
+        assert_eq!(
+            planner.connection_failed(),
+            ReconnectAction::ScheduleAttempt {
+                attempt: 2,
+                delay: Duration::from_secs(2),
+            }
+        );
+        assert_eq!(
+            planner.delay_elapsed(),
+            ReconnectAction::StartFreshConnection {
+                attempt: 2,
+                host_verification: FreshHostVerification::Required,
+            }
+        );
+        assert_eq!(
+            planner.connection_failed(),
+            ReconnectAction::ScheduleAttempt {
+                attempt: 3,
+                delay: Duration::from_secs(3),
+            }
+        );
+        assert_eq!(
+            planner.delay_elapsed(),
+            ReconnectAction::StartFreshConnection {
+                attempt: 3,
+                host_verification: FreshHostVerification::Required,
+            }
+        );
+        assert_eq!(planner.connection_failed(), ReconnectAction::Exhausted);
+        assert_eq!(planner.state(), ReconnectState::Exhausted);
+        assert_eq!(planner.disconnected(), ReconnectAction::None);
+    }
+
+    #[test]
+    fn reconnect_planner_caps_delay_without_duration_overflow() {
+        let maximum = Duration::from_secs(u64::MAX);
+        let initial = Duration::from_secs(u64::MAX - 1);
+        let policy = ReconnectPolicy::new(2, initial, maximum).unwrap();
+        let mut planner = ReconnectPlanner::new(policy);
+
+        assert_eq!(
+            planner.disconnected(),
+            ReconnectAction::ScheduleAttempt {
+                attempt: 1,
+                delay: initial,
+            }
+        );
+        assert!(matches!(
+            planner.delay_elapsed(),
+            ReconnectAction::StartFreshConnection { attempt: 1, .. }
+        ));
+        assert_eq!(
+            planner.connection_failed(),
+            ReconnectAction::ScheduleAttempt {
+                attempt: 2,
+                delay: maximum,
+            }
+        );
+    }
+
+    #[test]
+    fn reconnect_planner_cancels_and_resets_without_an_immediate_loop() {
+        let policy =
+            ReconnectPolicy::new(2, Duration::from_secs(1), Duration::from_secs(2)).unwrap();
+        let mut planner = ReconnectPlanner::new(policy);
+
+        assert!(matches!(
+            planner.disconnected(),
+            ReconnectAction::ScheduleAttempt { attempt: 1, .. }
+        ));
+        assert_eq!(planner.cancel(), ReconnectAction::Cancelled);
+        assert_eq!(planner.state(), ReconnectState::Cancelled);
+        assert_eq!(planner.delay_elapsed(), ReconnectAction::None);
+        assert_eq!(planner.connection_failed(), ReconnectAction::None);
+        assert_eq!(planner.reset(), ReconnectAction::Reset);
+        assert_eq!(planner.state(), ReconnectState::Idle);
+        assert_eq!(
+            planner.disconnected(),
+            ReconnectAction::ScheduleAttempt {
+                attempt: 1,
+                delay: Duration::from_secs(1),
+            }
+        );
+    }
+
+    #[test]
+    fn reconnect_planner_requires_fresh_host_trust_for_every_attempt() {
+        let policy =
+            ReconnectPolicy::new(2, Duration::from_secs(1), Duration::from_secs(2)).unwrap();
+        let mut planner = ReconnectPlanner::new(policy);
+
+        let first = planner.disconnected();
+        assert!(matches!(
+            first,
+            ReconnectAction::ScheduleAttempt { attempt: 1, .. }
+        ));
+        let first_connection = planner.delay_elapsed();
+        assert_eq!(
+            first_connection,
+            ReconnectAction::StartFreshConnection {
+                attempt: 1,
+                host_verification: FreshHostVerification::Required,
+            }
+        );
+        assert!(matches!(
+            planner.connection_failed(),
+            ReconnectAction::ScheduleAttempt { attempt: 2, .. }
+        ));
+        assert_eq!(
+            planner.delay_elapsed(),
+            ReconnectAction::StartFreshConnection {
+                attempt: 2,
+                host_verification: FreshHostVerification::Required,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_command_queue_is_bounded_and_rejects_large_input() {
+        let (worker, receiver, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            2,
+            4,
+            noop_session_event_notifier(),
+        );
+        let too_large = vec![0; MAX_IO_CHUNK_BYTES + 1];
+        assert_eq!(
+            worker.try_send_input(&too_large),
+            Err(SessionSendError::TooLarge {
+                operation: SessionOperation::Input,
+                maximum: MAX_IO_CHUNK_BYTES,
+                actual: MAX_IO_CHUNK_BYTES + 1,
+            })
+        );
+        worker.try_send_input(b"one").unwrap();
+        worker
+            .try_resize(TerminalSize::new(100, 40).unwrap())
+            .unwrap();
+        assert_eq!(
+            worker.try_shutdown(),
+            Err(SessionSendError::Full {
+                operation: SessionOperation::Shutdown,
+                capacity: 2,
+            })
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"one"
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::Resize(size)) if size == TerminalSize::new(100, 40).unwrap()
+        ));
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting))
+        ));
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Backpressure {
+                direction: FlowDirection::Control,
+                queued: 2,
+                capacity: 2,
+            })
+        ));
+        assert_eq!(worker.metrics().backpressure_count, 1);
+    }
+
+    fn reserve_when_admission_available(
+        worker: &SshWorkerFoundation,
+        bytes: &[u8],
+    ) -> Result<ReservedAutomationInput, ReserveAutomationInputError> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match worker.reserve_automation_input(1, bytes) {
+                Err(ReserveAutomationInputError::Busy) if Instant::now() < deadline => {
+                    thread::yield_now();
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn receive_when_available(
+        commands: &WorkerCommandReceiver,
+    ) -> Result<WorkerCommand, TryRecvError> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match commands.try_recv() {
+                Err(TryRecvError::Empty) if Instant::now() < deadline => thread::yield_now(),
+                result => return result,
+            }
+        }
+    }
+
+    #[test]
+    fn ssh_automation_reservation_preserves_input_order_and_releases_cancelled_slots() {
+        let (worker, commands, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            4,
+            8,
+            noop_session_event_notifier(),
+        );
+        worker.shared.begin_transport();
+        worker.set_running();
+
+        worker.try_send_input(b"before").unwrap();
+        let reservation = reserve_when_admission_available(&worker, b"automated").unwrap();
+        worker.try_send_input(b"after").unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"before"
+        ));
+        assert!(matches!(commands.try_recv(), Err(TryRecvError::Empty)));
+        reservation
+            .commit_with(|bytes| {
+                assert_eq!(bytes, b"automated");
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(matches!(
+            receive_when_available(&commands),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"automated"
+        ));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"after"
+        ));
+
+        let cancelled = reserve_when_admission_available(&worker, b"cancelled").unwrap();
+        worker.try_send_input(b"after cancellation").unwrap();
+        assert!(matches!(commands.try_recv(), Err(TryRecvError::Empty)));
+        drop(cancelled);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"after cancellation"
+        ));
+
+        let expired = reserve_when_admission_available(&worker, b"expired").unwrap();
+        worker.try_send_input(b"after expiry").unwrap();
+        assert!(matches!(commands.try_recv(), Err(TryRecvError::Empty)));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"after expiry"
+        ));
+        assert!(matches!(
+            expired.commit_with(|_| Ok::<_, ()>(())),
+            Err(festerm_session::CommitAutomationInputError::ClosedOrExpired)
+        ));
+    }
+
+    #[test]
+    fn ssh_automation_reservation_never_crosses_attachment_replacement() {
+        let (worker, commands, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            4,
+            16,
+            noop_session_event_notifier(),
+        );
+        worker.shared.begin_transport();
+        worker.set_running();
+
+        let pending = reserve_when_admission_available(&worker, b"old pending").unwrap();
+        assert!(matches!(commands.try_recv(), Err(TryRecvError::Empty)));
+        worker.shared.begin_transport();
+        worker.set_running();
+        worker.try_send_input(b"new human input").unwrap();
+        assert!(matches!(
+            receive_when_available(&commands),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"new human input"
+        ));
+        let called = std::cell::Cell::new(false);
+        assert!(matches!(
+            pending.commit_with(|_| {
+                called.set(true);
+                Ok::<_, ()>(())
+            }),
+            Err(festerm_session::CommitAutomationInputError::ClosedOrExpired)
+        ));
+        assert!(!called.get());
+
+        let committed = reserve_when_admission_available(&worker, b"old committed").unwrap();
+        committed.commit_with(|_| Ok::<_, ()>(())).unwrap();
+        worker.shared.begin_transport();
+        worker.set_running();
+        worker.try_send_input(b"replacement input").unwrap();
+        assert!(matches!(
+            receive_when_available(&commands),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"replacement input"
+        ));
+        assert!(matches!(commands.try_recv(), Err(TryRecvError::Empty)));
+        let errors = std::iter::from_fn(|| worker.try_recv_event().ok())
+            .filter(|event| matches!(
+                event,
+                SessionEvent::Error(error)
+                    if error.message() == "SSH automation input was canceled because its attachment or admission is no longer valid"
+            ))
+            .count();
+        assert_eq!(errors, 2);
+    }
+
+    #[test]
+    fn ssh_automation_reservation_refuses_unavailable_or_full_queues() {
+        let (worker, commands, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            1,
+            8,
+            noop_session_event_notifier(),
+        );
+        assert!(matches!(
+            worker.reserve_automation_input(1, b""),
+            Err(ReserveAutomationInputError::Empty)
+        ));
+        assert!(matches!(
+            reserve_when_admission_available(&worker, b"not running"),
+            Err(ReserveAutomationInputError::Unavailable)
+        ));
+        worker.shared.begin_transport();
+        worker.set_running();
+        assert!(matches!(
+            worker.reserve_automation_input(1, &vec![0; MAX_IO_CHUNK_BYTES + 1]),
+            Err(ReserveAutomationInputError::Rejected(
+                SessionSendError::TooLarge {
+                    operation: SessionOperation::Input,
+                    ..
+                }
+            ))
+        ));
+        worker.shared.set_reconnecting(true);
+        assert!(matches!(
+            reserve_when_admission_available(&worker, b"reconnecting"),
+            Err(ReserveAutomationInputError::Rejected(
+                SessionSendError::Closed {
+                    operation: SessionOperation::Input
+                }
+            ))
+        ));
+        worker.shared.set_reconnecting(false);
+        worker.try_send_input(b"full").unwrap();
+        assert!(matches!(
+            reserve_when_admission_available(&worker, b"not queued"),
+            Err(ReserveAutomationInputError::Rejected(
+                SessionSendError::Full {
+                    operation: SessionOperation::Input,
+                    capacity: 1
+                }
+            ))
+        ));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"full"
+        ));
+        let lost = reserve_when_admission_available(&worker, b"receiver gone").unwrap();
+        drop(commands);
+        assert!(matches!(
+            lost.commit_with(|_| Ok::<_, ()>(())),
+            Err(festerm_session::CommitAutomationInputError::ClosedOrExpired)
+        ));
+    }
+
+    #[test]
+    fn ssh_automation_receiver_yields_after_bounded_cancelled_slots() {
+        let (worker, commands, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            MAX_DISCARDED_AUTOMATION_INPUTS_PER_POLL + 1,
+            8,
+            noop_session_event_notifier(),
+        );
+        worker.shared.begin_transport();
+        worker.set_running();
+        for _ in 0..MAX_DISCARDED_AUTOMATION_INPUTS_PER_POLL {
+            drop(reserve_when_admission_available(&worker, b"cancelled").unwrap());
+        }
+        worker.try_send_input(b"after").unwrap();
+
+        assert!(matches!(commands.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"after"
+        ));
+    }
+
+    #[test]
+    fn ssh_automation_receiver_stays_responsive_during_busy_admission() {
+        const CHILD: &str = "FESTERM_SSH_AUTOMATION_BUSY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::ssh_automation_receiver_stays_responsive_during_busy_admission",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated busy-admission test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (worker, commands, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            4,
+            8,
+            noop_session_event_notifier(),
+        );
+        worker.shared.begin_transport();
+        worker.set_running();
+        let committed = worker.reserve_automation_input(1, b"committed").unwrap();
+        committed.commit_with(|_| Ok::<_, ()>(())).unwrap();
+        let expired = worker.reserve_automation_input(1, b"expired").unwrap();
+        worker.try_send_input(b"human").unwrap();
+
+        let guard = festerm_session::automation_admission_lock().unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            let busy = matches!(
+                worker.reserve_automation_input(1, b"busy"),
+                Err(ReserveAutomationInputError::Busy)
+            );
+            let waiting = matches!(commands.try_recv(), Err(TryRecvError::Empty));
+            sender.send((busy, waiting, commands)).unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        thread.join().unwrap();
+        let (busy, waiting, commands) = result.expect("SSH admission blocked the worker");
+        assert!(busy && waiting);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::Input(bytes)) if bytes == b"committed"
+        ));
+
+        let guard = festerm_session::automation_admission_lock().unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            let human = matches!(
+                commands.try_recv(),
+                Ok(WorkerCommand::Input(bytes)) if bytes == b"human"
+            );
+            sender.send(human).unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        thread.join().unwrap();
+        assert_eq!(result, Ok(true));
+        assert!(matches!(
+            expired.commit_with(|_| Ok::<_, ()>(())),
+            Err(festerm_session::CommitAutomationInputError::ClosedOrExpired)
+        ));
+    }
+
+    #[test]
+    fn slow_ssh_writes_preserve_queued_input_and_remain_interruptible() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (worker, commands, _, _) = SshWorkerFoundation::new_with_capacities(
+                profile(),
+                4,
+                8,
+                noop_session_event_notifier(),
+            );
+            worker.shared.begin_transport();
+            worker.set_running();
+            let reservation = reserve_when_admission_available(&worker, b"automation").unwrap();
+            reservation.commit_with(|_| Ok::<_, ()>(())).unwrap();
+            worker.try_send_input(b"human").unwrap();
+
+            let slow_write = async {
+                tokio::time::sleep(COMMAND_POLL_INTERVAL * 3).await;
+                Ok::<_, russh::Error>(())
+            };
+            assert!(matches!(
+                wait_for_running_ssh_operation(slow_write, &worker.shared, &worker.host_key_gate)
+                    .await,
+                WorkerWait::Completed(Ok(()))
+            ));
+            assert!(matches!(
+                receive_when_available(&commands),
+                Ok(WorkerCommand::Input(bytes)) if bytes == b"automation"
+            ));
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(WorkerCommand::Input(bytes)) if bytes == b"human"
+            ));
+
+            let shutdown = async {
+                tokio::time::sleep(COMMAND_POLL_INTERVAL * 2).await;
+                worker.try_shutdown().unwrap();
+            };
+            let (outcome, ()) = tokio::join!(
+                wait_for_running_ssh_operation(
+                    std::future::pending::<Result<(), russh::Error>>(),
+                    &worker.shared,
+                    &worker.host_key_gate,
+                ),
+                shutdown,
+            );
+            assert!(matches!(outcome, WorkerWait::Shutdown));
+        });
+    }
+
+    #[test]
+    fn full_event_queue_cannot_preserve_ssh_epoch_across_reconnect() {
+        let (worker, commands, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            2,
+            1,
+            noop_session_event_notifier(),
+        );
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting))
+        ));
+        worker.shared.begin_transport();
+        worker.set_running();
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running))
+        ));
+        let epoch = Arc::clone(&worker.shared.automation_epoch);
+        let original = epoch.capture().unwrap();
+        assert!(worker.shared.record_output(b"old transport".to_vec()));
+
+        worker.try_reconnect().unwrap();
+        assert!(matches!(commands.try_recv(), Ok(WorkerCommand::Reconnect)));
+        worker.shared.invalidate_automation_epoch();
+        assert_eq!(epoch.capture(), None);
+        worker.shared.set_lifecycle(SessionLifecycle::Stopped);
+        worker.shared.set_lifecycle(SessionLifecycle::Starting);
+        worker.shared.begin_transport();
+        worker.set_running();
+        let replacement = epoch.capture().unwrap();
+        {
+            let _guard = festerm_session::automation_admission_lock().unwrap();
+            assert!(!epoch.is_current(original));
+            assert!(epoch.is_current(replacement));
+        }
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Output(bytes)) if bytes == b"old transport"
+        ));
+        assert_eq!(worker.try_recv_event(), Err(SessionTryReceiveError::Empty));
+        assert!(worker.shared.record_output(b"replacement".to_vec()));
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Output(bytes)) if bytes == b"replacement"
+        ));
+    }
+
+    #[test]
+    fn shutdown_during_ssh_startup_cannot_rearm_automation_epoch() {
+        let (worker, _commands, _, _) = SshWorkerFoundation::new(profile());
+        worker.shared.request_shutdown();
+        worker.set_running();
+        assert_eq!(worker.shared.automation_epoch.capture(), None);
+    }
+
+    #[test]
+    fn poisoned_ssh_lifecycle_serializer_cannot_rearm_automation_epoch() {
+        let (worker, _commands, _, _) = SshWorkerFoundation::new(profile());
+        worker.set_running();
+        let epoch = Arc::clone(&worker.shared.automation_epoch);
+        let original = epoch.capture().unwrap();
+        let shared = Arc::clone(&worker.shared);
+        assert!(thread::spawn(move || {
+            let _transition = shared.lifecycle_transition.lock().unwrap();
+            panic!("poison this backend's lifecycle serializer");
+        })
+        .join()
+        .is_err());
+
+        worker.set_running();
+        assert_eq!(epoch.capture(), None);
+        {
+            let _guard = festerm_session::automation_admission_lock().unwrap();
+            assert!(!epoch.is_current(original));
+        }
+        worker.shared.begin_transport();
+        worker.set_running();
+        assert_eq!(epoch.capture(), None);
+        worker.shared.request_shutdown();
+    }
+
+    #[test]
+    fn live_remote_file_requestor_enqueues_reads_without_reauthenticating() {
+        let (worker, receiver, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            2,
+            4,
+            noop_session_event_notifier(),
+        );
+        worker.shared.set_lifecycle(SessionLifecycle::Running);
+        let requestor = worker.live_remote_file_requestor();
+        let reader = requestor.clone();
+        let join =
+            thread::spawn(move || reader.read_remote_file_snapshot("/srv/docs/guide.md", 4096));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (path, max_bytes, result_sender) = loop {
+            match receiver.try_recv() {
+                Ok(WorkerCommand::ReadRemoteFile {
+                    path,
+                    max_bytes,
+                    result_sender,
+                    ..
+                }) => break (path, max_bytes, result_sender),
+                Ok(_) => panic!("expected a live remote-file read command"),
+                Err(TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "remote-file read command was never queued"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!("remote-file read command channel closed early")
+                }
+            }
+        };
+        assert_eq!(path, "/srv/docs/guide.md");
+        assert_eq!(max_bytes, 4096);
+        result_sender
+            .send(Ok(RemoteFileSnapshot {
+                metadata: SftpPathMetadata {
+                    path: SftpPath::remote("/srv/docs/guide.md"),
+                    file_type: SftpEntryType::File,
+                    size: Some(5),
+                    modified_at: None,
+                    permissions: None,
+                },
+                bytes: b"hello".to_vec(),
+            }))
+            .unwrap();
+
+        let snapshot = join.join().unwrap().unwrap();
+        assert_eq!(requestor.session_id(), worker.id());
+        assert_eq!(snapshot.bytes(), b"hello");
+    }
+
+    #[test]
+    fn live_remote_file_requestor_rejects_old_transport_generations_and_oversize_requests() {
+        let (worker, receiver, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            2,
+            4,
+            noop_session_event_notifier(),
+        );
+        worker.shared.set_lifecycle(SessionLifecycle::Running);
+        let stale = worker.live_remote_file_requestor();
+        worker.shared.begin_transport();
+        worker.shared.set_lifecycle(SessionLifecycle::Running);
+        assert_eq!(
+            stale.read_remote_file_snapshot("/old.txt", 100),
+            Err(RemoteFileReadError::NotRunning)
+        );
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        let current = worker.live_remote_file_requestor();
+        assert_eq!(
+            current.read_remote_file_snapshot("/large.txt", usize::MAX),
+            Err(RemoteFileReadError::InvalidRequest)
+        );
+        assert_eq!(
+            current.read_remote_file_snapshot("/empty.txt", 0),
+            Err(RemoteFileReadError::InvalidRequest)
+        );
+        let reader = current.clone();
+        let read = thread::spawn(move || reader.read_remote_file_snapshot("/current.txt", 100));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let result_sender = loop {
+            match receiver.try_recv() {
+                Ok(WorkerCommand::ReadRemoteFile {
+                    generation,
+                    result_sender,
+                    ..
+                }) => {
+                    assert_eq!(generation, current.transport_generation());
+                    break result_sender;
+                }
+                Err(TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                _ => panic!("expected remote file request"),
+            }
+        };
+        worker.shared.begin_transport();
+        worker.shared.set_lifecycle(SessionLifecycle::Running);
+        result_sender
+            .send(Err(RemoteFileReadError::Missing {
+                path: "/current.txt".to_owned(),
+            }))
+            .unwrap();
+        assert_eq!(read.join().unwrap(), Err(RemoteFileReadError::Closed));
+    }
+
+    #[test]
+    fn worker_rejects_input_and_resize_while_reconnecting() {
+        let (worker, receiver, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            2,
+            4,
+            noop_session_event_notifier(),
+        );
+        worker.shared.set_reconnecting(true);
+
+        assert_eq!(
+            worker.try_send_input(b"must-not-be-queued"),
+            Err(SessionSendError::Closed {
+                operation: SessionOperation::Input,
+            })
+        );
+        assert_eq!(
+            worker.try_resize(TerminalSize::new(100, 40).unwrap()),
+            Err(SessionSendError::Closed {
+                operation: SessionOperation::Resize,
+            })
+        );
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn worker_retains_the_latest_resize_while_connecting_without_an_error() {
+        let (worker, receiver, _, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            2,
+            4,
+            noop_session_event_notifier(),
+        );
+        let requested = TerminalSize::new(132, 43).unwrap();
+        worker.try_resize(requested).unwrap();
+
+        assert!(!process_commands_before_running(
+            &receiver,
+            &worker.shared,
+            &HostKeyDecisionGate::new(),
+        ));
+        assert_eq!(worker.shared.desired_terminal_size(), requested);
+        assert_eq!(worker.shared.take_pre_running_resize(), Some(requested));
+        assert_eq!(worker.shared.take_pre_running_resize(), None);
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting))
+        ));
+        assert!(matches!(
+            worker.try_recv_event(),
+            Err(SessionTryReceiveError::Empty)
+        ));
+    }
+
+    #[test]
+    fn worker_events_update_lifecycle_metrics_and_notifier() {
+        let notifier = Arc::new(CountingNotifier::default());
+        let (worker, _receiver, _, _) =
+            SshWorkerFoundation::new_with_capacities(profile(), 2, 4, notifier.clone());
+        let id = worker.id();
+        assert_eq!(worker.lifecycle(), SessionLifecycle::Starting);
+        worker.set_running();
+        assert!(worker.shared.record_output(b"ready".to_vec()));
+        worker
+            .shared
+            .record_resize_applied(TerminalSize::new(100, 40).unwrap());
+        worker.shared.record_input_sent(3);
+
+        let metrics = worker.metrics();
+        assert_eq!(metrics.input_bytes, 3);
+        assert_eq!(metrics.output_bytes, 5);
+        assert_eq!(metrics.resize_count, 1);
+        assert_eq!(metrics.event_queue_depth, 4);
+        assert_eq!(metrics.event_queue_high_watermark, 4);
+        assert_eq!(metrics.event_queue_capacity, 4);
+        assert_eq!(notifier.notifications(), 4);
+        assert!(id.get() > 0);
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting))
+        ));
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running))
+        ));
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Output(bytes)) if bytes == b"ready"
+        ));
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::ResizeApplied(size)) if size == TerminalSize::new(100, 40).unwrap()
+        ));
+        assert_eq!(worker.metrics().event_queue_depth, 0);
+        assert_eq!(worker.try_recv_event(), Err(SessionTryReceiveError::Empty));
+    }
+
+    #[test]
+    fn sftp_input_refusal_survives_full_queue_without_reallocating_or_failing_the_session() {
+        let notifier = Arc::new(CountingNotifier::default());
+        let (worker, _receiver, _, _) =
+            SshWorkerFoundation::new_with_capacities(profile(), 2, 1, notifier.clone());
+        worker.try_recv_event().unwrap();
+        worker.set_running();
+        let mut notice = SftpInputNotice::default();
+        notice.refuse(&worker.shared);
+        let message_address = |notice: &SftpInputNotice| match notice.pending.as_ref().unwrap() {
+            SessionEvent::Error(error) => error.message().as_ptr(),
+            _ => panic!("only a bounded input error is retained"),
+        };
+        let original = message_address(&notice);
+        for _ in 0..10 {
+            notice.flush(&worker.shared);
+            assert_eq!(message_address(&notice), original);
+        }
+        notice.refuse(&worker.shared);
+        assert_eq!(message_address(&notice), original);
+        assert_eq!(worker.metrics().event_queue_depth, 1);
+        assert_eq!(worker.metrics().error_count, 0);
+        assert!(worker.metrics().backpressure_count > 0);
+        assert_eq!(notifier.notifications(), 2);
+        worker.try_recv_event().unwrap();
+        notice.flush(&worker.shared);
+        assert!(notice.pending.is_none());
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Error(error))
+                if error.kind() == SessionErrorKind::Input
+                    && error.message() == SFTP_INPUT_REFUSAL_MESSAGE
+        ));
+        assert_eq!(worker.metrics().error_count, 1);
+        assert_eq!(notifier.notifications(), 3);
+        assert_eq!(worker.lifecycle(), SessionLifecycle::Running);
+    }
+
+    #[test]
+    fn sftp_input_refusal_is_retried_while_a_command_waits_for_io() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (worker, _receiver, _, _) = SshWorkerFoundation::new_with_capacities(
+                profile(),
+                2,
+                1,
+                noop_session_event_notifier(),
+            );
+            let mut notice = SftpInputNotice::default();
+            notice.refuse(&worker.shared);
+            let operation = async {
+                tokio::time::sleep(COMMAND_POLL_INTERVAL * 2).await;
+                worker.try_recv_event().unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Ok(SessionEvent::Error(error)) = worker.try_recv_event() {
+                            return error.kind();
+                        }
+                        tokio::time::sleep(COMMAND_POLL_INTERVAL).await;
+                    }
+                })
+                .await
+                .unwrap()
+            };
+            assert!(matches!(
+                wait_for_sftp_owner_operation(operation, &worker.shared, || {
+                    notice.flush(&worker.shared);
+                })
+                .await,
+                SftpOwnerOperation::Completed(SessionErrorKind::Input)
+            ));
+            assert!(notice.pending.is_none());
+        });
+    }
+
+    #[test]
+    fn host_key_gate_accepts_only_explicit_resolutions() {
+        let (worker, _receiver, resolver, _) = SshWorkerFoundation::new(profile());
+        let waiter = worker
+            .request_host_key_verification("SHA256:abcDef012+/")
+            .unwrap();
+        assert!(matches!(
+            worker.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting))
+        ));
+        let prompt = match worker.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) => prompt,
+            event => panic!("expected host-key prompt, received {event:?}"),
+        };
+        assert_eq!(prompt.host(), "example.com");
+        assert_eq!(prompt.port(), 22);
+        assert_eq!(prompt.sha256_fingerprint(), "SHA256:abcDef012+/");
+        resolver
+            .resolve(&prompt, HostTrustDecision::AcceptOnce)
+            .unwrap();
+        assert_eq!(
+            waiter.wait(&worker.host_key_gate, Duration::ZERO),
+            HostTrustDecision::AcceptOnce
+        );
+    }
+
+    #[test]
+    fn gui_sftp_connect_without_a_prompt_returns_connected_immediately() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_event_sender, event_receiver) = mpsc::sync_channel(DEFAULT_EVENT_QUEUE_CAPACITY);
+        let resolver = HostKeyDecisionResolver {
+            gate: Arc::new(HostKeyDecisionGate::new()),
+        };
+
+        let outcome = runtime
+            .block_on(async {
+                observe_gui_sftp_connect(
+                    event_receiver,
+                    resolver,
+                    tokio::spawn(async { Ok::<_, GuiSftpSessionConnectError>("connected") }),
+                    None,
+                )
+                .await
+            })
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            GuiSftpConnectOutcome::Connected("connected")
+        ));
+    }
+
+    struct ConnectDropProbe(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for ConnectDropProbe {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn text_sftp_runtime_reports_completion_without_waiting_for_blocking_io() {
+        let (started, start) = mpsc::sync_channel(1);
+        let (release, blocked) = mpsc::sync_channel(1);
+        let (finished, finish) = mpsc::sync_channel(1);
+        let (completed, completion) = mpsc::sync_channel(1);
+        let owner = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let timed_out = SftpTerminalSession::run_sftp_worker_runtime(runtime, async {
+                let operation = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    blocked.recv().unwrap();
+                    finished.send(()).unwrap();
+                });
+                tokio::time::timeout(SFTP_CANCELLATION_CLEANUP_TIMEOUT, operation)
+                    .await
+                    .is_err()
+            });
+            completed.send(timed_out).unwrap();
+        });
+        start.recv_timeout(Duration::from_secs(3)).unwrap();
+        let result = completion.recv_timeout(Duration::from_secs(3));
+        let still_blocked = matches!(finish.try_recv(), Err(TryRecvError::Empty));
+        release.send(()).unwrap();
+        finish.recv_timeout(Duration::from_secs(3)).unwrap();
+        owner.join().unwrap();
+        assert!(still_blocked);
+        assert_eq!(
+            result,
+            Ok(true),
+            "text completion must not wait for an already-started blocking call"
+        );
+    }
+
+    #[test]
+    fn cancelling_gui_connect_completion_wait_retires_its_pending_task() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (retired, retirement) = tokio::sync::oneshot::channel();
+            let probe = ConnectDropProbe(Some(retired));
+            let task = tokio::spawn(async move {
+                let _probe = probe;
+                std::future::pending::<Result<(), GuiSftpSessionConnectError>>().await
+            });
+            let mut waiting = Box::pin(GuiSftpConnectCompletion::new(task).wait());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                    .await
+                    .is_err()
+            );
+            drop(waiting);
+            tokio::time::timeout(Duration::from_secs(1), retirement)
+                .await
+                .expect("dropping the wait must not detach its pending task")
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn cancelling_gui_connect_observation_retires_the_pre_prompt_task() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (event_sender, event_receiver) = mpsc::sync_channel(DEFAULT_EVENT_QUEUE_CAPACITY);
+            let (retired, retirement) = tokio::sync::oneshot::channel();
+            let probe = ConnectDropProbe(Some(retired));
+            let task = tokio::spawn(async move {
+                let _sender = event_sender;
+                let _probe = probe;
+                std::future::pending::<Result<(), GuiSftpSessionConnectError>>().await
+            });
+            let resolver = HostKeyDecisionResolver {
+                gate: Arc::new(HostKeyDecisionGate::new()),
+            };
+            assert!(tokio::time::timeout(
+                Duration::from_millis(10),
+                observe_gui_sftp_connect(event_receiver, resolver, task, None),
+            )
+            .await
+            .is_err());
+            tokio::time::timeout(Duration::from_secs(1), retirement)
+                .await
+                .expect("dropping observation must not detach its pre-prompt task")
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn gui_connect_cancellation_signals_shutdown_and_rejects_pending_trust() {
+        let (foundation, _commands, _resolver, _) = SshWorkerFoundation::new(profile());
+        let waiter = foundation
+            .request_host_key_verification("SHA256:cancel-owner")
+            .unwrap();
+        let (shutdown, mut cancelled) = tokio::sync::oneshot::channel();
+        drop(GuiSftpConnectCancellation {
+            shutdown: Some(shutdown),
+            shared: Arc::clone(&foundation.shared),
+            host_key_gate: Arc::clone(&foundation.host_key_gate),
+        });
+        assert!(foundation.shared.shutdown_requested());
+        assert_eq!(cancelled.try_recv(), Ok(()));
+        assert_eq!(
+            waiter.wait(&foundation.host_key_gate, Duration::ZERO),
+            HostTrustDecision::Reject
+        );
+    }
+
+    #[test]
+    fn text_sftp_shutdown_cancels_a_pending_operation_without_draining_input() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (foundation, commands, _, _) = SshWorkerFoundation::new(profile());
+            foundation.set_running();
+            foundation.try_send_input(b"queued-command\n").unwrap();
+            foundation.shared.request_shutdown();
+            assert!(matches!(
+                wait_for_sftp_owner_operation(
+                    std::future::pending::<()>(),
+                    &foundation.shared,
+                    || {}
+                )
+                .await,
+                SftpOwnerOperation::Cancelled
+            ));
+            assert!(matches!(commands.try_recv(), Ok(WorkerCommand::Input(_))));
+        });
+    }
+
+    #[test]
+    fn gui_sftp_connect_surfaces_a_pending_host_key_decision() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (event_sender, event_receiver) = mpsc::sync_channel(DEFAULT_EVENT_QUEUE_CAPACITY);
+        let gate = Arc::new(HostKeyDecisionGate::new());
+        let resolver = HostKeyDecisionResolver {
+            gate: Arc::clone(&gate),
+        };
+        let prompt =
+            festerm_session::HostKeyPrompt::new("sftp.example.test", 22, "SHA256:abcDef012+/");
+        let waiter = gate.begin(prompt.clone()).unwrap();
+        let wait_gate = Arc::clone(&gate);
+
+        let outcome = runtime
+            .block_on(async {
+                observe_gui_sftp_connect(
+                    event_receiver,
+                    resolver.clone(),
+                    tokio::spawn(async move {
+                        event_sender
+                            .send(SessionEvent::HostKeyVerification(prompt))
+                            .unwrap();
+                        match waiter.wait_async(&wait_gate, Duration::from_secs(1)).await {
+                            HostTrustDecision::AcceptOnce | HostTrustDecision::AcceptAndPersist => {
+                                Ok("connected")
+                            }
+                            HostTrustDecision::Reject => {
+                                Err(GuiSftpSessionConnectError::HostKeyRejected)
+                            }
+                        }
+                    }),
+                    None,
+                )
+                .await
+            })
+            .unwrap();
+
+        let GuiSftpConnectOutcome::NeedsHostKeyDecision {
+            prompt,
+            resolver: returned_resolver,
+            completion,
+        } = outcome
+        else {
+            panic!("expected a pending host-key decision");
+        };
+        assert_eq!(prompt.host(), "sftp.example.test");
+        assert_eq!(prompt.sha256_fingerprint(), "SHA256:abcDef012+/");
+        returned_resolver
+            .resolve(&prompt, HostTrustDecision::Reject)
+            .unwrap();
+        assert_eq!(
+            runtime.block_on(completion.wait()),
+            Err(GuiSftpSessionConnectError::HostKeyRejected)
+        );
+        assert_eq!(
+            resolver.cancel(&prompt),
+            Err(HostKeyDecisionResolutionError::NoPendingPrompt)
+        );
+    }
+
+    #[test]
+    fn gui_sftp_connect_accept_once_resumes_and_finishes_successfully() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (event_sender, event_receiver) = mpsc::sync_channel(DEFAULT_EVENT_QUEUE_CAPACITY);
+        let gate = Arc::new(HostKeyDecisionGate::new());
+        let resolver = HostKeyDecisionResolver {
+            gate: Arc::clone(&gate),
+        };
+        let prompt =
+            festerm_session::HostKeyPrompt::new("sftp.example.test", 22, "SHA256:acceptOncePrompt");
+        let waiter = gate.begin(prompt.clone()).unwrap();
+        let wait_gate = Arc::clone(&gate);
+
+        let outcome = runtime
+            .block_on(async {
+                observe_gui_sftp_connect(
+                    event_receiver,
+                    resolver,
+                    tokio::spawn(async move {
+                        event_sender
+                            .send(SessionEvent::HostKeyVerification(prompt))
+                            .unwrap();
+                        match waiter.wait_async(&wait_gate, Duration::from_secs(1)).await {
+                            HostTrustDecision::AcceptOnce | HostTrustDecision::AcceptAndPersist => {
+                                Ok("connected")
+                            }
+                            HostTrustDecision::Reject => {
+                                Err(GuiSftpSessionConnectError::HostKeyRejected)
+                            }
+                        }
+                    }),
+                    None,
+                )
+                .await
+            })
+            .unwrap();
+
+        let GuiSftpConnectOutcome::NeedsHostKeyDecision {
+            prompt,
+            resolver,
+            completion,
+        } = outcome
+        else {
+            panic!("expected a pending host-key decision");
+        };
+        resolver
+            .resolve(&prompt, HostTrustDecision::AcceptOnce)
+            .unwrap();
+        assert_eq!(runtime.block_on(completion.wait()).unwrap(), "connected");
+    }
+
+    #[test]
+    fn gui_sftp_connect_rejecting_the_host_key_fails_the_connect_attempt() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (event_sender, event_receiver) = mpsc::sync_channel(DEFAULT_EVENT_QUEUE_CAPACITY);
+        let gate = Arc::new(HostKeyDecisionGate::new());
+        let resolver = HostKeyDecisionResolver {
+            gate: Arc::clone(&gate),
+        };
+        let prompt =
+            festerm_session::HostKeyPrompt::new("sftp.example.test", 22, "SHA256:rejectPrompt");
+        let waiter = gate.begin(prompt.clone()).unwrap();
+        let wait_gate = Arc::clone(&gate);
+
+        let outcome = runtime
+            .block_on(async {
+                observe_gui_sftp_connect(
+                    event_receiver,
+                    resolver,
+                    tokio::spawn(async move {
+                        event_sender
+                            .send(SessionEvent::HostKeyVerification(prompt))
+                            .unwrap();
+                        match waiter.wait_async(&wait_gate, Duration::from_secs(1)).await {
+                            HostTrustDecision::AcceptOnce | HostTrustDecision::AcceptAndPersist => {
+                                Ok("connected")
+                            }
+                            HostTrustDecision::Reject => {
+                                Err(GuiSftpSessionConnectError::HostKeyRejected)
+                            }
+                        }
+                    }),
+                    None,
+                )
+                .await
+            })
+            .unwrap();
+
+        let GuiSftpConnectOutcome::NeedsHostKeyDecision {
+            prompt,
+            resolver,
+            completion,
+        } = outcome
+        else {
+            panic!("expected a pending host-key decision");
+        };
+        resolver
+            .resolve(&prompt, HostTrustDecision::Reject)
+            .unwrap();
+        assert_eq!(
+            runtime.block_on(completion.wait()),
+            Err(GuiSftpSessionConnectError::HostKeyRejected)
+        );
+    }
+
+    #[test]
+    fn gui_sftp_connect_timeout_rejects_and_cleans_up_the_pending_gate() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (event_sender, event_receiver) = mpsc::sync_channel(DEFAULT_EVENT_QUEUE_CAPACITY);
+        let gate = Arc::new(HostKeyDecisionGate::new());
+        let resolver = HostKeyDecisionResolver {
+            gate: Arc::clone(&gate),
+        };
+        let prompt =
+            festerm_session::HostKeyPrompt::new("sftp.example.test", 22, "SHA256:timeoutPrompt");
+        let waiter = gate.begin(prompt.clone()).unwrap();
+        let wait_gate = Arc::clone(&gate);
+        let prompt_for_assert = prompt.clone();
+
+        let outcome = runtime
+            .block_on(async {
+                observe_gui_sftp_connect(
+                    event_receiver,
+                    resolver.clone(),
+                    tokio::spawn(async move {
+                        event_sender
+                            .send(SessionEvent::HostKeyVerification(prompt))
+                            .unwrap();
+                        match waiter
+                            .wait_async(&wait_gate, Duration::from_millis(10))
+                            .await
+                        {
+                            HostTrustDecision::AcceptOnce | HostTrustDecision::AcceptAndPersist => {
+                                Ok("connected")
+                            }
+                            HostTrustDecision::Reject => {
+                                Err(GuiSftpSessionConnectError::HostKeyRejected)
+                            }
+                        }
+                    }),
+                    None,
+                )
+                .await
+            })
+            .unwrap();
+
+        let GuiSftpConnectOutcome::NeedsHostKeyDecision { completion, .. } = outcome else {
+            panic!("expected a pending host-key decision");
+        };
+        assert_eq!(
+            runtime.block_on(completion.wait()),
+            Err(GuiSftpSessionConnectError::HostKeyRejected)
+        );
+        assert_eq!(
+            resolver.cancel(&prompt_for_assert),
+            Err(HostKeyDecisionResolutionError::NoPendingPrompt)
+        );
+    }
+
+    #[test]
+    fn stale_host_key_decision_cannot_approve_a_later_prompt() {
+        let (worker, _receiver, resolver, _) = SshWorkerFoundation::new(profile());
+        let expired = worker
+            .request_host_key_verification("SHA256:expired")
+            .unwrap();
+        let expired_prompt = expired.prompt().clone();
+        assert_eq!(
+            expired.wait(&worker.host_key_gate, Duration::ZERO),
+            HostTrustDecision::Reject
+        );
+
+        let current = worker
+            .request_host_key_verification("SHA256:current")
+            .unwrap();
+        assert_eq!(
+            resolver.resolve(&expired_prompt, HostTrustDecision::AcceptOnce),
+            Err(HostKeyDecisionResolutionError::PromptMismatch)
+        );
+        resolver
+            .resolve(current.prompt(), HostTrustDecision::AcceptOnce)
+            .unwrap();
+        assert_eq!(
+            current.wait(&worker.host_key_gate, Duration::ZERO),
+            HostTrustDecision::AcceptOnce
+        );
+    }
+
+    #[test]
+    fn connect_deadline_is_held_only_while_a_host_key_is_under_review() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let gate = HostKeyDecisionGate::new();
+            let near = tokio::time::Instant::now() + Duration::from_millis(50);
+            let mut deadline = std::pin::pin!(tokio::time::sleep_until(near));
+
+            hold_connect_deadline_while_reviewing(deadline.as_mut(), &gate);
+            assert_eq!(deadline.deadline(), near, "idle gate leaves the deadline");
+
+            let prompt = festerm_session::HostKeyPrompt::new("example.test", 22, "SHA256:review");
+            let waiter = gate.begin(prompt.clone()).expect("begin review");
+            hold_connect_deadline_while_reviewing(deadline.as_mut(), &gate);
+            assert!(deadline.deadline() > near + Duration::from_secs(5));
+
+            gate.cancel(&prompt).expect("cancel");
+            drop(waiter);
+            let held = deadline.deadline();
+            hold_connect_deadline_while_reviewing(deadline.as_mut(), &gate);
+            assert_eq!(deadline.deadline(), held, "finished review stops holding");
+        });
+    }
+
+    #[test]
+    fn host_key_gate_rejects_missing_timeout_cancel_and_invalid_resolutions() {
+        let (worker, _receiver, resolver, _) = SshWorkerFoundation::new(profile());
+        assert_eq!(
+            resolver.resolve(
+                &festerm_session::HostKeyPrompt::new("example.com", 22, "SHA256:missing"),
+                HostTrustDecision::AcceptAndPersist
+            ),
+            Err(HostKeyDecisionResolutionError::NoPendingPrompt)
+        );
+        assert!(matches!(
+            worker.request_host_key_verification("not-a-fingerprint"),
+            Err(HostKeyVerificationRequestError::InvalidFingerprint)
+        ));
+
+        let timed_out = worker
+            .request_host_key_verification("SHA256:timeOut")
+            .unwrap();
+        assert_eq!(
+            timed_out.wait(&worker.host_key_gate, Duration::ZERO),
+            HostTrustDecision::Reject
+        );
+
+        let cancelled = worker
+            .request_host_key_verification("SHA256:cancel")
+            .unwrap();
+        resolver.cancel(cancelled.prompt()).unwrap();
+        assert_eq!(
+            cancelled.wait(&worker.host_key_gate, Duration::ZERO),
+            HostTrustDecision::Reject
+        );
+
+        let resolved = worker
+            .request_host_key_verification("SHA256:reject")
+            .unwrap();
+        resolver
+            .resolve(resolved.prompt(), HostTrustDecision::Reject)
+            .unwrap();
+        assert_eq!(
+            resolver.resolve(resolved.prompt(), HostTrustDecision::AcceptOnce),
+            Err(HostKeyDecisionResolutionError::AlreadyResolved)
+        );
+        assert_eq!(
+            resolved.wait(&worker.host_key_gate, Duration::ZERO),
+            HostTrustDecision::Reject
+        );
+    }
+
+    #[test]
+    fn host_key_prompt_is_rejected_when_the_bounded_event_queue_is_full() {
+        let (worker, _receiver, resolver, _) = SshWorkerFoundation::new_with_capacities(
+            profile(),
+            1,
+            1,
+            noop_session_event_notifier(),
+        );
+        assert!(matches!(
+            worker.request_host_key_verification("SHA256:queueFull"),
+            Err(HostKeyVerificationRequestError::EventQueueFull)
+        ));
+        assert_eq!(
+            resolver.cancel(&festerm_session::HostKeyPrompt::new(
+                "example.com",
+                22,
+                "SHA256:queueFull"
+            )),
+            Err(HostKeyDecisionResolutionError::NoPendingPrompt)
+        );
+        assert_eq!(worker.metrics().backpressure_count, 1);
+    }
+
+    #[test]
+    fn password_gate_rejects_missing_timeout_cancel_and_invalid_resolutions() {
+        let (worker, _receiver, _host_key_resolver, resolver) = SshWorkerFoundation::new(profile());
+        assert_eq!(
+            resolver.resolve(
+                &festerm_session::PasswordPrompt::new("fes", "example.com", 1, false),
+                "irrelevant".to_owned()
+            ),
+            Err(PasswordDecisionResolutionError::NoPendingPrompt)
+        );
+
+        let timed_out = worker.request_password_verification(1, false).unwrap();
+        assert_eq!(timed_out.wait(&worker.password_gate, Duration::ZERO), None);
+
+        let cancelled = worker.request_password_verification(2, true).unwrap();
+        resolver.cancel(cancelled.prompt()).unwrap();
+        assert_eq!(cancelled.wait(&worker.password_gate, Duration::ZERO), None);
+
+        let resolved = worker.request_password_verification(3, true).unwrap();
+        resolver
+            .resolve(resolved.prompt(), "typed-password".to_owned())
+            .unwrap();
+        assert_eq!(
+            resolver.resolve(resolved.prompt(), "second-typed-password".to_owned()),
+            Err(PasswordDecisionResolutionError::AlreadyResolved)
+        );
+        assert_eq!(
+            resolved.wait(&worker.password_gate, Duration::ZERO),
+            Some("typed-password".to_owned())
+        );
+    }
+
+    #[test]
+    fn stale_password_decision_cannot_resolve_a_later_prompt() {
+        let (worker, _receiver, _host_key_resolver, resolver) = SshWorkerFoundation::new(profile());
+        let expired = worker.request_password_verification(1, false).unwrap();
+        let expired_prompt = expired.prompt().clone();
+        assert_eq!(expired.wait(&worker.password_gate, Duration::ZERO), None);
+
+        let current = worker.request_password_verification(2, true).unwrap();
+        assert_eq!(
+            resolver.resolve(&expired_prompt, "stale-password".to_owned()),
+            Err(PasswordDecisionResolutionError::PromptMismatch)
+        );
+        resolver
+            .resolve(current.prompt(), "current-password".to_owned())
+            .unwrap();
+        assert_eq!(
+            current.wait(&worker.password_gate, Duration::ZERO),
+            Some("current-password".to_owned())
+        );
+    }
+
+    #[test]
+    fn password_prompt_is_rejected_when_the_bounded_event_queue_is_full() {
+        let (worker, _receiver, _host_key_resolver, resolver) =
+            SshWorkerFoundation::new_with_capacities(
+                profile(),
+                1,
+                1,
+                noop_session_event_notifier(),
+            );
+        assert!(matches!(
+            worker.request_password_verification(1, false),
+            Err(PasswordVerificationRequestError::EventQueueFull)
+        ));
+        assert_eq!(
+            resolver.cancel(&festerm_session::PasswordPrompt::new(
+                "fes",
+                "example.com",
+                1,
+                false
+            )),
+            Err(PasswordDecisionResolutionError::NoPendingPrompt)
+        );
+        assert_eq!(worker.metrics().backpressure_count, 1);
+    }
+
+    #[test]
+    fn sha256_fingerprint_uses_canonical_unpadded_ssh_format() {
+        let public_key = russh::keys::PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti",
+        )
+        .unwrap();
+
+        assert_eq!(
+            sha256_fingerprint(&public_key),
+            "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ"
+        );
+    }
+
+    #[test]
+    fn handler_accepts_only_resolved_host_key_decisions() {
+        let (worker, _receiver, resolver, _) = SshWorkerFoundation::new(profile());
+        let public_key = russh::keys::PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti",
+        )
+        .unwrap();
+        let identity = worker.profile.identity.clone();
+        let shared = Arc::clone(&worker.shared);
+        let gate = Arc::clone(&worker.host_key_gate);
+        let callback = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let mut handler = SshClientHandler {
+                identity,
+                shared,
+                host_key_gate: gate,
+                host_key_rejected: Arc::new(AtomicBool::new(false)),
+                forwarded_tcpip_sender: tokio::sync::mpsc::channel(
+                    PORT_FORWARD_PENDING_CONNECTION_CAPACITY,
+                )
+                .0,
+                expected_fingerprint: None,
+            };
+            runtime
+                .block_on(handler.check_server_key(&public_key))
+                .unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let prompt = loop {
+            match worker.try_recv_event() {
+                Ok(SessionEvent::HostKeyVerification(prompt)) => break prompt,
+                Ok(_) | Err(SessionTryReceiveError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "host-key callback did not prompt"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(SessionTryReceiveError::Closed) => panic!("host-key callback closed early"),
+            }
+        };
+        resolver
+            .resolve(&prompt, HostTrustDecision::AcceptAndPersist)
+            .unwrap();
+        assert!(callback.join().unwrap());
+    }
+
+    #[test]
+    fn handler_silently_accepts_a_matching_known_host_fingerprint() {
+        let (worker, _receiver, _resolver, _) = SshWorkerFoundation::new(profile());
+        let public_key = russh::keys::PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti",
+        )
+        .unwrap();
+        let identity = worker.profile.identity.clone();
+        let shared = Arc::clone(&worker.shared);
+        let gate = Arc::clone(&worker.host_key_gate);
+        let mut handler = SshClientHandler {
+            identity,
+            shared,
+            host_key_gate: gate,
+            host_key_rejected: Arc::new(AtomicBool::new(false)),
+            forwarded_tcpip_sender: tokio::sync::mpsc::channel(
+                PORT_FORWARD_PENDING_CONNECTION_CAPACITY,
+            )
+            .0,
+            expected_fingerprint: Some(
+                "SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ".to_owned(),
+            ),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let accepted = runtime
+            .block_on(handler.check_server_key(&public_key))
+            .unwrap();
+
+        assert!(
+            accepted,
+            "a matching known-host fingerprint must be accepted"
+        );
+        assert_eq!(
+            worker.verified_host_key_fingerprint(),
+            Some("SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ".to_owned())
+        );
+        loop {
+            match worker.try_recv_event() {
+                Ok(SessionEvent::HostKeyVerification(_)) => {
+                    panic!("a matching known-host fingerprint must never prompt")
+                }
+                Ok(_) => continue,
+                Err(SessionTryReceiveError::Empty | SessionTryReceiveError::Closed) => break,
+            }
+        }
+    }
+
+    #[test]
+    fn handler_flags_a_mismatched_known_host_fingerprint_as_a_changed_key_warning() {
+        let (worker, _receiver, resolver, _) = SshWorkerFoundation::new(profile());
+        let public_key = russh::keys::PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti",
+        )
+        .unwrap();
+        let identity = worker.profile.identity.clone();
+        let shared = Arc::clone(&worker.shared);
+        let gate = Arc::clone(&worker.host_key_gate);
+        let callback = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let mut handler = SshClientHandler {
+                identity,
+                shared,
+                host_key_gate: gate,
+                host_key_rejected: Arc::new(AtomicBool::new(false)),
+                forwarded_tcpip_sender: tokio::sync::mpsc::channel(
+                    PORT_FORWARD_PENDING_CONNECTION_CAPACITY,
+                )
+                .0,
+                expected_fingerprint: Some("SHA256:previouslyTrustedButDifferent".to_owned()),
+            };
+            runtime
+                .block_on(handler.check_server_key(&public_key))
+                .unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let prompt = loop {
+            match worker.try_recv_event() {
+                Ok(SessionEvent::HostKeyVerification(prompt)) => break prompt,
+                Ok(_) | Err(SessionTryReceiveError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "host-key callback did not prompt"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(SessionTryReceiveError::Closed) => panic!("host-key callback closed early"),
+            }
+        };
+        assert!(prompt.is_key_change());
+        assert_eq!(
+            prompt.previously_trusted_fingerprint(),
+            Some("SHA256:previouslyTrustedButDifferent")
+        );
+        resolver
+            .resolve(&prompt, HostTrustDecision::Reject)
+            .unwrap();
+        assert!(!callback.join().unwrap());
+        assert_eq!(worker.verified_host_key_fingerprint(), None);
+    }
+
+    #[test]
+    fn handler_records_accept_once_fingerprint_for_live_session() {
+        let (worker, _receiver, resolver, _) = SshWorkerFoundation::new(profile());
+        let public_key = russh::keys::PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti",
+        )
+        .unwrap();
+        let identity = worker.profile.identity.clone();
+        let shared = Arc::clone(&worker.shared);
+        let gate = Arc::clone(&worker.host_key_gate);
+        let callback = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let mut handler = SshClientHandler {
+                identity,
+                shared,
+                host_key_gate: gate,
+                host_key_rejected: Arc::new(AtomicBool::new(false)),
+                forwarded_tcpip_sender: tokio::sync::mpsc::channel(
+                    PORT_FORWARD_PENDING_CONNECTION_CAPACITY,
+                )
+                .0,
+                expected_fingerprint: None,
+            };
+            runtime
+                .block_on(handler.check_server_key(&public_key))
+                .unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let prompt = loop {
+            match worker.try_recv_event() {
+                Ok(SessionEvent::HostKeyVerification(prompt)) => break prompt,
+                Ok(_) | Err(SessionTryReceiveError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "host-key callback did not prompt"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(SessionTryReceiveError::Closed) => panic!("host-key callback closed early"),
+            }
+        };
+        resolver
+            .resolve(&prompt, HostTrustDecision::AcceptOnce)
+            .unwrap();
+        assert!(callback.join().unwrap());
+        assert_eq!(
+            worker.verified_host_key_fingerprint(),
+            Some(prompt.sha256_fingerprint().to_owned())
+        );
+    }
+
+    #[test]
+    fn closed_loopback_connection_fails_within_a_bounded_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let profile = SshConnectionProfile::new(
+            HostIdentity::new("127.0.0.1", port).unwrap(),
+            "alice",
+            SshConnectionProfile::DEFAULT_TERMINAL_TYPE,
+            TerminalSize::new(80, 24).unwrap(),
+        )
+        .unwrap();
+        let session =
+            SshSession::start(profile, SshAuthentication::password("test-password")).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let error = loop {
+            match session.try_recv_event() {
+                Ok(SessionEvent::Error(error)) => break error,
+                Ok(_) | Err(SessionTryReceiveError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "closed loopback connection did not fail promptly"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(SessionTryReceiveError::Closed) => panic!("SSH worker closed without an error"),
+            }
+        };
+        assert_eq!(error.kind(), SessionErrorKind::Spawn);
+        let lifecycle_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let lifecycle = session.lifecycle();
+            if let SessionLifecycle::Failed(failure) = &lifecycle {
+                assert_eq!(failure.kind(), error.kind());
+                break;
+            }
+            assert!(
+                Instant::now() < lifecycle_deadline,
+                "SSH lifecycle did not reach Failed after its error: {lifecycle:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        match session.shutdown(Duration::from_secs(1)) {
+            Err(ShutdownError::Failed(error)) => {
+                assert_eq!(error.kind(), SessionErrorKind::Spawn);
+            }
+            result => panic!("expected failed SSH shutdown, received {result:?}"),
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingNotifier(AtomicUsize);
+
+    impl CountingNotifier {
+        fn notifications(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    impl SessionEventNotifier for CountingNotifier {
+        fn notify(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}

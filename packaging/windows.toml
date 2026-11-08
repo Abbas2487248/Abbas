@@ -1,0 +1,29 @@
+name = "festerm"
+version = "0.15.0"
+product-name = "fesTerm"
+identifier = "dev.fes.festerm"
+description = "An AI-friendly local, SSH, and serial terminal."
+homepage = "https://github.com/fes/fesTerm"
+authors = ["fes"]
+out-dir = "../target/release"
+formats = ["nsis"]
+icons = ["../assets/app-icon/festerm.ico"]
+binaries = [
+  { path = "festerm", main = true },
+]
+resources = [
+  { src = "../target/release/festerm-sessiond-0.15.0.exe", target = "festerm-sessiond-0.15.0.exe" },
+  { src = "../target/release/festerm-tunnel-setup.exe", target = "festerm-tunnel-setup.exe" },
+  { src = "../target/release/festerm-tunnel-bridge.exe", target = "festerm-tunnel-bridge.exe" },
+  { src = "../target/release/festerm-tunnel-worker.exe", target = "festerm-tunnel-worker.exe" },
+  { src = "../target/release/runtime/conpty", target = "runtime/conpty" },
+]
+
+[nsis]
+installMode = "currentUser"
+installer-icon = "../assets/app-icon/festerm.ico"
+appdata-paths = ["$APPDATA/fesTerm", "$LOCALAPPDATA/fesTerm"]
+template = "../packaging/windows-open-with.nsi"
+
+[windows]
+allow-downgrades = false

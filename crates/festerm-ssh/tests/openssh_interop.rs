@@ -1,0 +1,3350 @@
+use std::{
+    env, fs,
+    future::Future,
+    io::Read,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use festerm_session::{
+    HostKeyPrompt, Session, SessionErrorKind, SessionEvent, SessionLifecycle, SessionOperation,
+    SessionSendError, SessionTryReceiveError, ShutdownError, ShutdownResult,
+    SshPortForwardDirection, SshPortForwardRuntime, SshPortForwardSource, SshPortForwardState,
+    TerminalSize,
+};
+use festerm_ssh::{
+    HostIdentity, HostTrustDecision, PersistenceProvider, PersistentSessionName, ReconnectPolicy,
+    RecoveryPolicy, SessionStrategy, SftpCommandOutcome, SftpEntryType, SftpSession,
+    SftpSessionError, SshAuthentication, SshConnectionProfile, SshKeyPassphrase,
+    SshLivenessCheckError, SshPortForwardSpec, SshPrivateKey, SshSession, SshSessionOptions,
+};
+
+const MARKER: &[u8] = b"__FESTERM_OPENSSH_INTEROP_OK__";
+const EVENT_TIMEOUT: Duration = Duration::from_secs(20);
+const RECONNECT_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const DOCKER_HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
+static SFTP_INTEROP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct OpenSshConfiguration {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+}
+
+impl OpenSshConfiguration {
+    fn from_environment() -> Result<Self, String> {
+        let host = required_environment("FESTERM_OPENSSH_HOST")?;
+        let port = required_environment("FESTERM_OPENSSH_PORT")?
+            .parse::<u16>()
+            .map_err(|_| "FESTERM_OPENSSH_PORT must be a valid port number".to_owned())?;
+        let username = required_environment("FESTERM_OPENSSH_USER")?;
+        let password = required_environment("FESTERM_OPENSSH_PASSWORD")?;
+        Ok(Self {
+            host,
+            port,
+            username,
+            password,
+        })
+    }
+}
+
+fn required_environment(name: &str) -> Result<String, String> {
+    match env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) | Err(_) => Err(format!(
+            "{name} must be set for the OpenSSH interoperability test"
+        )),
+    }
+}
+
+fn connection_profile(configuration: &OpenSshConfiguration) -> SshConnectionProfile {
+    SshConnectionProfile::new(
+        HostIdentity::new(configuration.host.clone(), configuration.port)
+            .expect("OpenSSH fixture host identity is invalid"),
+        configuration.username.clone(),
+        SshConnectionProfile::DEFAULT_TERMINAL_TYPE,
+        TerminalSize::new(80, 24).expect("initial terminal size must be valid"),
+    )
+    .expect("OpenSSH fixture connection profile is invalid")
+}
+
+fn generated_private_key_from_environment() -> SshPrivateKey {
+    let path = required_environment("FESTERM_OPENSSH_PRIVATE_KEY_PATH")
+        .expect("OpenSSH fixture private-key path is invalid");
+    let encoded = fs::read(path).expect("could not read generated OpenSSH private key");
+    SshPrivateKey::from_openssh(encoded).expect("generated OpenSSH private key is invalid")
+}
+
+fn generated_encrypted_private_key_from_environment() -> SshPrivateKey {
+    let path = required_environment("FESTERM_OPENSSH_ENCRYPTED_PRIVATE_KEY_PATH")
+        .expect("OpenSSH fixture encrypted private-key path is invalid");
+    let passphrase = required_environment("FESTERM_OPENSSH_ENCRYPTED_PRIVATE_KEY_PASSPHRASE")
+        .expect("OpenSSH fixture encrypted private-key passphrase is invalid");
+    let encoded = fs::read(path).expect("could not read generated encrypted OpenSSH private key");
+    SshPrivateKey::from_encrypted_openssh(encoded, SshKeyPassphrase::new(passphrase))
+        .expect("generated encrypted OpenSSH private key is invalid")
+}
+
+fn marker_seen(output_tail: &mut Vec<u8>, bytes: &[u8], marker: &[u8]) -> bool {
+    output_tail.extend_from_slice(bytes);
+    let seen = output_tail
+        .windows(marker.len())
+        .any(|window| window == marker);
+    if output_tail.len() > marker.len() {
+        let first_retained_byte = output_tail.len() - marker.len();
+        output_tail.drain(..first_retained_byte);
+    }
+    seen
+}
+
+struct RawInteropClient {
+    expected_fingerprint: Option<String>,
+    forwarded_tcpip_sender: Option<tokio::sync::mpsc::UnboundedSender<RawForwardedTcpIp>>,
+}
+
+struct RawForwardedTcpIp {
+    channel: russh::Channel<russh::client::Msg>,
+    connected_address: String,
+    connected_port: u32,
+    originator_address: String,
+    originator_port: u32,
+}
+
+impl russh::client::Handler for RawInteropClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &russh::keys::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        let fingerprint = server_public_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+        if let Some(expected) = self.expected_fingerprint.as_deref() {
+            assert_eq!(
+                fingerprint, expected,
+                "raw russh test saw an unexpected OpenSSH fixture host-key fingerprint"
+            );
+        }
+        Ok(true)
+    }
+
+    fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut russh::client::Session,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let forwarded_tcpip_sender = self.forwarded_tcpip_sender.clone();
+        let connected_address = connected_address.to_owned();
+        let originator_address = originator_address.to_owned();
+        async move {
+            reply.accept().await;
+            if let Some(sender) = forwarded_tcpip_sender {
+                let _ = sender.send(RawForwardedTcpIp {
+                    channel,
+                    connected_address,
+                    connected_port,
+                    originator_address,
+                    originator_port,
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+fn expected_host_fingerprint_from_environment() -> Option<String> {
+    env::var("FESTERM_OPENSSH_EXPECTED_HOST_FINGERPRINT")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn remaining_until(deadline: Instant, operation: &str) -> Duration {
+    deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or_else(|| panic!("{operation} did not complete within the test timeout"))
+}
+
+fn raw_russh_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("could not build the raw russh interoperability test runtime")
+}
+
+async fn connect_authenticated_raw_handle(
+    configuration: &OpenSshConfiguration,
+    expected_fingerprint: Option<&str>,
+    forwarded_tcpip_sender: Option<tokio::sync::mpsc::UnboundedSender<RawForwardedTcpIp>>,
+    deadline: Instant,
+) -> russh::client::Handle<RawInteropClient> {
+    let config = Arc::new(russh::client::Config {
+        nodelay: true,
+        ..Default::default()
+    });
+    let mut handle = match tokio::time::timeout(
+        remaining_until(deadline, "OpenSSH fixture raw russh connection"),
+        russh::client::connect(
+            config,
+            (configuration.host.as_str(), configuration.port),
+            RawInteropClient {
+                expected_fingerprint: expected_fingerprint.map(str::to_owned),
+                forwarded_tcpip_sender,
+            },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(_)) => panic!("could not establish a raw russh connection to the OpenSSH fixture"),
+        Err(_) => panic!("raw russh connection to the OpenSSH fixture timed out"),
+    };
+    let authentication = match tokio::time::timeout(
+        remaining_until(deadline, "OpenSSH fixture raw russh authentication"),
+        handle.authenticate_password(
+            configuration.username.clone(),
+            configuration.password.clone(),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(authentication)) => authentication,
+        Ok(Err(_)) => panic!("raw russh authentication against the OpenSSH fixture failed"),
+        Err(_) => panic!("raw russh authentication against the OpenSSH fixture timed out"),
+    };
+    assert!(
+        authentication.success(),
+        "raw russh authentication against the OpenSSH fixture was rejected"
+    );
+    handle
+}
+
+async fn shutdown_raw_handle(mut handle: russh::client::Handle<RawInteropClient>) {
+    match tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+        let _ = handle
+            .disconnect(
+                russh::Disconnect::ByApplication,
+                "festerm raw interop shutdown",
+                "",
+            )
+            .await;
+        let _ = (&mut handle).await;
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => panic!("raw russh OpenSSH handle did not shut down within the test timeout"),
+    }
+}
+
+struct InteropPortForwardSpec {
+    direction: SshPortForwardDirection,
+    bind_host: &'static str,
+    bind_port: u16,
+    destination_host: &'static str,
+    destination_port: u16,
+}
+
+impl SshPortForwardSpec for InteropPortForwardSpec {
+    fn direction(&self) -> SshPortForwardDirection {
+        self.direction
+    }
+
+    fn bind_host(&self) -> &str {
+        self.bind_host
+    }
+
+    fn bind_port(&self) -> u16 {
+        self.bind_port
+    }
+
+    fn destination_host(&self) -> &str {
+        self.destination_host
+    }
+
+    fn destination_port(&self) -> u16 {
+        self.destination_port
+    }
+}
+
+fn unused_local_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("could not reserve a loopback port for the interoperability test")
+        .local_addr()
+        .expect("reserved loopback address must be queryable")
+        .port()
+}
+
+fn wait_for_running_session(session: &SshSession, deadline: Instant) {
+    let resolver = session.host_key_decision_resolver();
+    let mut running = false;
+    while Instant::now() < deadline && !running {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) => resolver
+                .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                .expect("could not accept the OpenSSH fixture host key"),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) => running = true,
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error before reaching Running",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before reaching Running");
+            }
+        }
+    }
+    assert!(
+        running,
+        "SSH session did not reach Running within the test timeout"
+    );
+}
+
+fn wait_for_port_forward_snapshot<F>(
+    session: &SshSession,
+    deadline: Instant,
+    predicate: F,
+) -> Vec<SshPortForwardRuntime>
+where
+    F: Fn(&[SshPortForwardRuntime]) -> bool,
+{
+    while Instant::now() < deadline {
+        match session.try_recv_event() {
+            Ok(SessionEvent::PortForwardsUpdated(forwards)) if predicate(&forwards) => {
+                return forwards;
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error while waiting for a port-forward snapshot",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed while waiting for a port-forward snapshot");
+            }
+        }
+    }
+    panic!("SSH session did not emit the expected port-forward snapshot within the test timeout");
+}
+
+fn connect_and_echo_local_forward(port: u16, payload: &[u8], deadline: Instant) {
+    let remaining = remaining_until(deadline, "connect to the local forwarded listener");
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        remaining.min(Duration::from_secs(2)),
+    )
+    .unwrap_or_else(|_| panic!("could not connect to the local forwarded listener on {port}"));
+    stream
+        .set_read_timeout(Some(remaining.min(Duration::from_secs(2))))
+        .expect("could not set the forwarded listener read timeout");
+    stream
+        .set_write_timeout(Some(remaining.min(Duration::from_secs(2))))
+        .expect("could not set the forwarded listener write timeout");
+    stream
+        .write_all(payload)
+        .expect("could not write to the local forwarded listener");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("could not half-close the local forwarded listener socket");
+    let mut echoed = Vec::new();
+    stream
+        .read_to_end(&mut echoed)
+        .expect("could not read the local forwarded echo payload");
+    assert_eq!(
+        echoed.as_slice(),
+        payload,
+        "the local forwarded listener did not echo the expected payload"
+    );
+}
+
+fn wait_for_local_connect_failure(port: u16, deadline: Instant) {
+    while Instant::now() < deadline {
+        match std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(100),
+        ) {
+            Ok(stream) => {
+                drop(stream);
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return,
+        }
+    }
+    panic!("the local forwarded listener remained reachable past the test timeout");
+}
+
+fn wait_for_session_disconnected(session: &SshSession, deadline: Instant) {
+    while Instant::now() < deadline {
+        match session.try_recv_event() {
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Disconnected(_))) => return,
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error before disconnect teardown completed",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before reaching Disconnected");
+            }
+        }
+    }
+    panic!("SSH session did not reach Disconnected within the test timeout");
+}
+
+fn docker_output_with_deadline(arguments: &[&str], operation: &str, deadline: Instant) -> String {
+    let mut child = Command::new("docker")
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|_| panic!("could not invoke Docker to {operation}"));
+    loop {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("Docker did not {operation} within the test timeout");
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child
+                    .wait_with_output()
+                    .expect("could not collect Docker command output");
+                assert!(status.success(), "Docker could not {operation}");
+                return String::from_utf8(output.stdout).expect("Docker returned non-UTF-8 output");
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(_) => panic!("could not observe Docker progress while trying to {operation}"),
+        }
+    }
+}
+
+fn spawn_local_echo_server(deadline: Instant) -> (u16, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("could not bind a local echo server for remote forwarding");
+    listener
+        .set_nonblocking(true)
+        .expect("could not make the local echo server nonblocking");
+    let port = listener
+        .local_addr()
+        .expect("local echo server address must be queryable")
+        .port();
+    let handle = thread::spawn(move || {
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .expect("could not bound the local echo server read timeout");
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .expect("could not bound the local echo server write timeout");
+                    let mut bytes = Vec::new();
+                    stream
+                        .read_to_end(&mut bytes)
+                        .expect("could not read the remote-forward payload from the echo server");
+                    stream
+                        .write_all(&bytes)
+                        .expect("could not echo the remote-forward payload back to the client");
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => {
+                    panic!(
+                        "the local echo server failed before the remote-forward connection arrived"
+                    )
+                }
+            }
+        }
+        panic!("the remote-forwarded connection never reached the local echo server");
+    });
+    (port, handle)
+}
+
+fn unique_sftp_artifact_root(label: &str) -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("festerm-ssh manifest must live under the workspace root");
+    workspace_root
+        .join("target")
+        .join("test-artifacts")
+        .join("festerm-ssh-sftp-interop")
+        .join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            SFTP_INTEROP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+}
+
+fn recreate_directory(path: &Path) {
+    if path.exists() {
+        fs::remove_dir_all(path).expect("could not clear the pre-existing SFTP interop directory");
+    }
+    fs::create_dir_all(path).expect("could not create the SFTP interop directory");
+}
+
+fn remove_directory_if_present(path: &Path) {
+    if path.exists() {
+        fs::remove_dir_all(path).expect("could not remove the SFTP interop directory");
+    }
+}
+
+fn quote_command_argument(path: impl AsRef<Path>) -> String {
+    format!("\"{}\"", path.as_ref().display())
+}
+
+fn patterned_bytes(byte_count: usize) -> Vec<u8> {
+    (0..byte_count)
+        .map(|index| b'a' + (index % 26) as u8)
+        .collect()
+}
+
+async fn connect_authenticated_sftp_session(
+    configuration: &OpenSshConfiguration,
+    local_working_directory: &Path,
+    deadline: Instant,
+) -> (russh::client::Handle<RawInteropClient>, SftpSession) {
+    let expected_fingerprint = expected_host_fingerprint_from_environment();
+    let handle = connect_authenticated_raw_handle(
+        configuration,
+        expected_fingerprint.as_deref(),
+        None,
+        deadline,
+    )
+    .await;
+    let session = match tokio::time::timeout(
+        remaining_until(deadline, "connect the SFTP backend session"),
+        SftpSession::connect_with_local_directory(&handle, local_working_directory.to_path_buf()),
+    )
+    .await
+    {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => panic!("could not connect the SFTP backend session: {error}"),
+        Err(_) => panic!("connecting the SFTP backend session timed out"),
+    };
+    (handle, session)
+}
+
+async fn run_sftp_command(
+    session: &mut SftpSession,
+    command: &str,
+    deadline: Instant,
+    operation: &str,
+) -> SftpCommandOutcome {
+    match tokio::time::timeout(
+        remaining_until(deadline, operation),
+        session.execute_line(command),
+    )
+    .await
+    {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => panic!("SFTP command {command:?} failed during {operation}: {error}"),
+        Err(_) => panic!("SFTP command {command:?} timed out during {operation}"),
+    }
+}
+
+async fn expect_sftp_command_error(
+    session: &mut SftpSession,
+    command: &str,
+    deadline: Instant,
+    operation: &str,
+) -> SftpSessionError {
+    match tokio::time::timeout(
+        remaining_until(deadline, operation),
+        session.execute_line(command),
+    )
+    .await
+    {
+        Ok(Ok(outcome)) => {
+            panic!(
+                "SFTP command {command:?} unexpectedly succeeded during {operation}: {outcome:?}"
+            )
+        }
+        Ok(Err(error)) => error,
+        Err(_) => panic!("SFTP command {command:?} timed out during {operation}"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_interoperability() {
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let profile = connection_profile(&configuration);
+    let session = SshSession::start(profile, SshAuthentication::password(configuration.password))
+        .expect("could not start OpenSSH session");
+    let resolver = session.host_key_decision_resolver();
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut running = false;
+    let mut resize_applied = false;
+    let mut direct_marker_seen = false;
+    let mut output_tail = Vec::new();
+
+    while Instant::now() < deadline && !(running && resize_applied && direct_marker_seen) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) => resolver
+                .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                .expect("could not accept the test server host key"),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_resize(TerminalSize::new(100, 40).expect("resize terminal size is valid"))
+                    .expect("could not request SSH PTY resize");
+                session
+                    .try_send_input(b"printf '__FESTERM_OPENSSH_INTEROP_OK__\\n'\n")
+                    .expect("could not send controlled SSH shell command");
+            }
+            Ok(SessionEvent::ResizeApplied(size))
+                if size == TerminalSize::new(100, 40).expect("resize terminal size is valid") =>
+            {
+                resize_applied = true;
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                direct_marker_seen |= marker_seen(&mut output_tail, &bytes, MARKER);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error before controlled exchange completed",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before controlled exchange completed");
+            }
+        }
+    }
+
+    assert!(
+        running,
+        "SSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        resize_applied,
+        "SSH PTY resize was not acknowledged within the test timeout"
+    );
+    assert!(
+        direct_marker_seen,
+        "controlled SSH shell command did not produce its expected marker"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("SSH session did not shut down within the test timeout"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_automation_reservations_preserve_order_and_cancellation() {
+    const AUTOMATED: &[u8] = b"printf '__SSH_AUTO_%s__\\n' 'MIDDLE'\n";
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let session = SshSession::start(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password),
+    )
+    .expect("could not start OpenSSH session");
+    let resolver = session.host_key_decision_resolver();
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut running = false;
+    let mut output = Vec::new();
+
+    while Instant::now() < deadline {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) => resolver
+                .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                .expect("could not accept the test server host key"),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_send_input(b"printf '__SSH_AUTO_%s__\\n' 'BEFORE'\n")
+                    .unwrap();
+                let reservation = session.reserve_automation_input(1, AUTOMATED).unwrap();
+                session
+                    .try_send_input(b"printf '__SSH_AUTO_%s__\\n' 'AFTER'\n")
+                    .unwrap();
+                reservation
+                    .commit_with(|bytes| {
+                        assert_eq!(bytes, AUTOMATED);
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                let cancelled = session
+                    .reserve_automation_input(1, b"printf '__SSH_AUTO_%s__\\n' 'CANCELLED'\n")
+                    .unwrap();
+                drop(cancelled);
+                session
+                    .try_send_input(b"printf '__SSH_AUTO_%s__\\n' 'FINISHED'\n")
+                    .unwrap();
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                output.extend_from_slice(&bytes);
+                assert!(output.len() <= 64 * 1024, "unexpectedly large test output");
+                if output
+                    .windows(b"__SSH_AUTO_FINISHED__".len())
+                    .any(|window| window == b"__SSH_AUTO_FINISHED__")
+                {
+                    break;
+                }
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH reservation exchange emitted a {:?} error",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session closed before the reservation exchange completed");
+            }
+        }
+    }
+
+    assert!(running, "SSH session did not reach Running");
+    let position = |marker: &[u8]| {
+        output
+            .windows(marker.len())
+            .position(|window| window == marker)
+    };
+    let before = position(b"__SSH_AUTO_BEFORE__").expect("missing preceding human input");
+    let middle = position(b"__SSH_AUTO_MIDDLE__").expect("missing committed automation input");
+    let after = position(b"__SSH_AUTO_AFTER__").expect("missing following human input");
+    let finished = position(b"__SSH_AUTO_FINISHED__").expect("missing final human input");
+    assert!(before < middle && middle < after && after < finished);
+    assert!(position(b"__SSH_AUTO_CANCELLED__").is_none());
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("SSH session did not shut down within the test timeout"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_interactive_password_interoperability() {
+    const INTERACTIVE_MARKER: &[u8] = b"__FESTERM_OPENSSH_INTERACTIVE_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    // Interactive auth never carries a credential upfront: the worker
+    // connects and verifies the host key first, exactly like the fingerprint
+    // -first UX this exercises, and only asks for a password afterward.
+    let session = SshSession::start(
+        connection_profile(&configuration),
+        SshAuthentication::interactive(),
+    )
+    .expect("could not start interactive OpenSSH session");
+    let host_key_resolver = session.host_key_decision_resolver();
+    let password_resolver = session.password_decision_resolver();
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut host_key_prompt_seen = false;
+    let mut wrong_password_sent = false;
+    let mut reprompt_after_rejection_seen = false;
+    let mut running = false;
+    let mut marker_seen_in_output = false;
+    let mut output_tail = Vec::new();
+
+    while Instant::now() < deadline && !(running && marker_seen_in_output) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) if !host_key_prompt_seen => {
+                host_key_resolver
+                    .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                    .expect("could not accept the interactive test server host key");
+                host_key_prompt_seen = true;
+            }
+            Ok(SessionEvent::HostKeyVerification(_)) => {
+                panic!("interactive OpenSSH session emitted more than one host-key prompt")
+            }
+            Ok(SessionEvent::PasswordRequested(prompt)) if !wrong_password_sent => {
+                assert!(
+                    host_key_prompt_seen,
+                    "the password prompt must arrive only after host-key verification, \
+                     mirroring `ssh`'s own fingerprint-first ordering"
+                );
+                assert!(
+                    !prompt.previous_attempt_failed(),
+                    "the first password attempt must not claim a prior rejection"
+                );
+                password_resolver
+                    .resolve(&prompt, "definitely-the-wrong-password".to_owned())
+                    .expect("could not submit the deliberately wrong interactive password");
+                wrong_password_sent = true;
+            }
+            Ok(SessionEvent::PasswordRequested(prompt)) if !reprompt_after_rejection_seen => {
+                assert!(
+                    prompt.previous_attempt_failed(),
+                    "a reprompt following a rejected password must report the prior failure, \
+                     mirroring `ssh`'s own \"Permission denied, please try again.\""
+                );
+                password_resolver
+                    .resolve(&prompt, configuration.password.clone())
+                    .expect("could not submit the correct interactive password after rejection");
+                reprompt_after_rejection_seen = true;
+            }
+            Ok(SessionEvent::PasswordRequested(_)) => {
+                panic!("interactive OpenSSH session requested a password more times than expected")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_send_input(b"printf '__FESTERM_OPENSSH_INTERACTIVE_OK__\\n'\n")
+                    .expect("could not send interactive controlled SSH shell command");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                marker_seen_in_output |= marker_seen(&mut output_tail, &bytes, INTERACTIVE_MARKER);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "interactive SSH session emitted a {:?} error before controlled exchange completed",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!(
+                    "interactive SSH session event stream closed before controlled exchange completed"
+                );
+            }
+        }
+    }
+
+    assert!(
+        host_key_prompt_seen,
+        "interactive SSH session did not request host-key verification"
+    );
+    assert!(
+        wrong_password_sent && reprompt_after_rejection_seen,
+        "interactive SSH session did not exercise a rejected-then-corrected password round"
+    );
+    assert!(
+        running,
+        "interactive SSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        marker_seen_in_output,
+        "interactive controlled SSH shell command did not produce its expected marker"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("interactive SSH session did not shut down within the test timeout"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_public_key_interoperability() {
+    const KEY_MARKER: &[u8] = b"__FESTERM_OPENSSH_PUBLIC_KEY_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let session = SshSession::start(
+        connection_profile(&configuration),
+        SshAuthentication::public_key(generated_private_key_from_environment()),
+    )
+    .expect("could not start public-key OpenSSH session");
+    let resolver = session.host_key_decision_resolver();
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut host_key_prompt_seen = false;
+    let mut running = false;
+    let mut marker_seen_in_output = false;
+    let mut output_tail = Vec::new();
+
+    while Instant::now() < deadline && !(running && marker_seen_in_output) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) if !host_key_prompt_seen => {
+                resolver
+                    .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                    .expect("could not accept the public-key test server host key");
+                host_key_prompt_seen = true;
+            }
+            Ok(SessionEvent::HostKeyVerification(_)) => {
+                panic!("public-key OpenSSH session emitted more than one host-key prompt")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_send_input(b"printf '__FESTERM_OPENSSH_PUBLIC_KEY_OK__\\n'\n")
+                    .expect("could not send public-key controlled SSH shell command");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                marker_seen_in_output |= marker_seen(&mut output_tail, &bytes, KEY_MARKER);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "public-key SSH session emitted a {:?} error before controlled exchange completed",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("public-key SSH session event stream closed before controlled exchange completed");
+            }
+        }
+    }
+
+    assert!(
+        host_key_prompt_seen,
+        "public-key SSH session did not request host-key verification"
+    );
+    assert!(
+        running,
+        "public-key SSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        marker_seen_in_output,
+        "public-key controlled SSH shell command did not produce its expected marker"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("public-key SSH session did not shut down within the test timeout"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_encrypted_public_key_interoperability() {
+    const KEY_MARKER: &[u8] = b"__FESTERM_OPENSSH_ENCRYPTED_PUBLIC_KEY_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let session = SshSession::start(
+        connection_profile(&configuration),
+        SshAuthentication::public_key(generated_encrypted_private_key_from_environment()),
+    )
+    .expect("could not start encrypted public-key OpenSSH session");
+    let resolver = session.host_key_decision_resolver();
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut host_key_prompt_seen = false;
+    let mut running = false;
+    let mut marker_seen_in_output = false;
+    let mut output_tail = Vec::new();
+
+    while Instant::now() < deadline && !(running && marker_seen_in_output) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) if !host_key_prompt_seen => {
+                resolver
+                    .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                    .expect("could not accept the encrypted public-key test server host key");
+                host_key_prompt_seen = true;
+            }
+            Ok(SessionEvent::HostKeyVerification(_)) => {
+                panic!("encrypted public-key OpenSSH session emitted more than one host-key prompt")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_send_input(b"printf '__FESTERM_OPENSSH_ENCRYPTED_PUBLIC_KEY_OK__\\n'\n")
+                    .expect("could not send encrypted public-key controlled SSH shell command");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                marker_seen_in_output |= marker_seen(&mut output_tail, &bytes, KEY_MARKER);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "encrypted public-key SSH session emitted a {:?} error before controlled exchange completed",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("encrypted public-key SSH session event stream closed before controlled exchange completed");
+            }
+        }
+    }
+
+    assert!(
+        host_key_prompt_seen,
+        "encrypted public-key SSH session did not request host-key verification"
+    );
+    assert!(
+        running,
+        "encrypted public-key SSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        marker_seen_in_output,
+        "encrypted public-key controlled SSH shell command did not produce its expected marker"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => {
+            panic!("encrypted public-key SSH session did not shut down within the test timeout")
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_ecdsa_p256_host_key_interoperability() {
+    const ECDSA_MARKER: &[u8] = b"__FESTERM_OPENSSH_ECDSA_P256_HOST_KEY_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let expected_fingerprint = required_environment("FESTERM_OPENSSH_EXPECTED_HOST_FINGERPRINT")
+        .expect("OpenSSH fixture ECDSA host-key fingerprint is invalid");
+    let session = SshSession::start(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password.clone()),
+    )
+    .expect("could not start ECDSA host-key OpenSSH session");
+    let resolver = session.host_key_decision_resolver();
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut host_key_prompt_seen = false;
+    let mut running = false;
+    let mut marker_seen_in_output = false;
+    let mut output_tail = Vec::new();
+
+    while Instant::now() < deadline && !(running && marker_seen_in_output) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) if !host_key_prompt_seen => {
+                assert_eq!(prompt.host(), configuration.host.as_str());
+                assert_eq!(prompt.port(), configuration.port);
+                assert_eq!(prompt.sha256_fingerprint(), expected_fingerprint.as_str());
+                resolver
+                    .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                    .expect("could not accept the ECDSA test server host key");
+                host_key_prompt_seen = true;
+            }
+            Ok(SessionEvent::HostKeyVerification(_)) => {
+                panic!("ECDSA host-key OpenSSH session emitted more than one host-key prompt")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_send_input(b"printf '__FESTERM_OPENSSH_ECDSA_P256_HOST_KEY_OK__\\n'\n")
+                    .expect("could not send ECDSA host-key controlled SSH shell command");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                marker_seen_in_output |= marker_seen(&mut output_tail, &bytes, ECDSA_MARKER);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "ECDSA host-key SSH session emitted a {:?} error before controlled exchange completed",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("ECDSA host-key SSH session event stream closed before controlled exchange completed");
+            }
+        }
+    }
+
+    assert!(
+        host_key_prompt_seen,
+        "ECDSA host-key OpenSSH session did not request host-key verification"
+    );
+    assert!(
+        running,
+        "ECDSA host-key OpenSSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        marker_seen_in_output,
+        "ECDSA host-key controlled SSH shell command did not produce its expected marker"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("ECDSA host-key SSH session did not shut down within the test timeout"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_sftp_subsystem_smoke() {
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let expected_fingerprint = expected_host_fingerprint_from_environment();
+    let runtime = raw_russh_runtime();
+    runtime.block_on(async {
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        let handle = connect_authenticated_raw_handle(
+            &configuration,
+            expected_fingerprint.as_deref(),
+            None,
+            deadline,
+        )
+        .await;
+        let mut channel = match tokio::time::timeout(
+            remaining_until(deadline, "open the raw SFTP subsystem channel"),
+            handle.channel_open_session(),
+        )
+        .await
+        {
+            Ok(Ok(channel)) => channel,
+            Ok(Err(_)) => panic!("could not open a raw SFTP subsystem channel"),
+            Err(_) => panic!("opening the raw SFTP subsystem channel timed out"),
+        };
+        match tokio::time::timeout(
+            remaining_until(deadline, "request the raw SFTP subsystem"),
+            channel.request_subsystem(true, "sftp"),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("could not request the raw SFTP subsystem"),
+            Err(_) => panic!("requesting the raw SFTP subsystem timed out"),
+        }
+
+        let mut subsystem_accepted = false;
+        while Instant::now() < deadline && !subsystem_accepted {
+            let wait = remaining_until(deadline, "wait for the raw SFTP subsystem reply")
+                .min(Duration::from_millis(100));
+            match tokio::time::timeout(wait, channel.wait()).await {
+                Ok(Some(russh::ChannelMsg::Success)) => subsystem_accepted = true,
+                Ok(Some(
+                    russh::ChannelMsg::Failure | russh::ChannelMsg::Eof | russh::ChannelMsg::Close,
+                ))
+                | Ok(None) => {
+                    panic!("the OpenSSH fixture rejected or closed the raw SFTP subsystem request")
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
+        }
+
+        assert!(
+            subsystem_accepted,
+            "the OpenSSH fixture did not accept the raw SFTP subsystem request within the test timeout"
+        );
+        shutdown_raw_handle(handle).await;
+    });
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_sftp_put_get_round_trip_and_tracks_working_directories() {
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let local_root = unique_sftp_artifact_root("round-trip");
+    let local_upload = local_root.join("upload.bin");
+    let local_downloads = local_root.join("downloads");
+    recreate_directory(&local_downloads);
+    let upload_bytes = patterned_bytes(200_000);
+    fs::write(&local_upload, &upload_bytes).expect("could not create local upload fixture");
+
+    let runtime = raw_russh_runtime();
+    runtime.block_on(async {
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        let (handle, mut session) =
+            connect_authenticated_sftp_session(&configuration, &local_root, deadline).await;
+
+        let remote_root_name = format!(
+            "festerm-sftp-round-trip-{}",
+            SFTP_INTEROP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let created = run_sftp_command(
+            &mut session,
+            &format!("mkdir {remote_root_name}"),
+            deadline,
+            "create the remote SFTP test directory",
+        )
+        .await;
+        assert_eq!(
+            created,
+            SftpCommandOutcome::CreatedDirectory {
+                path: format!("/home/festerm/{remote_root_name}")
+            }
+        );
+
+        let changed_remote = run_sftp_command(
+            &mut session,
+            &format!("cd {remote_root_name}"),
+            deadline,
+            "change into the remote SFTP test directory",
+        )
+        .await;
+        assert_eq!(
+            changed_remote,
+            SftpCommandOutcome::ChangedDirectory {
+                path: format!("/home/festerm/{remote_root_name}")
+            }
+        );
+
+        let pwd = run_sftp_command(
+            &mut session,
+            "pwd",
+            deadline,
+            "read the remote working directory",
+        )
+        .await;
+        assert_eq!(
+            pwd,
+            SftpCommandOutcome::WorkingDirectory {
+                path: format!("/home/festerm/{remote_root_name}")
+            }
+        );
+
+        let changed_local = run_sftp_command(
+            &mut session,
+            &format!("lcd {}", quote_command_argument(&local_downloads)),
+            deadline,
+            "change the local working directory",
+        )
+        .await;
+        assert_eq!(
+            changed_local,
+            SftpCommandOutcome::ChangedLocalDirectory {
+                path: fs::canonicalize(&local_downloads)
+                    .expect("canonical local downloads directory")
+            }
+        );
+
+        let lpwd = run_sftp_command(
+            &mut session,
+            "lpwd",
+            deadline,
+            "read the local working directory",
+        )
+        .await;
+        assert_eq!(
+            lpwd,
+            SftpCommandOutcome::LocalWorkingDirectory {
+                path: fs::canonicalize(&local_downloads)
+                    .expect("canonical local downloads directory")
+            }
+        );
+
+        let upload = run_sftp_command(
+            &mut session,
+            &format!("put {}", quote_command_argument(&local_upload)),
+            deadline,
+            "upload the SFTP round-trip fixture",
+        )
+        .await;
+        assert_eq!(
+            upload,
+            SftpCommandOutcome::Uploaded {
+                // `put` reports the source path as resolved by
+                // `resolve_local_path`/`normalize_local_path`, which
+                // normalizes `.`/`..` segments but (unlike `lcd`/`lpwd`)
+                // does not canonicalize the filesystem path (e.g. it never
+                // adds the `\\?\` extended-length prefix Windows'
+                // `fs::canonicalize` adds). Since `local_upload` is already
+                // an absolute path with no `.`/`..` components, its
+                // resolved form is itself.
+                local_path: local_upload.clone(),
+                remote_path: format!("/home/festerm/{remote_root_name}/upload.bin"),
+                byte_count: upload_bytes.len() as u64,
+            }
+        );
+
+        let listing = run_sftp_command(
+            &mut session,
+            "ls",
+            deadline,
+            "list the uploaded remote directory",
+        )
+        .await;
+        let SftpCommandOutcome::DirectoryListing { path, entries } = listing else {
+            panic!("ls must produce a directory listing");
+        };
+        assert_eq!(path, format!("/home/festerm/{remote_root_name}"));
+        assert!(
+            entries.iter().any(|entry| {
+                entry.name == "upload.bin"
+                    && entry.file_type == SftpEntryType::File
+                    && entry.size == Some(upload_bytes.len() as u64)
+            }),
+            "the uploaded file must appear in the remote listing"
+        );
+
+        let local_download = local_downloads.join("downloaded.bin");
+        let download = run_sftp_command(
+            &mut session,
+            &format!("get upload.bin {}", quote_command_argument(&local_download)),
+            deadline,
+            "download the uploaded file back to a second local path",
+        )
+        .await;
+        assert_eq!(
+            download,
+            SftpCommandOutcome::Downloaded {
+                remote_path: format!("/home/festerm/{remote_root_name}/upload.bin"),
+                local_path: local_download.clone(),
+                byte_count: upload_bytes.len() as u64,
+            }
+        );
+        assert_eq!(
+            fs::read(&local_download).expect("could not read downloaded file"),
+            upload_bytes,
+            "SFTP get must preserve the uploaded bytes exactly"
+        );
+
+        let removed = run_sftp_command(
+            &mut session,
+            "rm upload.bin",
+            deadline,
+            "remove the uploaded remote file",
+        )
+        .await;
+        assert_eq!(
+            removed,
+            SftpCommandOutcome::RemovedFile {
+                path: format!("/home/festerm/{remote_root_name}/upload.bin")
+            }
+        );
+
+        let changed_remote = run_sftp_command(
+            &mut session,
+            "cd ..",
+            deadline,
+            "leave the remote SFTP test directory",
+        )
+        .await;
+        assert_eq!(
+            changed_remote,
+            SftpCommandOutcome::ChangedDirectory {
+                path: "/home/festerm".to_owned()
+            }
+        );
+
+        let removed_directory = run_sftp_command(
+            &mut session,
+            &format!("rmdir {remote_root_name}"),
+            deadline,
+            "remove the remote SFTP test directory",
+        )
+        .await;
+        assert_eq!(
+            removed_directory,
+            SftpCommandOutcome::RemovedDirectory {
+                path: format!("/home/festerm/{remote_root_name}")
+            }
+        );
+
+        let closed = run_sftp_command(
+            &mut session,
+            "quit",
+            deadline,
+            "close the SFTP backend session",
+        )
+        .await;
+        assert_eq!(closed, SftpCommandOutcome::SessionClosed);
+        shutdown_raw_handle(handle).await;
+    });
+
+    remove_directory_if_present(&local_root);
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_sftp_refuses_overwrite_without_mutating_destinations() {
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let local_root = unique_sftp_artifact_root("overwrite");
+    recreate_directory(&local_root);
+    let local_original = local_root.join("original.bin");
+    let local_replacement = local_root.join("replacement.bin");
+    let existing_download = local_root.join("existing-download.bin");
+    fs::write(&local_original, patterned_bytes(32_000)).expect("could not create local source");
+    fs::write(&local_replacement, patterned_bytes(16_000))
+        .expect("could not create local replacement source");
+    fs::write(&existing_download, b"keep-local-destination")
+        .expect("could not create existing local destination");
+
+    let runtime = raw_russh_runtime();
+    runtime.block_on(async {
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        let (handle, mut session) =
+            connect_authenticated_sftp_session(&configuration, &local_root, deadline).await;
+        let remote_root_name = format!(
+            "festerm-sftp-overwrite-{}",
+            SFTP_INTEROP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let remote_root = format!("/home/festerm/{remote_root_name}");
+
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("mkdir {remote_root_name}"),
+            deadline,
+            "create the remote overwrite test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("cd {remote_root_name}"),
+            deadline,
+            "change into the remote overwrite test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("put {}", quote_command_argument(&local_original)),
+            deadline,
+            "upload the original remote fixture",
+        )
+        .await;
+
+        let get_error = expect_sftp_command_error(
+            &mut session,
+            &format!(
+                "get original.bin {}",
+                quote_command_argument(&existing_download)
+            ),
+            deadline,
+            "attempt to overwrite an existing local file via get",
+        )
+        .await;
+        assert_eq!(
+            get_error,
+            SftpSessionError::DestinationExists {
+                path: existing_download.display().to_string()
+            }
+        );
+        assert_eq!(
+            fs::read(&existing_download).expect("could not read existing local destination"),
+            b"keep-local-destination",
+            "get must not modify an existing local destination file"
+        );
+
+        let put_error = expect_sftp_command_error(
+            &mut session,
+            &format!(
+                "put {} original.bin",
+                quote_command_argument(&local_replacement)
+            ),
+            deadline,
+            "attempt to overwrite an existing remote file via put",
+        )
+        .await;
+        assert_eq!(
+            put_error,
+            SftpSessionError::DestinationExists {
+                path: format!("{remote_root}/original.bin")
+            }
+        );
+
+        let remote_verification = local_root.join("remote-verification.bin");
+        let _ = run_sftp_command(
+            &mut session,
+            &format!(
+                "get original.bin {}",
+                quote_command_argument(&remote_verification)
+            ),
+            deadline,
+            "download the existing remote file for overwrite verification",
+        )
+        .await;
+        assert_eq!(
+            fs::read(&remote_verification).expect("could not read remote verification file"),
+            fs::read(&local_original).expect("could not read original local source"),
+            "put must not modify an existing remote destination file"
+        );
+
+        let _ = run_sftp_command(
+            &mut session,
+            "rm original.bin",
+            deadline,
+            "remove the remote overwrite fixture file",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            "cd ..",
+            deadline,
+            "leave the remote overwrite test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("rmdir {remote_root_name}"),
+            deadline,
+            "remove the remote overwrite test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            "quit",
+            deadline,
+            "close the overwrite SFTP session",
+        )
+        .await;
+        shutdown_raw_handle(handle).await;
+    });
+
+    remove_directory_if_present(&local_root);
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_sftp_remote_directory_snapshot_contains_sortable_metadata() {
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let local_root = unique_sftp_artifact_root("snapshot");
+    recreate_directory(&local_root);
+    let local_upload = local_root.join("snapshot.txt");
+    fs::write(&local_upload, b"snapshot-fixture").expect("could not create local snapshot fixture");
+
+    let runtime = raw_russh_runtime();
+    runtime.block_on(async {
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        let (handle, mut session) =
+            connect_authenticated_sftp_session(&configuration, &local_root, deadline).await;
+        let remote_root_name = format!(
+            "festerm-sftp-snapshot-{}",
+            SFTP_INTEROP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("mkdir {remote_root_name}"),
+            deadline,
+            "create the remote snapshot test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("cd {remote_root_name}"),
+            deadline,
+            "change into the remote snapshot test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("put {}", quote_command_argument(&local_upload)),
+            deadline,
+            "upload the remote snapshot fixture",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            "mkdir nested",
+            deadline,
+            "create a nested remote snapshot directory",
+        )
+        .await;
+
+        let snapshot = tokio::time::timeout(
+            remaining_until(deadline, "read remote snapshot metadata"),
+            session.remote_directory_snapshot(None),
+        )
+        .await
+        .expect("reading remote snapshot metadata should not time out")
+        .expect("remote snapshot metadata should load");
+
+        assert_eq!(snapshot.location, festerm_ssh::SftpLocation::Remote);
+        assert_eq!(
+            snapshot.path,
+            festerm_ssh::SftpPath::remote(format!("/home/festerm/{remote_root_name}"))
+        );
+        assert!(
+            snapshot.entries.iter().any(|entry| {
+                entry.name == "nested"
+                    && entry.file_type == SftpEntryType::Directory
+                    && entry.modified_at.is_some()
+            }),
+            "remote snapshot should include nested directory metadata"
+        );
+        assert!(
+            snapshot.entries.iter().any(|entry| {
+                entry.name == "snapshot.txt"
+                    && entry.file_type == SftpEntryType::File
+                    && entry.size == Some(16)
+                    && entry.modified_at.is_some()
+                    && entry.permissions.is_some()
+            }),
+            "remote snapshot should include file metadata for sorting columns"
+        );
+
+        let _ = run_sftp_command(
+            &mut session,
+            "rm snapshot.txt",
+            deadline,
+            "remove the remote snapshot fixture",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            "rmdir nested",
+            deadline,
+            "remove the nested remote snapshot directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            "cd ..",
+            deadline,
+            "leave the remote snapshot test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("rmdir {remote_root_name}"),
+            deadline,
+            "remove the remote snapshot test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            "quit",
+            deadline,
+            "close the remote snapshot session",
+        )
+        .await;
+        shutdown_raw_handle(handle).await;
+    });
+
+    remove_directory_if_present(&local_root);
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_sftp_mutating_commands_change_remote_state() {
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let local_root = unique_sftp_artifact_root("mutations");
+    recreate_directory(&local_root);
+    let local_upload = local_root.join("rename-source.txt");
+    fs::write(&local_upload, b"rename me").expect("could not create local rename fixture");
+
+    let runtime = raw_russh_runtime();
+    runtime.block_on(async {
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        let (handle, mut session) =
+            connect_authenticated_sftp_session(&configuration, &local_root, deadline).await;
+        let remote_root_name = format!(
+            "festerm-sftp-mutations-{}",
+            SFTP_INTEROP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let remote_root = format!("/home/festerm/{remote_root_name}");
+
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("mkdir {remote_root_name}"),
+            deadline,
+            "create the remote mutation test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("cd {remote_root_name}"),
+            deadline,
+            "change into the remote mutation test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            "mkdir nested",
+            deadline,
+            "create a nested remote directory",
+        )
+        .await;
+
+        let nested_listing = run_sftp_command(
+            &mut session,
+            "ls",
+            deadline,
+            "list the remote mutation directory",
+        )
+        .await;
+        let SftpCommandOutcome::DirectoryListing { entries, .. } = nested_listing else {
+            panic!("ls must produce a directory listing");
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == "nested" && entry.file_type == SftpEntryType::Directory),
+            "mkdir must create a remotely visible directory"
+        );
+
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("put {}", quote_command_argument(&local_upload)),
+            deadline,
+            "upload the remote rename fixture",
+        )
+        .await;
+        let renamed = run_sftp_command(
+            &mut session,
+            "rename rename-source.txt renamed.txt",
+            deadline,
+            "rename the uploaded remote file",
+        )
+        .await;
+        assert_eq!(
+            renamed,
+            SftpCommandOutcome::Renamed {
+                source: format!("{remote_root}/rename-source.txt"),
+                destination: format!("{remote_root}/renamed.txt")
+            }
+        );
+
+        let chmod = run_sftp_command(
+            &mut session,
+            "chmod 640 renamed.txt",
+            deadline,
+            "change the uploaded remote file mode",
+        )
+        .await;
+        assert_eq!(
+            chmod,
+            SftpCommandOutcome::PermissionsChanged {
+                path: format!("{remote_root}/renamed.txt"),
+                mode: 0o640
+            }
+        );
+
+        let file_listing = run_sftp_command(
+            &mut session,
+            "ls renamed.txt",
+            deadline,
+            "inspect the renamed remote file",
+        )
+        .await;
+        let SftpCommandOutcome::DirectoryListing { entries, .. } = file_listing else {
+            panic!("ls renamed.txt must produce a single-entry listing");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "renamed.txt");
+        assert_eq!(entries[0].file_type, SftpEntryType::File);
+        assert_eq!(entries[0].permissions.map(|mode| mode & 0o777), Some(0o640));
+
+        let _ = run_sftp_command(
+            &mut session,
+            "rm renamed.txt",
+            deadline,
+            "remove the renamed remote file",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            "rmdir nested",
+            deadline,
+            "remove the nested remote directory",
+        )
+        .await;
+
+        let final_listing = run_sftp_command(
+            &mut session,
+            "ls",
+            deadline,
+            "verify the remote directory is empty",
+        )
+        .await;
+        let SftpCommandOutcome::DirectoryListing { entries, .. } = final_listing else {
+            panic!("ls must produce a final directory listing");
+        };
+        assert!(
+            entries.is_empty(),
+            "rm and rmdir must leave the remote mutation directory empty"
+        );
+
+        let _ = run_sftp_command(
+            &mut session,
+            "cd ..",
+            deadline,
+            "leave the remote mutation test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            &format!("rmdir {remote_root_name}"),
+            deadline,
+            "remove the remote mutation test directory",
+        )
+        .await;
+        let _ = run_sftp_command(
+            &mut session,
+            "quit",
+            deadline,
+            "close the mutation SFTP session",
+        )
+        .await;
+        shutdown_raw_handle(handle).await;
+    });
+
+    remove_directory_if_present(&local_root);
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_direct_tcpip_echo_smoke() {
+    const ECHO_PAYLOAD: &[u8] = b"__FESTERM_OPENSSH_DIRECT_TCPIP_ECHO_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let expected_fingerprint = expected_host_fingerprint_from_environment();
+    let runtime = raw_russh_runtime();
+    runtime.block_on(async {
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        let handle = connect_authenticated_raw_handle(
+            &configuration,
+            expected_fingerprint.as_deref(),
+            None,
+            deadline,
+        )
+        .await;
+        let mut channel = match tokio::time::timeout(
+            remaining_until(deadline, "open the raw direct-tcpip channel"),
+            handle.channel_open_direct_tcpip("127.0.0.1", 9000, "127.0.0.1", 0),
+        )
+        .await
+        {
+            Ok(Ok(channel)) => channel,
+            Ok(Err(_)) => panic!("could not open a raw direct-tcpip channel to 127.0.0.1:9000"),
+            Err(_) => panic!("opening the raw direct-tcpip channel timed out"),
+        };
+        match tokio::time::timeout(
+            remaining_until(deadline, "send the raw direct-tcpip echo payload"),
+            channel.data(ECHO_PAYLOAD),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("could not send the raw direct-tcpip echo payload"),
+            Err(_) => panic!("sending the raw direct-tcpip echo payload timed out"),
+        }
+        match tokio::time::timeout(
+            remaining_until(deadline, "close the raw direct-tcpip write side"),
+            channel.eof(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("could not close the raw direct-tcpip write side"),
+            Err(_) => panic!("closing the raw direct-tcpip write side timed out"),
+        }
+
+        let mut echoed = Vec::new();
+        while Instant::now() < deadline && echoed.len() < ECHO_PAYLOAD.len() {
+            let wait = remaining_until(deadline, "read the raw direct-tcpip echo reply")
+                .min(Duration::from_millis(100));
+            match tokio::time::timeout(wait, channel.wait()).await {
+                Ok(Some(russh::ChannelMsg::Data { data })) => {
+                    echoed.extend_from_slice(data.as_ref());
+                    assert!(
+                        echoed.len() <= ECHO_PAYLOAD.len(),
+                        "the OpenSSH fixture echo service returned unexpected extra bytes"
+                    );
+                }
+                Ok(Some(russh::ChannelMsg::Failure)) => {
+                    panic!("the OpenSSH fixture direct-tcpip channel reported a failure")
+                }
+                Ok(Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close)) | Ok(None) => break,
+                Ok(Some(_)) | Err(_) => {}
+            }
+        }
+
+        assert_eq!(
+            echoed.as_slice(),
+            ECHO_PAYLOAD,
+            "the OpenSSH fixture direct-tcpip echo service did not return the expected payload within the test timeout"
+        );
+        shutdown_raw_handle(handle).await;
+    });
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_remote_tcpip_forward_smoke() {
+    const PAYLOAD: &[u8] = b"__FESTERM_OPENSSH_FORWARDED_TCPIP_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let fixture = DockerFixture::from_environment();
+    let expected_fingerprint = expected_host_fingerprint_from_environment();
+    let runtime = raw_russh_runtime();
+    runtime.block_on(async {
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        let (forwarded_sender, mut forwarded_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let handle = connect_authenticated_raw_handle(
+            &configuration,
+            expected_fingerprint.as_deref(),
+            Some(forwarded_sender),
+            deadline,
+        )
+        .await;
+        let remote_port = match tokio::time::timeout(
+            remaining_until(deadline, "request the raw tcpip-forward"),
+            handle.tcpip_forward("127.0.0.1", 0),
+        )
+        .await
+        {
+            Ok(Ok(port)) => port,
+            Ok(Err(_)) => panic!("the OpenSSH fixture rejected the raw tcpip-forward request"),
+            Err(_) => panic!("requesting the raw tcpip-forward timed out"),
+        };
+        assert!(
+            remote_port > 0,
+            "the OpenSSH fixture returned an invalid remote forwarded port"
+        );
+        let docker_status = Command::new("docker")
+            .args([
+                "exec",
+                &fixture.container_name,
+                "sh",
+                "-c",
+                &format!(
+                    "printf '{}' | nc -w 2 127.0.0.1 {}",
+                    std::str::from_utf8(PAYLOAD).expect("payload is valid UTF-8"),
+                    remote_port
+                ),
+            ])
+            .status()
+            .unwrap_or_else(|_| {
+                panic!("could not invoke Docker to connect to the raw remote forwarded port")
+            });
+        assert!(
+            docker_status.success(),
+            "Docker could not connect to the raw remote forwarded port inside the OpenSSH fixture"
+        );
+
+        let mut forwarded = match tokio::time::timeout(
+            remaining_until(deadline, "wait for the raw forwarded-tcpip channel"),
+            forwarded_receiver.recv(),
+        )
+        .await
+        {
+            Ok(Some(forwarded)) => forwarded,
+            Ok(None) => panic!("the raw forwarded-tcpip receiver closed unexpectedly"),
+            Err(_) => panic!("the OpenSSH fixture did not open a raw forwarded-tcpip channel"),
+        };
+        assert_eq!(forwarded.connected_address, "127.0.0.1");
+        assert_eq!(forwarded.connected_port, remote_port);
+        assert!(
+            !forwarded.originator_address.is_empty(),
+            "the raw forwarded-tcpip originator address should not be empty"
+        );
+        assert!(
+            forwarded.originator_port > 0,
+            "the raw forwarded-tcpip originator port should be nonzero"
+        );
+
+        let mut received = Vec::new();
+        while Instant::now() < deadline && received.len() < PAYLOAD.len() {
+            let wait = remaining_until(deadline, "read the raw forwarded-tcpip payload")
+                .min(Duration::from_millis(100));
+            match tokio::time::timeout(wait, forwarded.channel.wait()).await {
+                Ok(Some(russh::ChannelMsg::Data { data })) => {
+                    received.extend_from_slice(data.as_ref());
+                    assert!(
+                        received.len() <= PAYLOAD.len(),
+                        "the raw forwarded-tcpip channel returned unexpected extra bytes"
+                    );
+                }
+                Ok(Some(russh::ChannelMsg::Failure)) => {
+                    panic!("the raw forwarded-tcpip channel reported a failure")
+                }
+                Ok(Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close)) | Ok(None) => break,
+                Ok(Some(_)) | Err(_) => {}
+            }
+        }
+        assert_eq!(
+            received.as_slice(),
+            PAYLOAD,
+            "the raw forwarded-tcpip channel did not receive the expected payload"
+        );
+
+        match tokio::time::timeout(
+            remaining_until(deadline, "cancel the raw tcpip-forward"),
+            handle.cancel_tcpip_forward("127.0.0.1", remote_port),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("could not cancel the raw tcpip-forward request"),
+            Err(_) => panic!("canceling the raw tcpip-forward request timed out"),
+        }
+        shutdown_raw_handle(handle).await;
+    });
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn local_forward_bridges_bytes_bidirectionally() {
+    const PAYLOAD: &[u8] = b"__FESTERM_SSH_LOCAL_FORWARD_ECHO_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let local_port = unused_local_port();
+    let options = SshSessionOptions::new()
+        .with_profile_port_forwards([InteropPortForwardSpec {
+            direction: SshPortForwardDirection::Local,
+            bind_host: "127.0.0.1",
+            bind_port: local_port,
+            destination_host: "127.0.0.1",
+            destination_port: 9000,
+        }])
+        .expect("valid saved local forward must be accepted");
+    let session = SshSession::start_with_options(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password.clone()),
+        options,
+    )
+    .expect("could not start the OpenSSH session with a saved local forward");
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+
+    wait_for_running_session(&session, deadline);
+    let forwards = wait_for_port_forward_snapshot(&session, deadline, |forwards| {
+        forwards.iter().any(|forward| {
+            forward.direction() == SshPortForwardDirection::Local
+                && forward.bind_host() == "127.0.0.1"
+                && forward.bind_port() == local_port
+                && forward.destination_host() == "127.0.0.1"
+                && forward.destination_port() == 9000
+                && forward.source() == SshPortForwardSource::Profile
+                && forward.state() == SshPortForwardState::Active
+        })
+    });
+    assert_eq!(forwards.len(), 1);
+    connect_and_echo_local_forward(local_port, PAYLOAD, deadline);
+
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("SSH session with a saved local forward did not shut down in time"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn live_ephemeral_forward_can_be_added_and_removed_mid_session() {
+    const PAYLOAD: &[u8] = b"__FESTERM_SSH_EPHEMERAL_FORWARD_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let session = SshSession::start(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password.clone()),
+    )
+    .expect("could not start the OpenSSH session for ephemeral forwarding");
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let local_port = unused_local_port();
+
+    wait_for_running_session(&session, deadline);
+    session
+        .try_add_port_forward(InteropPortForwardSpec {
+            direction: SshPortForwardDirection::Local,
+            bind_host: "127.0.0.1",
+            bind_port: local_port,
+            destination_host: "127.0.0.1",
+            destination_port: 9000,
+        })
+        .expect("could not add an ephemeral local SSH forward");
+    let _ = wait_for_port_forward_snapshot(&session, deadline, |forwards| {
+        forwards.iter().any(|forward| {
+            forward.direction() == SshPortForwardDirection::Local
+                && forward.bind_port() == local_port
+                && forward.source() == SshPortForwardSource::Ephemeral
+                && forward.state() == SshPortForwardState::Active
+        })
+    });
+    connect_and_echo_local_forward(local_port, PAYLOAD, deadline);
+
+    session
+        .try_remove_port_forward(SshPortForwardDirection::Local, "127.0.0.1", local_port)
+        .expect("could not remove the ephemeral local SSH forward");
+    let _ = wait_for_port_forward_snapshot(&session, deadline, |forwards| {
+        forwards.iter().all(|forward| {
+            !(forward.direction() == SshPortForwardDirection::Local
+                && forward.bind_port() == local_port)
+        })
+    });
+    wait_for_local_connect_failure(local_port, deadline);
+
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("SSH session with an ephemeral forward did not shut down in time"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn forwards_are_torn_down_cleanly_on_disconnect() {
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let fixture = DockerFixture::from_environment();
+    let local_port = unused_local_port();
+    let options = SshSessionOptions::new()
+        .with_profile_port_forwards([InteropPortForwardSpec {
+            direction: SshPortForwardDirection::Local,
+            bind_host: "127.0.0.1",
+            bind_port: local_port,
+            destination_host: "127.0.0.1",
+            destination_port: 9000,
+        }])
+        .expect("valid saved local forward must be accepted");
+    let session = SshSession::start_with_options(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password.clone()),
+        options,
+    )
+    .expect("could not start the OpenSSH session for disconnect teardown");
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+
+    wait_for_running_session(&session, deadline);
+    let _ = wait_for_port_forward_snapshot(&session, deadline, |forwards| {
+        forwards.iter().any(|forward| {
+            forward.direction() == SshPortForwardDirection::Local
+                && forward.bind_port() == local_port
+                && forward.state() == SshPortForwardState::Active
+        })
+    });
+    fixture.sever_active_ssh_connection();
+    wait_for_session_disconnected(&session, deadline);
+    let rebound = std::net::TcpListener::bind(("127.0.0.1", local_port))
+        .expect("disconnect teardown did not release the local forwarded listener");
+    drop(rebound);
+
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("disconnected SSH session did not shut down in time"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn remote_forward_bridges_bytes_bidirectionally() {
+    const PAYLOAD: &str = "__FESTERM_SSH_REMOTE_FORWARD_ECHO_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let fixture = DockerFixture::from_environment();
+    let session = SshSession::start(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password.clone()),
+    )
+    .expect("could not start the OpenSSH session for remote forwarding");
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let remote_port = unused_local_port();
+    let (local_echo_port, local_echo_server) = spawn_local_echo_server(deadline);
+
+    wait_for_running_session(&session, deadline);
+    session
+        .try_add_port_forward(InteropPortForwardSpec {
+            direction: SshPortForwardDirection::Remote,
+            bind_host: "127.0.0.1",
+            bind_port: remote_port,
+            destination_host: "127.0.0.1",
+            destination_port: local_echo_port,
+        })
+        .expect("could not add an ephemeral remote SSH forward");
+    let _ = wait_for_port_forward_snapshot(&session, deadline, |forwards| {
+        forwards.iter().any(|forward| {
+            forward.direction() == SshPortForwardDirection::Remote
+                && forward.bind_port() == remote_port
+                && forward.source() == SshPortForwardSource::Ephemeral
+                && forward.state() == SshPortForwardState::Active
+        })
+    });
+    let echoed = docker_output_with_deadline(
+        &[
+            "exec",
+            &fixture.container_name,
+            "sh",
+            "-c",
+            &format!("printf '{PAYLOAD}' | nc -w 2 127.0.0.1 {remote_port}"),
+        ],
+        "exercise the remote forwarded port",
+        deadline,
+    );
+    assert_eq!(
+        echoed, PAYLOAD,
+        "the remote forwarded port did not echo the expected payload"
+    );
+    local_echo_server
+        .join()
+        .expect("the local echo server thread panicked");
+
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("SSH session with a remote forward did not shut down in time"),
+    }
+}
+
+struct DockerFixture {
+    container_name: String,
+}
+
+impl DockerFixture {
+    fn from_environment() -> Self {
+        Self {
+            container_name: required_environment("FESTERM_OPENSSH_CONTAINER_NAME")
+                .expect("OpenSSH fixture container name is invalid"),
+        }
+    }
+
+    fn kill(&self) {
+        docker_status(&["kill", &self.container_name], "kill the OpenSSH fixture");
+    }
+
+    /// Severs only the client's active SSH connection by killing its
+    /// per-connection `sshd` handler process inside the fixture container,
+    /// leaving the container (and, crucially, any durable `tmux`/`screen`
+    /// session it hosts) running. This is what actually distinguishes a
+    /// durable-session interop test from [`Self::kill`]: killing the whole
+    /// container would also kill the persistence provider's daemon, which
+    /// would defeat the point of testing that a durable session survives an
+    /// unintentional transport loss (ADR 0018).
+    ///
+    /// This container is reused across every test in this file, so a stale
+    /// `sshd-session: festerm@...` process from an *earlier* test can
+    /// briefly still be reaping in the background when this one starts.
+    /// Selecting the numerically highest PID (i.e. the most recently forked
+    /// matching process, since PIDs increase monotonically within a
+    /// container) rather than the first line of `ps` output ensures this
+    /// only ever targets the connection this test itself just established.
+    fn sever_active_ssh_connection(&self) {
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                &self.container_name,
+                "sh",
+                "-c",
+                "pid=$(ps aux | grep 'sshd-session: festerm@' | grep -v grep \
+                 | awk '{print $1}' | sort -rn | head -1); [ -n \"$pid\" ] && kill -9 \"$pid\"",
+            ])
+            .output()
+            .unwrap_or_else(|_| {
+                panic!("could not invoke Docker to sever the active SSH connection")
+            });
+        assert!(
+            output.status.success(),
+            "Docker could not sever the active SSH connection inside the OpenSSH fixture"
+        );
+    }
+
+    fn start_and_wait(&self, expected_port: u16) {
+        docker_status(
+            &["start", &self.container_name],
+            "restart the OpenSSH fixture",
+        );
+        self.wait_until_healthy();
+        self.assert_mapped_port(expected_port);
+    }
+
+    fn wait_until_healthy(&self) {
+        let deadline = Instant::now() + DOCKER_HEALTH_TIMEOUT;
+        loop {
+            let health = docker_output(
+                &[
+                    "inspect",
+                    "--format",
+                    "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+                    &self.container_name,
+                ],
+                "inspect the OpenSSH fixture health",
+            );
+            match health.trim() {
+                "healthy" => return,
+                "unhealthy" => panic!("OpenSSH fixture became unhealthy after restart"),
+                _ if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+                _ => panic!("OpenSSH fixture did not become healthy after restart"),
+            }
+        }
+    }
+
+    fn assert_mapped_port(&self, expected_port: u16) {
+        let mapping = docker_output(
+            &["port", &self.container_name, "22/tcp"],
+            "inspect the OpenSSH fixture port mapping",
+        );
+        let expected_port = expected_port.to_string();
+        assert!(
+            mapping
+                .lines()
+                .any(|line| line.rsplit(':').next() == Some(expected_port.as_str())),
+            "OpenSSH fixture did not retain its mapped host port after restart"
+        );
+    }
+
+    fn disable_screen(&self) -> DisabledFixtureProgram {
+        let original_path = docker_output(
+            &[
+                "exec",
+                &self.container_name,
+                "sh",
+                "-c",
+                "command -v screen",
+            ],
+            "locate GNU Screen inside the OpenSSH fixture",
+        )
+        .trim()
+        .to_owned();
+        assert!(
+            original_path.starts_with('/'),
+            "OpenSSH fixture returned an invalid GNU Screen path"
+        );
+        let disabled_path = format!("{original_path}.festerm-disabled");
+        docker_status(
+            &[
+                "exec",
+                &self.container_name,
+                "mv",
+                &original_path,
+                &disabled_path,
+            ],
+            "disable GNU Screen inside the OpenSSH fixture",
+        );
+        DisabledFixtureProgram {
+            container_name: self.container_name.clone(),
+            original_path,
+            disabled_path,
+        }
+    }
+
+    fn override_password(&self, replacement: &str, original: String) -> FixturePasswordOverride {
+        assert!(
+            set_fixture_password(&self.container_name, replacement),
+            "Docker could not replace the OpenSSH fixture password"
+        );
+        FixturePasswordOverride {
+            container_name: self.container_name.clone(),
+            original,
+        }
+    }
+
+    fn rotate_ecdsa_host_key(&self) -> RotatedFixtureHostKey {
+        docker_status(
+            &[
+                "exec",
+                &self.container_name,
+                "sh",
+                "-c",
+                "rm -f /run/festerm-original-ecdsa-key \
+                    /run/festerm-original-ecdsa-key.pub && \
+                 cp /etc/ssh/ssh_host_ecdsa_key /run/festerm-original-ecdsa-key && \
+                 cp /etc/ssh/ssh_host_ecdsa_key.pub /run/festerm-original-ecdsa-key.pub && \
+                 rm -f /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ecdsa_key.pub && \
+                 ssh-keygen -q -t ecdsa -b 256 -N '' \
+                    -f /etc/ssh/ssh_host_ecdsa_key",
+            ],
+            "rotate the OpenSSH fixture ECDSA host key",
+        );
+        docker_status(
+            &["kill", "--signal", "HUP", &self.container_name],
+            "reload the OpenSSH fixture after rotating its host key",
+        );
+        thread::sleep(Duration::from_secs(1));
+        self.wait_until_healthy();
+        RotatedFixtureHostKey {
+            container_name: self.container_name.clone(),
+            fingerprint: self.ecdsa_host_key_fingerprint(),
+        }
+    }
+
+    fn ecdsa_host_key_fingerprint(&self) -> String {
+        let details = docker_output(
+            &[
+                "exec",
+                &self.container_name,
+                "ssh-keygen",
+                "-lf",
+                "/etc/ssh/ssh_host_ecdsa_key.pub",
+                "-E",
+                "sha256",
+            ],
+            "read the OpenSSH fixture ECDSA host-key fingerprint",
+        );
+        let fingerprint = details
+            .split_whitespace()
+            .nth(1)
+            .expect("OpenSSH fixture host-key details did not include a fingerprint")
+            .to_owned();
+        assert!(
+            fingerprint.starts_with("SHA256:"),
+            "OpenSSH fixture returned an invalid ECDSA host-key fingerprint"
+        );
+        fingerprint
+    }
+}
+
+struct DisabledFixtureProgram {
+    container_name: String,
+    original_path: String,
+    disabled_path: String,
+}
+
+impl Drop for DisabledFixtureProgram {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args([
+                "exec",
+                &self.container_name,
+                "mv",
+                &self.disabled_path,
+                &self.original_path,
+            ])
+            .output();
+    }
+}
+
+struct FixturePasswordOverride {
+    container_name: String,
+    original: String,
+}
+
+impl Drop for FixturePasswordOverride {
+    fn drop(&mut self) {
+        let _ = set_fixture_password(&self.container_name, &self.original);
+    }
+}
+
+struct RotatedFixtureHostKey {
+    container_name: String,
+    fingerprint: String,
+}
+
+impl RotatedFixtureHostKey {
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+impl Drop for RotatedFixtureHostKey {
+    fn drop(&mut self) {
+        let restored = Command::new("docker")
+            .args([
+                "exec",
+                &self.container_name,
+                "sh",
+                "-c",
+                "mv /run/festerm-original-ecdsa-key \
+                    /etc/ssh/ssh_host_ecdsa_key && \
+                 mv /run/festerm-original-ecdsa-key.pub \
+                    /etc/ssh/ssh_host_ecdsa_key.pub",
+            ])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if restored {
+            let _ = Command::new("docker")
+                .args(["kill", "--signal", "HUP", &self.container_name])
+                .output();
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+fn set_fixture_password(container_name: &str, password: &str) -> bool {
+    let Ok(mut child) = Command::new("docker")
+        .args(["exec", "-i", container_name, "chpasswd"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| writeln!(stdin, "festerm:{password}").is_ok());
+    written && child.wait().is_ok_and(|status| status.success())
+}
+
+fn docker_status(arguments: &[&str], operation: &str) {
+    let output = Command::new("docker")
+        .args(arguments)
+        .output()
+        .unwrap_or_else(|_| panic!("could not invoke Docker to {operation}"));
+    assert!(output.status.success(), "Docker could not {operation}");
+}
+
+fn docker_output(arguments: &[&str], operation: &str) -> String {
+    let output = Command::new("docker")
+        .args(arguments)
+        .output()
+        .unwrap_or_else(|_| panic!("could not invoke Docker to {operation}"));
+    assert!(output.status.success(), "Docker could not {operation}");
+    String::from_utf8(output.stdout).expect("Docker returned non-UTF-8 fixture metadata")
+}
+
+fn start_known_host_automatic_screen_session(
+    configuration: &OpenSshConfiguration,
+    session_name: &str,
+    marker: &[u8],
+    command: &[u8],
+) -> SshSession {
+    let known_fingerprint = required_environment("FESTERM_OPENSSH_EXPECTED_HOST_FINGERPRINT")
+        .expect("OpenSSH fixture host-key fingerprint is invalid");
+    let strategy = SessionStrategy::Persistent {
+        provider: PersistenceProvider::Screen,
+        session_name: PersistentSessionName::new(session_name)
+            .expect("durable session name is valid"),
+    };
+    let options = SshSessionOptions::with_recovery_policy(
+        strategy,
+        RecoveryPolicy::Automatic(ReconnectPolicy::default_automatic()),
+    )
+    .expect("automatic recovery is valid for a persistent strategy")
+    .with_known_host_fingerprint(known_fingerprint);
+    let session = SshSession::start_with_options(
+        connection_profile(configuration),
+        SshAuthentication::password(configuration.password.clone()),
+        options,
+    )
+    .expect("could not start the automatic-recovery OpenSSH session");
+
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut running = false;
+    let mut marker_seen_in_output = false;
+    let mut output_tail = Vec::new();
+    while Instant::now() < deadline && !(running && marker_seen_in_output) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(_)) => {
+                panic!("the unchanged known OpenSSH host key unexpectedly required confirmation")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_send_input(command)
+                    .expect("could not send the automatic-recovery readiness command");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                marker_seen_in_output |= marker_seen(&mut output_tail, &bytes, marker);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error before automatic-recovery failure testing",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before automatic-recovery failure testing")
+            }
+        }
+    }
+    assert!(
+        running,
+        "automatic-recovery OpenSSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        marker_seen_in_output,
+        "automatic-recovery readiness command did not produce its expected marker"
+    );
+    session
+}
+
+fn assert_automatic_recovery_stops_with<F>(
+    session: &SshSession,
+    expected_kind: SessionErrorKind,
+    expected_message: &str,
+    mut handle_host_key_prompt: F,
+) -> usize
+where
+    F: FnMut(&HostKeyPrompt),
+{
+    let deadline = Instant::now() + RECONNECT_EVENT_TIMEOUT;
+    let mut starting_count = 0;
+    let mut error_event = None;
+    let mut failed_lifecycle = None;
+    while Instant::now() < deadline && (error_event.is_none() || failed_lifecycle.is_none()) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting)) => {
+                starting_count += 1;
+            }
+            Ok(SessionEvent::HostKeyVerification(prompt)) => {
+                handle_host_key_prompt(&prompt);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                assert!(
+                    error_event.is_none(),
+                    "automatic recovery emitted more than one terminal error"
+                );
+                error_event = Some(error);
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Failed(error))) => {
+                assert!(
+                    failed_lifecycle.is_none(),
+                    "automatic recovery entered Failed more than once"
+                );
+                failed_lifecycle = Some(error);
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) => {
+                panic!("automatic recovery unexpectedly returned to Running")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Disconnected(_))) => {
+                panic!("a permanent recovery failure must stop instead of becoming Disconnected")
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before reporting recovery failure")
+            }
+        }
+    }
+
+    assert!(
+        starting_count > 0,
+        "the automatic-recovery session never entered Starting"
+    );
+    let error_event =
+        error_event.expect("automatic recovery did not emit its terminal error in time");
+    let failed_lifecycle =
+        failed_lifecycle.expect("automatic recovery did not enter Failed in time");
+    for error in [&error_event, &failed_lifecycle] {
+        assert_eq!(error.kind(), expected_kind);
+        assert_eq!(error.message(), expected_message);
+    }
+    assert_eq!(
+        session.lifecycle(),
+        SessionLifecycle::Failed(failed_lifecycle.clone()),
+        "automatic recovery did not remain terminal after its permanent failure"
+    );
+    assert!(
+        !session.reconnect_available(),
+        "a terminal automatic-recovery failure must not remain reconnectable"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Err(ShutdownError::Failed(error)) => {
+            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(error.message(), expected_message);
+        }
+        result => {
+            panic!("expected failed SSH shutdown after recovery stopped, received {result:?}")
+        }
+    }
+    starting_count
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_manual_reconnect_interoperability() {
+    const INITIAL_MARKER: &[u8] = b"__FESTERM_OPENSSH_RECONNECT_INITIAL_OK__";
+    const RECONNECTED_MARKER: &[u8] = b"__FESTERM_OPENSSH_RECONNECT_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let fixture = DockerFixture::from_environment();
+    // Ordinary SSH sessions are plain shells with no durable-session
+    // provider, so automatic recovery is not valid for them (ADR 0018);
+    // `SshSessionOptions::new()` is the only constructible option today and
+    // always means manual-only reconnect.
+    let session = SshSession::start_with_options(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password),
+        SshSessionOptions::new(),
+    )
+    .expect("could not start the OpenSSH session");
+    let resolver = session.host_key_decision_resolver();
+
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut initial_prompt_seen = false;
+    let mut initial_running = false;
+    let mut initial_marker_seen = false;
+    let mut output_tail = Vec::new();
+    while Instant::now() < deadline && !(initial_running && initial_marker_seen) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) if !initial_prompt_seen => {
+                resolver
+                    .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                    .expect("could not accept the initial test server host key");
+                initial_prompt_seen = true;
+            }
+            Ok(SessionEvent::HostKeyVerification(_)) => {
+                panic!("initial OpenSSH connection emitted more than one host-key prompt")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !initial_running => {
+                initial_running = true;
+                session
+                    .try_send_input(
+                        b"printf '%s%s%s\\n' '__FESTERM_OPENSSH_' 'RECONNECT_INITIAL_' 'OK__'\n",
+                    )
+                    .expect("could not send initial controlled SSH shell command");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                initial_marker_seen |= marker_seen(&mut output_tail, &bytes, INITIAL_MARKER);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error before reconnect testing began",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before reconnect testing began");
+            }
+        }
+    }
+    assert!(
+        initial_prompt_seen,
+        "initial OpenSSH connection did not request host-key verification"
+    );
+    assert!(
+        initial_running,
+        "initial OpenSSH connection did not reach Running within the test timeout"
+    );
+    assert!(
+        initial_marker_seen,
+        "initial controlled SSH shell command did not produce its expected marker"
+    );
+
+    // Ordinary SSH sessions have no durable-session provider (ADR 0018), so
+    // there is no automatic recovery here: killing the fixture alone must
+    // never move the session into a reconnecting state by itself. Recovery
+    // only happens once the user explicitly requests it.
+    fixture.kill();
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !matches!(
+            session.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting))
+        ),
+        "an unintentional transport loss must never auto-reconnect a plain SSH session"
+    );
+    session
+        .try_reconnect()
+        .expect("an explicit reconnect must always be available for a running plain SSH session");
+
+    let deadline = Instant::now() + RECONNECT_EVENT_TIMEOUT;
+    let mut reconnecting = false;
+    while Instant::now() < deadline && !reconnecting {
+        match session.try_recv_event() {
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting)) => reconnecting = true,
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error before it began reconnecting",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before it began reconnecting");
+            }
+        }
+    }
+    assert!(
+        reconnecting,
+        "the explicitly requested reconnect did not enter a reconnecting state within the test timeout"
+    );
+    assert_eq!(
+        session.try_send_input(b"must-not-be-queued-during-reconnect"),
+        Err(SessionSendError::Closed {
+            operation: SessionOperation::Input,
+        }),
+        "SSH input must be rejected while reconnecting"
+    );
+    assert_eq!(
+        session.try_resize(TerminalSize::new(101, 41).expect("resize terminal size is valid")),
+        Err(SessionSendError::Closed {
+            operation: SessionOperation::Resize,
+        }),
+        "SSH resize must be rejected while reconnecting"
+    );
+
+    fixture.start_and_wait(configuration.port);
+
+    let deadline = Instant::now() + RECONNECT_EVENT_TIMEOUT;
+    let mut fresh_prompt_seen = false;
+    let mut reconnected_running = false;
+    let mut reconnected_marker_seen = false;
+    let mut output_tail = Vec::new();
+    while Instant::now() < deadline && !(reconnected_running && reconnected_marker_seen) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) if !fresh_prompt_seen => {
+                resolver
+                    .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                    .expect("could not accept the fresh test server host key");
+                fresh_prompt_seen = true;
+            }
+            Ok(SessionEvent::HostKeyVerification(_)) => {
+                panic!("reconnected OpenSSH session emitted more than one host-key prompt")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if fresh_prompt_seen => {
+                reconnected_running = true;
+                session
+                    .try_send_input(
+                        b"printf '%s%s%s\\n' '__FESTERM_OPENSSH_' 'RECONNECT_' 'OK__'\n",
+                    )
+                    .expect("could not send reconnected controlled SSH shell command");
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) => {
+                panic!("reconnected OpenSSH session reached Running without fresh host trust")
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                if reconnected_running {
+                    reconnected_marker_seen |=
+                        marker_seen(&mut output_tail, &bytes, RECONNECTED_MARKER);
+                }
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error while reconnecting",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed while reconnecting");
+            }
+        }
+    }
+    assert!(
+        fresh_prompt_seen,
+        "reconnected OpenSSH session did not request fresh host-key verification"
+    );
+    assert!(
+        reconnected_running,
+        "reconnected OpenSSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        reconnected_marker_seen,
+        "reconnected controlled SSH shell command did not produce its expected marker"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("reconnected SSH session did not shut down within the test timeout"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_liveness_probe_succeeds_without_disrupting_a_healthy_session() {
+    const MARKER_BEFORE: &[u8] = b"__FESTERM_OPENSSH_LIVENESS_BEFORE_OK__";
+    const MARKER_AFTER: &[u8] = b"__FESTERM_OPENSSH_LIVENESS_AFTER_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let session = SshSession::start(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password),
+    )
+    .expect("could not start OpenSSH session");
+    let resolver = session.host_key_decision_resolver();
+
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut running = false;
+    let mut marker_before_seen = false;
+    let mut output_tail = Vec::new();
+    while Instant::now() < deadline && !(running && marker_before_seen) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) => resolver
+                .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                .expect("could not accept the test server host key"),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_send_input(
+                        b"printf '%s%s%s\\n' '__FESTERM_OPENSSH_' 'LIVENESS_BEFORE_' 'OK__'\n",
+                    )
+                    .expect("could not send controlled SSH shell command");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                marker_before_seen |= marker_seen(&mut output_tail, &bytes, MARKER_BEFORE);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error before liveness testing began",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before liveness testing began");
+            }
+        }
+    }
+    assert!(
+        running,
+        "SSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        marker_before_seen,
+        "controlled SSH shell command did not produce its expected marker before the liveness probe"
+    );
+
+    // ADR 0018: an on-demand liveness probe against a healthy transport must
+    // succeed silently and never disrupt the running session, and a second
+    // request must coalesce with the still-pending first one.
+    session
+        .try_check_liveness()
+        .expect("a liveness probe must be available for a running session");
+    assert_eq!(
+        session.try_check_liveness(),
+        Err(SshLivenessCheckError::AlreadyRequested),
+        "a second on-demand probe must coalesce with the first until the worker services it"
+    );
+    session
+        .try_send_input(b"printf '%s%s%s\\n' '__FESTERM_OPENSSH_' 'LIVENESS_AFTER_' 'OK__'\n")
+        .expect("could not send controlled SSH shell command after requesting a liveness probe");
+
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut marker_after_seen = false;
+    output_tail.clear();
+    while Instant::now() < deadline && !marker_after_seen {
+        match session.try_recv_event() {
+            Ok(SessionEvent::Lifecycle(
+                SessionLifecycle::Disconnected(_)
+                | SessionLifecycle::Failed(_)
+                | SessionLifecycle::Exited(_)
+                | SessionLifecycle::Stopping
+                | SessionLifecycle::Stopped,
+            )) => {
+                panic!("a liveness probe against a healthy transport must not disrupt the session");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                marker_after_seen |= marker_seen(&mut output_tail, &bytes, MARKER_AFTER);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error while a liveness probe was pending",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed while a liveness probe was pending");
+            }
+        }
+    }
+    assert!(
+        marker_after_seen,
+        "controlled SSH shell command did not produce its expected marker after the liveness probe"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("SSH session did not shut down within the test timeout"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_tmux_persistent_session_reattaches_after_manual_reconnect() {
+    const SET_MARKER: &[u8] = b"__FESTERM_TMUX_SET_OK__";
+    const SIZE_MARKER: &[u8] = b"__FESTERM_TMUX_SIZE_37_111__";
+    const STATUS_MARKER: &[u8] = b"__FESTERM_TMUX_STATUS_off__";
+    const PROOF_MARKER: &[u8] = b"__FESTERM_TMUX_PROOF_persisted-value__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let fixture = DockerFixture::from_environment();
+    let strategy = SessionStrategy::Persistent {
+        provider: PersistenceProvider::Tmux,
+        session_name: PersistentSessionName::new("festerm-interop-tmux")
+            .expect("durable session name is valid"),
+    };
+    let session = SshSession::start_with_options(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password.clone()),
+        SshSessionOptions::manual_recovery(strategy),
+    )
+    .expect("could not start the OpenSSH session");
+    session
+        .try_resize(TerminalSize::new(111, 37).expect("test size is valid"))
+        .expect("could not queue the initial tmux PTY size");
+    let resolver = session.host_key_decision_resolver();
+
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut running = false;
+    let mut proof_set = false;
+    let mut correct_size_seen = false;
+    let mut bare_status_seen = false;
+    let mut output_tail = Vec::new();
+    let mut size_output_tail = Vec::new();
+    let mut status_output_tail = Vec::new();
+    while Instant::now() < deadline
+        && !(running && proof_set && correct_size_seen && bare_status_seen)
+    {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) => resolver
+                .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                .expect("could not accept the test server host key"),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_send_input(
+                        b"export FESTERM_PROOF=persisted-value; \
+                          printf '%s\\n' '__FESTERM_TMUX_SET_OK__'; \
+                          printf '__FESTERM_TMUX_SIZE_%s__\\n' \"$(stty size | tr ' ' '_')\"; \
+                          printf '__FESTERM_TMUX_STATUS_%s__\\n' \
+                          \"$(tmux show-option -t festerm-interop-tmux -v status)\"\n",
+                    )
+                    .expect("could not set the durable-session proof variable");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                proof_set |= marker_seen(&mut output_tail, &bytes, SET_MARKER);
+                correct_size_seen |= marker_seen(&mut size_output_tail, &bytes, SIZE_MARKER);
+                bare_status_seen |= marker_seen(&mut status_output_tail, &bytes, STATUS_MARKER);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error before the durable-session proof was set",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before the durable-session proof was set");
+            }
+        }
+    }
+    assert!(
+        running,
+        "SSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        proof_set,
+        "could not set the durable-session proof variable inside the tmux session"
+    );
+    assert!(
+        correct_size_seen,
+        "the first tmux shell did not receive the pre-connect 111x37 terminal size"
+    );
+    assert!(
+        bare_status_seen,
+        "the tmux session did not disable its status-bar chrome"
+    );
+
+    // Sever only the transport, not the container: the durable tmux session
+    // (and the proof variable set inside it) must survive, unlike
+    // `controlled_openssh_manual_reconnect_interoperability`'s whole-container
+    // kill, which would also kill the persistence provider's daemon.
+    fixture.sever_active_ssh_connection();
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !matches!(
+            session.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting))
+        ),
+        "manual-only recovery must never auto-reconnect after an unintentional transport loss"
+    );
+    session
+        .try_reconnect()
+        .expect("an explicit reconnect must always be available for a running persistent session");
+
+    let deadline = Instant::now() + RECONNECT_EVENT_TIMEOUT;
+    let mut fresh_prompt_seen = false;
+    let mut reconnected_running = false;
+    let mut proof_confirmed = false;
+    output_tail.clear();
+    while Instant::now() < deadline && !(reconnected_running && proof_confirmed) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) if !fresh_prompt_seen => {
+                resolver
+                    .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                    .expect("could not accept the fresh test server host key");
+                fresh_prompt_seen = true;
+            }
+            Ok(SessionEvent::HostKeyVerification(_)) => {
+                panic!("reattached OpenSSH session emitted more than one host-key prompt")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if fresh_prompt_seen => {
+                reconnected_running = true;
+                session
+                    .try_send_input(b"printf '__FESTERM_TMUX_PROOF_%s__\\n' \"$FESTERM_PROOF\"\n")
+                    .expect("could not read back the durable-session proof variable");
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) => {
+                panic!("reattached OpenSSH session reached Running without fresh host trust")
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                if reconnected_running {
+                    proof_confirmed |= marker_seen(&mut output_tail, &bytes, PROOF_MARKER);
+                }
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error while reattaching to the durable session",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed while reattaching to the durable session");
+            }
+        }
+    }
+    assert!(
+        fresh_prompt_seen,
+        "reattached OpenSSH session did not request fresh host-key verification"
+    );
+    assert!(
+        reconnected_running,
+        "reattached OpenSSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        proof_confirmed,
+        "reattached tmux session did not retain the proof variable set before the transport was \
+         severed; this means the client created a new session instead of reattaching to the \
+         durable one"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => panic!("reattached SSH session did not shut down within the test timeout"),
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_screen_persistent_session_reattaches_after_automatic_recovery() {
+    const SET_MARKER: &[u8] = b"__FESTERM_SCREEN_SET_OK__";
+    const PROOF_MARKER: &[u8] = b"__FESTERM_SCREEN_PROOF_persisted-value__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let fixture = DockerFixture::from_environment();
+    let strategy = SessionStrategy::Persistent {
+        provider: PersistenceProvider::Screen,
+        session_name: PersistentSessionName::new("festerm-interop-screen")
+            .expect("durable session name is valid"),
+    };
+    let session = SshSession::start_with_options(
+        connection_profile(&configuration),
+        SshAuthentication::password(configuration.password.clone()),
+        SshSessionOptions::with_recovery_policy(
+            strategy,
+            RecoveryPolicy::Automatic(ReconnectPolicy::default_automatic()),
+        )
+        .expect("automatic recovery is valid for a persistent strategy"),
+    )
+    .expect("could not start the OpenSSH session");
+    let resolver = session.host_key_decision_resolver();
+
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    let mut running = false;
+    let mut proof_set = false;
+    let mut output_tail = Vec::new();
+    while Instant::now() < deadline && !(running && proof_set) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::HostKeyVerification(prompt)) => resolver
+                .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                .expect("could not accept the test server host key"),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if !running => {
+                running = true;
+                session
+                    .try_send_input(
+                        b"export FESTERM_PROOF=persisted-value; printf '%s\\n' '__FESTERM_SCREEN_SET_OK__'\n",
+                    )
+                    .expect("could not set the durable-session proof variable");
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                proof_set |= marker_seen(&mut output_tail, &bytes, SET_MARKER);
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error before the durable-session proof was set",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!("SSH session event stream closed before the durable-session proof was set");
+            }
+        }
+    }
+    assert!(
+        running,
+        "SSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        proof_set,
+        "could not set the durable-session proof variable inside the screen session"
+    );
+
+    // Sever only the transport, not the container: an opted-in automatic
+    // recovery policy must reconnect on its own, without any explicit
+    // `try_reconnect()` call, and reattach to the same durable screen
+    // session rather than creating a fresh one.
+    fixture.sever_active_ssh_connection();
+
+    let deadline = Instant::now() + RECONNECT_EVENT_TIMEOUT;
+    let mut auto_reconnecting = false;
+    let mut fresh_prompt_seen = false;
+    let mut reconnected_running = false;
+    let mut proof_confirmed = false;
+    output_tail.clear();
+    while Instant::now() < deadline && !(reconnected_running && proof_confirmed) {
+        match session.try_recv_event() {
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Starting)) => {
+                auto_reconnecting = true;
+            }
+            Ok(SessionEvent::HostKeyVerification(prompt)) if !fresh_prompt_seen => {
+                resolver
+                    .resolve(&prompt, HostTrustDecision::AcceptOnce)
+                    .expect("could not accept the fresh test server host key");
+                fresh_prompt_seen = true;
+            }
+            Ok(SessionEvent::HostKeyVerification(_)) => {
+                panic!("reattached OpenSSH session emitted more than one host-key prompt")
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) if fresh_prompt_seen => {
+                reconnected_running = true;
+                session
+                    .try_send_input(b"printf '__FESTERM_SCREEN_PROOF_%s__\\n' \"$FESTERM_PROOF\"\n")
+                    .expect("could not read back the durable-session proof variable");
+            }
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running)) => {
+                panic!("reattached OpenSSH session reached Running without fresh host trust")
+            }
+            Ok(SessionEvent::Output(bytes)) => {
+                if reconnected_running {
+                    proof_confirmed |= marker_seen(&mut output_tail, &bytes, PROOF_MARKER);
+                }
+            }
+            Ok(SessionEvent::Error(error)) => {
+                panic!(
+                    "SSH session emitted a {:?} error while automatically reattaching to the \
+                     durable session",
+                    error.kind()
+                );
+            }
+            Ok(_) | Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(SessionTryReceiveError::Closed) => {
+                panic!(
+                    "SSH session event stream closed while automatically reattaching to the \
+                     durable session"
+                );
+            }
+        }
+    }
+    assert!(
+        auto_reconnecting,
+        "an automatic-recovery-enabled durable session must reconnect on its own after an \
+         unintentional transport loss, without any explicit try_reconnect() call"
+    );
+    assert!(
+        fresh_prompt_seen,
+        "automatically reattached OpenSSH session did not request fresh host-key verification"
+    );
+    assert!(
+        reconnected_running,
+        "automatically reattached OpenSSH session did not reach Running within the test timeout"
+    );
+    assert!(
+        proof_confirmed,
+        "automatically reattached screen session did not retain the proof variable set before \
+         the transport was severed; this means the client created a new session instead of \
+         reattaching to the durable one"
+    );
+    match session.shutdown(SHUTDOWN_TIMEOUT) {
+        Ok(ShutdownResult::Stopped | ShutdownResult::AlreadyStopped) => {}
+        Err(_) => {
+            panic!("automatically reattached SSH session did not shut down within the test timeout")
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_automatic_recovery_stops_when_provider_disappears() {
+    const READY_MARKER: &[u8] = b"__FESTERM_RECOVERY_PROVIDER_READY_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let fixture = DockerFixture::from_environment();
+    let session = start_known_host_automatic_screen_session(
+        &configuration,
+        "festerm-recovery-provider-disappears",
+        READY_MARKER,
+        b"printf '%s%s%s\\n' '__FESTERM_' 'RECOVERY_PROVIDER_READY_' 'OK__'\n",
+    );
+
+    let _disabled_screen = fixture.disable_screen();
+    fixture.sever_active_ssh_connection();
+
+    let starting_count = assert_automatic_recovery_stops_with(
+        &session,
+        SessionErrorKind::Spawn,
+        "the configured durable-session provider is not available on the remote host",
+        |_| panic!("unchanged known host trust unexpectedly prompted during automatic recovery"),
+    );
+    assert_eq!(
+        starting_count, 1,
+        "provider disappearance must stop automatic recovery after its first fresh connection"
+    );
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_automatic_recovery_stops_when_host_key_change_is_rejected() {
+    const READY_MARKER: &[u8] = b"__FESTERM_RECOVERY_HOST_KEY_READY_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let expected_fingerprint = required_environment("FESTERM_OPENSSH_EXPECTED_HOST_FINGERPRINT")
+        .expect("OpenSSH fixture host-key fingerprint is invalid");
+    let fixture = DockerFixture::from_environment();
+    let session = start_known_host_automatic_screen_session(
+        &configuration,
+        "festerm-recovery-host-key-changes",
+        READY_MARKER,
+        b"printf '%s%s%s\\n' '__FESTERM_' 'RECOVERY_HOST_KEY_READY_' 'OK__'\n",
+    );
+    let rotated_host_key = fixture.rotate_ecdsa_host_key();
+    assert_ne!(
+        rotated_host_key.fingerprint(),
+        expected_fingerprint,
+        "the OpenSSH fixture host-key rotation did not change its fingerprint"
+    );
+    fixture.sever_active_ssh_connection();
+
+    let resolver = session.host_key_decision_resolver();
+    let mut prompt_count = 0;
+    let starting_count = assert_automatic_recovery_stops_with(
+        &session,
+        SessionErrorKind::Spawn,
+        "SSH host key was rejected",
+        |prompt| {
+            prompt_count += 1;
+            assert_eq!(prompt.host(), configuration.host);
+            assert_eq!(prompt.port(), configuration.port);
+            assert!(prompt.is_key_change());
+            assert_eq!(
+                prompt.previously_trusted_fingerprint(),
+                Some(expected_fingerprint.as_str())
+            );
+            assert_eq!(prompt.sha256_fingerprint(), rotated_host_key.fingerprint());
+            resolver
+                .resolve(prompt, HostTrustDecision::Reject)
+                .expect("could not reject the changed OpenSSH fixture host key");
+        },
+    );
+    assert_eq!(
+        prompt_count, 1,
+        "changed host trust must produce exactly one recovery prompt"
+    );
+    assert_eq!(
+        starting_count, 1,
+        "rejected changed host trust must stop automatic recovery after its first attempt"
+    );
+}
+
+#[test]
+#[ignore = "requires the repository-owned OpenSSH Docker fixture"]
+fn controlled_openssh_automatic_recovery_stops_when_password_is_rejected() {
+    const READY_MARKER: &[u8] = b"__FESTERM_RECOVERY_PASSWORD_READY_OK__";
+
+    let configuration =
+        OpenSshConfiguration::from_environment().expect("OpenSSH fixture environment is invalid");
+    let fixture = DockerFixture::from_environment();
+    let session = start_known_host_automatic_screen_session(
+        &configuration,
+        "festerm-recovery-password-rejected",
+        READY_MARKER,
+        b"printf '%s%s%s\\n' '__FESTERM_' 'RECOVERY_PASSWORD_READY_' 'OK__'\n",
+    );
+
+    let _password_override = fixture.override_password(
+        "festerm-deliberately-rejected-during-recovery",
+        configuration.password,
+    );
+    fixture.sever_active_ssh_connection();
+
+    let starting_count = assert_automatic_recovery_stops_with(
+        &session,
+        SessionErrorKind::Authentication,
+        "SSH authentication failed",
+        |_| panic!("unchanged known host trust unexpectedly prompted during automatic recovery"),
+    );
+    assert_eq!(
+        starting_count, 1,
+        "rejected credentials must stop automatic recovery after its first fresh connection"
+    );
+}

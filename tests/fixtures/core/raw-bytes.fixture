@@ -1,0 +1,10 @@
+# \xNN input escapes are raw bytes. M3 uses strict incremental UTF-8:
+# malformed leading/continuation sequences become U+FFFD, while the unfinished
+# final sequence remains buffered for a later ingest call.
+name: raw C1 and malformed UTF-8 input uses replacement characters
+size: 5x1
+input: "\x80A\xC3\x28B\xC2\x9B"
+grid:
+  - "�A�(B"
+cursor: 4,0
+replies: ""

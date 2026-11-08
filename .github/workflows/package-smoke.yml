@@ -1,0 +1,534 @@
+name: Native package smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/package-smoke.yml'
+      - '.github/workflows/release.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'app/festerm/**'
+      - 'crates/festerm-automation-js/**'
+      - 'crates/festerm-tunnel-bridge/**'
+      - 'crates/festerm-sessiond/**'
+      - 'crates/festerm-windows-direct2d/**'
+      - 'assets/app-icon/**'
+      - 'packaging/**'
+      - 'scripts/check_packaging.py'
+      - 'scripts/smoke_linux_automation_worker.py'
+      - 'scripts/tests/test_check_packaging.py'
+      - 'scripts/stage-conpty.ps1'
+      - 'scripts/stage-windows-sessiond.ps1'
+      - 'third_party/conpty/**'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            platform: macos
+            runner: macos-latest
+          - name: windows-x86_64
+            platform: windows
+            runner: windows-latest
+            conpty_runtime: win-x64
+            package_arch: x86_64
+          - name: windows-aarch64
+            platform: windows
+            runner: windows-11-vs2026-arm
+            conpty_runtime: win-arm64
+            package_arch: aarch64
+          - name: linux-x86_64
+            platform: linux
+            runner: ubuntu-latest
+          - name: linux-aarch64
+            platform: linux
+            runner: ubuntu-24.04-arm
+    env:
+      FESTERM_UPDATE_PUBLIC_KEY: unsigned-package-smoke-key
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add native LLVM to PATH on Windows ARM64
+        if: matrix.name == 'windows-aarch64'
+        shell: pwsh
+        run: |
+          $llvmBin = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path (Join-Path $llvmBin 'clang.exe') -PathType Leaf)) {
+            throw "Native LLVM is unavailable at $llvmBin"
+          }
+          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache key from ci.yml's `quality` job: this workflow
+          # builds `--release` artifacts, which produce different
+          # fingerprints/objects than the dev/test builds cached there.
+          key: package-smoke
+      - name: Validate packaging metadata
+        run: |
+          python scripts/generate_windows_icon.py --check
+          python scripts/check_packaging.py
+      - name: Install Linux packaging dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          sudo apt-get update
+          sudo apt-get install -y libfuse2t64 libudev-dev pkg-config
+      - name: Cache pinned cargo-packager binary
+        id: cargo-packager-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-packager
+            ~/.cargo/bin/cargo-packager.exe
+          key: cargo-packager-0.11.8-${{ runner.os }}-${{ runner.arch }}
+      - name: Install pinned cargo-packager
+        if: steps.cargo-packager-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --version 0.11.8 --locked --force
+      - name: Smoke reviewed macOS CLI signature prerequisites
+        if: matrix.platform == 'macos'
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import stat
+          import subprocess
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          limit = 128 * 1024 * 1024
+          manifest = json.loads(Path("crates/festerm-tunnel-bridge/devtunnel-cli-pins.json").read_text())
+          pins = [pin for pin in manifest["pins"] if pin["platform"] == "macos"]
+          if sorted(pin["architecture"] for pin in pins) != ["aarch64", "x86_64"]:
+              raise SystemExit("Expected both reviewed macOS CLI architectures exactly once")
+          failures = []
+          with tempfile.TemporaryDirectory(prefix=".macos-cli-smoke-", dir=Path.cwd()) as directory:
+              for pin in pins:
+                  architecture = pin["architecture"]
+                  try:
+                      if pin["format"] != "zip" or not pin["download"].startswith("https://"):
+                          raise ValueError("Expected reviewed HTTPS ZIP download")
+                      cache = Path(directory) / architecture
+                      cache.mkdir(mode=0o700)
+                      archive = cache / "devtunnel.zip"
+                      print(f"Checking reviewed macOS CLI: {architecture}", flush=True)
+                      subprocess.run([
+                          "curl", "--fail", "--location", "--silent", "--show-error",
+                          "--proto", "=https", "--proto-redir", "=https",
+                          "--connect-timeout", "15", "--max-time", "90",
+                          "--max-filesize", str(limit), "--output", str(archive), pin["download"],
+                      ], check=True, timeout=100)
+                      if archive.stat().st_size > limit:
+                          raise ValueError("CLI archive exceeds runtime size limit")
+                      if hashlib.sha256(archive.read_bytes()).hexdigest() != pin["archive_sha256"]:
+                          raise ValueError("CLI archive SHA256 mismatch")
+                      with zipfile.ZipFile(archive) as source:
+                          entries = source.infolist()
+                          if len(entries) != 1:
+                              raise ValueError("Expected a single CLI ZIP entry")
+                          entry = entries[0]
+                          if (entry.filename != "devtunnel" or entry.is_dir()
+                                  or stat.S_ISLNK(entry.external_attr >> 16)
+                                  or entry.file_size > limit):
+                              raise ValueError("Unsafe CLI ZIP entry")
+                          with source.open(entry) as stream:
+                              executable_bytes = stream.read(limit + 1)
+                      if len(executable_bytes) > limit:
+                          raise ValueError("CLI executable exceeds runtime size limit")
+                      if hashlib.sha256(executable_bytes).hexdigest() != pin["executable_sha256"]:
+                          raise ValueError("CLI executable SHA256 mismatch")
+                      executable = cache / "devtunnel"
+                      with executable.open("xb") as destination:
+                          destination.write(executable_bytes)
+                      executable.chmod(0o700)
+                      subprocess.run(["/usr/bin/codesign", "-dv", str(executable)],
+                                     check=False, timeout=20)
+                      subprocess.run([
+                          "/usr/bin/codesign", "--verify", "--strict",
+                          "-R=anchor apple generic", str(executable),
+                      ], check=True, timeout=20)
+                  except (OSError, ValueError, RuntimeError, subprocess.SubprocessError,
+                          zipfile.BadZipFile) as error:
+                      failures.append(f"{architecture}: {error}")
+                      print(f"::error::Reviewed macOS CLI signature prerequisite failed: {architecture}: {error}",
+                            flush=True)
+          if failures:
+              raise SystemExit("\n".join(failures))
+          PY
+      - name: Build unsigned macOS package
+        if: matrix.platform == 'macos'
+        env:
+          FESTERM_INSTALLATION_KIND: app
+        run: |
+          cargo build --release -p festerm -p festerm-sessiond
+          cargo build --locked --release -p festerm-tunnel-bridge --no-default-features --features relay --bins
+          cargo packager --config packaging/macos.toml --formats app
+          test -x target/release/fesTerm.app/Contents/MacOS/festerm
+          test -x target/release/fesTerm.app/Contents/MacOS/festerm-sessiond
+          test -x target/release/fesTerm.app/Contents/MacOS/festerm-tunnel-setup
+          test -x target/release/fesTerm.app/Contents/MacOS/festerm-tunnel-bridge
+          test ! -e target/release/fesTerm.app/Contents/MacOS/devtunnel
+          test -f target/release/fesTerm.app/Contents/Info.plist
+          test "$(defaults read "$PWD/target/release/fesTerm.app/Contents/Info" CFBundleIdentifier)" = "dev.fes.festerm"
+          test "$(defaults read "$PWD/target/release/fesTerm.app/Contents/Info" CFBundleExecutable)" = "festerm"
+          python - <<'PY'
+          import plistlib
+          from pathlib import Path
+
+          info = plistlib.loads(Path("target/release/fesTerm.app/Contents/Info.plist").read_bytes())
+          document_types = info.get("CFBundleDocumentTypes")
+          expected_document_type = {
+              "CFBundleTypeExtensions": ["md", "markdown"],
+              "CFBundleTypeName": "Markdown Document",
+              "CFBundleTypeRole": "Viewer",
+              "LSHandlerRank": "Alternate",
+              "LSItemContentTypes": ["net.daringfireball.markdown", "public.markdown"],
+          }
+          if document_types != [expected_document_type]:
+              raise SystemExit(f"unexpected Markdown document types: {document_types!r}")
+          imported_types = info.get("UTImportedTypeDeclarations")
+          expected_imported_type = {
+              "UTTypeConformsTo": ["public.plain-text", "public.text"],
+              "UTTypeDescription": "Markdown Document",
+              "UTTypeIdentifier": "net.daringfireball.markdown",
+              "UTTypeTagSpecification": {
+                  "public.filename-extension": ["md", "markdown"],
+                  "public.mime-type": "text/markdown",
+              },
+          }
+          if imported_types != [expected_imported_type]:
+              raise SystemExit(f"unexpected Markdown imported types: {imported_types!r}")
+          tags = imported_types[0]["UTTypeTagSpecification"]
+          if "com.apple.ostype" in tags:
+              raise SystemExit("Markdown UTI must not include broad legacy TEXT OSType")
+          PY
+      - name: Build unsigned Windows package with verified ConPTY sidecar
+        if: matrix.platform == 'windows'
+        env:
+          FESTERM_INSTALLATION_KIND: nsis
+        shell: pwsh
+        run: |
+          ./scripts/stage-conpty.ps1 -Configuration Release
+          cargo build --locked --release -p festerm-tunnel-bridge --no-default-features --features relay --bins
+          if ($LASTEXITCODE -ne 0) { throw 'Tunnel helper build failed' }
+          ./scripts/stage-windows-sessiond.ps1 -Configuration Release
+          cargo packager --config packaging/windows.toml --formats nsis
+          $installer = Get-ChildItem target/release -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $installer) {
+            throw 'cargo-packager did not produce an NSIS installer'
+          }
+          $installDirectory = Join-Path $env:LOCALAPPDATA 'fesTerm'
+          $markdownSentinel = 'fesTermSmoke.SentinelMarkdown'
+          function Get-RegistryDefault([string]$Path) {
+            $key = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+            if (-not $key) { return $null }
+            return $key.GetValue('', $null)
+          }
+          function Get-RegistryValueNames([string]$Path) {
+            $key = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+            if (-not $key) { return @() }
+            return @($key.GetValueNames())
+          }
+          function Initialize-MarkdownSentinel {
+            foreach ($extension in @('.md', '.markdown')) {
+              $path = "HKCU:\Software\Classes\$extension"
+              New-Item -Path $path -Force | Out-Null
+              Set-Item -Path $path -Value $markdownSentinel
+            }
+          }
+          function Assert-MarkdownSentinelDefault {
+            foreach ($extension in @('.md', '.markdown')) {
+              $actual = Get-RegistryDefault "HKCU:\Software\Classes\$extension"
+              if ($actual -ne $markdownSentinel) {
+                throw "NSIS changed $extension default from sentinel '$markdownSentinel' to '$actual'"
+              }
+            }
+          }
+          function Assert-MarkdownOpenWith([bool]$ExpectedPresent) {
+            Assert-MarkdownSentinelDefault
+            $expectedCommand = "`"$installedBinary`" --open -- `"%1`""
+            $command = Get-RegistryDefault 'HKCU:\Software\Classes\fesTerm.Markdown\shell\open\command'
+            foreach ($extension in @('.md', '.markdown')) {
+              $names = Get-RegistryValueNames "HKCU:\Software\Classes\$extension\OpenWithProgids"
+              $hasOpenWith = $names -contains 'fesTerm.Markdown'
+              if ($ExpectedPresent -and -not $hasOpenWith) {
+                throw "NSIS did not add fesTerm.Markdown to $extension OpenWithProgids"
+              }
+              if (-not $ExpectedPresent -and $hasOpenWith) {
+                throw "NSIS uninstall left fesTerm.Markdown in $extension OpenWithProgids"
+              }
+            }
+            if ($ExpectedPresent) {
+              if ($command -ne $expectedCommand) {
+                throw "NSIS Markdown command was '$command', expected '$expectedCommand'"
+              }
+            } elseif ($null -ne $command) {
+              throw "NSIS uninstall left fesTerm.Markdown command '$command'"
+            }
+          }
+          Initialize-MarkdownSentinel
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "NSIS clean install failed with exit code $($process.ExitCode)"
+          }
+          $installedBinary = Join-Path $installDirectory 'festerm.exe'
+          $legacySessionDaemon = Join-Path $installDirectory 'festerm-sessiond.exe'
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $sessiondVersion = @(
+            $metadata.packages | Where-Object { $_.name -eq 'festerm-sessiond' }
+          )[0].version
+          $installedSessionDaemon = Join-Path $installDirectory "festerm-sessiond-$sessiondVersion.exe"
+          $installedConpty = Join-Path $installDirectory 'runtime/conpty/${{ matrix.conpty_runtime }}/conpty.dll'
+          $uninstaller = Join-Path $installDirectory 'uninstall.exe'
+          if (-not (Test-Path $installedBinary -PathType Leaf)) {
+            throw 'NSIS install did not place festerm.exe'
+          }
+          if (-not (Test-Path $installedSessionDaemon -PathType Leaf)) {
+            throw 'NSIS install did not place the release-versioned session daemon'
+          }
+          $installedTunnelHelpers = @('festerm-tunnel-setup.exe', 'festerm-tunnel-bridge.exe', 'festerm-tunnel-worker.exe') |
+            ForEach-Object { Join-Path $installDirectory $_ }
+          foreach ($helper in $installedTunnelHelpers) {
+            if (-not (Test-Path $helper -PathType Leaf)) {
+              throw "NSIS install did not place tunnel helper: $helper"
+            }
+          }
+          if (Test-Path (Join-Path $installDirectory 'devtunnel.exe')) {
+            throw 'NSIS must not bundle the downloaded Dev Tunnels CLI'
+          }
+          if (Test-Path $legacySessionDaemon) {
+            throw 'NSIS clean install unexpectedly placed the legacy stable session daemon'
+          }
+          if (-not (Test-Path $installedConpty -PathType Leaf)) {
+            throw 'NSIS install did not place the ConPTY runtime'
+          }
+          if (-not (Test-Path $uninstaller -PathType Leaf)) {
+            throw 'NSIS install did not place an uninstaller'
+          }
+          Assert-MarkdownOpenWith $true
+          $process = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "NSIS uninstall failed with exit code $($process.ExitCode)"
+          }
+          Assert-MarkdownOpenWith $false
+          if (Test-Path $installedBinary) {
+            throw 'NSIS uninstall left the application binary installed'
+          }
+          foreach ($helper in $installedTunnelHelpers) {
+            if (Test-Path $helper) {
+              throw "NSIS uninstall left tunnel helper installed: $helper"
+            }
+          }
+          if (Test-Path $installedSessionDaemon) {
+            throw 'NSIS uninstall left the session daemon installed'
+          }
+
+          $legacyInstaller = Join-Path $env:RUNNER_TEMP 'festerm-0.2.0-setup.exe'
+          $legacyUri = 'https://github.com/fes/fesTerm/releases/download/v0.2.0/' +
+            'fesTerm-0.2.0-windows-${{ matrix.package_arch }}-setup.exe'
+          # v0.2.0 is the oldest release whose daemon must survive an upgrade.
+          # Move this baseline when MIN_SUPPORTED_PROTOCOL_VERSION rises above
+          # the epoch it wrote.
+          $download = $null
+          foreach ($attempt in 1..3) {
+            try {
+              Invoke-WebRequest -Uri $legacyUri -OutFile $legacyInstaller
+              $download = $true
+              break
+            } catch {
+              $download = $_
+              Write-Warning "Attempt ${attempt} to download the v0.2.0 installer failed: $_"
+              Start-Sleep -Seconds (5 * $attempt)
+            }
+          }
+          if ($download -ne $true) {
+            throw "Could not download the v0.2.0 installer: $download"
+          }
+          if ((Get-AuthenticodeSignature $legacyInstaller).Status -ne 'Valid') {
+            throw 'Downloaded v0.2.0 installer is not Authenticode-valid'
+          }
+          $daemonPid = $null
+          try {
+            $process = Start-Process -FilePath $legacyInstaller -ArgumentList '/S' -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "NSIS v0.2.0 install failed with exit code $($process.ExitCode)"
+            }
+            Initialize-MarkdownSentinel
+
+            $legacySessionDaemon = Join-Path $installDirectory 'festerm-sessiond.exe'
+            $sessionName = "package-upgrade-$PID"
+            & $legacySessionDaemon start --name $sessionName --shell $env:ComSpec
+            if ($LASTEXITCODE -ne 0) {
+              throw "v0.2.0 session daemon failed to start with exit code $LASTEXITCODE"
+            }
+            $registryPath = Join-Path $env:LOCALAPPDATA 'fesTerm/sessiond/registry.json'
+            $registry = Get-Content -LiteralPath $registryPath -Raw | ConvertFrom-Json
+            $daemonPid = [int]$registry.sessions.$sessionName.pid
+
+            $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "NSIS upgrade from v0.2.0 failed with exit code $($process.ExitCode)"
+            }
+            if (-not (Test-Path $installedSessionDaemon -PathType Leaf)) {
+              throw 'NSIS upgrade did not place the release-versioned session daemon'
+            }
+            Assert-MarkdownOpenWith $true
+            if (-not (Get-Process -Id $daemonPid -ErrorAction SilentlyContinue)) {
+              throw 'The v0.2.0 session daemon did not survive the side-by-side upgrade'
+            }
+            $sessions = (& $installedSessionDaemon list | Out-String)
+            if ($LASTEXITCODE -ne 0 -or $sessions -notmatch [regex]::Escape($sessionName)) {
+              throw 'The new helper could not discover the live v0.2.0 session'
+            }
+
+            & $installedSessionDaemon kill --name $sessionName
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The new helper could not terminate the migrated v0.2.0 session'
+            }
+            $deadline = [DateTime]::UtcNow.AddSeconds(10)
+            while ((Get-Process -Id $daemonPid -ErrorAction SilentlyContinue) -and
+                   [DateTime]::UtcNow -lt $deadline) {
+              Start-Sleep -Milliseconds 100
+            }
+            if (Get-Process -Id $daemonPid -ErrorAction SilentlyContinue) {
+              throw 'The migrated v0.2.0 session daemon did not exit after kill'
+            }
+            & $installedSessionDaemon list | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The new helper failed while pruning the exited legacy daemon image'
+            }
+            if (Test-Path $legacySessionDaemon) {
+              throw 'The legacy daemon image was not pruned after its final process exited'
+            }
+
+            $uninstaller = Join-Path $installDirectory 'uninstall.exe'
+            $process = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "NSIS upgraded uninstall failed with exit code $($process.ExitCode)"
+            }
+            Assert-MarkdownOpenWith $false
+          } finally {
+            if ($null -ne $daemonPid) {
+              $daemon = Get-Process -Id $daemonPid -ErrorAction SilentlyContinue
+              if ($daemon) {
+                Stop-Process -Id $daemonPid -Force
+                $daemon.WaitForExit(10000)
+              }
+            }
+            $uninstaller = Join-Path $installDirectory 'uninstall.exe'
+            if (Test-Path $uninstaller -PathType Leaf) {
+              $cleanup = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+              if ($cleanup.ExitCode -ne 0) {
+                Write-Warning "NSIS cleanup failed with exit code $($cleanup.ExitCode)"
+              }
+            }
+          }
+      - name: Build unsigned Linux AppImage
+        if: matrix.platform == 'linux'
+        env:
+          FESTERM_INSTALLATION_KIND: appimage
+        run: |
+          cargo build --release -p festerm -p festerm-sessiond -p festerm-automation-js
+          cargo build --locked --release -p festerm-tunnel-bridge --no-default-features --features relay --bins
+          cargo packager --config packaging/linux.toml --formats appimage
+          appimage="$(find target/release -maxdepth 1 -name '*.AppImage' -print -quit)"
+          test -n "$appimage"
+          chmod +x "$appimage"
+          (
+            cd target/release
+            rm -rf squashfs-root
+            "./$(basename "$appimage")" --appimage-extract >/dev/null
+            test -x squashfs-root/AppRun
+            test -x squashfs-root/usr/bin/festerm
+            test -x squashfs-root/usr/bin/festerm-sessiond
+            test -x squashfs-root/usr/bin/festerm-tunnel-setup
+            test -x squashfs-root/usr/bin/festerm-tunnel-bridge
+            test ! -e squashfs-root/usr/bin/devtunnel
+            timeout --kill-after=6s 15s python3 ../../scripts/smoke_linux_automation_worker.py squashfs-root/usr/bin/festerm-automation-js-worker
+            desktop="$(find squashfs-root/usr/share/applications -maxdepth 1 -name '*.desktop' -print -quit)"
+            test -n "$desktop"
+            python - "$desktop" <<'PY'
+          import sys
+          from pathlib import Path
+
+          desktop = Path(sys.argv[1]).read_text(encoding="utf-8")
+          required = {
+              "Exec=festerm --open -- %F",
+              "MimeType=text/markdown",
+              "Terminal=false",
+              "Type=Application",
+          }
+          missing = sorted(required - set(desktop.splitlines()))
+          if missing:
+              raise SystemExit(f"AppImage desktop entry missing {missing}: {desktop!r}")
+          if "text/plain" in desktop:
+              raise SystemExit("AppImage desktop entry must not register broad text/plain")
+          PY
+            rm -rf squashfs-root
+          )
+      - name: Rebuild package-managed Linux binary and Debian package
+        if: matrix.platform == 'linux'
+        env:
+          FESTERM_INSTALLATION_KIND: managed
+        run: |
+          cargo build --release -p festerm -p festerm-sessiond -p festerm-automation-js
+          cargo build --locked --release -p festerm-tunnel-bridge --no-default-features --features relay --bins
+          cargo packager --config packaging/linux.toml --formats deb
+          deb="$(find target/release -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$deb"
+          dpkg-deb --info "$deb" >/dev/null
+          dpkg-deb --contents "$deb" | grep -q 'usr/bin/festerm$'
+          dpkg-deb --contents "$deb" | grep -q 'usr/bin/festerm-sessiond$'
+          dpkg-deb --contents "$deb" | grep -q 'usr/bin/festerm-tunnel-setup$'
+          dpkg-deb --contents "$deb" | grep -q 'usr/bin/festerm-tunnel-bridge$'
+          if dpkg-deb --contents "$deb" | grep -q 'usr/bin/devtunnel$'; then
+            echo 'Debian package must not bundle the downloaded Dev Tunnels CLI' >&2
+            exit 1
+          fi
+          dpkg-deb --contents "$deb" | grep -q 'usr/bin/festerm-automation-js-worker$'
+          deb_desktop="$(dpkg-deb --contents "$deb" | awk '/usr\/share\/applications\/.*\.desktop$/ { print $6; exit }')"
+          test -n "$deb_desktop"
+          desktop_entry="$(dpkg-deb --fsys-tarfile "$deb" | tar -xOf - "$deb_desktop")"
+          DESKTOP_ENTRY="$desktop_entry" python - <<'PY'
+          import os
+          import sys
+
+          listing = os.environ["DESKTOP_ENTRY"]
+          required = {
+              "Exec=festerm --open -- %F",
+              "MimeType=text/markdown",
+              "Terminal=false",
+              "Type=Application",
+          }
+          missing = sorted(required - set(listing.splitlines()))
+          if missing:
+              raise SystemExit(f"Debian desktop entry missing {missing}: {listing!r}")
+          if "text/plain" in listing:
+              raise SystemExit("Debian desktop entry must not register broad text/plain")
+          PY
+          sudo dpkg --install "$deb"
+          test -x /usr/bin/festerm
+          test -x /usr/bin/festerm-sessiond
+          test -x /usr/bin/festerm-tunnel-setup
+          test -x /usr/bin/festerm-tunnel-bridge
+          timeout --kill-after=6s 15s python3 scripts/smoke_linux_automation_worker.py /usr/bin/festerm-automation-js-worker
+          sudo dpkg --remove festerm
+          test ! -e /usr/bin/festerm
+          test ! -e /usr/bin/festerm-sessiond
+          test ! -e /usr/bin/festerm-tunnel-setup
+          test ! -e /usr/bin/festerm-tunnel-bridge
+          test ! -e /usr/bin/festerm-automation-js-worker

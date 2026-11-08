@@ -1,0 +1,63 @@
+# fesTerm clipboard provenance patch
+
+Source: crates.io `egui-winit` **0.36.1**, registry checksum
+`9327fc8edef2c57db9bcbcacc82c8a4b1e8cc64cd41a67db4419dcf643d88c83`.
+Original MIT/Apache-2.0 licenses accompany the source. The workspace
+`[patch.crates-io]` selects this source reproducibly; no installed registry
+source is modified.
+
+Local changes in `src/lib.rs` keyboard adaptation:
+
+* emit the exact logical/physical key, pressed state, modifiers and native
+  repeat flag immediately before derived Copy/Cut/Paste, including empty paste;
+* exclude Ctrl+Alt (AltGr) from clipboard command classification;
+* permit layout text associated with Ctrl+Alt rather than suppressing it as a
+  command. macOS Command remains a command.
+
+No clipboard payload is logged. Ordinary egui widgets still receive their
+semantic events. The composition root can now remove a derived event for
+terminal pass-through or app capture without guessing from a later modifier
+snapshot. Widget RequestPaste intent remains unpaired. eframe's
+`raw_input_hook` alone cannot recover information discarded by the unpatched
+adapter. Keep this patch small, review it whenever egui is upgraded, and remove
+it when upstream provides an equivalent supported provenance/raw-input seam.
+
+`clipboard_requests.rs` adds an identified clipboard-read mailbox, served once
+by `State::take_egui_input` on an explicitly requested next native frame. It is
+not a clipboard watcher. Each viewport retains at most one request and one
+response; identifiers never wrap or get reused. Cancelled/superseded callback
+IDs cannot complete a newer read. The application keeps only content-free
+tab/generation/ownership metadata and routes the returned payload through its
+existing paste safety policy, never through an unowned widget Paste event.
+The mailbox temporarily transports the same clipboard text that ordinary
+egui Paste delivery transports, without logging or persisting it.
+
+`src/clipboard.rs` normalizes LF, lone CR and existing CRLF to exactly one CRLF
+at the Windows clipboard-write boundary, as required by `CF_UNICODETEXT`.
+Logical row order, Unicode and trailing separators are preserved; internal text
+and non-Windows clipboard writes are unchanged. The workspace regression
+`windows_clipboard_newlines_preserve_multiline_source_order` covers mixed,
+blank, trailing and already-normalized line endings plus idempotence.
+
+`src/lib.rs` and `src/clipboard.rs` also carry restricted HTML plus its plain
+fallback as one output command. Native arboard backends publish both formats;
+an HTML-write failure retries plain text, Smithay/Wayland remains explicitly
+text-only, and a missing Smithay route uses the ordinary plain clipboard
+fallback instead of silently publishing through an unrelated rich backend.
+Disconnected fallback storage retains only the plain value.
+Windows normalizes that plain alternative through the same `CF_UNICODETEXT`
+boundary before either the combined write or its fallback.
+
+The app depends directly on this same pinned egui-winit package to use that
+small seam; no second clipboard implementation or registry source edit is used.
+Native clipboard key payloads already delivered alongside their key are used
+directly, not discarded and reread. The opt-in native keyboard fixture writes
+controlled clipboard text and invokes palette Paste to exercise this seam.
+
+See `docs/keyboard-shortcuts.md` and the production routing regression tests.
+
+The separately opt-in `egui_winit::pointer_input` debug target records adapted
+pointer positions, button identity, pressed/released state and wheel deltas for native
+input-ordering investigations. It does not log keyboard events, text or
+clipboard data, and does not change input delivery or query the current OS
+cursor to replace historical event coordinates.

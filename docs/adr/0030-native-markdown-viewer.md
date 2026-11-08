@@ -1,0 +1,532 @@
+# ADR 0030: Native Markdown Viewer as a First-Class Bounded Application Surface
+
+- **Status:** Proposed
+- **Date:** 2026-09-03
+- **Supersedes:** None
+
+## Context
+
+`docs/markdown-viewer-design.md` approves a native, read-only Markdown viewer
+with local and SFTP entry routes, Preview/Source modes, Find, bounded resource
+loading, and explicit remote-origin pinning. That scope crosses several stable
+repository boundaries and therefore needs an ADR rather than an implementation-
+local choice.
+
+First, the application already distinguishes between session-backed tabs and
+non-terminal application surfaces. `ApplicationSession` owns only live local,
+persistent-local, SSH, SFTP, and serial transports; `TabContent` separately
+owns Launcher, Settings, Profiles, and auth-required non-session surfaces.
+ADR 0014 makes that ownership distinction explicit: tabs may outlive a
+transport attempt, while application surfaces have no terminal/session pair at
+all. The Markdown viewer must fit that model instead of smuggling a document
+surface through the terminal/session path.
+
+Second, the configuration/workspace layer is intentionally additive and
+metadata-only. `festerm-config` keeps `SCHEMA_VERSION = 1`, extends
+`InterfaceSettings` via `#[serde(default)]` fields and validated replacement
+helpers, and persists only stable workspace metadata through `WorkspaceTab`.
+At the same time, the approved Markdown-viewer product spec explicitly says
+viewer documents, paths, contents, scroll positions, and Find queries are not
+persisted in workspace state in v1. The design therefore needs a clear answer
+about which parts of the feature become configuration/workspace schema and
+which stay runtime-only.
+
+Third, the repository already has a reusable remote-file boundary for SFTP.
+ADR 0028 selected `russh-sftp` and the existing `festerm-ssh::sftp::SftpSession`
+backend. Live SFTP tabs already carry typed `HostIdentity`-based connection
+metadata, optional persisted known-host fingerprints, and a session-controller
+lifecycle generation that distinguishes one live transport episode from the
+next. The Markdown viewer should reuse that existing authenticated SFTP path
+for remote snapshots rather than inventing a second SSH file-read mechanism.
+
+Finally, bounded behavior is a repository-wide invariant, not an isolated UI
+preference. `festerm-session` caps one I/O chunk at `MAX_IO_CHUNK_BYTES = 64
+KiB`, and ADR 0017 established the project's general memory/diagnostics
+philosophy: explicit limits, powers-of-two sizing, content-free errors, and
+truthful recovery semantics. The Markdown viewer needs concrete bounds for
+input bytes, decoded lines, nesting, tables, code blocks, and explicit image
+loads that follow that same philosophy.
+
+## Decision
+
+### The Markdown viewer is a runtime `TabContent` surface, not an `ApplicationSession`
+
+fesTerm will implement the Markdown viewer as a dedicated non-terminal tab
+surface, for example `TabContent::MarkdownViewer(MarkdownViewerTab)`, owned
+entirely by the application/UI layer.
+
+It will **not** be represented as an `ApplicationSession` variant:
+
+- a viewer has no `Session`, PTY, SSH channel, transcript, or terminal grid;
+- it should not participate in terminal input, resize, scrollback, or session
+  shutdown semantics; and
+- its lifetime matches Launcher/Settings-style application surfaces more than
+  SFTP/SSH session tabs.
+
+Likewise, v1 will **not** add `WorkspaceTab::MarkdownViewer`. The approved
+product spec explicitly excludes persistence of open viewer documents and their
+state, so workspace capture/restoration should skip Markdown viewer tabs just
+as it currently skips other runtime-only state. If a future product decision
+chooses viewer persistence, that can be an additive later change with its own
+`WorkspaceTab::MarkdownViewer(MarkdownViewerTabConfiguration)` metadata shape.
+
+This means the integration pattern is:
+
+- **`TabContent`:** gains a first-class Markdown-viewer variant.
+- **`ApplicationSession`:** no new variant.
+- **`WorkspaceTab`:** no new v1 variant; workspace save/restore omits viewer
+  tabs by design.
+
+### Add a small parser/model crate and keep rendering egui-native
+
+fesTerm will add a small workspace crate dedicated to bounded Markdown loading
+and projection, e.g. `crates/festerm-markdown`. That crate owns:
+
+- typed source identities (`Local` and `Remote`);
+- bounded UTF-8 decoding and limit enforcement;
+- Markdown parsing into a deterministic document model for Preview;
+- source offsets/heading metadata needed by Find, Outline, and Preview/Source
+  scroll mapping; and
+- content-free parse/load errors.
+
+`app/festerm` remains responsible for chip lifecycle, commands, focus,
+keybindings, and egui rendering.
+
+Rendering remains fully egui-native. The implementation should use existing
+`egui`/`eframe` primitives already present in the workspace — `ScrollArea`,
+text layout, read-only multiline text editing or selectable labels, `Grid`,
+and targeted custom painting where needed — rather than embedding a webview,
+HTML renderer, or a second UI framework. Wide tables and code blocks may use
+nested bounded scroll regions inside the main reading column; this is
+consistent with the approved mockup and with the application's current bounded
+scroll-surface patterns.
+
+### Use `pulldown-cmark` for Markdown parsing and `syntect` for bounded syntax highlighting
+
+fesTerm will parse Markdown with `pulldown-cmark`.
+
+This is the preferred parser because it matches the required contract with the
+smallest reasonable new dependency surface:
+
+- it is the conventional Rust choice for CommonMark parsing;
+- it supports the required GFM-style extensions needed here (tables, task
+  lists, strikethrough, autolinks, fenced code);
+- its event-stream model fits fesTerm's bounded, non-HTML, non-browser design
+  better than an HTML-first renderer; and
+- it keeps the viewer's parser boundary small and testable inside a repository
+  that already favors focused crates over large framework integrations.
+
+fesTerm will not adopt an HTML-rendering Markdown stack such as a browser
+surface or an egui wrapper around HTML output. Raw HTML in Markdown remains
+inert source or a visible placeholder exactly as the approved product spec
+requires.
+
+The later [ADR 0048](0048-bounded-native-svg-and-html-anchors.md) narrowly
+amends this baseline: static local/intrinsic SVG and restricted native HTML
+links/named targets are projected without a browser or secondary resource
+authority. All other HTML remains inert; the original raster-only restriction
+below describes the pre-amendment policy.
+The owner accepted ADR 0048 on 2026-10-14 after pre-parser marker refusal and
+actual named-target viewport navigation were repaired. SVG markers remain
+unsupported pending bounded per-vertex expansion; native fidelity,
+accessibility and DPI qualification remain pending under CP-06/CP-15.
+
+For syntax highlighting, fesTerm will add `syntect` behind a small adapter in
+`festerm-markdown` and will document a bounded language allowlist for v1.
+Unknown or unsupported language labels render as plain monospace code. `syntect`
+is chosen despite being a larger dependency than the parser because it gives a
+fully local, deterministic, bundled highlighter with mature syntax definitions
+and no web/runtime dependency. That is a better fit than introducing a browser
+engine or a tree-sitter-based highlighting stack solely for this feature.
+
+The initial documented highlight set should stay intentionally small and useful,
+for example: `text`, `md`, `rust`, `toml`, `json`, `yaml`, `shell`/`bash`/`sh`,
+`diff`, and `powershell`.
+
+### Remote snapshots must reuse the existing SFTP backend and typed SSH identity
+
+Remote Markdown loading will reuse the authenticated SFTP stack already chosen
+by ADR 0028.
+
+Concretely:
+
+- a remote viewer may only open from an explicit SFTP-origin action;
+- the snapshot read must flow through the live `ApplicationSession::Sftp`
+  transport path, using the existing `festerm-ssh::sftp::SftpSession`
+  machinery and the same `russh-sftp` file-open/read loop already used for SFTP
+  transfers;
+- the viewer must not translate a remote path into a local path, mount a
+  remote filesystem, or open a second ad hoc SSH connection just to read a
+  file.
+
+The viewer's remote source identity should be captured as a typed value derived
+from existing session concepts, not display strings. At minimum it should bind:
+
+- the remote `HostIdentity` (`host` + `port`);
+- the SSH username or saved profile identifier that launched the SFTP session;
+- the canonical remote path returned by the SFTP layer; and
+- the producing SFTP tab's `SessionController::lifecycle_generation()`.
+
+That generation value prevents a live viewer from silently treating a later,
+different transport episode as the same still-verified source. While a session
+remains connected, reloads and explicit remote resource fetches must require
+that same generation.
+
+To satisfy the product requirement of reloading only after reconnecting to the
+**same verified origin**, the implementation should also expose the verified
+host-key fingerprint used by the live SFTP session (or an equivalent typed
+trust identity) as sanitized session metadata. Existing known-host plumbing
+already carries a persisted expected fingerprint into SFTP startup; the viewer
+should build on that seam rather than trusting a chip label or display string.
+A disconnected viewer may continue to display its last good snapshot, but it may
+reload only after the application has re-established an SFTP transport whose
+host identity and verified trust identity match the source the snapshot was
+pinned to.
+
+### Preview, Source, Outline, and Find are in-memory snapshot features
+
+Each viewer tab owns one immutable loaded snapshot plus small transient UI
+state:
+
+- active mode (`Preview` or `Source`);
+- outline-open state and selected/current heading;
+- scroll anchor;
+- Find query plus match list/current match; and
+- per-resource approval state for the current tab lifetime only.
+
+Preview is rendered from the parsed bounded document model. Source renders the
+exact decoded UTF-8 text (after optional BOM stripping) from the same snapshot;
+there is no second parser or re-read path for Source mode.
+
+Find works over the decoded in-memory text only. The parser/model crate should
+retain source offsets or line/byte spans so Find can:
+
+- report `N of M` deterministically;
+- move next/previous with wrap;
+- preserve the current match across a same-source reload when the match still
+  exists; and
+- map Preview matches back to headings/blocks without reparsing for every
+  keystroke.
+
+Preview/Source mode switches preserve the nearest heading and relative position
+within that heading's section, not a raw widget scroll offset from unrelated
+layouts.
+
+**Keybinding conflict resolution:** the approved product spec proposes
+`Ctrl/Cmd+Shift+M` for the Preview/Source toggle, but that chord is already
+bound to `ApplicationShortcut::PortForwardManager` (`app/festerm/src/app.rs`
+lines 216, and macOS variant at 215). fesTerm will bind the Markdown viewer's
+Preview/Source toggle to **`Ctrl/Cmd+Shift+V`** instead, which is unused by any
+existing `ApplicationShortcut`. The command palette remains authoritative for
+discoverability regardless of the bound chord, consistent with the spec's own
+"the command palette is authoritative" language.
+
+### Explicit, non-persisted resource approval only
+
+The viewer never performs implicit secondary loads.
+
+For each image-like resource reference, Preview renders a placeholder with its
+alt text and source class. Explicit per-item activation may then attempt a
+bounded raster load subject to source-type policy:
+
+- **Local document:** canonicalize the document path, resolve the relative
+  target against it, require a regular local file, reject disallowed schemes,
+  reject SVG and non-raster formats, and enforce resource limits before decode.
+- **Remote document:** resolve the relative target against the viewer's typed
+  remote source, then fetch it only through the same verified SFTP
+  origin/generation described above.
+
+Approvals are stored only in the live `MarkdownViewerTab` state, keyed by a
+stable per-resource identity, and are cleared on close, on source-identity
+change, and after a successful reload that produces a new snapshot. They are
+never persisted in configuration, workspace state, recent history, or trust
+stores.
+
+### Amendment: automatic loading of local relative images
+
+*Amended after the first release of the viewer.*
+
+"The viewer never performs implicit secondary loads" made the common case
+unusable: a local design document is mostly diagrams and screenshots, and
+opening one produced a page of grey "Load local image" buttons that had to be
+clicked one at a time before the document could be read at all. The rule was
+written to keep the viewer from reaching out to the network or to files the
+reader had not offered it, and that concern does not apply to an image the
+open document references from its own directory.
+
+The rule is therefore narrowed, not dropped. **Images that a *local* document
+references with a *relative* target load automatically when the document is
+opened.** Everything else keeps its explicit placeholder:
+
+- remote documents (every reference class),
+- absolute URLs of any scheme,
+- SFTP-origin-relative references,
+- non-image resource references.
+
+An automatic load is otherwise identical to the explicit one: the same
+canonicalization, the same regular-file requirement, the same raster-format
+restriction and the same byte and raster-area limits in "Bounded-loading
+limits". The argument that this is safe is an ownership argument, not a
+weakening of the limits: opening `README.md` from a directory is already a
+statement that the directory's contents may be read, and the relative-target
+class is exactly the set of files inside that grant.
+
+Automatic loading is additionally bounded so that a hostile or merely enormous
+document cannot turn one open into unbounded work:
+
+- **Maximum automatic loads per document:** **64**. References past that budget
+  fall back to explicit placeholders.
+- **Maximum concurrent loads:** **4**, shared by manual and automatic loads
+  across viewer and editor Preview panes in the application's egui context.
+- Permanent failures are attempted once per snapshot unless explicitly retried.
+  Temporary worker or memory refusals retry only when the required slot or
+  whole-load allowance is available, without spending another distinct
+  automatic-load attempt.
+
+The budget is spent per snapshot and is reset by a reload, matching how
+approvals are cleared.
+
+### Bounded-loading limits
+
+The first implementation will ship with these concrete limits:
+
+- **Maximum Markdown source size:** **4 MiB** per snapshot (`64 ×
+  MAX_IO_CHUNK_BYTES`).
+- **Maximum decoded line count:** **65,536** lines.
+- **Maximum block/list nesting depth:** **16**.
+- **Maximum rendered table cells:** **8,192** cells across one document.
+- **Maximum fenced code block payload:** **256 KiB** for any single block.
+- **Maximum explicit image/resource payload:** **8 MiB** compressed input per
+  item.
+
+Image dimensions are checked before application-owned pixel expansion:
+**16 Mi-pixels** and the live renderer's texture-axis limit. Actual encoded
+reading stops at **8 MiB plus one overflow-probe byte**, independently of
+metadata. Open-handle metadata must identify a regular file; Unix opens are
+nonblocking and do not acquire a controlling terminal, so a FIFO cannot hold
+a worker waiting for a writer. Filesystem-absolute/rooted targets and canonical
+destinations outside the opened Markdown file's canonical parent directory
+are refused before content is read, including parent traversal and symlink
+escapes.
+
+The complete saved Markdown filename is canonicalized before establishing
+editor Preview's resource root. If that fails, text Preview remains available
+with a visible image-refusal explanation; a display fallback never grants
+filesystem access. The document store reads through one file handle acquired beneath a captured
+canonical parent and records that handle's canonical path, identity, size and
+modification generation plus the parent directory's stable filesystem
+identity. Preview carries that exact authority rather than recanonicalizing
+its typed origin independently.
+
+Image-root acquisition uses `cap-std` and `cap-fs-ext` 4.0.3. Starting at the
+filesystem root, each component of the already-authorized canonical parent is
+opened with `DirExt::open_dir_nofollow`; the parent is not recanonicalized into
+a different grant after the source identity is bound. Before image admission, the captured parent identity must still match and the
+Markdown filename is opened through that directory and must match the
+generation that supplied the editor bytes. Canonical final-name checks before
+and after open reject name-surrogate replacement while allowing ordinary
+Windows Cloud Files hydration. Source replacement, hard-link parent
+substitution, or parent rebinding therefore denies image authority.
+Image-path canonicalization
+preserves supported in-root aliases and checks containment, but is not
+sufficient authority: `Dir::open_with` resolves the admitted relative
+destination beneath the same directory handle, enforcing the library's
+sandboxed traversal contract. Regular-file and length checks, and bounded
+reading, use the resulting file handle without reopening its name. No
+directory capability is retained by a tab, decoded image or texture; the root
+handle is dropped immediately after file acquisition and on every refusal.
+This closes source-generation, final/intermediate symlink and Windows reparse
+races without adding hand-written native filesystem primitives.
+
+### Amendment: shared managed-image allowance and editor Preview
+
+The allocation/lifecycle audit in #320 found that per-image limits did not
+bound combined image ownership, and manual loads bypassed the automatic
+worker cap. It also found that ordinary local Markdown opens in the shared
+text editor, whose Preview rendered image placeholders but never invoked the
+loader. Connecting **saved local-file Preview** was explicitly approved;
+remote, untitled and terminal-history snapshots gain no local-file authority.
+
+One context-owned controller admits **512 MiB by default**, shared across
+windows, standalone viewers and editor Preview panes. Settings exposes
+**Image memory budget** with 64, 128, 256, 512, 1024 and 2048 MiB choices;
+there is no unlimited option. Lowering the allowance preserves existing
+admissions and visibly refuses new growth. Raising it can unblock temporary
+refusals. The live shared policy is authoritative, including after a reported
+configuration-save failure; stale window initialization or an unrelated
+unchanged-budget configuration broadcast cannot undo that choice.
+
+Admission reserves a conservative whole-load envelope atomically: bounded
+encoded/scratch/captured input, decoder-declared native output, RGBA conversion,
+and retained texture/upload allowance. Owned RGBA conversion avoids an
+unconditional raster clone. Worker slots end with actual work, independently
+of result polling. Byte reservations follow running work, queued decoded
+results and retained images, rather than disappearing when a pane closes.
+Texture retirement follows weak references to actual CPU upload owners; a
+rotating, 128-entry scan prevents an unbounded reclamation traversal or one
+live upload pinning later dead entries. The controller stores neither its
+own reservations nor an egui Context.
+Exceptional retirement-ledger capacity is discarded once sparse; that copy
+visits at most 128 retained entries rather than moving an arbitrarily large
+live ledger.
+
+Preview authority comes only from `DocumentOrigin::Local` and its canonical
+file generation, never a presentation label or the `preview.md` fallback.
+An external reload, explicit reload, successful save, first Save or Save
+As/rebinding replaces the recorded source generation and drops the old
+approvals, caches and receivers before reparsing those bytes.
+An ordinary editor reparse retains completed image/error state only where the
+new parse has the same reference kind, class and target at the same index;
+changed references and all pending receivers are discarded. This preserves the
+64-reference admission count and avoids repeated file reads, decodes, texture
+uploads and layout collapse while typing. A failed parse releases hidden image
+owners without loading the retained old document. Both surfaces use the same
+admission/poll/retry implementation and typed
+`LoadMarkdownLocalImage` command. Nonlocal Preview explains the saved-local
+requirement without offering a non-working local-load button.
+
+This is a **managed allowance**, not a process-RAM or VRAM guarantee.
+Decoder-private allocations may ignore `image::Limits.max_alloc`; native
+renderer/GPU staging and retirement, allocator fragmentation, other document
+storage and total RSS are outside it. These repairs do not establish the
+cause of #297's long-running growth.
+
+These numbers follow the same repository conventions already used elsewhere:
+explicit powers-of-two, limits materially below the much larger 64 MiB
+terminal-scrollback default, and crisp content-free failure categories rather
+than best-effort unbounded parsing.
+
+A source that exceeds any viewer-specific limit fails closed with a concise,
+content-free error. A partial parse or partial remote read must never replace a
+previously valid snapshot.
+
+## Alternatives considered
+
+- **Use `comrak` or another larger AST/HTML-oriented Markdown stack.**
+  Rejected. The product contract is not "render arbitrary HTML"; it is a small,
+  bounded CommonMark/GFM subset rendered through native widgets. `pulldown-
+  cmark` is the smaller and more direct fit.
+- **Use a webview/browser surface to get Markdown rendering "for free."**
+  Rejected. It would violate the product's explicit non-browser posture,
+  reintroduce HTML/script/resource trust problems the spec forbids, and add a
+  second rendering/runtime stack to an application that already committed to
+  egui in ADR 0007.
+- **Represent the viewer as a session or transcript tab.**
+  Rejected. A viewer owns no terminal, no byte-stream session, and no transport
+  lifecycle of its own. Modeling it as an `ApplicationSession` would blur an
+  ownership boundary ADR 0014 deliberately keeps sharp.
+- **Persist Markdown viewers in workspace state immediately.**
+  Rejected for v1. The approved product spec explicitly says viewer documents
+  and state are not persisted. Persisting them now would be a product change,
+  not an implementation detail.
+
+## Consequences
+
+- The workspace gains one new focused crate boundary for bounded document
+  loading/projection, but not a new UI framework.
+- `app/festerm` gains a first-class runtime document surface in the chip row,
+  with new typed commands for opening, focusing, closing, reloading, toggling
+  Preview/Source, Find, outline navigation, and explicit resource loads.
+- `festerm-config` does not gain a persisted `WorkspaceTab::MarkdownViewer` in
+  v1, preserving the approved non-persistence behavior.
+- `festerm-ssh` will need a small additive remote-snapshot API layered on the
+  existing SFTP backend rather than a second file-read path.
+- Remote viewer reload and remote-image load semantics become stricter and more
+  honest: a disconnected snapshot stays readable, but nothing silently retargets
+  to a different transport episode or host.
+- Syntax highlighting will add one non-trivial dependency (`syntect`), but only
+  for a documented small language allowlist and only inside the bounded document
+  path.
+
+## Validation impact
+
+- **Invariants introduced or changed:** Markdown viewers are runtime-only
+  `TabContent` surfaces, not `ApplicationSession`s; remote snapshots and remote
+  resources use only the existing SFTP transport boundary; viewer diagnostics
+  remain content-free; no secondary resource loads occur without explicit,
+  non-persisted approval; viewer parsing/loading respects fixed byte, line,
+  nesting, table-cell, code-block, and resource limits.
+- **GUI/action edges affected:** New stable workflow IDs are required for local
+  "Open File…" routing, remote SFTP "Preview Markdown", Preview/Source/Find/
+  Outline actions, explicit image loads, and offline-snapshot reload behavior.
+  `validation/traceability.json` should be updated in the implementing change
+  once those IDs exist.
+- **Automated tests required:** Planned coverage should include
+  `markdown_source_over_limit_is_rejected_without_content_leak`,
+  `markdown_preview_and_source_preserve_heading_anchor_across_mode_switch`,
+  `markdown_find_wraps_and_preserves_current_match_on_same_source_reload`,
+  `markdown_raw_html_is_never_rendered`,
+  `markdown_remote_snapshot_reloads_only_for_matching_verified_origin`,
+  `markdown_remote_image_requires_explicit_approval_and_matching_generation`,
+  `markdown_workspace_capture_omits_runtime_viewer_tabs`, and
+  `markdown_code_block_over_limit_degrades_with_a_content_free_error`.
+- **Native/manual evidence required:** Manual scenario coverage is required for
+  keyboard traversal, screen-reader order, wide-table/code scrolling, explicit
+  local and remote image loads, offline snapshot presentation, and content-free
+  oversize/binary/invalid-UTF-8 failures. Stable scenario IDs should be added in
+  the implementing change.
+- **Coverage superseded:** None.
+
+### Validation impact of the automatic local-image amendment
+
+- **Invariants introduced or changed:** "no secondary resource loads occur
+  without explicit, non-persisted approval" is narrowed to "no secondary
+  resource loads occur without explicit, non-persisted approval, except images
+  a local document references with a relative target, which load automatically
+  under the same bounded-loading limits plus a per-document count cap and a
+  concurrency cap". No other reference class changes.
+- **GUI/action edges affected:** None. Automatic loading reuses the existing
+  local-image load path; the explicit "Load local image" activation remains for
+  every class that still requires it and for references past the per-document
+  budget. `Ctrl+O` is added as a chord for the existing
+  `LAUNCH-11` open-Markdown-file workflow; it introduces no new edge, but from
+  inside a viewer it now retargets that viewer instead of opening a second tab.
+- **Automated tests required:**
+  `local_relative_images_load_without_the_reader_asking`,
+  `absolute_url_images_are_never_loaded_automatically`,
+  `a_local_image_that_cannot_be_read_is_only_attempted_once`,
+  `automatic_image_loading_is_bounded_by_the_concurrency_cap`, and
+  `replacing_a_viewers_document_drops_the_previous_documents_approvals`
+  (all in `app/festerm/src/markdown_viewer.rs`).
+- **Native/manual evidence required:** None beyond the existing manual image
+  scenarios, which still cover the explicit path.
+- **Coverage superseded:** The manual "explicit local image load" scenario no
+  longer exercises the default path for a local document; it remains valid for
+  over-budget references and for every non-local-relative class.
+
+### Validation impact of the shared allowance and Preview amendment
+
+- **Invariants introduced or changed:** combined managed-image ownership and
+  actual running work are bounded across both presentation surfaces;
+  saved-local Preview alone gains the existing relative-image policy.
+  Complete canonical source and parent identity, no-follow root acquisition,
+  directory-handle-contained final resolution and nonblocking Unix special-file
+  refusal enforce that policy before content reading.
+- **GUI/action edges affected:** `MD-05`, `SET-13`, `EDIT-18` and the
+  origin-rebinding part of `EDIT-04`.
+- **Automated evidence:** `image_budget_*` lifecycle/admission/retirement
+  regressions, the actual editor/file-open/manual-button command test,
+  nonlocal path-looking origins, first Save/Save As rebinding, stale-worker
+  results, unchanged-image reparse retention, failed parses, explicit retry,
+  shared bytes/worker slots, bounded
+  read/header controls and Settings/save/restart/reset/failed-save coverage
+  are registered in `validation/traceability.json`. Symlink-file source
+  identity,   loaded-generation replacement/reload, hard-link parent replacement,
+  final-source/final-image/intermediate symlink
+  rebinding, captured-root name rebinding and supported relative/absolute
+  in-root aliases are covered on Unix.
+  Windows uses unprivileged junction fixtures for intermediate and
+  root-acquisition rebinding. Portable tests cover visible unresolvable-source
+  refusal, source-generation and parent-identity mismatch, save-time parent
+  binding (including pathname rebinding during save and canonical-target saves
+  through selected symlinks), and image-directory handle release after
+  success/failure. The FIFO and
+  final-source symlink regressions remain Unix-only; Windows Cloud Files and
+  file-symlink presentation remain native evidence.
+- **Native/manual evidence required:** `CP-06` retains standalone remote-viewer
+  visual, focus and accessibility review. `CP-15` retains saved-local Preview
+  visual, path/symlink, refusal/recovery and accessibility review.
+  Deterministic headless tests do not count as native acceptance or RSS evidence.
+- **Coverage superseded:** local Preview placeholders were not evidence that
+  the ordinary editor invoked the standalone viewer's loader; the production
+  editor workflow now has its own automated evidence.

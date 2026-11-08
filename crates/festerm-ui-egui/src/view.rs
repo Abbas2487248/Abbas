@@ -1,0 +1,7470 @@
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use egui::{Align2, Popup, Rect, Sense, Stroke, Ui};
+use festerm_core::{
+    ContentPosition, Dimensions, FocusEvent, InputEventOutcome, MouseTrackingMode, Terminal,
+};
+use icu_properties::{props::BidiControl, CodePointSetData};
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::{
+    cache::{ResizeOutcome, ResizeTracker, TerminalRenderCache},
+    geometry::{
+        cell_from_point, clamped_cell_from_point, dimensions_from_viewport, viewport_layout,
+        CellMetrics, CellPosition, ViewSize,
+    },
+    input::{
+        route_egui_events, EncodedInputSink, InputAdapterState, InputSinkDiagnostics,
+        InputSuppression, KeyboardOwnership, TerminalPointerState, TERMINAL_RESIZE_DEBOUNCE,
+    },
+    rectangle_copy::{RectangleCopy, RectangleCopyError, RECTANGLE_COPY_MAX_BYTES},
+    renderer::{
+        measure_input_to_paint_submission, paint_grid, FontSettings, GlyphCache, GridLayout,
+        GridPaint,
+    },
+    selection::Selection,
+    selection::{selection_text, selection_text_with_limit, SelectedTextError},
+    TerminalSnapshot, DEFAULT_FOREGROUND,
+};
+
+use crate::fonts::DEFAULT_TERMINAL_FONT_SIZE;
+const MIN_TERMINAL_FONT_SIZE: f32 = 8.0;
+const MAX_TERMINAL_FONT_SIZE: f32 = 32.0;
+const TERMINAL_ZOOM_STEP: f32 = 1.0;
+const CONTEXT_MENU_MAX_WIDTH: f32 = 320.0;
+const CONTEXT_TARGET_TOOLTIP_MAX_WIDTH: f32 = 480.0;
+const SMART_SELECTION_FEEDBACK_DURATION: Duration = Duration::from_secs(4);
+const TERMINAL_CONTENT_MARGIN: egui::Margin =
+    egui::Margin::same(crate::chrome::CHROME_SIDE_INSET as i8);
+
+/// Application-owned terminal capabilities that affect local viewport
+/// commands without exposing a session backend to the presentation crate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalViewOptions {
+    /// The current session can accept a paste through its ordered input path.
+    pub paste_available: bool,
+    /// Application-owned foreground UI permits terminal keyboard and pointer
+    /// input this frame. Confirmation dialogs set this false so input cannot
+    /// leak through their backdrop into a shell or full-screen TUI. This is
+    /// a full blackout: history navigation, selection, and the context menu
+    /// are also inert while it is false. Accessibility actions are deferred
+    /// until after this background view renders so foreground widgets can
+    /// still receive them.
+    pub terminal_input_enabled: bool,
+    /// The session backing this view can still accept typed keystrokes
+    /// (i.e. it has not exited, failed, stopped, or disconnected). Unlike
+    /// `terminal_input_enabled`, this suppresses transport-bound keyboard/paste,
+    /// mouse and focus reports; scrollback navigation, selection, and Copy
+    /// remain available so a read-only/dead session's history stays
+    /// inspectable.
+    pub keyboard_input_enabled: bool,
+    /// Keep an active terminal focused without restarting IME composition
+    /// when it already owns focus. Opt-in for persistent keyboard surfaces.
+    pub persistent_keyboard_focus: bool,
+    /// Clipboard text is returned to the application policy layer instead of
+    /// being encoded immediately. This lets the composition root apply paste
+    /// confirmation without exposing session identity to this crate. Local
+    /// context/middle-click read intents are returned separately so the app
+    /// can identify their asynchronous clipboard replies.
+    pub defer_paste_to_application: bool,
+    /// Scales how many scrollback rows one trackpad/wheel scroll step
+    /// moves, on top of the fixed pixel-to-row mapping this view otherwise
+    /// uses. `1.0` preserves fesTerm's original behavior; this crate stays
+    /// unaware of `festerm-config`'s `ScrollSpeedPreference` clickstop names
+    /// and only sees the resulting multiplier (feature request #67).
+    pub scroll_speed_multiplier: f32,
+    /// One application-owned action that belongs to the terminal context
+    /// menu this frame, such as opening a detected path.
+    pub context_menu_action: Option<TerminalContextMenuAction>,
+    /// Whether the application wants terminal-history snapshot actions in the
+    /// local context menu when no selection is active.
+    pub history_snapshot_actions: bool,
+    /// Publish each visible, non-blank terminal row as a read-only label in
+    /// the AccessKit tree. Off by default: platform accessibility services can
+    /// read whatever is published, so the application decides when terminal
+    /// output may leave the process (ADR 0075).
+    pub expose_text_to_accessibility: bool,
+}
+
+impl Default for TerminalViewOptions {
+    fn default() -> Self {
+        Self {
+            paste_available: true,
+            terminal_input_enabled: true,
+            keyboard_input_enabled: true,
+            persistent_keyboard_focus: false,
+            defer_paste_to_application: false,
+            scroll_speed_multiplier: 1.0,
+            context_menu_action: None,
+            history_snapshot_actions: false,
+            expose_text_to_accessibility: false,
+        }
+    }
+}
+
+/// One application-owned terminal context-menu action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalContextMenuAction {
+    pub label: String,
+    pub preview: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+    /// A frozen value copied without invoking the application's open action.
+    pub copy: Option<(String, String)>,
+}
+
+/// Frozen content hit that opened the current context menu.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalContextTarget {
+    pub content_position: ContentPosition,
+    pub generation: u64,
+}
+
+pub const TERMINAL_CONTEXT_MAX_ROWS: usize = 16;
+pub const TERMINAL_CONTEXT_MAX_BYTES: usize = 8 * 1024;
+
+/// Bounded, frozen presentation text; destination policy remains application-owned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalContextText {
+    pub text: String,
+    pub clicked_range: std::ops::Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalHistoryAction {
+    OpenInEditor,
+    SaveAs,
+}
+
+/// Diagnostics captured by the UI path without recording terminal content.
+#[derive(Clone, Debug, Default)]
+pub struct FrameDiagnostics {
+    pub frame_time: Option<Duration>,
+    /// Time from observed input routing through submitting grid paint shapes to
+    /// egui. This does not measure GPU presentation or pixels on screen.
+    pub input_to_paint_submission: Option<Duration>,
+    pub calculated_dimensions: Option<festerm_core::Dimensions>,
+    pub grid_rect: Option<egui::Rect>,
+    pub dirty_rows: usize,
+    pub retained_rows_reused: usize,
+    pub retained_rows_rebuilt: usize,
+    pub retained_row_bytes: usize,
+    /// Color emoji glyphs successfully submitted through the renderer-owned
+    /// texture path during the latest frame.
+    pub color_emoji_paints: usize,
+    /// Color emoji paints that reused an existing text-and-size texture.
+    pub color_emoji_cache_hits: usize,
+    /// Color emoji paints that populated a new text-and-size texture.
+    pub color_emoji_cache_misses: usize,
+    /// Color rasterization attempts made after both positive and negative
+    /// cache lookup missed.
+    pub color_emoji_rasterization_attempts: usize,
+    /// Rasterization attempts that fell back to monochrome text.
+    pub color_emoji_rasterization_failures: usize,
+    /// Failed text-and-size keys reused from the bounded negative cache.
+    pub color_emoji_negative_cache_hits: usize,
+    pub last_input_outcome: Option<InputEventOutcome>,
+    pub input_queue_depth: usize,
+    pub input_sink: Option<InputSinkDiagnostics>,
+}
+
+/// The initial `egui` terminal renderer and input adapter.
+///
+/// It renders one cached layout per leading display cell by default. An
+/// explicit font policy may instead shape compatible ASCII cell runs while
+/// immutable grid geometry continues to own interaction and clipping.
+#[derive(Default)]
+pub struct TerminalView {
+    pub(crate) fonts: FontSettings,
+    force_cell_run_shaping: bool,
+    pub(crate) cache: TerminalRenderCache,
+    pub(crate) glyphs: GlyphCache,
+    full_redraw_requested: bool,
+    pub(crate) selection: Selection,
+    rectangle_copy: Option<RectangleCopy>,
+    rectangle_copy_exit_key: Option<egui::Key>,
+    rectangle_copy_held_buttons: u8,
+    rectangle_copy_popup_id: Option<egui::Id>,
+    retired_rectangle_popup_id: Option<egui::Id>,
+    pub(crate) resize: ResizeTracker,
+    pub(crate) diagnostics: FrameDiagnostics,
+    pub(crate) keyboard: KeyboardOwnership,
+    pub(crate) pointer: TerminalPointerState,
+    /// Whether this view has already claimed keyboard focus once. A freshly
+    /// started session should grab focus immediately so typing works without
+    /// first clicking into the terminal, but only on its first frame -
+    /// afterwards the user is free to click elsewhere (e.g. the launcher, a
+    /// rename field) without this view stealing focus back every frame.
+    has_requested_initial_focus: bool,
+    /// Explicit OSC 8 target captured under the pointer when the local menu
+    /// opens. It remains stable while the pointer moves through the popup.
+    context_link: Option<Arc<str>>,
+    context_target: Option<TerminalContextTarget>,
+    context_text: Option<TerminalContextText>,
+    next_context_generation: u64,
+    primary_link_gesture: Option<(Arc<str>, CellPosition)>,
+    file_link_context: Option<(u64, bool)>,
+    last_rendered_frame: Option<u64>,
+    secondary_gesture: SecondaryGestureOwnership,
+    /// Whether the in-progress middle-click gesture (paste-on-middle-click,
+    /// mirroring the X11 convention many terminal emulators adopt) has
+    /// claimed local handling, so its matching release is also suppressed
+    /// instead of falling through as an unmatched mouse-report release.
+    middle_click_paste_gesture: bool,
+    history: HistoryViewport,
+    scrollbar_dragging: bool,
+    pending_paste_requests: VecDeque<String>,
+    pending_clipboard_read: bool,
+    pending_find_request: bool,
+    smart_selection_feedback: Option<String>,
+    smart_selection_feedback_expires_at: Option<Instant>,
+    smart_keyboard_hit: Option<CellPosition>,
+    smart_held_keys: Vec<egui::Key>,
+    pending_link_requests: VecDeque<Arc<str>>,
+    pending_context_action_request: bool,
+    pending_history_actions: VecDeque<TerminalHistoryAction>,
+    /// Fractional scroll rows left over from the last wheel event after
+    /// applying `scroll_speed_multiplier`, carried into the next event so a
+    /// slow clickstop (e.g. "Very slow", well under `1.0`) actually slows
+    /// scrolling down rather than being silently rounded back up to at
+    /// least one row per event. Reset whenever the wheel direction flips so
+    /// a reversed scroll doesn't inherit a stale carry from the opposite
+    /// direction.
+    scroll_fraction_carry: f32,
+    /// Sign of the most recent wheel delta.y this carry was accumulated
+    /// under (`1.0`, `-1.0`, or `0.0` before the first event), used to
+    /// detect a direction reversal above.
+    scroll_fraction_sign: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HistoryViewport {
+    offset_rows: usize,
+    observed_history_rows: usize,
+    unseen_output: bool,
+}
+
+impl HistoryViewport {
+    fn sync(&mut self, terminal: &Terminal) {
+        let rows = terminal.scrollback_stats().physical_rows();
+        if self.offset_rows > 0 && rows > self.observed_history_rows {
+            self.offset_rows = self
+                .offset_rows
+                .saturating_add(rows - self.observed_history_rows);
+            self.unseen_output = true;
+        }
+        self.offset_rows = self.offset_rows.min(rows);
+        self.observed_history_rows = rows;
+    }
+
+    fn reflowed(
+        &mut self,
+        previous_rows: usize,
+        new_rows: usize,
+        mapped_top_content_row: Option<usize>,
+    ) {
+        if self.offset_rows > 0 && previous_rows > 0 {
+            self.offset_rows = if let Some(content_row) = mapped_top_content_row {
+                new_rows.saturating_sub(content_row.min(new_rows))
+            } else {
+                let ratio = f64::from(u32::try_from(self.offset_rows).unwrap_or(u32::MAX))
+                    / f64::from(u32::try_from(previous_rows).unwrap_or(u32::MAX).max(1));
+                let rescaled = (ratio * new_rows as f64).round();
+                if rescaled.is_finite() && rescaled >= 0.0 {
+                    (rescaled as usize).min(new_rows)
+                } else {
+                    new_rows
+                }
+            };
+        } else {
+            self.offset_rows = self.offset_rows.min(new_rows);
+        }
+        self.observed_history_rows = new_rows;
+    }
+
+    fn scroll_up(&mut self, rows: usize) {
+        self.offset_rows = self.offset_rows.saturating_add(rows);
+    }
+
+    fn scroll_down(&mut self, rows: usize) {
+        self.offset_rows = self.offset_rows.saturating_sub(rows);
+        if self.offset_rows == 0 {
+            self.unseen_output = false;
+        }
+    }
+
+    fn latest(&mut self) {
+        self.offset_rows = 0;
+        self.unseen_output = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScrollbarGeometry {
+    hit_track: Rect,
+    visual_track: Rect,
+    thumb: Rect,
+}
+
+/// Scales `raw_rows` (the pixel/line/page-derived row count from a single
+/// wheel event) by `multiplier`, carrying any fractional row leftover into
+/// `carry` for the next call instead of rounding every event up to at least
+/// one row. Without this, a clickstop like "Very slow" (well under `1.0`)
+/// would be indistinguishable from `Normal` on devices that emit many small
+/// wheel events per swipe (e.g. a trackpad), since each individual event's
+/// scaled row count would otherwise get floored back up to `1`.
+pub(crate) fn scaled_scroll_rows(raw_rows: f32, multiplier: f32, carry: &mut f32) -> usize {
+    let scaled = raw_rows.max(0.0) * multiplier.max(0.0) + *carry;
+    let rows = scaled.floor().max(0.0) as usize;
+    *carry = scaled - scaled.floor();
+    rows
+}
+
+pub(crate) fn wheel_delta_rows(
+    unit: egui::MouseWheelUnit,
+    delta_y: f32,
+    cell_height: f32,
+    page_rows: usize,
+) -> f32 {
+    match unit {
+        egui::MouseWheelUnit::Point => delta_y.abs() / cell_height,
+        egui::MouseWheelUnit::Line => delta_y.abs(),
+        egui::MouseWheelUnit::Page => delta_y.abs() * page_rows as f32,
+    }
+}
+
+fn scrollbar_geometry(
+    viewport: Rect,
+    visible_rows: usize,
+    history_rows: usize,
+    offset_rows: usize,
+) -> Option<ScrollbarGeometry> {
+    if history_rows == 0 || visible_rows == 0 || viewport.height() <= 0.0 {
+        return None;
+    }
+    let total_rows = history_rows.saturating_add(visible_rows);
+    let hit_track = Rect::from_min_max(
+        egui::pos2(viewport.right() - 6.0, viewport.top()),
+        viewport.right_bottom(),
+    );
+    let visual_track = Rect::from_min_max(
+        egui::pos2(viewport.right() - 3.0, viewport.top()),
+        viewport.right_bottom(),
+    );
+    let thumb_height = (viewport.height() * visible_rows as f32 / total_rows as f32)
+        .max(24.0)
+        .min(viewport.height());
+    let travel = (viewport.height() - thumb_height).max(0.0);
+    let top_content_row = history_rows.saturating_sub(offset_rows.min(history_rows));
+    let progress = top_content_row as f32 / history_rows as f32;
+    let thumb_top = viewport.top() + travel * progress;
+    Some(ScrollbarGeometry {
+        hit_track,
+        visual_track,
+        thumb: Rect::from_min_size(
+            egui::pos2(visual_track.left(), thumb_top),
+            egui::vec2(visual_track.width(), thumb_height),
+        ),
+    })
+}
+
+/// Text a screen reader or UI-automation client sees for one visible row:
+/// grapheme text without width-two continuations, control or bidi-control
+/// characters, or trailing blank cells.
+fn accessible_row_text(snapshot: TerminalSnapshot<'_>, row: usize) -> String {
+    let bidi = CodePointSetData::new::<BidiControl>();
+    let mut text = String::new();
+    for column in 0..snapshot.dimensions().columns() {
+        match snapshot.cell(column, row) {
+            Some(cell) if cell.is_continuation() => {}
+            Some(cell) => text.extend(
+                cell.text()
+                    .chars()
+                    .filter(|character| !character.is_control() && !bidi.contains(*character)),
+            ),
+            None => text.push(' '),
+        }
+    }
+    text.truncate(text.trim_end().len());
+    text
+}
+
+/// Publishes visible rows as hover-only label children of the viewport node.
+/// Hover-only widgets never take clicks or drags from the terminal.
+fn publish_accessible_rows(
+    ui: &mut Ui,
+    viewport_id: egui::Id,
+    layout: GridLayout,
+    snapshot: TerminalSnapshot<'_>,
+) {
+    if ui
+        .ctx()
+        .accesskit_node_builder(viewport_id, |node| {
+            node.set_role(egui::accesskit::Role::Terminal)
+        })
+        .is_none()
+    {
+        return;
+    }
+    // Rows are siblings of the viewport: iOS treats an actionable node as a
+    // leaf element and would hide rows parented to it.
+    let rows = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("terminal-accessible-rows")
+            .max_rect(layout.rect),
+    );
+    for row in 0..snapshot.dimensions().rows() {
+        let text = accessible_row_text(snapshot, row);
+        if text.is_empty() {
+            continue;
+        }
+        let rect = Rect::from_min_size(
+            layout.rect.min + egui::vec2(0.0, row as f32 * layout.metrics.height),
+            egui::vec2(layout.rect.width(), layout.metrics.height),
+        );
+        rows.interact(
+            rect,
+            viewport_id.with(("accessible-row", row)),
+            Sense::hover(),
+        )
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &text));
+    }
+}
+
+fn jump_to_latest_rect(viewport: Rect) -> Rect {
+    Rect::from_min_size(
+        egui::pos2(viewport.right() - 116.0, viewport.bottom() - 34.0),
+        egui::vec2(108.0, 26.0),
+    )
+}
+
+fn terminal_input_blackout(
+    context: &egui::Context,
+    options: &TerminalViewOptions,
+    context_menu_open: bool,
+) -> bool {
+    context_menu_open || !options.terminal_input_enabled || chip_drag_in_flight(context)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum SecondaryGestureOwnership {
+    #[default]
+    None,
+    Local(egui::Pos2),
+    Terminal,
+}
+
+impl TerminalView {
+    fn request_smart_selection(
+        &mut self,
+        snapshot: TerminalSnapshot<'_>,
+        hit: Option<CellPosition>,
+        scope: crate::SmartSelectionScope,
+    ) {
+        let selected = !self.pointer.pressed.iter().any(|pressed| *pressed)
+            && hit.is_some_and(|hit| self.selection.infer_smart(snapshot, hit, scope));
+        if selected {
+            self.clear_smart_selection_feedback();
+        } else {
+            self.set_transient_smart_selection_feedback(
+                "Smart selection unavailable here (blank/border or context limit). Existing selection unchanged; use ordinary drag.",
+            );
+        }
+    }
+
+    fn set_transient_smart_selection_feedback(&mut self, feedback: impl Into<String>) {
+        self.smart_selection_feedback = Some(feedback.into());
+        self.smart_selection_feedback_expires_at =
+            Some(Instant::now() + SMART_SELECTION_FEEDBACK_DURATION);
+    }
+
+    fn clear_smart_selection_feedback(&mut self) {
+        self.smart_selection_feedback = None;
+        self.smart_selection_feedback_expires_at = None;
+    }
+
+    fn expire_smart_selection_feedback(&mut self, context: &egui::Context) {
+        let Some(expires_at) = self.smart_selection_feedback_expires_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now >= expires_at {
+            self.clear_smart_selection_feedback();
+        } else {
+            context.request_repaint_after(expires_at.saturating_duration_since(now));
+        }
+    }
+
+    /// Current per-session terminal font size in logical points.
+    pub const fn font_size_points(&self) -> f32 {
+        self.fonts.size_points
+    }
+
+    /// Increases only this session's terminal presentation size.
+    pub fn zoom_in(&mut self) -> bool {
+        self.set_font_size_points(self.fonts.size_points + TERMINAL_ZOOM_STEP)
+    }
+
+    /// Decreases only this session's terminal presentation size.
+    pub fn zoom_out(&mut self) -> bool {
+        self.set_font_size_points(self.fonts.size_points - TERMINAL_ZOOM_STEP)
+    }
+
+    /// Scales this session's terminal text, using the same bounds as keyboard
+    /// zoom. Invalid gesture samples leave the presentation unchanged.
+    pub fn zoom_by_factor(&mut self, factor: f32) -> bool {
+        if !factor.is_finite() || factor <= 0.0 {
+            return false;
+        }
+        self.set_font_size_points(self.fonts.size_points * factor)
+    }
+
+    /// Restores only this session's terminal presentation size.
+    pub fn reset_zoom(&mut self) -> bool {
+        self.set_font_size_points(DEFAULT_TERMINAL_FONT_SIZE)
+    }
+
+    /// Text currently highlighted by this session's selection, if any. Used
+    /// by the command palette's "Copy" entry so it can copy the same text a
+    /// keyboard/OS copy shortcut would (`route_egui_events`'s
+    /// `egui::Event::Copy` handling), without duplicating the selection
+    /// logic.
+    pub fn selected_text(&self, terminal: &Terminal) -> Option<String> {
+        if let Some(copy) = &self.rectangle_copy {
+            return copy.selected_text(&self.cache);
+        }
+        selection_text(
+            TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows),
+            &self.selection,
+        )
+    }
+
+    /// Returns the complete normal, smart, or frozen rectangle selection.
+    ///
+    /// `Ok(None)` means no valid selection. An output larger than `max_bytes`
+    /// UTF-8 bytes fails without truncation or allocating the selected text.
+    /// Retained-history coordinates and this view's viewport offset are honored.
+    /// A fixed 65,536-unit ceiling on visited cells, rows, and scanned text bytes
+    /// returns `WorkLimitExceeded` independently of the output byte limit.
+    /// Ordinary [`Self::selected_text`] has no traversal ceiling.
+    pub fn selected_text_with_limit(
+        &self,
+        terminal: &Terminal,
+        max_bytes: usize,
+    ) -> Result<Option<String>, SelectedTextError> {
+        if let Some(copy) = &self.rectangle_copy {
+            return copy.selected_text_with_limit(&self.cache, max_bytes);
+        }
+        selection_text_with_limit(
+            TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows),
+            &self.selection,
+            max_bytes,
+        )
+    }
+
+    /// Selects around the keyboard target, the end of the current selection, or
+    /// the cursor, exactly as the Ctrl+Alt+Shift shortcuts do. It never copies.
+    pub fn smart_select_at_target(
+        &mut self,
+        terminal: &Terminal,
+        scope: crate::SmartSelectionScope,
+    ) {
+        self.history.sync(terminal);
+        let snapshot = TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows);
+        let hit = self
+            .smart_keyboard_hit
+            .or_else(|| {
+                self.selection
+                    .range_in_snapshot(snapshot)
+                    .map(|range| range.end)
+            })
+            .or_else(|| {
+                let cursor = snapshot.cursor();
+                (self.history.offset_rows == 0).then_some(CellPosition {
+                    column: cursor.column(),
+                    row: cursor.row(),
+                })
+            })
+            .or(Some(CellPosition { column: 0, row: 0 }));
+        self.request_smart_selection(snapshot, hit, scope);
+    }
+
+    pub fn begin_rectangle_copy(
+        &mut self,
+        terminal: &Terminal,
+        trim_trailing_spaces: bool,
+    ) -> Result<(), RectangleCopyError> {
+        if self.rectangle_copy.is_some() {
+            return Ok(());
+        }
+        if self.pointer.held_button().is_some()
+            || self.primary_link_gesture.is_some()
+            || !matches!(self.secondary_gesture, SecondaryGestureOwnership::None)
+            || self.middle_click_paste_gesture
+            || self.scrollbar_dragging
+        {
+            return Err(RectangleCopyError::PointerGestureInProgress);
+        }
+        self.history.sync(terminal);
+        let snapshot = TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows);
+        let copy =
+            RectangleCopy::capture(snapshot, trim_trailing_spaces, RECTANGLE_COPY_MAX_BYTES)?;
+        self.cache = TerminalRenderCache::default();
+        self.cache.update(snapshot, &[]);
+        self.selection.clear();
+        self.clear_smart_selection_feedback();
+        self.smart_keyboard_hit = None;
+        self.pointer = TerminalPointerState::default();
+        self.primary_link_gesture = None;
+        self.secondary_gesture = SecondaryGestureOwnership::default();
+        self.middle_click_paste_gesture = false;
+        self.scrollbar_dragging = false;
+        self.context_link = None;
+        self.context_target = None;
+        self.context_text = None;
+        self.rectangle_copy = Some(copy);
+        self.full_redraw_requested = true;
+        self.context_link = None;
+        self.context_target = None;
+        self.context_text = None;
+        self.request_focus_on_next_frame();
+        Ok(())
+    }
+
+    pub fn rectangle_copy_active(&self) -> bool {
+        self.rectangle_copy.is_some()
+    }
+
+    pub fn rectangle_copy_status(&self) -> Option<&'static str> {
+        self.rectangle_copy.as_ref().map(RectangleCopy::status)
+    }
+
+    pub fn cancel_rectangle_copy(&mut self) {
+        if let Some(copy) = self.rectangle_copy.take() {
+            self.rectangle_copy_held_buttons |= copy.held_buttons;
+            self.cache = TerminalRenderCache::default();
+            self.full_redraw_requested = true;
+            self.context_link = None;
+            self.context_target = None;
+            self.context_text = None;
+            self.pending_context_action_request = false;
+            self.pending_link_requests.clear();
+            self.clear_smart_selection_feedback();
+            self.smart_keyboard_hit = None;
+            if let Some(id) = self.rectangle_copy_popup_id.take() {
+                self.retired_rectangle_popup_id = Some(id);
+            }
+        }
+    }
+
+    /// Retires frozen input and its owned popup immediately when authority changes.
+    pub fn cancel_rectangle_copy_with_context(&mut self, context: &egui::Context) {
+        self.cancel_rectangle_copy();
+        self.close_retired_rectangle_popup(context);
+    }
+
+    fn close_retired_rectangle_popup(&mut self, context: &egui::Context) {
+        if let Some(id) = self.retired_rectangle_popup_id.take() {
+            Popup::close_id(context, id);
+        }
+    }
+
+    fn set_font_size_points(&mut self, requested: f32) -> bool {
+        let size = requested.clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE);
+        if (size - self.fonts.size_points).abs() < f32::EPSILON {
+            return false;
+        }
+        self.fonts.size_points = size;
+        true
+    }
+
+    /// Applies the application-wide primary-family and shaping policy while
+    /// preserving this session's independent zoom level.
+    pub fn set_font_set(&mut self, font_set: crate::TerminalFontSet) {
+        if self.fonts.font_set() == font_set {
+            return;
+        }
+        self.fonts.set_font_set(font_set);
+        self.glyphs.clear();
+    }
+
+    pub const fn color_emoji_enabled(&self) -> bool {
+        self.fonts.font_set().color_emoji()
+    }
+
+    #[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
+    pub(crate) fn enable_cell_run_shaping_for_test(&mut self) {
+        self.force_cell_run_shaping = true;
+    }
+
+    pub fn diagnostics(&self) -> &FrameDiagnostics {
+        &self.diagnostics
+    }
+
+    pub fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.clear_smart_selection_feedback();
+        self.smart_keyboard_hit = None;
+        self.cancel_rectangle_copy();
+    }
+
+    /// Rebuilds this view's presentation and redraws every visible region on
+    /// its next frame, without changing terminal state or sending input.
+    pub fn request_full_redraw(&mut self) {
+        if !self.rectangle_copy_active() {
+            self.cache = TerminalRenderCache::default();
+        }
+        self.glyphs.clear();
+        self.full_redraw_requested = true;
+    }
+
+    pub const fn history_offset_rows(&self) -> usize {
+        self.history.offset_rows
+    }
+
+    pub const fn follows_latest_output(&self) -> bool {
+        self.history.offset_rows == 0
+    }
+
+    /// Whether this viewport displays the terminal's live screen, not history.
+    pub fn shows_live_screen(&self, terminal: &Terminal) -> bool {
+        terminal.modes().alternate_screen() || self.follows_latest_output()
+    }
+
+    /// Validates frontend state that cannot be inferred by the recording core.
+    pub fn validate_recording_view(&self, terminal: &Terminal) -> Result<(), &'static str> {
+        if !self.shows_live_screen(terminal) {
+            return Err("Return the terminal to its live screen before recording");
+        }
+        if terminal.color_scheme() != &crate::renderer::terminal_color_scheme() {
+            return Err(
+                "Terminal colors do not match the visible view; retry after colors synchronize",
+            );
+        }
+        Ok(())
+    }
+
+    /// Marks this view as needing keyboard focus again on its next frame.
+    /// Chip/tab activation switches which session's `show`/`show_in_ui` is
+    /// called each frame (inactive tabs render nothing at all), so the
+    /// one-shot "claim focus on first frame" behavior only fires once ever
+    /// per session, not once per activation - clicking a chip to switch to
+    /// an already-rendered-before session left keyboard focus stranded on
+    /// the chrome row until the user clicked inside the terminal
+    /// themselves. Callers should invoke this whenever a session's tab
+    /// becomes the active tab (`docs/gui-design.md`).
+    pub fn request_focus_on_next_frame(&mut self) {
+        self.has_requested_initial_focus = false;
+    }
+
+    /// Relinquishes transient keyboard and pointer ownership when the
+    /// composition root stops presenting this terminal.
+    ///
+    /// Terminal content, completed selection, scroll position and zoom are
+    /// preserved. In-progress IME composition and gestures must not survive a
+    /// tab/workspace switch and suppress keys when the terminal is shown again.
+    /// The returned focus event belongs on the terminal's ordered input path.
+    pub fn relinquish_transient_input(&mut self) -> Option<FocusEvent> {
+        self.cancel_rectangle_copy();
+        self.smart_held_keys.clear();
+        self.smart_keyboard_hit = None;
+        if self.selection.is_active() {
+            self.selection.finish();
+        }
+        self.pointer = TerminalPointerState::default();
+        self.primary_link_gesture = None;
+        self.secondary_gesture = SecondaryGestureOwnership::default();
+        self.middle_click_paste_gesture = false;
+        self.scrollbar_dragging = false;
+        self.context_link = None;
+        self.context_target = None;
+        self.has_requested_initial_focus = false;
+        self.keyboard.focus_out_if_owned()
+    }
+
+    /// Takes every clipboard event deferred since the prior frame. Multiple
+    /// events are significant to paste safety and must not be collapsed.
+    pub fn take_paste_requests(&mut self) -> Vec<String> {
+        self.pending_paste_requests.drain(..).collect()
+    }
+
+    pub fn take_clipboard_read_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_clipboard_read)
+    }
+
+    pub fn take_find_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_find_request)
+    }
+
+    /// Takes explicit OSC 8 activation intents for application-owned
+    /// validation and OS launch policy.
+    pub fn take_link_requests(&mut self) -> Vec<Arc<str>> {
+        self.pending_link_requests.drain(..).collect()
+    }
+
+    /// Supplies presentation eligibility; the application still authorizes each activation.
+    pub fn set_file_link_context(&mut self, generation: u64, local: bool) {
+        let next = Some((generation, local));
+        if self.file_link_context != next {
+            self.primary_link_gesture = None;
+            self.pending_link_requests.clear();
+            self.context_link = None;
+            self.context_target = None;
+            self.context_text = None;
+            self.file_link_context = next;
+        }
+    }
+
+    fn link_can_open(&self, target: &str) -> bool {
+        festerm_core::normalize_external_web_url(target).is_some()
+            || (self.file_link_context.is_some_and(|(_, local)| local)
+                && festerm_core::local_file_hyperlink_path(target).is_some())
+    }
+
+    pub fn take_context_action_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_context_action_request)
+    }
+
+    pub const fn context_menu_target(&self) -> Option<TerminalContextTarget> {
+        self.context_target
+    }
+
+    pub fn context_menu_text(&self) -> Option<&TerminalContextText> {
+        self.context_text.as_ref()
+    }
+
+    /// Takes terminal-history snapshot intents chosen from the local context
+    /// menu. They stay application-owned so the same commands can also come
+    /// from the command palette.
+    pub fn take_history_actions(&mut self) -> Vec<TerminalHistoryAction> {
+        self.pending_history_actions.drain(..).collect()
+    }
+
+    /// Scrolls history so a terminal-search match becomes visible, used by
+    /// the application-owned find bar (`docs/gui-design.md`
+    /// "Terminal-content search"). `row` is a "document row": a retained
+    /// scrollback row (oldest-first, `row < terminal.scrollback_stats()
+    /// .physical_rows()`) or, past that, a live visible-screen row. A live
+    /// row simply returns the viewport to the latest position; while the
+    /// alternate screen is active, `row`'s scrollback component is ignored,
+    /// matching `TerminalSnapshot`'s own forced-zero scrollback offset in
+    /// that mode.
+    pub fn reveal_document_row(&mut self, terminal: &Terminal, row: usize) {
+        self.history.sync(terminal);
+        let history_rows = if terminal.modes().alternate_screen() {
+            0
+        } else {
+            terminal.scrollback_stats().physical_rows()
+        };
+        if row < history_rows {
+            self.history.offset_rows = history_rows - row;
+            self.history.unseen_output = false;
+        } else {
+            self.history.latest();
+        }
+    }
+
+    /// Shows the terminal, filling all available space in `ui`. Detailed
+    /// per-frame diagnostics are not rendered inline (`docs/gui-design.md`
+    /// "Bottom status bar"); callers that want to surface them can read
+    /// [`TerminalView::diagnostics`] or format [`TerminalView::diagnostics_summary`]
+    /// into their own chrome (e.g. the application status bar).
+    pub fn show(&mut self, ui: &mut Ui, terminal: &mut Terminal, sink: &mut impl EncodedInputSink) {
+        self.show_with_options(ui, terminal, sink, TerminalViewOptions::default());
+    }
+
+    pub fn reset_recovery_layout(&mut self) {
+        self.cancel_rectangle_copy();
+        self.resize = ResizeTracker::default();
+        self.selection.clear();
+        self.pointer = TerminalPointerState::default();
+        self.primary_link_gesture = None;
+    }
+
+    pub fn apply_terminal_resize(
+        &mut self,
+        terminal: &mut Terminal,
+        dimensions: Dimensions,
+    ) -> ResizeOutcome {
+        let stats = terminal.scrollback_stats();
+        let history_rows = stats.physical_rows();
+        let alternate = terminal.modes().alternate_screen();
+        let first_row = stats
+            .content_row_origin()
+            .saturating_add(history_rows.saturating_sub(self.history.offset_rows) as u64);
+        let mut positions = Vec::new();
+        let top = (!alternate && self.history.offset_rows > 0).then(|| {
+            positions.push(ContentPosition {
+                column: 0,
+                absolute_row: first_row,
+            });
+            positions.len() - 1
+        });
+        let selection = (!alternate)
+            .then(|| self.selection.content_endpoints())
+            .flatten()
+            .map(|(anchor, head, active)| {
+                let index = positions.len();
+                positions.extend([anchor, head]);
+                (index, active)
+            });
+        let (outcome, mapped) = self
+            .resize
+            .apply_dimensions_with_content_positions(terminal, dimensions, &positions);
+        if matches!(outcome, ResizeOutcome::Resized(_)) {
+            self.pointer = TerminalPointerState::default();
+            self.primary_link_gesture = None;
+            let mapped_top = top
+                .and_then(|index| mapped.get(index).copied().flatten())
+                .and_then(|position| {
+                    position
+                        .absolute_row
+                        .checked_sub(terminal.scrollback_stats().content_row_origin())
+                        .and_then(|row| usize::try_from(row).ok())
+                });
+            self.history.reflowed(
+                history_rows,
+                terminal.scrollback_stats().physical_rows(),
+                mapped_top,
+            );
+            if alternate {
+                self.selection.clamp_rectangular(terminal.dimensions());
+            } else if let Some((index, active)) = selection {
+                if let Some((anchor, head)) = mapped
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .zip(mapped.get(index + 1).copied().flatten())
+                {
+                    self.selection.remap_content(anchor, head, active);
+                } else {
+                    self.selection.clear();
+                }
+            }
+        }
+        outcome
+    }
+
+    pub fn show_with_options(
+        &mut self,
+        ui: &mut Ui,
+        terminal: &mut Terminal,
+        sink: &mut impl EncodedInputSink,
+        options: TerminalViewOptions,
+    ) {
+        let painter = ui.painter().clone();
+        let background = painter.add(egui::Shape::Noop);
+        let panel = egui::CentralPanel::default()
+            .frame(egui::Frame::default().inner_margin(TERMINAL_CONTENT_MARGIN))
+            .show(ui, |ui| {
+                self.show_in_ui_with_options(ui, terminal, sink, options);
+            });
+        painter.set(
+            background,
+            crate::background::background_shape(&painter, panel.response.rect),
+        );
+    }
+
+    /// Shows the cell grid inside an existing `egui` UI.
+    pub fn show_in_ui(
+        &mut self,
+        ui: &mut Ui,
+        terminal: &mut Terminal,
+        sink: &mut impl EncodedInputSink,
+    ) {
+        self.show_in_ui_with_options(ui, terminal, sink, TerminalViewOptions::default());
+    }
+
+    pub fn show_in_pane_with_options(
+        &mut self,
+        ui: &mut Ui,
+        terminal: &mut Terminal,
+        sink: &mut impl EncodedInputSink,
+        options: TerminalViewOptions,
+    ) {
+        let painter = ui.painter().clone();
+        let background = painter.add(egui::Shape::Noop);
+        let frame = egui::Frame::default()
+            .inner_margin(TERMINAL_CONTENT_MARGIN)
+            .show(ui, |ui| {
+                self.show_in_ui_with_options(ui, terminal, sink, options);
+            });
+        painter.set(
+            background,
+            crate::background::background_shape(&painter, frame.response.rect),
+        );
+    }
+
+    /// Paint and resize a non-focused pane without reading or consuming the
+    /// focused surface's events. Modal blackout alone intentionally consumes
+    /// events, so it cannot be used directly for a sibling pane.
+    pub fn show_passive_in_ui(
+        &mut self,
+        ui: &mut Ui,
+        terminal: &mut Terminal,
+        sink: &mut impl EncodedInputSink,
+    ) {
+        let events = ui.input_mut(|input| std::mem::take(&mut input.events));
+        ui.scope(|ui| {
+            ui.visuals_mut().disabled_alpha = 1.0;
+            ui.disable();
+            self.show_in_pane_with_options(
+                ui,
+                terminal,
+                sink,
+                TerminalViewOptions {
+                    terminal_input_enabled: false,
+                    keyboard_input_enabled: false,
+                    paste_available: false,
+                    ..Default::default()
+                },
+            );
+        });
+        ui.input_mut(|input| input.events = events);
+    }
+
+    pub fn minimum_pane_size(&self, ui: &Ui) -> egui::Vec2 {
+        let glyph = ui.painter().layout_no_wrap(
+            "M".to_owned(),
+            self.fonts.regular_font_id(),
+            DEFAULT_FOREGROUND,
+        );
+        egui::vec2(glyph.size().x * 52.0, glyph.size().y * 12.0) + TERMINAL_CONTENT_MARGIN.sum()
+    }
+
+    pub fn show_in_ui_with_options(
+        &mut self,
+        ui: &mut Ui,
+        terminal: &mut Terminal,
+        sink: &mut impl EncodedInputSink,
+        options: TerminalViewOptions,
+    ) {
+        self.close_retired_rectangle_popup(ui.ctx());
+        let frame = ui.ctx().cumulative_frame_nr();
+        if self
+            .last_rendered_frame
+            .is_some_and(|previous| frame > previous.saturating_add(1))
+        {
+            self.primary_link_gesture = None;
+            self.smart_held_keys.clear();
+        }
+        self.last_rendered_frame = Some(frame);
+        let Some((installed_family, installed_generation)) =
+            crate::terminal_font_installation(ui.ctx())
+        else {
+            let generation = crate::install_terminal_fonts(ui.ctx());
+            self.set_font_set(
+                crate::TerminalFontSet::new(
+                    crate::TerminalFontFamily::JetBrainsMono,
+                    self.fonts.font_set().ligatures(),
+                    generation,
+                )
+                .with_color_emoji(self.fonts.font_set().color_emoji()),
+            );
+            ui.ctx().request_repaint();
+            return;
+        };
+        if self.fonts.font_set().family() != installed_family
+            || self.fonts.font_set().generation() != installed_generation
+        {
+            self.set_font_set(
+                crate::TerminalFontSet::new(
+                    installed_family,
+                    self.fonts.font_set().ligatures(),
+                    installed_generation,
+                )
+                .with_color_emoji(self.fonts.font_set().color_emoji()),
+            );
+        }
+        let frame_started = Instant::now();
+        let glyph = ui.painter().layout_no_wrap(
+            "M".to_owned(),
+            self.fonts.regular_font_id(),
+            DEFAULT_FOREGROUND,
+        );
+        let Some(metrics) = CellMetrics::new(glyph.size().x, glyph.size().y) else {
+            return;
+        };
+        let available = ui.available_size_before_wrap();
+        let viewport = ViewSize {
+            width: available.x,
+            height: available.y,
+        };
+        let calculated = dimensions_from_viewport(viewport, metrics);
+        self.diagnostics.calculated_dimensions = calculated;
+        if let Some(dimensions) = calculated {
+            let requested = if sink.terminal_resizes_owned_by_backend() {
+                self.resize.request(dimensions)
+            } else {
+                matches!(
+                    self.apply_terminal_resize(terminal, dimensions),
+                    ResizeOutcome::Resized(_)
+                )
+            };
+            if requested {
+                sink.record_terminal_resize(dimensions);
+                ui.ctx().request_repaint_after(TERMINAL_RESIZE_DEBOUNCE);
+            }
+        }
+
+        let (viewport_rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Terminal viewport")
+        });
+        crate::background::paint_background(ui.painter(), viewport_rect);
+        let displayed_dimensions = self
+            .rectangle_copy
+            .as_ref()
+            .map_or(terminal.dimensions(), |copy| copy.dimensions);
+        let vp_layout = viewport_layout(viewport_rect.min, viewport, metrics, displayed_dimensions);
+        self.diagnostics.grid_rect = Some(vp_layout.grid);
+        if options.terminal_input_enabled
+            && (response.clicked()
+                || !self.has_requested_initial_focus
+                || options.persistent_keyboard_focus)
+        {
+            // egui interrupts IME even when requesting the current focus.
+            if !options.persistent_keyboard_focus || !response.has_focus() {
+                response.request_focus();
+            }
+            self.has_requested_initial_focus = true;
+        }
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            );
+        });
+        let layout = GridLayout {
+            rect: vp_layout.grid,
+            dimensions: vp_layout.dimensions,
+            metrics,
+        };
+        let mouse_reporting = options.keyboard_input_enabled
+            && !matches!(terminal.modes().mouse_tracking(), MouseTrackingMode::None);
+
+        if ui.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        }) {
+            self.smart_held_keys.clear();
+        }
+
+        if self.rectangle_copy_active() {
+            self.history.sync(terminal);
+            self.show_rectangle_copy(ui, terminal, sink, &response, layout, &options);
+            self.diagnostics.frame_time = Some(frame_started.elapsed());
+            return;
+        }
+        ui.input_mut(|input| {
+            input.events.retain(|event| match event {
+                egui::Event::WindowFocused(false) => {
+                    self.rectangle_copy_exit_key = None;
+                    self.rectangle_copy_held_buttons = 0;
+                    true
+                }
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    ..
+                } if self.rectangle_copy_exit_key == Some(*key) => {
+                    if !*pressed {
+                        self.rectangle_copy_exit_key = None;
+                    } else if !*repeat {
+                        self.rectangle_copy_exit_key = None;
+                        return true;
+                    }
+                    false
+                }
+                egui::Event::PointerButton {
+                    button,
+                    pressed: false,
+                    ..
+                } if self.rectangle_copy_held_buttons & (1 << *button as u8) != 0 => {
+                    self.rectangle_copy_held_buttons &= !(1 << *button as u8);
+                    false
+                }
+                egui::Event::PointerMoved(_) if self.rectangle_copy_held_buttons != 0 => false,
+                egui::Event::Text(text)
+                    if matches!(
+                        self.rectangle_copy_exit_key,
+                        Some(egui::Key::Enter | egui::Key::Escape)
+                    ) && matches!(text.as_str(), "\r" | "\n" | "\r\n" | "\u{1b}") =>
+                {
+                    false
+                }
+                _ => true,
+            });
+        });
+
+        let mut foreground_accessibility_events = Vec::new();
+        if !options.terminal_input_enabled {
+            // Defer accessibility actions until foreground widgets render,
+            // keeping the background terminal and its local controls inert.
+            // Clipboard delivery still invalidates an already captured paste.
+            ui.input_mut(|input| {
+                input.events.retain(|event| {
+                    if matches!(event, egui::Event::AccessKitActionRequest(_)) {
+                        foreground_accessibility_events.push(event.clone());
+                    }
+                    matches!(event, egui::Event::WindowFocused(_) | egui::Event::Paste(_))
+                });
+            });
+        }
+
+        self.history.sync(terminal);
+        if !terminal.modes().alternate_screen() {
+            let page_rows = terminal.dimensions().rows().saturating_sub(1).max(1);
+            let terminal_focused = response.has_focus();
+            let terminal_hovered = response.hovered();
+            let over_scrollbar = scrollbar_geometry(
+                vp_layout.viewport,
+                terminal.dimensions().rows(),
+                terminal.scrollback_stats().physical_rows(),
+                self.history.offset_rows,
+            )
+            .is_some_and(|geometry| {
+                ui.input(|input| {
+                    input
+                        .pointer
+                        .hover_pos()
+                        .is_some_and(|position| geometry.hit_track.contains(position))
+                })
+            });
+            let mut history_changed = false;
+            ui.input_mut(|input| {
+                input.events.retain(|event| match event {
+                    egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                        ..
+                    } if terminal_hovered
+                        && (!mouse_reporting || modifiers.shift || over_scrollbar) =>
+                    {
+                        sink.observe_local_gesture(
+                            "mouse-wheel",
+                            "local-history-scroll",
+                            u8::from(modifiers.shift),
+                        );
+                        let raw_rows = wheel_delta_rows(*unit, delta.y, metrics.height, page_rows);
+                        // Accumulate the fractional row this event didn't
+                        // quite earn (e.g. a 0.1x "Very slow" clickstop)
+                        // into the next same-direction event instead of
+                        // rounding every event up to at least one row,
+                        // which would otherwise make slow clickstops
+                        // indistinguishable from Normal on a trackpad's
+                        // rapid small wheel events. A direction reversal
+                        // drops any stale carry from the opposite way; a
+                        // horizontal-only event (delta.y == 0.0) leaves the
+                        // carry and its recorded direction untouched.
+                        if delta.y != 0.0 {
+                            let sign = delta.y.signum();
+                            if sign != self.scroll_fraction_sign {
+                                self.scroll_fraction_carry = 0.0;
+                                self.scroll_fraction_sign = sign;
+                            }
+                        }
+                        let rows = scaled_scroll_rows(
+                            raw_rows,
+                            options.scroll_speed_multiplier,
+                            &mut self.scroll_fraction_carry,
+                        );
+                        if rows > 0 {
+                            if delta.y > 0.0 {
+                                self.history.scroll_up(rows);
+                            } else if delta.y < 0.0 {
+                                self.history.scroll_down(rows);
+                            }
+                            history_changed = true;
+                        }
+                        false
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::PageUp,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if terminal_focused && modifiers.shift => {
+                        self.history.scroll_up(page_rows);
+                        history_changed = true;
+                        false
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::PageDown,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if terminal_focused && modifiers.shift => {
+                        self.history.scroll_down(page_rows);
+                        history_changed = true;
+                        false
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::End,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if terminal_focused && modifiers.ctrl => {
+                        self.history.latest();
+                        history_changed = true;
+                        false
+                    }
+                    _ => true,
+                });
+            });
+            if history_changed {
+                self.history.sync(terminal);
+                self.selection.clear();
+                self.pointer = TerminalPointerState::default();
+                self.primary_link_gesture = None;
+            }
+        }
+
+        let was_smart = self.selection.is_smart();
+        self.selection
+            .invalidate_smart(TerminalSnapshot::from_terminal_viewport(
+                terminal,
+                self.history.offset_rows,
+            ));
+        if was_smart && !self.selection.is_smart() {
+            self.set_transient_smart_selection_feedback(
+                "Smart selection cancelled: selected content, wrapping, dimensions or screen buffer changed."
+            );
+            self.smart_keyboard_hit = None;
+        }
+
+        let history_rows = terminal.scrollback_stats().physical_rows();
+        let scrollbar = scrollbar_geometry(
+            vp_layout.viewport,
+            terminal.dimensions().rows(),
+            history_rows,
+            self.history.offset_rows,
+        );
+        let scrollbar_response = scrollbar.map(|geometry| {
+            let response = ui.interact(
+                geometry.hit_track,
+                response.id.with("history_scrollbar"),
+                Sense::click_and_drag(),
+            );
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Slider,
+                    true,
+                    "Terminal history scrollbar",
+                )
+            });
+            if response.drag_started()
+                && response
+                    .interact_pointer_pos()
+                    .is_some_and(|position| geometry.thumb.expand(3.0).contains(position))
+            {
+                self.scrollbar_dragging = true;
+            }
+            if self.scrollbar_dragging && response.dragged() {
+                if let Some(position) = response.interact_pointer_pos() {
+                    let travel = geometry.visual_track.height() - geometry.thumb.height();
+                    let progress = if travel <= 0.0 {
+                        1.0
+                    } else {
+                        ((position.y - geometry.visual_track.top() - geometry.thumb.height() / 2.0)
+                            / travel)
+                            .clamp(0.0, 1.0)
+                    };
+                    let top_content_row = (progress * history_rows as f32).round() as usize;
+                    self.history.offset_rows = history_rows.saturating_sub(top_content_row);
+                    self.history.unseen_output &= self.history.offset_rows > 0;
+                }
+            } else if response.clicked() {
+                if let Some(position) = response.interact_pointer_pos() {
+                    let page = terminal.dimensions().rows().saturating_sub(1).max(1);
+                    if position.y < geometry.thumb.top() {
+                        self.history.scroll_up(page);
+                    } else if position.y > geometry.thumb.bottom() {
+                        self.history.scroll_down(page);
+                    }
+                    self.history.sync(terminal);
+                }
+            }
+            if response.drag_stopped() {
+                self.scrollbar_dragging = false;
+            }
+            response
+        });
+        let jump_rect = (self.history.offset_rows > 0 && self.history.unseen_output)
+            .then(|| jump_to_latest_rect(vp_layout.viewport));
+        let jump_response = jump_rect.map(|rect| {
+            let response = ui.interact(rect, response.id.with("jump_to_latest"), Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Jump to latest")
+            });
+            if response.clicked() {
+                self.history.latest();
+                self.selection.clear();
+                self.pointer = TerminalPointerState::default();
+            }
+            response
+        });
+        if jump_response.as_ref().is_some_and(egui::Response::clicked) {
+            response.request_focus();
+        }
+
+        let scrollbar_hovered = scrollbar_response
+            .as_ref()
+            .is_some_and(egui::Response::hovered);
+        let reserved_pointer_rects = [scrollbar.map(|geometry| geometry.hit_track), jump_rect];
+        ui.input_mut(|input| {
+            input.events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::PointerButton { pos, .. } | egui::Event::PointerMoved(pos)
+                        if reserved_pointer_rects
+                            .iter()
+                            .flatten()
+                            .any(|rect| rect.contains(*pos))
+                )
+            });
+        });
+
+        // Command-click (Ctrl on Windows/Linux, Command on macOS) is the only
+        // direct activation gesture. Consume both halves only when the press
+        // began on an explicit OSC 8 cell; ordinary clicks and modifier-clicks
+        // elsewhere keep their existing terminal/selection behavior.
+        let link_snapshot =
+            TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows);
+        let has_command_release = ui.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers,
+                        ..
+                    } if modifiers.command
+                )
+            })
+        });
+        if !ui.input(|input| input.pointer.primary_down()) && !has_command_release {
+            self.primary_link_gesture = None;
+        }
+        if let Some(link) = ui
+            .input(|input| input.pointer.hover_pos())
+            .filter(|position| vp_layout.viewport.contains(*position))
+            .and_then(|position| {
+                cell_from_point(layout.rect.min, layout.dimensions, layout.metrics, position)
+            })
+            .and_then(|cell| link_snapshot.cell(cell.column, cell.row))
+            .and_then(|cell| cell.hyperlink_target())
+        {
+            let preview = hyperlink_preview(&link);
+            let display: String = context_target_parts(&preview)
+                .iter()
+                .map(Cow::as_ref)
+                .collect();
+            response.clone().on_hover_text(display);
+            if self.link_can_open(&link) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+        let local_file_links = self.file_link_context.is_some_and(|(_, local)| local);
+        ui.input_mut(|input| {
+            input.events.retain(|event| {
+                let egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers,
+                } = event
+                else {
+                    return true;
+                };
+                if *pressed {
+                    if !modifiers.command || !vp_layout.viewport.contains(*pos) {
+                        return true;
+                    }
+                    let Some(cell) =
+                        cell_from_point(layout.rect.min, layout.dimensions, layout.metrics, *pos)
+                    else {
+                        return true;
+                    };
+                    let Some(link) = link_snapshot
+                        .cell(cell.column, cell.row)
+                        .and_then(|cell| cell.hyperlink_target())
+                    else {
+                        return true;
+                    };
+                    if !local_file_links && festerm_core::local_file_hyperlink_path(&link).is_some()
+                    {
+                        return true;
+                    }
+                    self.primary_link_gesture = Some((link, cell));
+                    return false;
+                }
+                let Some((link, pressed_cell)) = self.primary_link_gesture.take() else {
+                    return true;
+                };
+                if modifiers.command
+                    && vp_layout.viewport.contains(*pos)
+                    && cell_from_point(layout.rect.min, layout.dimensions, layout.metrics, *pos)
+                        == Some(pressed_cell)
+                {
+                    self.pending_link_requests.push_back(link);
+                }
+                false
+            });
+        });
+
+        // A TUI with mouse tracking owns ordinary right-click. Shift is the
+        // stable local override; without mouse tracking, right-click is local
+        // by default. Remove both press and release before terminal routing so
+        // opening the menu can never emit half of a mouse protocol gesture.
+        let mut local_context_release = None;
+        ui.input_mut(|input| {
+            input.events.retain(|event| {
+                let egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers,
+                } = event
+                else {
+                    return true;
+                };
+                if *pressed {
+                    if !viewport_rect.contains(*pos) {
+                        self.secondary_gesture = SecondaryGestureOwnership::None;
+                        return true;
+                    }
+                    if !mouse_reporting || modifiers.shift {
+                        self.secondary_gesture = SecondaryGestureOwnership::Local(*pos);
+                        sink.observe_local_gesture(
+                            "mouse-right-press",
+                            "local-context-gesture",
+                            u8::from(modifiers.shift),
+                        );
+                        return false;
+                    }
+                    self.secondary_gesture = SecondaryGestureOwnership::Terminal;
+                    return true;
+                }
+                match std::mem::take(&mut self.secondary_gesture) {
+                    SecondaryGestureOwnership::Local(press_position) => {
+                        local_context_release = Some(press_position);
+                        sink.observe_local_gesture(
+                            "mouse-right-release",
+                            "local-context-menu",
+                            u8::from(modifiers.shift),
+                        );
+                        false
+                    }
+                    SecondaryGestureOwnership::Terminal | SecondaryGestureOwnership::None => true,
+                }
+            });
+        });
+
+        // A TUI with mouse tracking owns ordinary middle-click by default
+        // (e.g. tmux/vim have their own middle-click paste bindings); Shift
+        // is the stable local override, mirroring the right-click
+        // convention above. Without mouse tracking, middle-click pastes the
+        // clipboard directly - the common X11/terminal-emulator convention
+        // - via the same `RequestPaste` viewport command the context menu's
+        // Paste button already uses. Both press and release are removed
+        // from terminal routing so a locally handled paste can never also
+        // emit half of a mouse-report gesture.
+        let mut request_local_paste = false;
+        ui.input_mut(|input| {
+            input.events.retain(|event| {
+                let egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Middle,
+                    pressed,
+                    modifiers,
+                } = event
+                else {
+                    return true;
+                };
+                if *pressed {
+                    if !viewport_rect.contains(*pos) || (mouse_reporting && !modifiers.shift) {
+                        self.middle_click_paste_gesture = false;
+                        return true;
+                    }
+                    self.middle_click_paste_gesture = true;
+                    request_local_paste = true;
+                    sink.observe_local_gesture(
+                        "mouse-middle-press",
+                        "local-paste-request",
+                        u8::from(modifiers.shift),
+                    );
+                    return false;
+                }
+                !std::mem::take(&mut self.middle_click_paste_gesture)
+            });
+        });
+        if request_local_paste && options.paste_available {
+            response.request_focus();
+            if options.defer_paste_to_application {
+                self.pending_clipboard_read = true;
+            } else {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            }
+        }
+
+        if let Some(position) = local_context_release {
+            self.smart_keyboard_hit = None;
+            self.context_text = None;
+            let snapshot =
+                TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows);
+            self.context_target =
+                cell_from_point(layout.rect.min, layout.dimensions, layout.metrics, position)
+                    .and_then(|cell| snapshot.content_position(cell))
+                    .map(|content_position| TerminalContextTarget {
+                        content_position,
+                        generation: self.next_context_generation,
+                    });
+            self.next_context_generation = self.next_context_generation.saturating_add(1);
+            self.context_link =
+                cell_from_point(layout.rect.min, layout.dimensions, layout.metrics, position)
+                    .and_then(|cell| snapshot.cell(cell.column, cell.row))
+                    .and_then(|cell| cell.hyperlink_target());
+        }
+        let snapshot = TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows);
+        let smart_hit = self.context_target.and_then(|target| {
+            (0..snapshot.dimensions().rows()).find_map(|row| {
+                (snapshot.content_row_for_viewport_row(row)
+                    == Some(target.content_position.absolute_row))
+                .then_some(CellPosition {
+                    column: target.content_position.column,
+                    row,
+                })
+            })
+        });
+        let keyboard_hit = self
+            .smart_keyboard_hit
+            .or_else(|| {
+                self.selection
+                    .range_in_snapshot(snapshot)
+                    .map(|range| range.end)
+            })
+            .or_else(|| {
+                let cursor = snapshot.cursor();
+                (self.history.offset_rows == 0).then_some(CellPosition {
+                    column: cursor.column(),
+                    row: cursor.row(),
+                })
+            })
+            .or(Some(CellPosition { column: 0, row: 0 }));
+        let mut smart_request = None;
+        let menu_id = Popup::default_response_id(&response);
+        let menu_was_open = Popup::is_id_open(ui.ctx(), menu_id);
+        let terminal_owns_keyboard = !terminal_input_blackout(
+            ui.ctx(),
+            &options,
+            menu_was_open || local_context_release.is_some(),
+        );
+        if !terminal_owns_keyboard {
+            self.smart_held_keys.clear();
+        }
+        ui.input_mut(|input| {
+            let mut ime_composing = self.keyboard.ime_composing();
+            input.events.retain_mut(|event| {
+                if matches!(event, egui::Event::WindowFocused(false)) {
+                    self.smart_held_keys.clear();
+                    return true;
+                }
+                if !terminal_owns_keyboard {
+                    return true;
+                }
+                match event {
+                    egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                        ime_composing = !text.is_empty();
+                        return true;
+                    }
+                    egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
+                        ime_composing = false;
+                        return true;
+                    }
+                    egui::Event::Ime(_) => {
+                        ime_composing = false;
+                        return true;
+                    }
+                    egui::Event::Key {
+                        key,
+                        pressed,
+                        repeat,
+                        modifiers,
+                        ..
+                    } => {
+                        let held = self.smart_held_keys.contains(key);
+                        let repeatable_arrow = *pressed
+                            && *repeat
+                            && modifiers.ctrl
+                            && modifiers.alt
+                            && modifiers.shift
+                            && matches!(
+                                key,
+                                egui::Key::ArrowLeft
+                                    | egui::Key::ArrowRight
+                                    | egui::Key::ArrowUp
+                                    | egui::Key::ArrowDown
+                            );
+                        if held && !repeatable_arrow {
+                            if !*pressed {
+                                self.smart_held_keys.retain(|held| held != key);
+                            }
+                            return false;
+                        }
+
+                        if !*pressed {
+                            return true;
+                        }
+                        if ime_composing {
+                            return true;
+                        }
+                        if modifiers.ctrl && modifiers.alt && modifiers.shift {
+                            let mut target = self.smart_keyboard_hit.or(keyboard_hit).unwrap_or(
+                                CellPosition {
+                                    column: 0,
+                                    row: 0,
+                                },
+                            );
+                            target.column =
+                                target.column.min(snapshot.dimensions().columns() - 1);
+                            target.row = target.row.min(snapshot.dimensions().rows() - 1);
+                            smart_request = match key {
+                                egui::Key::S => Some(crate::SmartSelectionScope::Sentence),
+                                egui::Key::P => Some(crate::SmartSelectionScope::Paragraph),
+                                egui::Key::B => Some(crate::SmartSelectionScope::Block),
+                                egui::Key::ArrowLeft => {
+                                    target.column = target.column.saturating_sub(1);
+                                    None
+                                }
+                                egui::Key::ArrowRight => {
+                                    target.column = (target.column + 1)
+                                        .min(snapshot.dimensions().columns() - 1);
+                                    None
+                                }
+                                egui::Key::ArrowUp => {
+                                    target.row = target.row.saturating_sub(1);
+                                    None
+                                }
+                                egui::Key::ArrowDown => {
+                                    target.row =
+                                        (target.row + 1).min(snapshot.dimensions().rows() - 1);
+                                    None
+                                }
+                                _ => return true,
+                            };
+                            self.smart_keyboard_hit = Some(target);
+                            if !held {
+                                self.smart_held_keys.push(*key);
+                            }
+                            if smart_request.is_none() {
+                                self.set_transient_smart_selection_feedback(format!(
+                                    "Smart target row {}, column {}. Ctrl+Alt+Shift+S/P/B selects; arrows move target; Escape cancels.",
+                                    target.row + 1,
+                                    target.column + 1
+                                ));
+                            }
+                            return false;
+                        }
+                        if *key == egui::Key::Escape
+                            && (self.selection.is_smart()
+                                || self.smart_keyboard_hit.is_some())
+                        {
+                            if self.selection.is_smart() {
+                                self.selection.clear();
+                            }
+                            self.clear_smart_selection_feedback();
+                            self.smart_keyboard_hit = None;
+                            self.smart_held_keys.push(*key);
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            });
+        });
+        if let Some(scope) = smart_request {
+            self.request_smart_selection(snapshot, self.smart_keyboard_hit.or(keyboard_hit), scope);
+        }
+        let selected_text = selection_text(
+            TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows),
+            &self.selection,
+        )
+        .filter(|text| !text.is_empty());
+        let show_history_actions = options.history_snapshot_actions && selected_text.is_none();
+        let show_find = options.terminal_input_enabled;
+        let menu_has_items = options.terminal_input_enabled
+            && (self.context_target.is_some()
+                || self.context_link.is_some()
+                || selected_text.is_some()
+                || options.paste_available
+                || show_find
+                || show_history_actions);
+        let set_open = local_context_release.map(|_| egui::SetOpenCommand::Bool(menu_has_items));
+        let menu = Popup::context_menu(&response)
+            .open_memory(set_open)
+            .show(|ui| {
+                style_context_menu(
+                    ui,
+                    options.context_menu_action.is_some() || self.context_link.is_some(),
+                );
+                let mut rendered_items = false;
+                if let Some(text) = selected_text.clone() {
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(text);
+                        self.selection.clear();
+                        self.clear_smart_selection_feedback();
+                        self.smart_keyboard_hit = None;
+                        ui.close();
+                    }
+                    rendered_items = true;
+                }
+                if self.show_context_target_actions(
+                    ui,
+                    options.context_menu_action.as_ref(),
+                    selected_text.is_none() && !options.paste_available,
+                    rendered_items,
+                ) {
+                    rendered_items = true;
+                }
+                if smart_hit.is_some() {
+                    if rendered_items {
+                        ui.separator();
+                    }
+                    for (label, scope) in [
+                        (
+                            "Smart Select Sentence",
+                            crate::SmartSelectionScope::Sentence,
+                        ),
+                        (
+                            "Smart Select Paragraph",
+                            crate::SmartSelectionScope::Paragraph,
+                        ),
+                        ("Smart Select Block", crate::SmartSelectionScope::Block),
+                    ] {
+                        if ui.button(label).on_hover_text(
+                            "Keyboard: Ctrl+Alt+Shift+S/P/B selects sentence/paragraph/block; Ctrl+Alt+Shift+arrows moves the target. Copy is separate."
+                        ).clicked() {
+                            self.request_smart_selection(snapshot, smart_hit, scope);
+                            response.request_focus();
+                            ui.close();
+                        }
+                    }
+                    rendered_items = true;
+                }
+                if options.paste_available {
+                    if rendered_items {
+                        ui.separator();
+                    }
+                    if ui.button("Paste").clicked() {
+                        response.request_focus();
+                        if options.defer_paste_to_application {
+                            self.pending_clipboard_read = true;
+                        } else {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                        }
+                        ui.close();
+                    }
+                    rendered_items = true;
+                }
+                if show_find {
+                    if rendered_items {
+                        ui.separator();
+                    }
+                    if ui.button("Find in Terminal").clicked() {
+                        self.pending_find_request = true;
+                        ui.close();
+                    }
+                    rendered_items = true;
+                }
+                if show_history_actions {
+                    if rendered_items {
+                        ui.separator();
+                    }
+                    if ui.button("Open Terminal History in Editor").clicked() {
+                        self.pending_history_actions
+                            .push_back(TerminalHistoryAction::OpenInEditor);
+                        ui.close();
+                    }
+                    if ui.button("Save Terminal History As…").clicked() {
+                        self.pending_history_actions
+                            .push_back(TerminalHistoryAction::SaveAs);
+                        ui.close();
+                    }
+                }
+            });
+        let context_menu_open = menu.is_some();
+        self.expire_smart_selection_feedback(ui.ctx());
+        if let Some(feedback) = &self.smart_selection_feedback {
+            response.clone().on_hover_text(feedback);
+            egui::Area::new(response.id.with("smart-selection-feedback"))
+                .pivot(Align2::LEFT_BOTTOM)
+                .fixed_pos(vp_layout.viewport.left_bottom())
+                .movable(false)
+                .interactable(false)
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |ui| {
+                    ui.set_max_width(vp_layout.viewport.width().min(480.0));
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(feedback);
+                    });
+                });
+        }
+        if !context_menu_open {
+            self.context_link = None;
+            self.context_target = None;
+            self.context_text = None;
+        }
+        if options.defer_paste_to_application {
+            // `response.has_focus()`/`clicked()` each read the egui context
+            // themselves (via `Context::input`/`Context::memory`), so they
+            // must be evaluated *before* entering `input_mut` below: egui's
+            // context lock is not reentrant, and calling them from inside
+            // the `input_mut` closure deadlocks the UI thread the moment a
+            // paste is delivered (e.g. Cmd+V).
+            let should_defer =
+                response.has_focus() || response.clicked() || !options.terminal_input_enabled;
+            ui.input_mut(|input| {
+                input.events.retain(|event| {
+                    if let egui::Event::Paste(text) = event {
+                        if should_defer {
+                            self.pending_paste_requests.push_back(text.clone());
+                            return false;
+                        }
+                    }
+                    true
+                });
+            });
+        }
+        let smart_before_routing = self.selection.is_smart();
+        let selection_before_routing = self.selection.content_endpoints();
+        let reports = route_egui_events(
+            ui,
+            &response,
+            layout,
+            terminal,
+            InputAdapterState {
+                selection: &mut self.selection,
+                keyboard: &mut self.keyboard,
+                pointer: &mut self.pointer,
+                viewport_offset_rows: self.history.offset_rows,
+                scroll_speed_multiplier: options.scroll_speed_multiplier,
+                persistent_keyboard_focus: options.persistent_keyboard_focus,
+            },
+            sink,
+            InputSuppression {
+                blackout: terminal_input_blackout(ui.ctx(), &options, context_menu_open),
+                keystrokes: !options.keyboard_input_enabled,
+            },
+        );
+        if !self.selection.is_smart()
+            && (smart_before_routing
+                || self.selection.content_endpoints() != selection_before_routing)
+        {
+            self.clear_smart_selection_feedback();
+            self.smart_keyboard_hit = None;
+        }
+        for report in reports.routes {
+            self.diagnostics.last_input_outcome = Some(report.outcome);
+            self.diagnostics.input_queue_depth = report.queue_depth;
+        }
+
+        let dirty_rows = terminal.take_dirty_rows();
+        let snapshot = TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows);
+        let update = self.cache.update(snapshot, &dirty_rows);
+        self.diagnostics.dirty_rows = update.updated_rows.len();
+        let full_redraw = self.full_redraw_requested
+            && ui.painter().is_visible()
+            && vp_layout.viewport.intersect(ui.clip_rect()).is_positive();
+        if full_redraw {
+            self.full_redraw_requested = false;
+        }
+        let (paint_stats, input_to_paint_submission) =
+            measure_input_to_paint_submission(reports.input_observed, || {
+                paint_grid(
+                    ui.painter().with_clip_rect(vp_layout.viewport),
+                    GridPaint {
+                        layout,
+                        snapshot,
+                        cache: &self.cache,
+                        selection: &self.selection,
+                        fonts: &self.fonts,
+                        color_scheme: None,
+                        shape_cell_runs: self.force_cell_run_shaping
+                            || self.fonts.font_set().ligatures(),
+                        focused: response.has_focus(),
+                        suppress_cursor: false,
+                        full_redraw,
+                    },
+                    &mut self.glyphs,
+                )
+            });
+        if options.expose_text_to_accessibility {
+            publish_accessible_rows(
+                ui,
+                response.id,
+                layout,
+                TerminalSnapshot::from_terminal_viewport(terminal, self.history.offset_rows),
+            );
+        }
+        if let Some(target) = self.smart_keyboard_hit {
+            let rect = Rect::from_min_size(
+                layout.rect.min
+                    + egui::vec2(
+                        target.column as f32 * layout.metrics.width,
+                        target.row as f32 * layout.metrics.height,
+                    ),
+                egui::vec2(layout.metrics.width, layout.metrics.height),
+            );
+            ui.painter().with_clip_rect(vp_layout.viewport).rect_stroke(
+                rect,
+                0.0,
+                ui.visuals().selection.stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        self.diagnostics.color_emoji_paints = paint_stats.color_emoji_paints;
+        let (reused, rebuilt, bytes) = self.glyphs.row_cache_diagnostics();
+        self.diagnostics.retained_rows_reused = reused;
+        self.diagnostics.retained_rows_rebuilt = rebuilt;
+        self.diagnostics.retained_row_bytes = bytes;
+        self.diagnostics.color_emoji_cache_hits = paint_stats.color_emoji_cache_hits;
+        self.diagnostics.color_emoji_cache_misses = paint_stats.color_emoji_cache_misses;
+        self.diagnostics.color_emoji_rasterization_attempts =
+            paint_stats.color_emoji_rasterization_attempts;
+        self.diagnostics.color_emoji_rasterization_failures =
+            paint_stats.color_emoji_rasterization_failures;
+        self.diagnostics.color_emoji_negative_cache_hits =
+            paint_stats.color_emoji_negative_cache_hits;
+        if let Some(geometry) = scrollbar {
+            let visible = self.history.offset_rows > 0
+                || scrollbar_hovered
+                || self.selection.is_active()
+                || self.scrollbar_dragging;
+            if visible {
+                let painter = ui.painter().with_clip_rect(vp_layout.viewport);
+                painter.rect_filled(
+                    geometry.visual_track,
+                    1.5,
+                    crate::theme::SURFACE_TAB_INACTIVE.gamma_multiply(0.65),
+                );
+                painter.rect_filled(
+                    scrollbar_geometry(
+                        vp_layout.viewport,
+                        terminal.dimensions().rows(),
+                        history_rows,
+                        self.history.offset_rows,
+                    )
+                    .expect("history rows still exist")
+                    .thumb,
+                    1.5,
+                    if scrollbar_hovered || self.scrollbar_dragging {
+                        crate::theme::BORDER_ACTIVE
+                    } else {
+                        crate::theme::TEXT_MUTED
+                    },
+                );
+            }
+        }
+        if let (Some(rect), Some(response)) = (jump_rect, jump_response) {
+            let visuals = if response.hovered() {
+                ui.visuals().widgets.hovered
+            } else {
+                ui.visuals().widgets.inactive
+            };
+            let painter = ui.painter().with_clip_rect(vp_layout.viewport);
+            painter.rect(
+                rect,
+                5.0,
+                visuals.weak_bg_fill,
+                Stroke::new(1.0, visuals.bg_stroke.color),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "Jump to latest",
+                egui::FontId::proportional(12.0),
+                visuals.fg_stroke.color,
+            );
+        }
+        self.diagnostics.input_to_paint_submission = input_to_paint_submission;
+        self.diagnostics.input_sink = sink.input_diagnostics();
+        self.diagnostics.frame_time = Some(frame_started.elapsed());
+        if !foreground_accessibility_events.is_empty() {
+            ui.input_mut(|input| input.events.extend(foreground_accessibility_events));
+        }
+    }
+
+    fn show_context_target_actions(
+        &mut self,
+        ui: &mut Ui,
+        action: Option<&TerminalContextMenuAction>,
+        resolving: bool,
+        leading_separator: bool,
+    ) -> bool {
+        let mut rendered_items = false;
+        let will_render = action.is_some()
+            || self.context_link.is_some()
+            || (resolving && self.context_target.is_some());
+        if will_render && leading_separator {
+            ui.separator();
+        }
+        if let Some(action) = action {
+            show_context_target(ui, &action.preview);
+            let clicked = if action.enabled {
+                ui.button(&action.label).clicked()
+            } else {
+                ui.add_enabled(false, egui::Button::new(&action.label))
+                    .on_hover_text(action.disabled_reason.as_deref().unwrap_or_default())
+                    .clicked()
+            };
+            rendered_items = true;
+            if action.enabled && clicked {
+                self.pending_context_action_request = true;
+                ui.close();
+            }
+            if let Some((label, value)) = &action.copy {
+                if ui.button(label).clicked() {
+                    ui.ctx().copy_text(value.clone());
+                    ui.close();
+                }
+            }
+        } else if resolving && self.context_target.is_some() && self.context_link.is_none() {
+            ui.add_enabled(false, egui::Button::new("Resolving path…"));
+            rendered_items = true;
+        }
+        if let Some(link) = self.context_link.clone() {
+            if rendered_items {
+                ui.separator();
+            }
+            let file_path = festerm_core::local_file_hyperlink_path(&link);
+            show_context_target(ui, &hyperlink_preview(&link));
+            if ui
+                .add_enabled(self.link_can_open(&link), egui::Button::new("Open link"))
+                .on_disabled_hover_text("File links can only open in a local session.")
+                .clicked()
+            {
+                self.pending_link_requests.push_back(link.clone());
+                ui.close();
+            }
+            if ui
+                .button(if file_path.is_some() {
+                    "Copy path"
+                } else {
+                    "Copy link"
+                })
+                .clicked()
+            {
+                ui.ctx().copy_text(hyperlink_preview(&link));
+                ui.close();
+            }
+
+            rendered_items = true;
+        }
+        rendered_items
+    }
+
+    fn show_rectangle_copy(
+        &mut self,
+        ui: &mut Ui,
+        terminal: &mut Terminal,
+        sink: &mut impl EncodedInputSink,
+        response: &egui::Response,
+        layout: GridLayout,
+        options: &TerminalViewOptions,
+    ) {
+        let viewport = response.rect;
+        let mut copied = None;
+        let mut cancel = false;
+        let mut changed = false;
+        let mut exit_key = None;
+        let mut context_release = None;
+        let menu_id = Popup::default_response_id(response);
+        let menu_was_open = Popup::is_id_open(ui.ctx(), menu_id);
+        let mut owns_input = options.terminal_input_enabled && ui.input(|input| input.focused);
+        let held_buttons = ui.input(|input| {
+            [
+                egui::PointerButton::Primary,
+                egui::PointerButton::Secondary,
+                egui::PointerButton::Middle,
+                egui::PointerButton::Extra1,
+                egui::PointerButton::Extra2,
+            ]
+            .into_iter()
+            .fold(0, |mask, button| {
+                mask | (u8::from(input.pointer.button_down(button)) << button as u8)
+            })
+        });
+        let copy = self
+            .rectangle_copy
+            .as_mut()
+            .expect("active rectangle-copy mode");
+        copy.held_buttons = held_buttons;
+        if !owns_input {
+            copy.secondary_pressed = false;
+            copy.primary_release();
+        }
+        ui.input_mut(|input| {
+            if !options.terminal_input_enabled {
+                return;
+            }
+            let events = std::mem::take(&mut input.events);
+            for event in events {
+                if matches!(
+                    event,
+                    egui::Event::WindowFocused(_) | egui::Event::AccessKitActionRequest(_)
+                ) {
+                    if let egui::Event::WindowFocused(focused) = event {
+                        owns_input = focused && options.terminal_input_enabled;
+                        if !focused {
+                            copy.secondary_pressed = false;
+                            copy.primary_release();
+                        }
+                    }
+                    input.events.push(event);
+                    continue;
+                }
+                if !owns_input || copied.is_some() || cancel {
+                    continue;
+                }
+                if menu_was_open
+                    && !matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                {
+                    input.events.push(event);
+                    continue;
+                }
+                match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    } if viewport.contains(pos) => {
+                        if let Some(position) =
+                            cell_from_point(layout.rect.min, layout.dimensions, layout.metrics, pos)
+                        {
+                            copy.primary_press(position);
+                            changed = true;
+                        }
+                    }
+                    egui::Event::PointerMoved(pos) => {
+                        if let Some(position) = clamped_cell_from_point(
+                            layout.rect.min,
+                            layout.dimensions,
+                            layout.metrics,
+                            pos,
+                        ) {
+                            changed |= copy.primary_move(position);
+                        }
+                    }
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    } => {
+                        if let Some(position) = clamped_cell_from_point(
+                            layout.rect.min,
+                            layout.dimensions,
+                            layout.metrics,
+                            pos,
+                        ) {
+                            changed |= copy.primary_move(position);
+                        }
+                        copy.primary_release();
+                    }
+                    egui::Event::PointerGone => copy.primary_release(),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        ..
+                    } => {
+                        if pressed {
+                            copy.secondary_pressed = viewport.contains(pos);
+                        } else if std::mem::take(&mut copy.secondary_pressed)
+                            && viewport.contains(pos)
+                        {
+                            context_release = Some(pos);
+                            copy.primary_release();
+                            changed = true;
+                        }
+                    }
+                    egui::Event::Copy => {
+                        copied = copy.selected_text(&self.cache);
+                        changed = true;
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => {
+                        copied = copy.selected_text(&self.cache);
+                        exit_key = copied.is_some().then_some(egui::Key::Enter);
+                        changed = true;
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } => {
+                        cancel = true;
+                        exit_key = Some(egui::Key::Escape);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let status = copy.status();
+        let bounds = copy.bounds();
+        if let Some(pos) = context_release {
+            let hit = cell_from_point(layout.rect.min, layout.dimensions, layout.metrics, pos);
+            self.context_text = hit.and_then(|position| copy.context_text(&self.cache, position));
+            self.context_target =
+                self.context_text
+                    .as_ref()
+                    .and(hit)
+                    .map(|position| TerminalContextTarget {
+                        content_position: copy.content_position(position),
+                        generation: self.next_context_generation,
+                    });
+            self.next_context_generation = self.next_context_generation.saturating_add(1);
+            self.context_link =
+                hit.filter(|position| copy.contains(*position))
+                    .and_then(|position| {
+                        self.cache
+                            .row(position.row)
+                            .and_then(|row| row.get(position.column))
+                            .and_then(|cell| cell.hyperlink.clone())
+                    });
+        }
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, status));
+        response.clone().on_hover_text(status);
+        let reports = route_egui_events(
+            ui,
+            response,
+            layout,
+            terminal,
+            InputAdapterState {
+                selection: &mut self.selection,
+                keyboard: &mut self.keyboard,
+                pointer: &mut self.pointer,
+                viewport_offset_rows: self.history.offset_rows,
+                scroll_speed_multiplier: options.scroll_speed_multiplier,
+                persistent_keyboard_focus: options.persistent_keyboard_focus,
+            },
+            sink,
+            InputSuppression {
+                blackout: true,
+                keystrokes: true,
+            },
+        );
+        for report in reports.routes {
+            self.diagnostics.last_input_outcome = Some(report.outcome);
+            self.diagnostics.input_queue_depth = report.queue_depth;
+        }
+        let menu = Popup::context_menu(response)
+            .open_memory(context_release.map(|_| egui::SetOpenCommand::Bool(true)))
+            .show(|ui| {
+                style_context_menu(
+                    ui,
+                    options.context_menu_action.is_some() || self.context_link.is_some(),
+                );
+                if ui.button("Copy").clicked() {
+                    copied = Some(
+                        self.rectangle_copy
+                            .as_ref()
+                            .expect("frozen menu owns copy mode")
+                            .context_copy_text(&self.cache),
+                    );
+                    ui.close();
+                }
+                if self.context_target.is_some() || self.context_link.is_some() {
+                    ui.separator();
+                    self.show_context_target_actions(
+                        ui,
+                        if context_release.is_none() {
+                            options.context_menu_action.as_ref()
+                        } else {
+                            None
+                        },
+                        false,
+                        false,
+                    );
+                }
+            });
+        self.rectangle_copy_popup_id = menu.as_ref().map(|_| menu_id);
+        if menu.is_none() {
+            self.context_link = None;
+            self.context_target = None;
+            self.context_text = None;
+        }
+        let painter = ui.painter().with_clip_rect(viewport);
+        let stats = paint_grid(
+            painter.clone(),
+            GridPaint {
+                layout,
+                snapshot: TerminalSnapshot::from_terminal(terminal),
+                cache: &self.cache,
+                selection: &self.selection,
+                fonts: &self.fonts,
+                color_scheme: None,
+                shape_cell_runs: self.force_cell_run_shaping || self.fonts.font_set().ligatures(),
+                focused: false,
+                suppress_cursor: true,
+                full_redraw: self.full_redraw_requested,
+            },
+            &mut self.glyphs,
+        );
+        self.full_redraw_requested = false;
+        if let Some((first, last)) = bounds {
+            let rect = Rect::from_min_max(
+                layout.rect.min
+                    + egui::vec2(
+                        first.column as f32 * layout.metrics.width,
+                        first.row as f32 * layout.metrics.height,
+                    ),
+                layout.rect.min
+                    + egui::vec2(
+                        (last.column + 1) as f32 * layout.metrics.width,
+                        (last.row + 1) as f32 * layout.metrics.height,
+                    ),
+            );
+            painter.rect(
+                rect,
+                0.0,
+                crate::theme::SURFACE_SELECTION.gamma_multiply(0.45),
+                Stroke::new(1.0, crate::theme::BORDER_ACTIVE),
+                egui::StrokeKind::Inside,
+            );
+        }
+        painter.rect_stroke(
+            viewport,
+            0.0,
+            Stroke::new(2.0, crate::theme::BORDER_ACTIVE),
+            egui::StrokeKind::Inside,
+        );
+        let badge = Rect::from_min_size(
+            viewport.right_top() - egui::vec2(62.0, 0.0),
+            egui::vec2(62.0, 20.0),
+        );
+        painter.rect_filled(badge, 0.0, crate::theme::SURFACE_WINDOW);
+        painter.text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            "FROZEN",
+            egui::FontId::proportional(11.0),
+            crate::theme::TEXT_PRIMARY,
+        );
+        self.diagnostics.dirty_rows = 0;
+        let (reused, rebuilt, bytes) = self.glyphs.row_cache_diagnostics();
+        self.diagnostics.retained_rows_reused = reused;
+        self.diagnostics.retained_rows_rebuilt = rebuilt;
+        self.diagnostics.retained_row_bytes = bytes;
+        self.diagnostics.color_emoji_paints = stats.color_emoji_paints;
+        self.diagnostics.color_emoji_cache_hits = stats.color_emoji_cache_hits;
+        self.diagnostics.color_emoji_cache_misses = stats.color_emoji_cache_misses;
+        self.diagnostics.color_emoji_rasterization_attempts =
+            stats.color_emoji_rasterization_attempts;
+        self.diagnostics.color_emoji_rasterization_failures =
+            stats.color_emoji_rasterization_failures;
+        self.diagnostics.color_emoji_negative_cache_hits = stats.color_emoji_negative_cache_hits;
+        self.diagnostics.input_to_paint_submission = None;
+        self.diagnostics.input_sink = sink.input_diagnostics();
+        if let Some(text) = copied {
+            ui.ctx().copy_text(text);
+            Popup::close_id(ui.ctx(), menu_id);
+            self.cancel_rectangle_copy();
+        } else if cancel {
+            Popup::close_id(ui.ctx(), menu_id);
+            self.cancel_rectangle_copy();
+        }
+        if !self.rectangle_copy_active() {
+            self.rectangle_copy_exit_key = exit_key;
+            self.rectangle_copy_held_buttons |= held_buttons;
+        } else {
+            self.rectangle_copy_held_buttons = 0;
+        }
+        if changed || cancel {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Grid dimensions of the most recently rendered frame, formatted as
+    /// e.g. `"80×24"`, for display in the application status bar
+    /// (`docs/gui-design.md` "Bottom status bar"). `None` before the first
+    /// frame has been shown.
+    pub fn dimensions_label(&self) -> Option<String> {
+        self.diagnostics
+            .calculated_dimensions
+            .map(|size| format!("{}×{}", size.columns(), size.rows()))
+    }
+
+    /// Formats detailed per-frame diagnostics (frame time, dirty rows, emoji
+    /// cache work, input queue depth, input-sink counters) as a single line,
+    /// for optional display in the application status bar. `session_diagnostics` is a
+    /// caller-supplied prefix describing session-level state (e.g. shell
+    /// process status) that isn't tracked by this view.
+    pub fn diagnostics_summary(&self, session_diagnostics: &str) -> String {
+        let dimensions = self
+            .diagnostics
+            .calculated_dimensions
+            .map(|size| format!("{}x{}", size.columns(), size.rows()))
+            .unwrap_or_else(|| "unavailable".to_owned());
+        let frame = self
+            .diagnostics
+            .frame_time
+            .map(|duration| format!("{:.2} ms", duration.as_secs_f64() * 1_000.0))
+            .unwrap_or_else(|| "n/a".to_owned());
+        let input_to_paint_submission = self
+            .diagnostics
+            .input_to_paint_submission
+            .map(|duration| format!("{:.2} ms", duration.as_secs_f64() * 1_000.0))
+            .unwrap_or_else(|| "n/a".to_owned());
+        let sink = self.diagnostics.input_sink.map_or_else(
+            || "input sink diagnostics unavailable".to_owned(),
+            |diagnostics| {
+                format!(
+                    "sink events {}; bytes {}; last {:?}; queue {}",
+                    diagnostics.event_count,
+                    diagnostics.byte_count,
+                    diagnostics.last_outcome,
+                    diagnostics.last_queue_depth,
+                )
+            },
+        );
+        format!(
+            "{session_diagnostics}; frame {frame}; size {dimensions}; dirty rows {}; \
+             emoji paints {}; cache hits {}; misses {}; raster attempts {}; failures {}; negative hits {}; \
+             input {:?}; queue {}; input→paint submission \
+             {input_to_paint_submission} (not presentation); {sink}",
+            self.diagnostics.dirty_rows,
+            self.diagnostics.color_emoji_paints,
+            self.diagnostics.color_emoji_cache_hits,
+            self.diagnostics.color_emoji_cache_misses,
+            self.diagnostics.color_emoji_rasterization_attempts,
+            self.diagnostics.color_emoji_rasterization_failures,
+            self.diagnostics.color_emoji_negative_cache_hits,
+            self.diagnostics.last_input_outcome,
+            self.diagnostics.input_queue_depth,
+        )
+    }
+}
+
+/// Whether a tab chip is being dragged anywhere in this window (ADR 0033).
+///
+/// A chip drag routinely passes over a terminal on its way to another window,
+/// and a press that began on a chip is not a request to select terminal text,
+/// so the terminal ignores pointer input for the duration of the gesture
+/// rather than highlighting whatever the pointer swept across.
+fn chip_drag_in_flight(context: &egui::Context) -> bool {
+    egui::DragAndDrop::has_payload_of_type::<crate::chrome::ChipId>(context)
+}
+
+fn style_context_menu(ui: &mut Ui, has_target: bool) {
+    let min_width = if has_target {
+        let margin = egui::Frame::popup(ui.style()).total_margin().sum().x;
+        let width = CONTEXT_MENU_MAX_WIDTH.min((ui.ctx().content_rect().width() - margin).max(0.0));
+        ui.set_max_width(width);
+        176.0_f32.min(width)
+    } else {
+        176.0
+    };
+    ui.set_min_width(min_width);
+    ui.spacing_mut().interact_size.y = 30.0;
+    ui.spacing_mut().item_spacing.y = 2.0;
+}
+
+fn context_target_parts(target: &str) -> Vec<Cow<'_, str>> {
+    let bidi_controls = CodePointSetData::new::<BidiControl>();
+    let needs_escape = |character: char| {
+        character.is_control()
+            || bidi_controls.contains(character)
+            || matches!(character, '\u{2028}' | '\u{2029}')
+    };
+    target
+        .graphemes(true)
+        .map(|grapheme| {
+            if grapheme.chars().any(needs_escape) {
+                let mut escaped = String::new();
+                for character in grapheme.chars() {
+                    if needs_escape(character) {
+                        escaped.extend(character.escape_default());
+                    } else {
+                        escaped.push(character);
+                    }
+                }
+                Cow::Owned(escaped)
+            } else {
+                Cow::Borrowed(grapheme)
+            }
+        })
+        .collect()
+}
+
+// Presentation only: Open/Go and Copy retain their original frozen targets.
+fn context_target_text(
+    target: &str,
+    max_width: f32,
+    mut measure: impl FnMut(&str) -> f32,
+) -> (String, String) {
+    let parts = context_target_parts(target);
+    let full: String = parts.iter().map(Cow::as_ref).collect();
+    if measure(&full) <= max_width {
+        return (full.clone(), full);
+    }
+
+    let url_summary = (full == target)
+        .then(|| url::Url::parse(target).ok())
+        .flatten()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+        .map(|url| {
+            let mut summary = url.origin().ascii_serialization();
+            if !url.username().is_empty() || url.password().is_some() {
+                summary = summary.replacen("://", "://…@", 1);
+            }
+            let prefix_end = summary.len() + usize::from(url.path().starts_with('/'));
+            summary.push_str(url.path());
+            if url.query().is_some() {
+                summary.push_str("?…");
+            }
+            if url.fragment().is_some() {
+                summary.push_str("#…");
+            }
+            (summary, prefix_end)
+        });
+    let (parts, preferred_head) = if let Some((summary, prefix_end)) = &url_summary {
+        (
+            context_target_parts(summary),
+            summary[..*prefix_end].graphemes(true).count(),
+        )
+    } else {
+        let mut separators = target
+            .char_indices()
+            .filter(|(_, c)| matches!(c, '/' | '\\'));
+        let prefix_end = if target.starts_with("\\\\") || target.starts_with("//") {
+            separators.nth(3)
+        } else {
+            separators.next()
+        }
+        .map_or(0, |(index, c)| index + c.len_utf8());
+        (parts, target[..prefix_end].graphemes(true).count())
+    };
+    let candidate: String = parts.iter().map(Cow::as_ref).collect();
+    if measure(&candidate) <= max_width {
+        return (full, candidate);
+    }
+
+    let mut best = String::new();
+    let mut low = 0;
+    let mut high = parts.len();
+    while low < high {
+        let kept = low + (high - low) / 2;
+        // Favor the filename/extension, while keeping a recognizable root or host.
+        let head = if preferred_head + 8 <= kept {
+            (kept / 3).max(preferred_head)
+        } else {
+            kept / 3
+        };
+        let tail = kept - head;
+        let candidate: String = parts[..head]
+            .iter()
+            .map(Cow::as_ref)
+            .chain(std::iter::once("…"))
+            .chain(parts[parts.len() - tail..].iter().map(Cow::as_ref))
+            .collect();
+        if measure(&candidate) <= max_width {
+            best = candidate;
+            low = kept + 1;
+        } else {
+            high = kept;
+        }
+    }
+    (full, best)
+}
+
+fn hyperlink_preview(target: &str) -> String {
+    let Some(path) = festerm_core::local_file_hyperlink_path(target) else {
+        return target.to_owned();
+    };
+    #[cfg(windows)]
+    if path.as_bytes().get(2) == Some(&b':') {
+        return path[1..].replace('/', "\\");
+    }
+    path
+}
+
+fn show_context_target(ui: &mut Ui, target: &str) {
+    let mut font = egui::TextStyle::Small.resolve(ui.style());
+    font.family = egui::FontFamily::Monospace;
+    let color = ui.visuals().text_color();
+    let width = ui.available_width().min(CONTEXT_MENU_MAX_WIDTH);
+    let (full, label) = context_target_text(target, width, |text| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font.clone(), color)
+            .size()
+            .x
+    });
+    let galley = ui.painter().layout_no_wrap(label, font.clone(), color);
+    // A normal Label inherits the menu's horizontal justification, stretching
+    // spaces and wrapped path/URL rows. An explicit galley keeps normal spacing.
+    let response = ui.add(egui::Label::new(galley).selectable(false));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &full));
+    response.on_hover_ui(|ui| {
+        let width = ui.available_width().min(CONTEXT_TARGET_TOOLTIP_MAX_WIDTH);
+        let job = egui::text::LayoutJob::simple(full, font, color, width);
+        let galley = ui.painter().layout_job(job);
+        ui.add(egui::Label::new(galley).selectable(false));
+    });
+}
+
+#[cfg(test)]
+mod context_target_tests {
+    use super::*;
+
+    fn grapheme_width(text: &str) -> f32 {
+        text.graphemes(true).count() as f32
+    }
+
+    #[test]
+    fn context_target_display_escapes_controls_without_changing_real_spaces() {
+        let raw = "/tmp/a  b\tc\r\n\u{202e}e\u{301}-\u{1f469}\u{200d}\u{1f52c}.md";
+        let expected = "/tmp/a  b\\tc\\r\\n\\u{202e}e\u{301}-\u{1f469}\u{200d}\u{1f52c}.md";
+        let (full, label) = context_target_text(raw, 1000.0, grapheme_width);
+        assert_eq!(full, expected);
+        assert_eq!(label, expected);
+        assert_eq!(
+            context_target_parts("e\u{301}\t\u{1f469}\u{200d}\u{1f52c}")
+                .iter()
+                .map(Cow::as_ref)
+                .collect::<Vec<_>>(),
+            ["e\u{301}", "\\t", "\u{1f469}\u{200d}\u{1f52c}"]
+        );
+        assert!(full.chars().all(|c| !c.is_control()));
+        assert!(!full.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn context_target_labels_keep_origins_and_filename_tails() {
+        for (target, prefix, suffix) in [
+            (
+                r"C:\Users\reader\projects\very-long-directory\another-directory\report.final.md",
+                r"C:\",
+                "report.final.md",
+            ),
+            (
+                r"\\server\share\projects\very-long-directory\another-directory\report.final.md",
+                r"\\server\share\",
+                "report.final.md",
+            ),
+            (
+                "deploy@host · /srv/projects/very-long-directory/another-directory/report.final.md",
+                "deploy@host · /",
+                "report.final.md",
+            ),
+            (
+                "https://example.com/projects/very-long-directory/another-directory/report.md?token=abcdefghijklmnopqrstuvwxyz#heading",
+                "https://example.com/",
+                "report.md?…#…",
+            ),
+        ] {
+            let (full, label) = context_target_text(target, 48.0, grapheme_width);
+            assert_eq!(full, target);
+            assert!(label.starts_with(prefix), "{label}");
+            assert!(label.ends_with(suffix), "{label}");
+            assert!(label.contains('…'), "{label}");
+            assert!(grapheme_width(&label) <= 48.0, "{label}");
+            assert!(!label.contains("token="), "{label}");
+        }
+    }
+
+    #[test]
+    fn context_target_url_summaries_identify_omitted_components() {
+        let target = format!(
+            "https://reader:synthetic@example.com:8443/report.md?query={}#heading",
+            "value".repeat(40)
+        );
+        let (full, label) = context_target_text(&target, 48.0, grapheme_width);
+        assert_eq!(full, target);
+        assert_eq!(label, "https://…@example.com:8443/report.md?…#…");
+
+        let short = "https://example.com/report.md?a=1#heading";
+        let (full, label) = context_target_text(short, 48.0, grapheme_width);
+        assert_eq!(full, short);
+        assert_eq!(label, short);
+    }
+
+    #[test]
+    fn context_target_elision_keeps_graphemes_and_escape_sequences_whole() {
+        let target = format!(
+            "/root/{}/e\u{301}\t\u{202e}.md",
+            "\u{1f469}\u{200d}\u{1f52c}".repeat(40)
+        );
+        let parts = context_target_parts(&target);
+        let full: String = parts.iter().map(Cow::as_ref).collect();
+        let mut boundaries = vec![0];
+        for part in &parts {
+            boundaries.push(boundaries.last().unwrap() + part.len());
+        }
+        for width in 0..60 {
+            let (actual_full, label) = context_target_text(&target, width as f32, grapheme_width);
+            assert_eq!(actual_full, full);
+            assert!(grapheme_width(&label) <= width as f32);
+            if label.is_empty() || label == full {
+                continue;
+            }
+            let (head, tail) = label.split_once('…').unwrap();
+            assert!(full.starts_with(head));
+            assert!(full.ends_with(tail));
+            assert!(boundaries.contains(&head.len()));
+            assert!(boundaries.contains(&(full.len() - tail.len())));
+        }
+    }
+
+    #[test]
+    fn context_target_galleys_are_single_line_unjustified_and_width_bounded() {
+        fn text_galleys(shape: &egui::Shape, output: &mut Vec<Arc<egui::Galley>>) {
+            match shape {
+                egui::Shape::Text(text) => output.push(text.galley.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text_galleys(shape, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let target = format!(
+            "deploy@host · /srv/{}/report  final.md",
+            "long-directory/".repeat(20)
+        );
+        for scale in [1.0, 1.25, 2.0] {
+            for viewport_width in [200.0, 800.0] {
+                let context = egui::Context::default();
+                let mut input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(viewport_width, 600.0),
+                    )),
+                    ..Default::default()
+                };
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .native_pixels_per_point = Some(scale);
+                let mut width = 0.0;
+                let mut output = context.run_ui(input, |ui| {
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                        style_context_menu(ui, true);
+                        width = ui.available_width().min(CONTEXT_MENU_MAX_WIDTH);
+                        show_context_target(ui, &target);
+                    });
+                });
+                assert_eq!(output.pixels_per_point, scale);
+                output.textures_delta.clear();
+                let mut galleys = Vec::new();
+                for shape in &output.shapes {
+                    text_galleys(&shape.shape, &mut galleys);
+                }
+                assert_eq!(galleys.len(), 1);
+                let galley = &galleys[0];
+                assert_eq!(galley.rows.len(), 1, "scale={scale}");
+                assert!(!galley.job.justify);
+                assert!(galley.size().x <= width, "scale={scale}, width={width}");
+                assert!(galley.text().contains('…'));
+                assert!(galley.text().ends_with("final.md"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod history_overlay_tests {
+    use super::*;
+
+    #[test]
+    fn scrollbar_thumb_maps_oldest_and_latest_without_consuming_grid_width() {
+        let viewport = Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(400.0, 200.0));
+        let latest = scrollbar_geometry(viewport, 20, 80, 0).unwrap();
+        let oldest = scrollbar_geometry(viewport, 20, 80, 80).unwrap();
+
+        assert_eq!(latest.hit_track.right(), viewport.right());
+        assert_eq!(latest.hit_track.width(), 6.0);
+        assert_eq!(latest.visual_track.width(), 3.0);
+        assert_eq!(latest.thumb.bottom(), viewport.bottom());
+        assert_eq!(oldest.thumb.top(), viewport.top());
+        assert_eq!(latest.thumb.height(), 40.0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_has_a_practical_minimum() {
+        let viewport = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 100.0));
+        let geometry = scrollbar_geometry(viewport, 10, 10_000, 5_000).unwrap();
+        assert_eq!(geometry.thumb.height(), 24.0);
+        assert!(scrollbar_geometry(viewport, 10, 0, 0).is_none());
+    }
+
+    #[test]
+    fn scaled_scroll_rows_preserves_a_slow_clickstop_instead_of_flooring_every_event_to_one() {
+        // Regression test: "Very slow" (0.1x) previously had no effect at
+        // all on trackpad-style scrolling, because each wheel event's
+        // single-event row count was rounded back up to a minimum of one
+        // row regardless of the multiplier. With a fractional carry, ten
+        // consecutive one-row events at 0.1x should move a total of one
+        // row, not ten.
+        let mut carry = 0.0f32;
+        let mut total_rows = 0usize;
+        for _ in 0..10 {
+            total_rows += scaled_scroll_rows(1.0, 0.1, &mut carry);
+        }
+        assert_eq!(total_rows, 1);
+
+        // The next nine events should still produce nothing (0.1 * 10 == 1
+        // exactly lands the carry back at 0.0, restarting the cycle).
+        for _ in 0..9 {
+            assert_eq!(scaled_scroll_rows(1.0, 0.1, &mut carry), 0);
+        }
+        assert_eq!(scaled_scroll_rows(1.0, 0.1, &mut carry), 1);
+    }
+
+    #[test]
+    fn scaled_scroll_rows_at_normal_multiplier_moves_every_event_immediately() {
+        let mut carry = 0.0f32;
+        assert_eq!(scaled_scroll_rows(3.0, 1.0, &mut carry), 3);
+        assert_eq!(carry, 0.0);
+        assert_eq!(scaled_scroll_rows(1.0, 1.0, &mut carry), 1);
+    }
+
+    #[test]
+    fn scaled_scroll_rows_at_fast_multiplier_still_moves_every_event() {
+        let mut carry = 0.0f32;
+        assert_eq!(scaled_scroll_rows(1.0, 1.75, &mut carry), 1);
+        assert!((carry - 0.75).abs() < 1e-6);
+        assert_eq!(scaled_scroll_rows(1.0, 1.75, &mut carry), 2);
+        assert!((carry - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sub_row_point_wheel_tail_does_not_force_a_delayed_jump() {
+        let mut carry = 0.0f32;
+        for expected_carry in [0.25, 0.5, 0.75] {
+            assert_eq!(scaled_scroll_rows(0.25, 1.0, &mut carry), 0);
+            assert!((carry - expected_carry).abs() < 1e-6);
+        }
+        assert_eq!(scaled_scroll_rows(0.25, 1.0, &mut carry), 1);
+        assert_eq!(carry, 0.0);
+    }
+
+    #[test]
+    fn wheel_units_preserve_fractional_movement_before_accumulation() {
+        assert_eq!(
+            wheel_delta_rows(egui::MouseWheelUnit::Point, 4.0, 16.0, 20),
+            0.25
+        );
+        assert_eq!(
+            wheel_delta_rows(egui::MouseWheelUnit::Line, 0.25, 16.0, 20),
+            0.25
+        );
+        assert_eq!(
+            wheel_delta_rows(egui::MouseWheelUnit::Page, 0.5, 16.0, 20),
+            10.0
+        );
+    }
+
+    #[test]
+    fn deferred_paste_requests_preserve_multiplicity_for_application_policy() {
+        let mut view = TerminalView::default();
+        view.pending_paste_requests
+            .push_back("first\nsecond".into());
+        view.pending_paste_requests.push_back("later".into());
+
+        assert_eq!(
+            view.take_paste_requests(),
+            vec!["first\nsecond".to_owned(), "later".to_owned()]
+        );
+        assert!(view.take_paste_requests().is_empty());
+    }
+
+    #[test]
+    fn reflowed_rescales_anchored_offset_and_clamps_to_new_history_size() {
+        // #51: an anchored viewport offset must stay roughly the same
+        // relative place in retained history after a resize reflows
+        // physical rows, rather than jumping to an unrelated raw count.
+        let mut history = HistoryViewport {
+            offset_rows: 40,
+            observed_history_rows: 100,
+            unseen_output: false,
+        };
+
+        // Reflow to a wider terminal that halves the physical row count:
+        // the anchored offset should rescale proportionally (40/100 -> ~20).
+        history.reflowed(100, 50, None);
+        assert_eq!(history.offset_rows, 20);
+        assert_eq!(history.observed_history_rows, 50);
+
+        // Reflow that shrinks retained history below the rescaled offset
+        // must clamp rather than leave a stale, out-of-range position.
+        history.reflowed(50, 5, None);
+        assert!(history.offset_rows <= 5);
+    }
+
+    #[test]
+    fn reflowed_uses_the_mapped_top_logical_position_when_available() {
+        let mut history = HistoryViewport {
+            offset_rows: 40,
+            observed_history_rows: 100,
+            unseen_output: false,
+        };
+
+        history.reflowed(100, 50, Some(12));
+
+        assert_eq!(history.offset_rows, 38);
+        assert_eq!(history.observed_history_rows, 50);
+    }
+
+    #[test]
+    fn reflowed_leaves_following_viewport_untouched() {
+        // A viewport that is not anchored (offset 0, i.e. "following
+        // latest") must remain following after reflow instead of being
+        // pulled into history.
+        let mut history = HistoryViewport::default();
+        history.reflowed(100, 40, None);
+        assert_eq!(history.offset_rows, 0);
+        assert_eq!(history.observed_history_rows, 40);
+    }
+
+    #[test]
+    fn sync_clamps_anchored_offset_when_eviction_shrinks_retained_history() {
+        // #51: when eviction removes the rows an anchored offset pointed
+        // into, the viewport must clamp to the nearest retained position
+        // (deterministic fallback) instead of tracking a now-invalid index.
+        let dimensions = festerm_core::Dimensions::new(4, 2).expect("4x2 is a valid terminal size");
+        let mut terminal = Terminal::with_scrollback_limit(dimensions, 1024)
+            .expect("small scrollback limit is valid");
+        for line in 1..=8 {
+            terminal.ingest(format!("line{line}\r\n").as_bytes());
+        }
+        let rows_before_more_output = terminal.scrollback_stats().physical_rows();
+
+        let mut history = HistoryViewport {
+            offset_rows: rows_before_more_output,
+            observed_history_rows: rows_before_more_output,
+            unseen_output: false,
+        };
+
+        // Push enough additional output to force eviction of older rows.
+        for line in 9..=64 {
+            terminal.ingest(format!("line{line}\r\n").as_bytes());
+        }
+        assert!(
+            terminal.scrollback_stats().evicted_lines() > 0,
+            "the tiny scrollback limit must have forced eviction"
+        );
+
+        history.sync(&terminal);
+
+        let rows_after = terminal.scrollback_stats().physical_rows();
+        assert!(
+            history.offset_rows <= rows_after,
+            "an anchored offset must clamp to retained history after eviction"
+        );
+    }
+
+    #[test]
+    fn live_screen_visibility_distinguishes_history_and_alternate_screen() {
+        let mut terminal = Terminal::new(festerm_core::Dimensions::new(8, 2).unwrap()).unwrap();
+        terminal.ingest(b"old\r\nscreen\r\nsecret");
+        let mut view = TerminalView::default();
+        assert!(view.shows_live_screen(&terminal));
+        view.reveal_document_row(&terminal, 0);
+        assert!(!view.shows_live_screen(&terminal));
+        terminal.ingest(b"\x1b[?1049h");
+        assert!(view.shows_live_screen(&terminal));
+    }
+
+    #[test]
+    fn recording_refuses_a_palette_that_does_not_match_the_visible_view() {
+        let mut terminal = Terminal::new(Dimensions::new(12, 2).unwrap()).unwrap();
+        terminal.ingest(b"\x1b[38;2;17;22;30msecret");
+        let view = TerminalView::default();
+        assert!(view.validate_recording_view(&terminal).is_ok());
+
+        terminal.set_color_scheme(festerm_core::ColorScheme::new(
+            festerm_core::ColorScheme::DEFAULT_FOREGROUND,
+            festerm_core::Rgb::new(0, 0, 0),
+            festerm_core::ColorScheme::DEFAULT_FOREGROUND,
+            festerm_core::ColorScheme::DEFAULT_ANSI,
+        ));
+        assert!(view
+            .validate_recording_view(&terminal)
+            .unwrap_err()
+            .contains("colors do not match"));
+    }
+
+    #[test]
+    fn selected_text_returns_none_without_an_active_selection() {
+        let dimensions = festerm_core::Dimensions::new(8, 1).expect("8x1 is a valid terminal size");
+        let terminal = Terminal::new(dimensions).expect("valid terminal");
+        let view = TerminalView::default();
+
+        assert_eq!(view.selected_text(&terminal), None);
+        assert_eq!(view.selected_text_with_limit(&terminal, 0), Ok(None));
+    }
+
+    #[test]
+    fn selected_text_returns_the_highlighted_text() {
+        let dimensions = festerm_core::Dimensions::new(8, 1).expect("8x1 is a valid terminal size");
+        let mut terminal = Terminal::new(dimensions).expect("valid terminal");
+        terminal.ingest(b"selected");
+        let mut view = TerminalView::default();
+        view.selection
+            .begin(crate::geometry::CellPosition { column: 0, row: 0 });
+        view.selection
+            .extend(crate::geometry::CellPosition { column: 3, row: 0 });
+        view.selection.finish();
+
+        assert_eq!(view.selected_text(&terminal), Some("sele".to_owned()));
+    }
+
+    #[test]
+    fn bounded_selection_text_routes_history_smart_and_frozen_rectangle_requests() {
+        let mut terminal = Terminal::new(festerm_core::Dimensions::new(8, 2).unwrap()).unwrap();
+        terminal.ingest("界e\u{301}.\r\nnew\r\nlive".as_bytes());
+        let mut view = TerminalView::default();
+        view.history.sync(&terminal);
+        view.history.offset_rows = terminal.scrollback_stats().physical_rows();
+        let snapshot =
+            TerminalSnapshot::from_terminal_viewport(&terminal, view.history.offset_rows);
+        let first = CellPosition { column: 0, row: 0 };
+        let last = CellPosition { column: 2, row: 0 };
+        view.selection
+            .begin_at(first, snapshot.content_position(first).unwrap());
+        view.selection
+            .extend_at(last, snapshot.content_position(last).unwrap());
+        view.selection.finish();
+        let expected = "界e\u{301}";
+        for offset in [0, view.history.offset_rows] {
+            view.history.offset_rows = offset;
+            assert_eq!(
+                view.selected_text_with_limit(&terminal, expected.len()),
+                Ok(Some(expected.to_owned()))
+            );
+            assert_eq!(
+                view.selected_text_with_limit(&terminal, expected.len() - 1),
+                Err(SelectedTextError::MaxBytesExceeded)
+            );
+        }
+
+        view.history.offset_rows = terminal.scrollback_stats().physical_rows();
+        view.smart_keyboard_hit = Some(first);
+        view.smart_select_at_target(&terminal, crate::SmartSelectionScope::Sentence);
+        assert_eq!(
+            view.selected_text_with_limit(&terminal, expected.len() + 1),
+            Ok(Some(format!("{expected}.")))
+        );
+        assert_eq!(
+            view.selected_text_with_limit(&terminal, expected.len()),
+            Err(SelectedTextError::MaxBytesExceeded)
+        );
+
+        view.begin_rectangle_copy(&terminal, true).unwrap();
+        assert_eq!(view.selected_text_with_limit(&terminal, 0), Ok(None));
+        let copy = view.rectangle_copy.as_mut().unwrap();
+        copy.primary_press(first);
+        copy.primary_move(last);
+        copy.primary_release();
+        terminal.ingest(b"\x1b[?1049hchanged");
+        terminal
+            .resize(festerm_core::Dimensions::new(4, 4).unwrap())
+            .unwrap();
+        assert_eq!(
+            view.selected_text_with_limit(&terminal, expected.len()),
+            Ok(Some(expected.to_owned()))
+        );
+        assert_eq!(
+            view.selected_text_with_limit(&terminal, expected.len() - 1),
+            Err(SelectedTextError::MaxBytesExceeded)
+        );
+        assert_eq!(view.selected_text(&terminal).as_deref(), Some(expected));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use egui::Vec2;
+    use egui_kittest::{kittest::Queryable, Harness};
+    use festerm_core::{Dimensions, Terminal};
+
+    #[derive(Default)]
+    struct Sink(Vec<Vec<u8>>);
+
+    impl EncodedInputSink for Sink {
+        fn record_encoded_input(&mut self, bytes: &[u8]) {
+            self.0.push(bytes.to_vec());
+        }
+    }
+
+    fn terminal(columns: usize, rows: usize) -> Terminal {
+        Terminal::new(Dimensions::new(columns, rows).expect("valid test size"))
+            .expect("test terminal allocation")
+    }
+
+    struct HeadlessViewState {
+        view: TerminalView,
+        terminal: Terminal,
+        sink: Sink,
+        copied: Vec<String>,
+        focus_thief: bool,
+    }
+
+    impl HeadlessViewState {
+        fn new() -> Self {
+            Self {
+                view: TerminalView::default(),
+                terminal: terminal(80, 24),
+                sink: Sink::default(),
+                copied: Vec::new(),
+                focus_thief: false,
+            }
+        }
+
+        fn with_terminal(terminal: Terminal) -> Self {
+            Self {
+                view: TerminalView::default(),
+                terminal,
+                sink: Sink::default(),
+                copied: Vec::new(),
+                focus_thief: false,
+            }
+        }
+    }
+
+    fn rectangle_copy_harness() -> Harness<'static, HeadlessViewState> {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                    state.copied.extend(ui.ctx().output(|output| {
+                        output
+                            .commands
+                            .iter()
+                            .filter_map(|command| match command {
+                                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    }));
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+        let state = harness.state_mut();
+        state
+            .terminal
+            .ingest(b"\x1b[Hfirst  \r\nsecond \x1b[?1003h\x1b[?1006h");
+        state
+            .view
+            .begin_rectangle_copy(&state.terminal, true)
+            .unwrap();
+        harness.run();
+        harness
+    }
+
+    fn smart_selection_harness() -> Harness<'static, HeadlessViewState> {
+        smart_selection_harness_with_read_only(false)
+    }
+
+    fn smart_selection_harness_with_read_only(
+        read_only: bool,
+    ) -> Harness<'static, HeadlessViewState> {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                move |ui, state: &mut HeadlessViewState| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            keyboard_input_enabled: !read_only,
+                            paste_available: false,
+                            ..Default::default()
+                        },
+                    );
+                    if state.focus_thief {
+                        ui.button("Focus thief").request_focus();
+                    }
+                    state.copied.extend(ui.ctx().output(|output| {
+                        output
+                            .commands
+                            .iter()
+                            .filter_map(|command| {
+                                if let egui::OutputCommand::CopyText(text) = command {
+                                    Some(text.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    }));
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+        let state = harness.state_mut();
+        state
+            .terminal
+            .ingest(b"\x1b[2J\x1b[HFirst sentence. Next one.\r\nSecond paragraph.\x1b[H\x1b[?1003h\x1b[?1006h");
+        harness.run();
+        harness
+    }
+
+    fn smart_key(harness: &mut Harness<'static, HeadlessViewState>, key: egui::Key) {
+        for pressed in [true, false] {
+            harness.event(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: if pressed {
+                    egui::Modifiers {
+                        ctrl: true,
+                        alt: true,
+                        shift: true,
+                        ..Default::default()
+                    }
+                } else {
+                    egui::Modifiers::NONE
+                },
+            });
+            harness.step();
+        }
+    }
+
+    #[test]
+    fn smart_selection_keyboard_is_local_deliberate_and_cancellable() {
+        let mut harness = smart_selection_harness();
+        smart_key(&mut harness, egui::Key::S);
+        assert_eq!(
+            harness
+                .state()
+                .view
+                .selected_text(&harness.state().terminal)
+                .as_deref(),
+            Some("First sentence.")
+        );
+        assert!(harness.state().copied.is_empty());
+        assert!(
+            harness.state().sink.0.is_empty(),
+            "including mouse reporting and key releases"
+        );
+        harness.event(egui::Event::Copy);
+        harness.run();
+        assert_eq!(harness.state().copied, vec!["First sentence."]);
+        assert!(harness.state().sink.0.is_empty());
+        smart_key(&mut harness, egui::Key::ArrowRight);
+        smart_key(&mut harness, egui::Key::P);
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert!(harness.state().view.selection.range().is_none());
+        assert_eq!(harness.state().copied.len(), 1);
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn smart_selection_held_cancel_never_leaks_key_repeat_or_release() {
+        let mut harness = smart_selection_harness();
+        smart_key(&mut harness, egui::Key::S);
+        for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
+            harness.event(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed,
+                repeat,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+            assert!(
+                harness.state().sink.0.is_empty(),
+                "pressed={pressed}, repeat={repeat}, encoded={:?}",
+                harness.state().sink.0
+            );
+        }
+        assert!(harness.state().view.selection.range().is_none());
+        assert!(harness.state().sink.0.is_empty());
+        assert!(harness.state().copied.is_empty());
+    }
+
+    #[test]
+    fn smart_selection_shortcuts_never_claim_text_or_ime_payloads() {
+        let mut harness = smart_selection_harness();
+        harness.input_mut().events.extend([
+            egui::Event::Key {
+                key: egui::Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            },
+            egui::Event::Text("ß".to_owned()),
+        ]);
+        harness.step();
+        assert_eq!(
+            harness.state().sink.0.concat(),
+            "ß".as_bytes(),
+            "AltGr/Option payload"
+        );
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        harness.input_mut().events.extend([
+            egui::Event::Key {
+                key: egui::Key::P,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            },
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "´".to_owned(),
+                active_range_chars: Some(0..1),
+            }),
+            egui::Event::Key {
+                key: egui::Key::P,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Ime(egui::ImeEvent::Commit("ṕ".to_owned())),
+        ]);
+        harness.step();
+        assert_eq!(
+            harness.state().sink.0.concat(),
+            "ßṕ".as_bytes(),
+            "IME/dead-key payload"
+        );
+
+        harness.input_mut().events.extend([
+            egui::Event::Key {
+                key: egui::Key::B,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            },
+            egui::Event::Key {
+                key: egui::Key::B,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("β".to_owned()),
+        ]);
+        harness.step();
+        assert_eq!(
+            harness.state().sink.0.concat(),
+            "ßṕβ".as_bytes(),
+            "same-batch text remains terminal input"
+        );
+
+        harness.input_mut().events.extend([
+            egui::Event::Key {
+                key: egui::Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("s".to_owned()),
+        ]);
+        harness.step();
+        assert_eq!(harness.state().sink.0.concat(), "ßṕβs".as_bytes());
+        assert!(harness.state().copied.is_empty());
+    }
+
+    #[test]
+    fn smart_selection_ime_termination_and_unrelated_commit_reach_terminal_input() {
+        let mut termination = smart_selection_harness();
+        termination.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "x".to_owned(),
+            active_range_chars: None,
+        }));
+        termination.run();
+        assert!(termination.state().view.keyboard.ime_composing());
+        termination.event(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        termination.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: String::new(),
+            active_range_chars: None,
+        }));
+        termination.run();
+        assert!(!termination.state().view.keyboard.ime_composing());
+        termination.event(egui::Event::Text("ü".to_owned()));
+        termination.run();
+        assert_eq!(termination.state().sink.0.concat(), "ü".as_bytes());
+        assert!(termination.state().view.selection.range().is_none());
+
+        let mut commit = smart_selection_harness();
+        commit.event(egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        commit.run();
+        commit.event(egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        commit.run();
+        commit.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "x".to_owned(),
+            active_range_chars: None,
+        }));
+        commit.run();
+        commit.event(egui::Event::Ime(egui::ImeEvent::Commit("界".to_owned())));
+        commit.step();
+        assert!(!commit.state().view.keyboard.ime_composing());
+        assert_eq!(commit.state().sink.0.concat(), "界".as_bytes());
+        assert!(commit.state().view.selection.range().is_none());
+    }
+
+    #[test]
+    fn smart_selection_shortcut_ime_termination_order_reaches_terminal_input() {
+        let smart_modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        let smart_press = || egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: smart_modifiers,
+        };
+        let smart_release = || egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        let mut commit = smart_selection_harness();
+        commit.input_mut().events.extend([
+            smart_press(),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "测试".to_owned(),
+                active_range_chars: Some(0..2),
+            }),
+            smart_release(),
+            egui::Event::Text("β".to_owned()),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: String::new(),
+                active_range_chars: None,
+            }),
+        ]);
+        commit.step();
+        assert_eq!(commit.state().sink.0.concat(), "β".as_bytes());
+        assert!(!commit.state().view.keyboard.ime_composing());
+
+        commit.event(egui::Event::Ime(egui::ImeEvent::Commit("测试".to_owned())));
+        commit.run();
+        assert_eq!(commit.state().sink.0.concat(), "β测试".as_bytes());
+
+        let mut cancelled = smart_selection_harness();
+        cancelled.input_mut().events.extend([
+            smart_press(),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ce".to_owned(),
+                active_range_chars: Some(0..2),
+            }),
+            smart_release(),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: String::new(),
+                active_range_chars: None,
+            }),
+        ]);
+        cancelled.step();
+        cancelled.run();
+        cancelled.event(egui::Event::Ime(egui::ImeEvent::Commit("界".to_owned())));
+        cancelled.run();
+        assert_eq!(cancelled.state().sink.0.concat(), "界".as_bytes());
+    }
+
+    #[test]
+    fn smart_selection_shortcut_ime_payload_crosses_batches_as_terminal_input() {
+        let mut harness = smart_selection_harness();
+        harness.event(egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        harness.run();
+        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "´".to_owned(),
+            active_range_chars: Some(0..1),
+        }));
+        harness.run();
+        harness.event(egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        harness.event(egui::Event::Ime(egui::ImeEvent::Commit("ṕ".to_owned())));
+        harness.run();
+
+        assert_eq!(harness.state().sink.0.concat(), "ṕ".as_bytes());
+    }
+
+    #[test]
+    fn smart_selection_unrelated_keypress_and_text_reach_terminal_input() {
+        for same_batch in [true, false] {
+            let mut harness = smart_selection_harness();
+            harness.event(egui::Event::Key {
+                key: egui::Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            });
+            harness.run();
+            harness.event(egui::Event::Key {
+                key: egui::Key::X,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            if !same_batch {
+                harness.run();
+            }
+            harness.event(egui::Event::Text("x".to_owned()));
+            harness.run();
+
+            assert_eq!(
+                harness.state().sink.0.concat(),
+                b"x",
+                "same_batch={same_batch}"
+            );
+        }
+    }
+
+    #[test]
+    fn smart_selection_duplicate_empty_preedits_do_not_claim_later_composition() {
+        let mut harness = smart_selection_harness();
+        harness.input_mut().events.extend([
+            egui::Event::Key {
+                key: egui::Key::P,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            },
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ce".to_owned(),
+                active_range_chars: Some(0..2),
+            }),
+            egui::Event::Key {
+                key: egui::Key::P,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: String::new(),
+                active_range_chars: Some(0..0),
+            }),
+        ]);
+        harness.step();
+        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: String::new(),
+            active_range_chars: None,
+        }));
+        harness.run();
+
+        harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "xin".to_owned(),
+            active_range_chars: Some(0..3),
+        }));
+        harness.run();
+        harness.event(egui::Event::Ime(egui::ImeEvent::Commit("新".to_owned())));
+        harness.run();
+        assert_eq!(harness.state().sink.0.concat(), "新".as_bytes());
+    }
+
+    #[test]
+    fn smart_selection_render_gap_clears_held_shortcut_ownership() {
+        let mut harness = smart_selection_harness();
+        {
+            let view = &mut harness.state_mut().view;
+            view.smart_held_keys.push(egui::Key::P);
+            view.last_rendered_frame = Some(0);
+        }
+        harness.run();
+        assert!(harness.state().view.smart_held_keys.is_empty());
+
+        harness.event(egui::Event::Text("x".to_owned()));
+        harness.run();
+        assert_eq!(harness.state().sink.0.concat(), b"x");
+    }
+
+    #[test]
+    fn smart_selection_shortcut_release_does_not_claim_later_text() {
+        let mut harness = smart_selection_harness();
+        harness.event(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        harness.run();
+        assert!(harness.state().sink.0.is_empty());
+        harness.event(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        harness.event(egui::Event::Text("€".to_owned()));
+        harness.run();
+        assert_eq!(harness.state().sink.0.concat(), "€".as_bytes());
+    }
+
+    #[test]
+    fn smart_selection_arrow_repeat_moves_without_repeating_one_shot_shortcuts() {
+        let mut harness = smart_selection_harness();
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        harness.event(egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        harness.run();
+        let first = harness.state().view.smart_keyboard_hit.unwrap();
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers,
+        });
+        harness.run();
+        let repeated = harness.state().view.smart_keyboard_hit.unwrap();
+        assert_eq!(repeated.column, first.column + 1);
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        harness.run();
+        let selected = harness.state().view.selection.content_endpoints();
+        harness.event(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers,
+        });
+        harness.run();
+        assert_eq!(harness.state().view.selection.content_endpoints(), selected);
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn smart_selection_uses_terminal_ownership_despite_widget_focus_mismatch() {
+        let mut harness = smart_selection_harness();
+        harness.state_mut().focus_thief = true;
+        harness.run();
+
+        smart_key(&mut harness, egui::Key::S);
+
+        assert_eq!(
+            harness
+                .state()
+                .view
+                .selected_text(&harness.state().terminal)
+                .as_deref(),
+            Some("First sentence.")
+        );
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn smart_selection_focus_loss_releases_held_shortcut_ownership() {
+        let mut harness = smart_selection_harness();
+        harness.event(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+        });
+        harness.run();
+        harness.event(egui::Event::WindowFocused(false));
+        harness.run();
+        harness.event(egui::Event::WindowFocused(true));
+        harness.run();
+        harness.event(egui::Event::Key {
+            key: egui::Key::S,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::Text("s".to_owned()));
+        harness.run();
+
+        assert_eq!(harness.state().sink.0.concat(), b"s");
+    }
+
+    #[test]
+    fn smart_selection_refusal_is_transient_and_does_not_hijack_escape() {
+        let mut harness = smart_selection_harness();
+        {
+            let state = harness.state_mut();
+            state
+                .view
+                .selection
+                .begin(CellPosition { column: 0, row: 0 });
+            state
+                .view
+                .selection
+                .extend(CellPosition { column: 4, row: 0 });
+            state.view.selection.finish();
+            state.view.request_smart_selection(
+                TerminalSnapshot::from_terminal(&state.terminal),
+                Some(CellPosition { column: 1, row: 5 }),
+                crate::SmartSelectionScope::Paragraph,
+            );
+            assert_eq!(
+                state.view.selected_text(&state.terminal).as_deref(),
+                Some("First")
+            );
+            assert!(state.view.smart_selection_feedback_expires_at.is_some());
+        }
+        harness.event(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert_eq!(harness.state().sink.0.concat(), b"\x1b");
+    }
+
+    #[test]
+    fn smart_selection_keyboard_target_can_leave_an_ordinary_selection() {
+        let mut harness = smart_selection_harness();
+        {
+            let state = harness.state_mut();
+            state
+                .view
+                .selection
+                .begin(CellPosition { column: 0, row: 0 });
+            state
+                .view
+                .selection
+                .extend(CellPosition { column: 4, row: 0 });
+            state.view.selection.finish();
+        }
+        smart_key(&mut harness, egui::Key::ArrowDown);
+        assert_eq!(
+            harness.state().view.smart_keyboard_hit,
+            Some(CellPosition { column: 4, row: 1 })
+        );
+        smart_key(&mut harness, egui::Key::B);
+        assert_eq!(
+            harness
+                .state()
+                .view
+                .selected_text(&harness.state().terminal)
+                .as_deref(),
+            Some("Second paragraph.")
+        );
+        assert!(harness.state().sink.0.is_empty());
+        assert!(harness.state().copied.is_empty());
+    }
+
+    #[test]
+    fn smart_selection_same_batch_move_selects_the_moved_target() {
+        let mut harness = smart_selection_harness();
+        harness.state_mut().view.smart_keyboard_hit = Some(CellPosition { column: 4, row: 0 });
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        harness.input_mut().events.extend([
+            egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+            egui::Event::Key {
+                key: egui::Key::B,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+        ]);
+        harness.step();
+
+        assert_eq!(
+            harness
+                .state()
+                .view
+                .selected_text(&harness.state().terminal)
+                .as_deref(),
+            Some("Second paragraph.")
+        );
+        assert_eq!(
+            harness.state().view.smart_keyboard_hit,
+            Some(CellPosition { column: 4, row: 1 })
+        );
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn rectangle_copy_retires_smart_feedback_and_keyboard_target() {
+        let terminal = terminal(8, 2);
+        let mut view = TerminalView::default();
+        view.request_smart_selection(
+            TerminalSnapshot::from_terminal(&terminal),
+            Some(CellPosition { column: 0, row: 0 }),
+            crate::SmartSelectionScope::Sentence,
+        );
+        view.smart_keyboard_hit = Some(CellPosition { column: 0, row: 0 });
+
+        view.begin_rectangle_copy(&terminal, true).unwrap();
+
+        assert!(view.smart_selection_feedback.is_none());
+        assert!(view.smart_selection_feedback_expires_at.is_none());
+        assert!(view.smart_keyboard_hit.is_none());
+
+        view.cancel_rectangle_copy();
+        assert!(view.smart_selection_feedback.is_none());
+        assert!(view.smart_keyboard_hit.is_none());
+    }
+
+    #[test]
+    fn smart_selection_context_menu_respects_mouse_override_and_copy() {
+        let mut harness = smart_selection_harness();
+        let grid = harness.state().view.diagnostics.grid_rect.unwrap();
+        let point = grid.min + egui::vec2(20.0, 5.0);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        assert!(harness.query_by_label("Smart Select Sentence").is_none());
+        assert!(!harness.state().sink.0.is_empty());
+        harness.state_mut().sink.0.clear();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::SHIFT,
+            });
+            harness.step();
+        }
+        harness.get_by_label("Smart Select Sentence").click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .view
+                .selected_text(&harness.state().terminal)
+                .as_deref(),
+            Some("First sentence.")
+        );
+        assert!(harness.state().copied.is_empty());
+        assert!(harness.state().sink.0.is_empty());
+        harness.event(egui::Event::Copy);
+        harness.run();
+        assert_eq!(harness.state().copied, vec!["First sentence."]);
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn smart_selection_read_only_history_and_live_overwrite_are_safe() {
+        let mut harness = smart_selection_harness_with_read_only(true);
+        {
+            let state = harness.state_mut();
+            state.terminal.ingest(&b"\r\nretained row".repeat(60));
+            state.view.history.sync(&state.terminal);
+            state.view.history.offset_rows = state.terminal.scrollback_stats().physical_rows();
+            let snapshot = TerminalSnapshot::from_terminal_viewport(
+                &state.terminal,
+                state.view.history.offset_rows,
+            );
+            state.view.request_smart_selection(
+                snapshot,
+                Some(CellPosition { column: 2, row: 0 }),
+                crate::SmartSelectionScope::Sentence,
+            );
+            assert_eq!(
+                state.view.selected_text(&state.terminal).as_deref(),
+                Some("First sentence."),
+                "top={:?}, history={:?}, feedback={:?}",
+                (0..snapshot.dimensions().columns())
+                    .filter_map(|column| snapshot.cell(column, 0))
+                    .map(|cell| cell.text())
+                    .collect::<String>(),
+                state.terminal.scrollback_stats(),
+                state.view.smart_selection_feedback
+            );
+        }
+        harness.event(egui::Event::Copy);
+        harness.run();
+        assert_eq!(harness.state().copied, vec!["First sentence."]);
+        {
+            let state = harness.state_mut();
+            state.view.history.offset_rows = 0;
+            state.terminal.ingest(b"\x1b[Horiginal");
+            let snapshot = TerminalSnapshot::from_terminal(&state.terminal);
+            state.view.request_smart_selection(
+                snapshot,
+                Some(CellPosition { column: 2, row: 0 }),
+                crate::SmartSelectionScope::Sentence,
+            );
+            state.terminal.ingest(b"\x1b[Hchanged!");
+        }
+        harness.run();
+        assert!(
+            harness.state().view.selection.range().is_none(),
+            "the production frame removes an overwritten highlight"
+        );
+        harness.event(egui::Event::Copy);
+        harness.run();
+        assert_eq!(
+            harness.state().copied.len(),
+            1,
+            "changed cells cannot be copied as the old inference"
+        );
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn smart_selection_frame_revalidation_clears_eviction_resize_and_screen_changes() {
+        let mut harness = smart_selection_harness_with_read_only(true);
+        {
+            let state = harness.state_mut();
+            state.terminal.ingest(&b"\r\nretained row".repeat(60));
+            state.view.history.sync(&state.terminal);
+            state.view.history.offset_rows = state.terminal.scrollback_stats().physical_rows();
+            state.view.request_smart_selection(
+                TerminalSnapshot::from_terminal_viewport(
+                    &state.terminal,
+                    state.view.history.offset_rows,
+                ),
+                Some(CellPosition { column: 2, row: 0 }),
+                crate::SmartSelectionScope::Sentence,
+            );
+            state.terminal.set_scrollback_limit(1);
+        }
+        harness.run();
+        assert!(
+            harness.state().view.selection.range().is_none(),
+            "eviction removes state and highlight"
+        );
+
+        {
+            let state = harness.state_mut();
+            state.view.history.latest();
+            state.terminal.ingest(b"\x1b[2J\x1b[Hsame text");
+            state.view.request_smart_selection(
+                TerminalSnapshot::from_terminal(&state.terminal),
+                Some(CellPosition { column: 2, row: 0 }),
+                crate::SmartSelectionScope::Sentence,
+            );
+        }
+        harness.set_size(Vec2::new(420.0, 320.0));
+        harness.run();
+        assert!(
+            harness.state().view.selection.range().is_none(),
+            "resize/reflow removes state and highlight"
+        );
+
+        {
+            let state = harness.state_mut();
+            state.terminal.ingest(b"\x1b[2J\x1b[Hsame text");
+            state.view.request_smart_selection(
+                TerminalSnapshot::from_terminal(&state.terminal),
+                Some(CellPosition { column: 2, row: 0 }),
+                crate::SmartSelectionScope::Sentence,
+            );
+            state.terminal.ingest(b"\x1b[?1049hsame text\x1b[?1049l");
+        }
+        harness.run();
+        assert!(
+            harness.state().view.selection.range().is_none(),
+            "hidden alternate transitions remove state and highlight"
+        );
+    }
+
+    #[test]
+    fn smart_selection_passive_invalidation_feedback_expires_without_input() {
+        let mut harness = smart_selection_harness_with_read_only(true);
+        {
+            let state = harness.state_mut();
+            state.view.request_smart_selection(
+                TerminalSnapshot::from_terminal(&state.terminal),
+                Some(CellPosition { column: 2, row: 0 }),
+                crate::SmartSelectionScope::Sentence,
+            );
+            state.terminal.ingest(b"\x1b[Hchanged!");
+        }
+        harness.run();
+        assert!(harness
+            .state()
+            .view
+            .smart_selection_feedback
+            .as_deref()
+            .is_some_and(|feedback| feedback.contains("cancelled")));
+        assert!(harness
+            .state()
+            .view
+            .smart_selection_feedback_expires_at
+            .is_some());
+
+        harness.state_mut().view.smart_selection_feedback_expires_at =
+            Some(Instant::now() - Duration::from_millis(1));
+        harness.run();
+        assert!(harness.state().view.smart_selection_feedback.is_none());
+        assert!(harness
+            .state()
+            .view
+            .smart_selection_feedback_expires_at
+            .is_none());
+    }
+
+    fn rectangle_copy_point(
+        harness: &Harness<'static, HeadlessViewState>,
+        column: usize,
+        row: usize,
+    ) -> egui::Pos2 {
+        let state = harness.state();
+        let grid = state.view.diagnostics.grid_rect.unwrap();
+        let dimensions = state.view.rectangle_copy.as_ref().unwrap().dimensions;
+        grid.min
+            + egui::vec2(
+                (column as f32 + 0.5) * grid.width() / dimensions.columns() as f32,
+                (row as f32 + 0.5) * grid.height() / dimensions.rows() as f32,
+            )
+    }
+
+    fn rectangle_copy_click(
+        harness: &mut Harness<'static, HeadlessViewState>,
+        column: usize,
+        row: usize,
+    ) {
+        let pos = rectangle_copy_point(harness, column, row);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+    }
+
+    #[test]
+    fn rectangle_copy_view_drag_draws_across_frames_and_waits_for_copy() {
+        for reversed in [false, true] {
+            let mut harness = rectangle_copy_harness();
+            let mut points = [
+                rectangle_copy_point(&harness, 0, 0),
+                rectangle_copy_point(&harness, 6, 1),
+            ];
+            if reversed {
+                points.reverse();
+            }
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos: points[0],
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+            assert!(harness
+                .state()
+                .view
+                .selected_text(&harness.state().terminal)
+                .is_none());
+            harness
+                .input_mut()
+                .events
+                .push(egui::Event::PointerMoved(points[1]));
+            harness.step();
+            assert_eq!(
+                harness
+                    .state()
+                    .view
+                    .selected_text(&harness.state().terminal)
+                    .as_deref(),
+                Some("first\nsecond")
+            );
+            {
+                let state = harness.state_mut();
+                state.terminal.ingest(b"\x1b[Hchanged\r\nlive");
+                state.view.request_full_redraw();
+            }
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos: points[1],
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+            assert!(harness.state().view.rectangle_copy_active());
+            assert!(harness.state().copied.is_empty());
+            let hover = rectangle_copy_point(&harness, 1, 0);
+            harness
+                .input_mut()
+                .events
+                .push(egui::Event::PointerMoved(hover));
+            harness.step();
+            harness.input_mut().events.push(egui::Event::Copy);
+            harness.step();
+            assert_eq!(harness.state().copied, ["first\nsecond"]);
+            assert!(!harness.state().view.rectangle_copy_active());
+            assert!(harness.state().sink.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn rectangle_copy_view_drag_and_copy_share_one_ordered_input_batch() {
+        let mut harness = rectangle_copy_harness();
+        let anchor = rectangle_copy_point(&harness, 6, 1);
+        let opposite = rectangle_copy_point(&harness, 0, 0);
+        harness.input_mut().events.extend([
+            egui::Event::PointerButton {
+                pos: anchor,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: opposite,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Copy,
+        ]);
+        harness.step();
+        assert_eq!(harness.state().copied, ["first\nsecond"]);
+        assert!(!harness.state().view.rectangle_copy_active());
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn rectangle_copy_view_drag_clamps_owned_edges_and_ignores_outside_presses() {
+        let mut harness = rectangle_copy_harness();
+        let outside =
+            harness.state().view.diagnostics.grid_rect.unwrap().max + egui::vec2(50.0, 50.0);
+        let anchor = rectangle_copy_point(&harness, 0, 0);
+        harness.input_mut().events.extend([
+            egui::Event::PointerButton {
+                pos: outside,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerMoved(anchor),
+            egui::Event::PointerButton {
+                pos: anchor,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.step();
+        assert!(harness
+            .state()
+            .view
+            .rectangle_copy
+            .as_ref()
+            .unwrap()
+            .bounds()
+            .is_none());
+        harness.input_mut().events.extend([
+            egui::Event::PointerButton {
+                pos: anchor,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerMoved(outside),
+            egui::Event::PointerButton {
+                pos: outside,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.step();
+        let copy = harness.state().view.rectangle_copy.as_ref().unwrap();
+        assert_eq!(
+            copy.bounds(),
+            Some((
+                CellPosition { column: 0, row: 0 },
+                CellPosition {
+                    column: copy.dimensions.columns() - 1,
+                    row: copy.dimensions.rows() - 1,
+                },
+            ))
+        );
+        assert!(harness.state().copied.is_empty());
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn rectangle_copy_view_drag_ends_on_focus_or_pointer_loss() {
+        for loss in 0..3 {
+            let mut harness = rectangle_copy_harness();
+            let anchor = rectangle_copy_point(&harness, 6, 1);
+            let opposite = rectangle_copy_point(&harness, 4, 0);
+            harness.input_mut().events.extend([
+                egui::Event::PointerButton {
+                    pos: anchor,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(opposite),
+            ]);
+            harness.step();
+            let bounds = harness
+                .state()
+                .view
+                .rectangle_copy
+                .as_ref()
+                .unwrap()
+                .bounds();
+            if loss != 0 {
+                harness.input_mut().focused = false;
+                if loss == 1 {
+                    harness
+                        .input_mut()
+                        .events
+                        .push(egui::Event::WindowFocused(false));
+                }
+            } else {
+                harness.input_mut().events.push(egui::Event::PointerGone);
+            }
+            harness.step();
+            harness.input_mut().focused = true;
+            let later = rectangle_copy_point(&harness, 0, 0);
+            harness.input_mut().events.extend([
+                egui::Event::WindowFocused(true),
+                egui::Event::PointerMoved(later),
+                egui::Event::PointerButton {
+                    pos: later,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            harness.step();
+            assert_eq!(
+                harness
+                    .state()
+                    .view
+                    .rectangle_copy
+                    .as_ref()
+                    .unwrap()
+                    .bounds(),
+                bounds
+            );
+            assert!(harness.state().copied.is_empty());
+            assert!(harness.state().sink.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn rectangle_copy_view_foreground_blackout_ends_drag_without_clearing_rectangle() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, (state, blocked): &mut (HeadlessViewState, bool)| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            terminal_input_enabled: !*blocked,
+                            ..Default::default()
+                        },
+                    );
+                },
+                (HeadlessViewState::new(), false),
+            );
+        harness.run();
+        {
+            let state = &mut harness.state_mut().0;
+            state
+                .terminal
+                .ingest(b"\x1b[Hfirst\r\nsecond\x1b[?1003h\x1b[?1006h");
+            state
+                .view
+                .begin_rectangle_copy(&state.terminal, true)
+                .unwrap();
+        }
+        harness.run();
+        let grid = harness.state().0.view.diagnostics.grid_rect.unwrap();
+        let dimensions = harness
+            .state()
+            .0
+            .view
+            .rectangle_copy
+            .as_ref()
+            .unwrap()
+            .dimensions;
+        let point = |column: f32, row: f32| {
+            grid.min
+                + egui::vec2(
+                    (column + 0.5) * grid.width() / dimensions.columns() as f32,
+                    (row + 0.5) * grid.height() / dimensions.rows() as f32,
+                )
+        };
+        harness.input_mut().events.extend([
+            egui::Event::PointerButton {
+                pos: point(6.0, 1.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerMoved(point(4.0, 0.0)),
+        ]);
+        harness.step();
+        let bounds = harness
+            .state()
+            .0
+            .view
+            .rectangle_copy
+            .as_ref()
+            .unwrap()
+            .bounds();
+        harness.state_mut().1 = true;
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(point(0.0, 0.0)));
+        harness.step();
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .view
+                .rectangle_copy
+                .as_ref()
+                .unwrap()
+                .bounds(),
+            bounds
+        );
+        harness.state_mut().1 = false;
+        harness.input_mut().events.extend([
+            egui::Event::PointerMoved(point(0.0, 0.0)),
+            egui::Event::PointerButton {
+                pos: point(0.0, 0.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.step();
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .view
+                .rectangle_copy
+                .as_ref()
+                .unwrap()
+                .bounds(),
+            bounds
+        );
+        assert!(harness.state().0.view.rectangle_copy_active());
+        assert!(harness.state().0.sink.0.is_empty());
+    }
+
+    #[test]
+    fn rectangle_copy_view_drag_exit_keeps_held_mouse_input_local() {
+        for cancel in [false, true] {
+            let mut harness = rectangle_copy_harness();
+            let anchor = rectangle_copy_point(&harness, 6, 1);
+            let opposite = rectangle_copy_point(&harness, 0, 0);
+            harness.input_mut().events.extend([
+                egui::Event::PointerButton {
+                    pos: anchor,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerMoved(opposite),
+                egui::Event::Key {
+                    key: if cancel {
+                        egui::Key::Escape
+                    } else {
+                        egui::Key::Enter
+                    },
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            harness.step();
+            assert!(!harness.state().view.rectangle_copy_active());
+            assert_eq!(harness.state().copied.len(), usize::from(!cancel));
+            harness.input_mut().events.extend([
+                egui::Event::PointerMoved(anchor),
+                egui::Event::PointerButton {
+                    pos: anchor,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            harness.step();
+            assert!(harness.state().sink.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn rectangle_copy_view_freezes_cached_rows_and_redraws_live_content_on_enter() {
+        let mut harness = rectangle_copy_harness();
+        rectangle_copy_click(&mut harness, 0, 0);
+        assert!(harness
+            .state()
+            .view
+            .selected_text(&harness.state().terminal)
+            .is_none());
+        rectangle_copy_click(&mut harness, 6, 1);
+        assert_eq!(
+            harness
+                .state()
+                .view
+                .selected_text(&harness.state().terminal)
+                .as_deref(),
+            Some("first\nsecond")
+        );
+        {
+            let state = harness.state_mut();
+            state.terminal.ingest(b"\x1b[Hupdated\r\nnew row");
+            state.view.request_full_redraw();
+        }
+        harness.set_size(egui::vec2(640.0, 480.0));
+        harness.run();
+        assert_eq!(harness.state().view.cache.row(0).unwrap()[0].text(), "f");
+        assert!(harness.output().shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "FROZEN")
+        }));
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("must not reach the shell".to_owned()));
+        harness.step();
+        assert_eq!(harness.state().copied, ["first\nsecond"]);
+        assert!(!harness.state().view.rectangle_copy_active());
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("\r\n".to_owned()));
+        harness.step();
+        assert!(
+            harness.state().sink.0.is_empty(),
+            "copy and its repeat never submit Enter: {:?}",
+            harness.state().sink.0
+        );
+        assert_eq!(harness.state().view.cache.row(0).unwrap()[0].text(), "u");
+        harness.event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+        assert_eq!(
+            harness.state().sink.0.concat(),
+            b"\r",
+            "a fresh Enter resumes normal input"
+        );
+    }
+
+    #[test]
+    fn rectangle_copy_view_right_click_owns_the_whole_gesture_and_escape_cancels() {
+        for copy in [true, false] {
+            let mut harness = rectangle_copy_harness();
+            rectangle_copy_click(&mut harness, 6, 1);
+            rectangle_copy_click(&mut harness, 0, 0);
+            let pos =
+                harness.state().view.diagnostics.grid_rect.unwrap().min + egui::vec2(3.0, 3.0);
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+            assert!(
+                harness.state().view.rectangle_copy_active(),
+                "right press alone cannot copy"
+            );
+            if copy {
+                harness.input_mut().events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            } else {
+                harness.input_mut().events.push(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: Some(egui::Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness
+                .input_mut()
+                .events
+                .push(egui::Event::Paste("must not paste".to_owned()));
+            harness.step();
+            if copy {
+                assert!(
+                    harness.state().view.rectangle_copy_active(),
+                    "right-click opens a menu without copying"
+                );
+                assert!(harness.state().copied.is_empty());
+                assert!(harness.query_by_label("Paste").is_none());
+                harness.get_by_label("Copy").click();
+                harness.run();
+            }
+            assert!(!harness.state().view.rectangle_copy_active());
+            assert_eq!(harness.state().copied.len(), usize::from(copy));
+            if !copy {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.step();
+            }
+            assert!(
+                harness.state().sink.0.is_empty(),
+                "no partial mouse gesture or paste reaches the TUI: {:?}",
+                harness.state().sink.0
+            );
+        }
+    }
+
+    #[test]
+    fn rectangle_copy_view_swallows_typing_paste_wheel_and_incomplete_copy() {
+        let mut harness = rectangle_copy_harness();
+        for event in [
+            egui::Event::Text("typing".to_owned()),
+            egui::Event::Paste("clipboard".to_owned()),
+            egui::Event::Copy,
+            egui::Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 3.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ] {
+            harness.event(event);
+        }
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(harness.state().view.rectangle_copy_active());
+        assert!(harness.state().sink.0.is_empty());
+        assert!(harness
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .all(|command| !matches!(command, egui::OutputCommand::CopyText(_))));
+        assert_eq!(harness.state().view.history.offset_rows, 0);
+    }
+
+    #[test]
+    fn rectangle_copy_view_menu_copies_whole_frozen_viewport_without_corners() {
+        let mut harness = rectangle_copy_harness();
+        let expected = harness
+            .state()
+            .view
+            .rectangle_copy
+            .as_ref()
+            .unwrap()
+            .context_copy_text(&harness.state().view.cache);
+        harness
+            .state_mut()
+            .terminal
+            .ingest(b"\x1b[2J\x1b[Hnew live output");
+        let pos = rectangle_copy_point(&harness, 1, 0);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        assert!(harness.state().view.rectangle_copy_active());
+        assert!(harness.state().copied.is_empty());
+        harness.get_by_label("Copy").click();
+        harness.run();
+        assert_eq!(harness.state().copied, vec![expected]);
+        assert!(!harness.state().view.rectangle_copy_active());
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn rectangle_copy_view_menu_limits_link_actions_to_frozen_rectangle() {
+        let mut harness = rectangle_copy_harness();
+        {
+            let state = harness.state_mut();
+            state.view.cancel_rectangle_copy();
+            state
+                .terminal
+                .ingest(b"\x1b[2J\x1b[H\x1b]8;;https://example.com/frozen\x1b\\link\x1b]8;;\x1b\\");
+            state
+                .view
+                .begin_rectangle_copy(&state.terminal, true)
+                .unwrap();
+            state
+                .terminal
+                .ingest(b"\x1b[2J\x1b[H\x1b]8;;https://wrong.example/live\x1b\\new!\x1b]8;;\x1b\\");
+        }
+        harness.run();
+        rectangle_copy_click(&mut harness, 0, 0);
+        rectangle_copy_click(&mut harness, 2, 0);
+        let pos = rectangle_copy_point(&harness, 1, 0);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        assert!(harness.query_by_label("Copy").is_some());
+        assert!(harness.query_by_label("Open link").is_some());
+        harness.get_by_label("Copy link").click();
+        harness.run();
+        assert_eq!(harness.state().copied, vec!["https://example.com/frozen"]);
+        assert!(
+            harness.state().view.rectangle_copy_active(),
+            "Copy link does not copy the rectangle or resume"
+        );
+        let pos = rectangle_copy_point(&harness, 3, 0);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        assert!(harness.query_by_label("Open link").is_none());
+        assert!(harness.query_by_label("Copy link").is_none());
+        assert!(harness.state().view.context_menu_target().is_none());
+        harness.get_by_label("Copy").click();
+        harness.run();
+        assert_eq!(
+            harness.state().copied.last().map(String::as_str),
+            Some("lin")
+        );
+        assert!(harness.state().sink.0.is_empty());
+    }
+    #[test]
+    fn rectangle_copy_cancel_retires_popup_targets_and_pending_activation_only() {
+        let mut harness = rectangle_copy_harness();
+        let context = harness.ctx.clone();
+        let pos = rectangle_copy_point(&harness, 1, 0);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        assert!(Popup::is_any_open(&context));
+        assert!(harness.state().view.context_menu_text().is_some());
+        {
+            let view = &mut harness.state_mut().view;
+            view.pending_context_action_request = true;
+            view.pending_link_requests
+                .push_back(Arc::from("https://example.com/frozen"));
+            view.cancel_rectangle_copy();
+            assert!(view.context_menu_text().is_none());
+            assert!(view.context_menu_target().is_none());
+            assert!(!view.take_context_action_request());
+            assert!(view.take_link_requests().is_empty());
+        }
+        harness.run_steps(3);
+        assert!(!Popup::is_any_open(&context));
+        harness.state_mut().terminal.ingest(b"\x1b[?1003l");
+        harness.get_by_label("Terminal viewport").click_secondary();
+        harness.run();
+        assert!(Popup::is_any_open(&context));
+        assert!(harness.state().view.context_menu_target().is_some());
+        harness.state_mut().view.cancel_rectangle_copy();
+        harness.run();
+        assert!(
+            Popup::is_any_open(&context),
+            "ordinary live menu is not a frozen owner"
+        );
+        assert!(harness.state().view.context_menu_target().is_some());
+    }
+
+    #[test]
+    fn rectangle_copy_view_cancels_when_relinquished_or_recovery_layout_resets() {
+        for recovery in [false, true] {
+            let mut harness = rectangle_copy_harness();
+            let view = &mut harness.state_mut().view;
+            if recovery {
+                view.reset_recovery_layout();
+            } else {
+                view.relinquish_transient_input();
+            }
+            assert!(!view.rectangle_copy_active());
+            assert!(view.cache.dimensions().is_none());
+            assert!(view.full_redraw_requested);
+        }
+    }
+
+    #[test]
+    fn rectangle_copy_view_refuses_oversize_without_discarding_selection() {
+        let columns = 512;
+        let rows =
+            RECTANGLE_COPY_MAX_BYTES / (columns * std::mem::size_of::<crate::RenderedCell>()) + 1;
+        let terminal = terminal(columns, rows);
+        let mut view = TerminalView::default();
+        let cell = CellPosition { column: 0, row: 0 };
+        view.selection.begin(cell);
+        view.selection.finish();
+        let selection = view.selection.range();
+        assert_eq!(
+            view.begin_rectangle_copy(&terminal, true),
+            Err(RectangleCopyError::SnapshotTooLarge)
+        );
+        assert!(!view.rectangle_copy_active());
+        assert!(view.cache.dimensions().is_none());
+        assert_eq!(view.selection.range(), selection);
+    }
+
+    #[test]
+    fn rectangle_copy_view_refuses_an_owned_pointer_gesture() {
+        let terminal = terminal(8, 2);
+        for button in [
+            festerm_core::MouseButton::Left,
+            festerm_core::MouseButton::Middle,
+            festerm_core::MouseButton::Right,
+        ] {
+            let mut view = TerminalView::default();
+            view.pointer.press(
+                button,
+                egui::pos2(1.0, 1.0),
+                true,
+                false,
+                festerm_core::Modifiers::NONE,
+            );
+            assert_eq!(
+                view.begin_rectangle_copy(&terminal, true),
+                Err(RectangleCopyError::PointerGestureInProgress)
+            );
+            assert!(!view.rectangle_copy_active());
+            view.pointer
+                .release(button, egui::pos2(1.0, 1.0), festerm_core::Modifiers::NONE);
+            assert!(view.begin_rectangle_copy(&terminal, true).is_ok());
+        }
+    }
+
+    #[test]
+    fn rectangle_copy_view_retains_history_through_live_updates_in_read_only_mode() {
+        let mut state = HeadlessViewState::with_terminal(terminal(8, 2));
+        state
+            .terminal
+            .ingest(b"rowzero\r\nrowone\r\nrowtwo\r\nrowthree\r\nrowfour");
+        state.view.history.sync(&state.terminal);
+        state.view.history.offset_rows = 2;
+        state
+            .view
+            .begin_rectangle_copy(&state.terminal, true)
+            .unwrap();
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            keyboard_input_enabled: false,
+                            ..Default::default()
+                        },
+                    );
+                    state.copied.extend(ui.ctx().output(|output| {
+                        output
+                            .commands
+                            .iter()
+                            .filter_map(|command| match command {
+                                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    }));
+                },
+                state,
+            );
+        harness.run();
+        rectangle_copy_click(&mut harness, 0, 0);
+        rectangle_copy_click(&mut harness, 7, 1);
+        {
+            let state = harness.state_mut();
+            state.terminal.ingest(b"\x1b[?1049hnew screen");
+            state
+                .terminal
+                .resize(Dimensions::new(4, 4).unwrap())
+                .unwrap();
+        }
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert_eq!(harness.state().copied, ["rowone\nrowtwo"]);
+        assert!(!harness.state().view.rectangle_copy_active());
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn terminal_modal_blackout_defers_accessibility_without_activating_background_controls() {
+        let mut state = HeadlessViewState::new();
+        for _ in 0..100 {
+            state.terminal.ingest(b"history\r\n");
+        }
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, (state, foreground_actions): &mut (HeadlessViewState, usize)| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            terminal_input_enabled: false,
+                            ..TerminalViewOptions::default()
+                        },
+                    );
+                    egui::Area::new(egui::Id::new("foreground-blackout-test"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(egui::pos2(10.0, 10.0))
+                        .show(ui.ctx(), |ui| {
+                            if ui.button("Foreground action").clicked() {
+                                *foreground_actions += 1;
+                            }
+                        });
+                },
+                (state, 0),
+            );
+        harness.run();
+        harness.state_mut().0.view.history.scroll_up(2);
+        harness.state_mut().0.view.history.unseen_output = true;
+        harness.run();
+        let offset = harness.state().0.view.history.offset_rows;
+        assert!(offset > 0);
+        harness.get_by_label("Jump to latest").click_accesskit();
+        harness.event(egui::Event::Text("must not reach the terminal".to_owned()));
+        harness.run();
+        assert_eq!(harness.state().0.view.history.offset_rows, offset);
+        assert!(harness.state().0.view.selection.range().is_none());
+        assert!(harness.state().0.sink.0.is_empty());
+        assert_eq!(harness.state().1, 0);
+
+        harness.get_by_label("Foreground action").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().1, 1);
+        assert_eq!(harness.state().0.view.history.offset_rows, offset);
+        assert!(harness.state().0.sink.0.is_empty());
+
+        harness.get_by_label("Jump to latest").click_accesskit();
+        harness.get_by_label("Foreground action").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().1, 2);
+        assert_eq!(harness.state().0.view.history.offset_rows, offset);
+        assert!(harness.state().0.sink.0.is_empty());
+    }
+
+    fn accessible_row_values(harness: &Harness<'_, HeadlessViewState>) -> Vec<String> {
+        harness
+            .query_all_by_role(egui::accesskit::Role::Label)
+            .filter_map(|node| node.value())
+            .collect()
+    }
+
+    #[test]
+    fn terminal_rows_reach_accessibility_only_when_the_application_opts_in() {
+        let mut state = HeadlessViewState::new();
+        state
+            .terminal
+            .ingest("prompt$ ls\r\n\x1b[31mred\x1b[0m \u{202e}evil\r\n\r\nlast   ".as_bytes());
+        let expose = std::rc::Rc::new(std::cell::Cell::new(false));
+        let builder_expose = expose.clone();
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                move |ui, state: &mut HeadlessViewState| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            expose_text_to_accessibility: builder_expose.get(),
+                            ..TerminalViewOptions::default()
+                        },
+                    );
+                },
+                state,
+            );
+        harness.run();
+        assert!(accessible_row_values(&harness).is_empty());
+        assert!(harness
+            .query_by_role(egui::accesskit::Role::Terminal)
+            .is_none());
+
+        expose.set(true);
+        harness.run();
+        assert_eq!(
+            accessible_row_values(&harness),
+            ["prompt$ ls", "red evil", "last"]
+        );
+        let terminal = harness.get_by_role(egui::accesskit::Role::Terminal);
+        let first_row = harness
+            .query_all_by_role(egui::accesskit::Role::Label)
+            .next()
+            .unwrap();
+        assert!(terminal.rect().contains_rect(first_row.rect()));
+        // iOS hides the descendants of actionable nodes, so no ancestor of a
+        // row may take clicks or focus.
+        use egui_kittest::kittest::NodeT as _;
+        let mut ancestor = first_row.parent();
+        while let Some(node) = ancestor {
+            let data = node.accesskit_node().data().clone();
+            assert!(
+                !data.supports_action(egui::accesskit::Action::Click)
+                    && !data.supports_action(egui::accesskit::Action::Focus),
+                "row is inside actionable {:?}",
+                data.role()
+            );
+            ancestor = node.parent();
+        }
+
+        // Hover-only row widgets must not take pointer input from the grid.
+        let start = first_row.rect().left_center() + Vec2::new(2.0, 0.0);
+        harness.drag_at(start);
+        harness.hover_at(start + Vec2::new(120.0, 30.0));
+        harness.drop_at(start + Vec2::new(120.0, 30.0));
+        harness.run();
+        assert!(harness.state().view.selection.range().is_some());
+
+        expose.set(false);
+        harness.run();
+        assert!(accessible_row_values(&harness).is_empty());
+    }
+
+    /// Drags the pointer across the terminal viewport and reports whether a
+    /// selection was made, optionally with a tab chip drag already in flight.
+    fn selection_after_drag_across_terminal(carrying_a_chip: bool) -> bool {
+        let mut state = HeadlessViewState::new();
+        state.terminal.ingest(b"select me please");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                move |ui, state: &mut HeadlessViewState| {
+                    if carrying_a_chip {
+                        egui::DragAndDrop::set_payload(ui.ctx(), crate::chrome::ChipId(1));
+                    }
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                state,
+            );
+        harness.run();
+
+        let rect = harness.get_by_label("Terminal viewport").rect();
+        let start = rect.left_top() + Vec2::new(8.0, 8.0);
+        harness.event(egui::Event::PointerMoved(start));
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        for step in 1..=4 {
+            let position = start + Vec2::new(30.0 * step as f32, 0.0);
+            harness.event(egui::Event::PointerMoved(position));
+            harness.run();
+        }
+        let end = start + Vec2::new(120.0, 0.0);
+        harness.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        harness.state().view.selection().range().is_some()
+    }
+
+    /// The control for the test below: an ordinary drag across the terminal
+    /// still selects text.
+    #[test]
+    fn dragging_across_the_terminal_selects_text() {
+        assert!(selection_after_drag_across_terminal(false));
+    }
+
+    /// A tab chip dragged towards another window routinely passes over a
+    /// terminal, and the press that started it was aimed at the chip row, so
+    /// it must not leave a swathe of highlighted text behind (ADR 0033).
+    #[test]
+    fn dragging_a_tab_chip_over_the_terminal_selects_nothing() {
+        assert!(!selection_after_drag_across_terminal(true));
+    }
+
+    #[test]
+    fn full_redraw_request_is_view_local() {
+        let terminal = terminal(8, 4);
+        let mut first = TerminalView::default();
+        let mut second = TerminalView::default();
+        first
+            .cache
+            .update(TerminalSnapshot::from_terminal(&terminal), &[]);
+        second
+            .cache
+            .update(TerminalSnapshot::from_terminal(&terminal), &[]);
+        let other_cache = second.cache.clone();
+        first.request_full_redraw();
+        assert_eq!(first.cache.dimensions(), None);
+        assert!(first.full_redraw_requested);
+        assert_eq!(second.cache, other_cache);
+        assert!(!second.full_redraw_requested);
+    }
+
+    #[test]
+    fn full_redraw_rebuilds_unchanged_rows_and_preserves_terminal_and_view_state() {
+        let mut state = HeadlessViewState::new();
+        for row in 0..60 {
+            state.terminal.ingest(format!("row {row}\r\n").as_bytes());
+        }
+        state.terminal.ingest(b"\x1b[1;31munchanged");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                state,
+            );
+        harness.run();
+        harness.state_mut().view.history.offset_rows = 3;
+        harness.run();
+        {
+            let state = harness.state_mut();
+            state
+                .view
+                .selection
+                .begin(CellPosition { column: 0, row: 0 });
+            state
+                .view
+                .selection
+                .extend(CellPosition { column: 3, row: 0 });
+            state.view.selection.finish();
+        }
+        harness.run();
+        assert_eq!(harness.state().view.diagnostics.dirty_rows, 0);
+        let before = harness.state().terminal.clone();
+        let selection = harness.state().view.selection.clone();
+        let font_size = harness.state().view.font_size_points();
+        let native_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = native_requests.clone();
+        crate::install_root_terminal_painter(&harness.ctx, move |_, frame| {
+            observed.lock().unwrap().push(frame.full_redraw);
+            None
+        });
+        harness.state_mut().view.request_full_redraw();
+        assert_eq!(harness.state().view.cache.dimensions(), None);
+        assert_eq!(harness.state().terminal, before);
+        harness.step();
+        assert_eq!(
+            harness.state().view.diagnostics.dirty_rows,
+            before.dimensions().rows(),
+            "unchanged visible rows must all be rebuilt"
+        );
+        assert_eq!(harness.state().terminal, before);
+        assert_eq!(harness.state().view.selection, selection);
+        assert_eq!(harness.state().view.history_offset_rows(), 3);
+        assert_eq!(harness.state().view.font_size_points(), font_size);
+        assert!(harness.state().sink.0.is_empty());
+        harness.step();
+        assert_eq!(harness.state().view.diagnostics.dirty_rows, 0);
+        assert_eq!(
+            native_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|&&full| full)
+                .count(),
+            1,
+            "native retained-region invalidation must be one-shot"
+        );
+    }
+
+    #[test]
+    fn terminal_zoom_is_session_local_bounded_and_resettable() {
+        let mut first = TerminalView::default();
+        let second = TerminalView::default();
+
+        assert!(first.zoom_in());
+        assert_eq!(first.font_size_points(), 15.0);
+        assert_eq!(second.font_size_points(), 14.0);
+        for _ in 0..100 {
+            first.zoom_in();
+        }
+        assert_eq!(first.font_size_points(), 32.0);
+        assert!(!first.zoom_in());
+        for _ in 0..100 {
+            first.zoom_out();
+        }
+        assert_eq!(first.font_size_points(), 8.0);
+        assert!(first.reset_zoom());
+        assert_eq!(first.font_size_points(), 14.0);
+        assert!(!first.reset_zoom());
+    }
+
+    #[test]
+    fn terminal_pinch_zoom_uses_shared_bounds_and_rejects_invalid_samples() {
+        let mut view = TerminalView::default();
+        assert!(view.zoom_by_factor(1.5));
+        assert_eq!(view.font_size_points(), 21.0);
+        assert_eq!(TerminalView::default().font_size_points(), 14.0);
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
+            assert!(!view.zoom_by_factor(invalid));
+            assert_eq!(view.font_size_points(), 21.0);
+        }
+        assert!(view.zoom_by_factor(f32::MAX));
+        assert_eq!(view.font_size_points(), 32.0);
+        assert!(view.zoom_by_factor(0.5));
+        assert_eq!(view.font_size_points(), 16.0);
+        assert!(view.zoom_by_factor(f32::MIN_POSITIVE));
+        assert_eq!(view.font_size_points(), 8.0);
+        assert!(view.reset_zoom());
+    }
+
+    #[test]
+    fn backend_owned_resize_waits_for_acknowledgement_and_does_not_repeat_requests() {
+        #[derive(Default)]
+        struct BackendSink(Vec<Dimensions>);
+        impl EncodedInputSink for BackendSink {
+            fn record_encoded_input(&mut self, _: &[u8]) {}
+            fn terminal_resizes_owned_by_backend(&self) -> bool {
+                true
+            }
+            fn record_terminal_resize(&mut self, dimensions: Dimensions) {
+                self.0.push(dimensions);
+            }
+        }
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, (view, terminal, sink): &mut (TerminalView, Terminal, BackendSink)| {
+                    view.show(ui, terminal, sink);
+                },
+                (
+                    TerminalView::default(),
+                    terminal(20, 6),
+                    BackendSink::default(),
+                ),
+            );
+        harness.run();
+        let (view, terminal, sink) = harness.state_mut();
+        let requested = sink.0[0];
+        assert_ne!(requested, terminal.dimensions());
+        assert_eq!(terminal.dimensions(), Dimensions::new(20, 6).unwrap());
+        assert_eq!(sink.0.len(), 1);
+        assert!(matches!(
+            view.apply_terminal_resize(terminal, requested),
+            ResizeOutcome::Resized(_)
+        ));
+        harness.run();
+        assert_eq!(harness.state().1.dimensions(), requested);
+        assert_eq!(harness.state().2 .0.len(), 1);
+    }
+
+    #[test]
+    fn terminal_shift_tab_routes_backtab_presses_repeats_and_not_releases() {
+        for alternate in [false, true] {
+            for application_modes in [false, true] {
+                let mut state = HeadlessViewState::new();
+                if alternate {
+                    state.terminal.ingest(b"\x1b[?1049h");
+                }
+                if application_modes {
+                    state.terminal.ingest(b"\x1b[?1h\x1b=");
+                }
+                let mut harness = Harness::builder()
+                    .with_size(Vec2::new(800.0, 600.0))
+                    .build_ui_state(
+                        |ui, state: &mut HeadlessViewState| {
+                            state.view.show(ui, &mut state.terminal, &mut state.sink);
+                        },
+                        state,
+                    );
+                harness.run();
+                for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
+                    harness.event(egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: Some(egui::Key::Tab),
+                        pressed,
+                        repeat,
+                        modifiers: egui::Modifiers::SHIFT,
+                    });
+                    harness.run();
+                }
+                for modifiers in [
+                    egui::Modifiers::NONE,
+                    egui::Modifiers::CTRL,
+                    egui::Modifiers::ALT,
+                    egui::Modifiers::MAC_CMD,
+                    egui::Modifiers::SHIFT | egui::Modifiers::CTRL,
+                    egui::Modifiers::SHIFT | egui::Modifiers::ALT,
+                    egui::Modifiers::SHIFT | egui::Modifiers::MAC_CMD,
+                ] {
+                    harness.event(egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    });
+                    harness.run();
+                }
+                assert_eq!(
+                    harness.state().sink.0.concat(),
+                    b"\x1b[Z\x1b[Z\t\t\t\t\t\t\t",
+                    "alternate={alternate}, application_modes={application_modes}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_shift_tab_obeys_foreground_readonly_ime_lock_and_rectangle_suppression() {
+        for suppression in ["blackout", "readonly", "ime", "lock", "rectangle"] {
+            let mut state = HeadlessViewState::new();
+            if suppression == "lock" {
+                state.terminal.ingest(b"\x1b[2h");
+            }
+            if suppression == "rectangle" {
+                state
+                    .view
+                    .begin_rectangle_copy(&state.terminal, true)
+                    .unwrap();
+            }
+            let mut harness = Harness::builder()
+                .with_size(Vec2::new(800.0, 600.0))
+                .build_ui_state(
+                    move |ui, state: &mut HeadlessViewState| {
+                        state.view.show_with_options(
+                            ui,
+                            &mut state.terminal,
+                            &mut state.sink,
+                            TerminalViewOptions {
+                                terminal_input_enabled: suppression != "blackout",
+                                keyboard_input_enabled: suppression != "readonly",
+                                ..TerminalViewOptions::default()
+                            },
+                        );
+                    },
+                    state,
+                );
+            harness.run();
+            if suppression == "ime" {
+                harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "x".into(),
+                    active_range_chars: None,
+                }));
+                harness.run();
+            }
+            for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
+                harness.event(egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed,
+                    repeat,
+                    modifiers: egui::Modifiers::SHIFT,
+                });
+                harness.run();
+            }
+            assert!(harness.state().sink.0.is_empty(), "{suppression}");
+            assert_eq!(
+                harness.state().view.rectangle_copy_active(),
+                suppression == "rectangle"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_shift_tab_preserves_focus_reports_without_duplicate_input() {
+        let mut state = HeadlessViewState::new();
+        state.terminal.ingest(b"\x1b[?1004h");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                state,
+            );
+        harness.run();
+        harness.state_mut().sink.0.clear();
+        harness.event(egui::Event::WindowFocused(false));
+        harness.run();
+        harness.event(egui::Event::WindowFocused(true));
+        harness.run();
+        harness.event(egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        harness.run();
+        assert_eq!(harness.state().sink.0.concat(), b"\x1b[O\x1b[I\x1b[Z");
+    }
+
+    #[test]
+    fn terminal_page_keys_route_plain_presses_repeats_and_not_releases() {
+        for alternate in [false, true] {
+            for application_cursor in [false, true] {
+                let mut state = HeadlessViewState::new();
+                if alternate {
+                    state.terminal.ingest(b"\x1b[?1049h");
+                }
+                if application_cursor {
+                    state.terminal.ingest(b"\x1b[?1h");
+                }
+                let mut harness = Harness::builder()
+                    .with_size(Vec2::new(800.0, 600.0))
+                    .build_ui_state(
+                        |ui, state: &mut HeadlessViewState| {
+                            state.view.show(ui, &mut state.terminal, &mut state.sink);
+                        },
+                        state,
+                    );
+                harness.get_by_label("Terminal viewport").click();
+                harness.run();
+                for (pressed, repeat) in [(true, false), (true, true), (false, false)] {
+                    for key in [egui::Key::PageUp, egui::Key::PageDown] {
+                        harness.event(egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed,
+                            repeat,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                        harness.run();
+                    }
+                }
+                assert_eq!(
+                    harness.state().sink.0,
+                    vec![
+                        b"\x1b[5~".to_vec(),
+                        b"\x1b[6~".to_vec(),
+                        b"\x1b[5~".to_vec(),
+                        b"\x1b[6~".to_vec(),
+                    ],
+                    "alternate={alternate}, application_cursor={application_cursor}"
+                );
+                assert_eq!(harness.state().view.history_offset_rows(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_page_keys_preserve_shift_history_and_other_modified_chords() {
+        for alternate in [false, true] {
+            let mut state = HeadlessViewState::new();
+            for _ in 0..100 {
+                state.terminal.ingest(b"retained history\r\n");
+            }
+            if alternate {
+                state.terminal.ingest(b"\x1b[?1049h");
+            }
+            let mut harness = Harness::builder()
+                .with_size(Vec2::new(800.0, 600.0))
+                .build_ui_state(
+                    |ui, state: &mut HeadlessViewState| {
+                        state.view.show(ui, &mut state.terminal, &mut state.sink);
+                    },
+                    state,
+                );
+            harness.get_by_label("Terminal viewport").click();
+            harness.run();
+            harness.event(egui::Event::Key {
+                key: egui::Key::PageUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            });
+            harness.run();
+            assert_eq!(harness.state().view.history_offset_rows() > 0, !alternate);
+            harness.event(egui::Event::Key {
+                key: egui::Key::PageDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::SHIFT,
+            });
+            harness.run();
+            assert_eq!(harness.state().view.history_offset_rows(), 0);
+            for modifiers in [
+                egui::Modifiers::CTRL,
+                egui::Modifiers::ALT,
+                egui::Modifiers::MAC_CMD,
+                egui::Modifiers::CTRL | egui::Modifiers::ALT,
+            ] {
+                for key in [egui::Key::PageUp, egui::Key::PageDown] {
+                    harness.event(egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    });
+                    harness.run();
+                }
+            }
+            assert!(harness.state().sink.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn terminal_page_keys_obey_foreground_readonly_and_ime_suppression() {
+        for alternate in [false, true] {
+            for (terminal_input_enabled, keyboard_input_enabled, composing) in [
+                (false, true, false),
+                (true, false, false),
+                (true, true, true),
+            ] {
+                let mut state = HeadlessViewState::new();
+                if alternate {
+                    state.terminal.ingest(b"\x1b[?1049h");
+                }
+                let mut harness = Harness::builder()
+                    .with_size(Vec2::new(800.0, 600.0))
+                    .build_ui_state(
+                        move |ui, state: &mut HeadlessViewState| {
+                            state.view.show_with_options(
+                                ui,
+                                &mut state.terminal,
+                                &mut state.sink,
+                                TerminalViewOptions {
+                                    terminal_input_enabled,
+                                    keyboard_input_enabled,
+                                    ..TerminalViewOptions::default()
+                                },
+                            );
+                        },
+                        state,
+                    );
+                if composing {
+                    harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "x".into(),
+                        active_range_chars: None,
+                    }));
+                    harness.run();
+                }
+                for key in [egui::Key::PageUp, egui::Key::PageDown] {
+                    harness.key_press(key);
+                    harness.run();
+                }
+                assert!(harness.state().sink.0.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn pane_minimum_preserves_terminal_cell_budget_after_padding() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    if crate::terminal_font_installation(ui.ctx()).is_none() {
+                        crate::install_terminal_fonts(ui.ctx());
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    let minimum = state.view.minimum_pane_size(ui);
+                    let rect = Rect::from_min_size(ui.next_widget_position(), minimum);
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        state.view.show_in_pane_with_options(
+                            ui,
+                            &mut state.terminal,
+                            &mut state.sink,
+                            TerminalViewOptions::default(),
+                        );
+                    });
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+        let dimensions = harness
+            .state()
+            .view
+            .diagnostics()
+            .calculated_dimensions
+            .unwrap();
+        assert_eq!(dimensions.columns(), 52);
+        assert_eq!(dimensions.rows(), 12);
+    }
+
+    #[test]
+    fn headless_harness_drives_terminal_view_input_resize_and_diagnostics() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+
+        let grid = harness
+            .state()
+            .view
+            .diagnostics()
+            .grid_rect
+            .expect("headless frame records grid geometry");
+        assert_eq!(
+            harness.state().view.diagnostics().calculated_dimensions,
+            Some(harness.state().terminal.dimensions())
+        );
+        assert!(grid.is_finite());
+
+        harness.event(egui::Event::PointerButton {
+            pos: grid.center(),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: grid.center(),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::Text("Q".to_owned()));
+        harness.run();
+        assert_eq!(harness.state().sink.0, vec![b"Q".to_vec()]);
+
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+        harness.key_press(egui::Key::ArrowUp);
+        harness.run();
+        harness.key_press(egui::Key::ArrowDown);
+        harness.run();
+        harness.key_press(egui::Key::ArrowLeft);
+        harness.run();
+        harness.key_press(egui::Key::ArrowRight);
+        harness.run();
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert_eq!(
+            harness.state().sink.0,
+            vec![
+                b"Q".to_vec(),
+                b"\t".to_vec(),
+                b"\x1b[A".to_vec(),
+                b"\x1b[B".to_vec(),
+                b"\x1b[D".to_vec(),
+                b"\x1b[C".to_vec(),
+                b"\x1b".to_vec(),
+            ]
+        );
+
+        harness.set_size(Vec2::new(730.0, 520.0));
+        harness.run();
+        let state = harness.state();
+        assert_eq!(
+            state.view.diagnostics().calculated_dimensions,
+            Some(state.terminal.dimensions())
+        );
+        assert_eq!(
+            state.view.cache.dimensions(),
+            Some(state.terminal.dimensions())
+        );
+        assert!(state
+            .view
+            .diagnostics()
+            .grid_rect
+            .is_some_and(|grid| grid.is_finite()));
+    }
+
+    #[test]
+    fn ris_and_repeated_resizes_replace_stale_rendered_content() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+
+        for generation in 0..100 {
+            let size = if generation % 2 == 0 {
+                Vec2::new(430.0, 280.0)
+            } else {
+                Vec2::new(930.0, 680.0)
+            };
+            harness.set_size(size);
+            let marker = format!("\x1bc\x1b[3JRECONNECT:{generation:03}\r\nprompt> ");
+            harness.state_mut().terminal.ingest(marker.as_bytes());
+            harness.run();
+
+            let state = harness.state();
+            assert_eq!(
+                state.view.cache.dimensions(),
+                Some(state.terminal.dimensions()),
+                "generation {generation}"
+            );
+            let rendered = (0..state.terminal.dimensions().rows())
+                .filter_map(|row| state.view.cache.row(row))
+                .flatten()
+                .map(|cell| cell.text())
+                .collect::<String>();
+            assert!(rendered.contains(&format!("RECONNECT:{generation:03}")));
+            assert!(rendered.contains("prompt>"));
+            if generation > 0 {
+                assert!(!rendered.contains(&format!("RECONNECT:{:03}", generation - 1)));
+            }
+        }
+    }
+
+    #[test]
+    fn ris_replaces_cached_content_without_a_resize() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+        harness.state_mut().terminal.ingest(b"old content");
+        harness.run();
+        let dimensions = harness.state().terminal.dimensions();
+        harness.state_mut().terminal.ingest(b"\x1bcnew content");
+        harness.run();
+
+        let state = harness.state();
+        assert_eq!(state.view.cache.dimensions(), Some(dimensions));
+        let rendered = (0..dimensions.rows())
+            .filter_map(|row| state.view.cache.row(row))
+            .flatten()
+            .map(|cell| cell.text())
+            .collect::<String>();
+        assert!(rendered.contains("new content"));
+        assert!(!rendered.contains("old content"));
+    }
+
+    #[test]
+    fn ordinary_click_stays_clear_of_selection_even_while_output_streams_between_press_and_release()
+    {
+        // #94: heavy/streaming PTY output arriving between a press and its
+        // release must not turn an ordinary click (the on-screen cell never
+        // actually moves) into a stray one-cell selection. A regression
+        // reintroduced this by having the no-drag check compare absolute
+        // scrollback rows instead of the grid-relative cell the pointer
+        // pressed and released at - absolute rows shift as new lines arrive
+        // even though the stationary on-screen cell's row index never does.
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+        let grid = harness
+            .state()
+            .view
+            .diagnostics()
+            .grid_rect
+            .expect("headless frame records grid geometry");
+
+        harness.event(egui::Event::PointerButton {
+            pos: grid.center(),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        // Simulate heavy output arriving while the button is held, with no
+        // pointer movement at all: enough newlines to scroll the live
+        // screen and advance every on-screen row's absolute scrollback
+        // index well past what it was at press time.
+        for line in 0..200 {
+            harness
+                .state_mut()
+                .terminal
+                .ingest(format!("line-{line:04}\r\n").as_bytes());
+        }
+        harness.run();
+
+        harness.event(egui::Event::PointerButton {
+            pos: grid.center(),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        assert!(
+            harness.state().view.selection().range().is_none(),
+            "a click with no pointer movement must never leave a selection behind, \
+             regardless of output arriving while the button was held"
+        );
+    }
+
+    #[test]
+    fn terminal_view_preserves_selected_text_across_primary_reflow() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 120.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+
+        let columns = harness.state().terminal.dimensions().columns();
+        assert!(columns > 12);
+        let text = (0..columns - 1)
+            .map(|index| char::from(b'a' + u8::try_from(index % 26).unwrap()))
+            .collect::<String>();
+        harness.state_mut().terminal.ingest(text.as_bytes());
+        harness.run();
+
+        let start = CellPosition { column: 3, row: 0 };
+        let end = CellPosition {
+            column: columns - 4,
+            row: 0,
+        };
+        harness.state_mut().view.selection.begin(start);
+        harness.state_mut().view.selection.extend(end);
+        harness.state_mut().view.selection.finish();
+        let before = selection_text(
+            TerminalSnapshot::from_terminal(&harness.state().terminal),
+            &harness.state().view.selection,
+        )
+        .unwrap();
+
+        harness.set_size(Vec2::new(180.0, 120.0));
+        harness.run();
+
+        assert!(harness.state().terminal.dimensions().columns() < columns);
+        assert!(
+            harness.state().terminal.scrollback_stats().physical_rows() > 0,
+            "the narrow viewport should push part of the selected line off-screen"
+        );
+        assert!(harness.state().view.selection.range().is_some());
+        assert_eq!(
+            selection_text(
+                TerminalSnapshot::from_terminal(&harness.state().terminal),
+                &harness.state().view.selection,
+            )
+            .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn alternate_screen_selection_uses_rectangular_resize_coordinates() {
+        let mut terminal = terminal(80, 24);
+        terminal.ingest(b"\x1b[?1049hcurrent alternate row");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 240.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::with_terminal(terminal),
+            );
+        harness.run();
+        harness
+            .state_mut()
+            .view
+            .selection
+            .begin(CellPosition { column: 0, row: 0 });
+        harness
+            .state_mut()
+            .view
+            .selection
+            .extend(CellPosition { column: 6, row: 0 });
+        harness.state_mut().view.selection.finish();
+
+        harness.set_size(Vec2::new(400.0, 180.0));
+        harness.run();
+
+        assert_eq!(
+            harness
+                .state()
+                .view
+                .selected_text(&harness.state().terminal),
+            Some("current".to_owned())
+        );
+    }
+
+    #[test]
+    fn resizing_the_view_rescales_an_anchored_history_offset_instead_of_resetting_it() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(420.0, 240.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+        let rows = harness.state().terminal.dimensions().rows();
+        for line in 0..rows + 40 {
+            // A line far longer than any tested viewport width guarantees it
+            // soft-wraps into multiple physical rows at the narrow size and
+            // then reflows into fewer physical rows once widened.
+            harness
+                .state_mut()
+                .terminal
+                .ingest(format!("line {line} {}\r\n", "x".repeat(300)).as_bytes());
+        }
+        harness.run();
+        let center = harness
+            .state()
+            .view
+            .diagnostics()
+            .grid_rect
+            .unwrap()
+            .center();
+        harness.event(egui::Event::PointerMoved(center));
+        harness.run();
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 400.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        let history_before = harness.state().terminal.scrollback_stats().physical_rows();
+        let offset_before = harness.state().view.history_offset_rows();
+        assert!(offset_before > 0);
+
+        // Widen the view: retained scrollback reflows into fewer physical
+        // rows, so the anchored offset must shrink proportionally rather
+        // than being clamped to an unrelated raw row count or reset to 0.
+        harness.set_size(Vec2::new(900.0, 240.0));
+        harness.run();
+        let history_after = harness.state().terminal.scrollback_stats().physical_rows();
+        assert!(history_after < history_before);
+        let offset_after = harness.state().view.history_offset_rows();
+        assert!(offset_after > 0, "resize must not reset an anchored view");
+        assert!(offset_after <= history_after);
+        // The rescaled offset preserves roughly the same relative position
+        // in the (now smaller) retained history rather than jumping.
+        let ratio_before = offset_before as f64 / history_before as f64;
+        let ratio_after = offset_after as f64 / history_after as f64;
+        assert!(
+            (ratio_before - ratio_after).abs() < 0.15,
+            "expected proportional offset, before={offset_before}/{history_before} \
+             after={offset_after}/{history_after}"
+        );
+    }
+
+    #[test]
+    fn a_reporting_application_is_scrolled_by_rows_and_obeys_the_speed_preference() {
+        // Bug report: scrolling a full-screen TUI was far too fast even at
+        // "Very slow". A mouse-reporting application used to get exactly one
+        // wheel report per egui event regardless of how far the event moved
+        // and regardless of the scroll-speed preference, so a trackpad's
+        // stream of pixel-sized events counted as a full notch each. Reports
+        // now follow the same rows-then-multiplier math local scrollback
+        // uses.
+        fn reports_for(
+            multiplier: f32,
+            unit: egui::MouseWheelUnit,
+            delta_y: f32,
+            events: usize,
+        ) -> usize {
+            let mut harness = Harness::builder()
+                .with_size(Vec2::new(420.0, 240.0))
+                .build_ui_state(
+                    |ui, state: &mut HeadlessViewState| {
+                        state.view.show_with_options(
+                            ui,
+                            &mut state.terminal,
+                            &mut state.sink,
+                            TerminalViewOptions {
+                                scroll_speed_multiplier: multiplier,
+                                ..TerminalViewOptions::default()
+                            },
+                        );
+                    },
+                    HeadlessViewState::new(),
+                );
+            harness.run();
+            // Normal mouse tracking: the application owns the wheel.
+            harness.state_mut().terminal.ingest(b"\x1b[?1000h");
+            let center = harness
+                .state()
+                .view
+                .diagnostics()
+                .grid_rect
+                .unwrap()
+                .center();
+            harness.event(egui::Event::PointerMoved(center));
+            harness.run();
+            let before = harness.state().sink.0.len();
+            for _ in 0..events {
+                harness.event(egui::Event::MouseWheel {
+                    unit,
+                    delta: egui::vec2(0.0, delta_y),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.run();
+            }
+            harness.state().sink.0.len() - before
+        }
+
+        // One three-line wheel notch still reports three lines at Normal.
+        assert_eq!(
+            reports_for(1.0, egui::MouseWheelUnit::Line, 3.0, 1),
+            3,
+            "a normal-speed wheel notch reports one line per row it would have scrolled"
+        );
+
+        // "Very slow" is 0.1x: ten of those notches report three lines in
+        // total rather than thirty.
+        let very_slow = reports_for(0.1, egui::MouseWheelUnit::Line, 3.0, 10);
+        assert_eq!(
+            very_slow, 3,
+            "the slowest clickstop must reach the application, too: {very_slow}"
+        );
+
+        // A trackpad's small pixel deltas no longer each count as a notch.
+        let pixels = reports_for(1.0, egui::MouseWheelUnit::Point, 2.0, 4);
+        assert!(
+            pixels <= 1,
+            "four sub-row pixel events must not report four notches: {pixels}"
+        );
+    }
+
+    #[test]
+    fn scroll_speed_multiplier_scales_rows_moved_per_wheel_step() {
+        // Feature request #67: `TerminalViewOptions::scroll_speed_multiplier`
+        // must actually change how far one wheel step moves through
+        // scrollback, not just be threaded through unused.
+        fn offset_after_one_wheel_step(multiplier: f32) -> usize {
+            let mut harness = Harness::builder()
+                .with_size(Vec2::new(420.0, 240.0))
+                .build_ui_state(
+                    |ui, state: &mut HeadlessViewState| {
+                        state.view.show_with_options(
+                            ui,
+                            &mut state.terminal,
+                            &mut state.sink,
+                            TerminalViewOptions {
+                                scroll_speed_multiplier: multiplier,
+                                ..TerminalViewOptions::default()
+                            },
+                        );
+                    },
+                    HeadlessViewState::new(),
+                );
+            let rows = harness.state().terminal.dimensions().rows();
+            for line in 0..rows + 40 {
+                harness
+                    .state_mut()
+                    .terminal
+                    .ingest(format!("line {line}\r\n").as_bytes());
+            }
+            harness.run();
+            let center = harness
+                .state()
+                .view
+                .diagnostics()
+                .grid_rect
+                .unwrap()
+                .center();
+            harness.event(egui::Event::PointerMoved(center));
+            harness.run();
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 3.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run();
+            harness.state().view.history_offset_rows()
+        }
+
+        let normal = offset_after_one_wheel_step(1.0);
+        let slow = offset_after_one_wheel_step(0.25);
+        let fast = offset_after_one_wheel_step(2.5);
+
+        assert!(
+            slow < normal,
+            "a below-1.0 multiplier must scroll fewer rows: slow={slow} normal={normal}"
+        );
+        assert!(
+            fast > normal,
+            "an above-1.0 multiplier must scroll more rows: fast={fast} normal={normal}"
+        );
+    }
+
+    #[test]
+    fn local_wheel_anchors_history_and_ctrl_end_resumes_following() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(420.0, 240.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+        let rows = harness.state().terminal.dimensions().rows();
+        for line in 0..rows + 8 {
+            harness
+                .state_mut()
+                .terminal
+                .ingest(format!("line {line}\r\n").as_bytes());
+        }
+        harness.run();
+        let center = harness
+            .state()
+            .view
+            .diagnostics()
+            .grid_rect
+            .unwrap()
+            .center();
+        harness.event(egui::Event::PointerMoved(center));
+        harness.run();
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 80.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        let anchored = harness.state().view.history_offset_rows();
+        assert!(anchored > 0);
+        assert!(harness.state().sink.0.is_empty());
+
+        harness.state_mut().terminal.ingest(b"new output\r\n");
+        harness.run();
+        assert!(harness.state().view.history_offset_rows() > anchored);
+        assert!(harness.query_by_label("Jump to latest").is_some());
+        harness.get_by_label("Jump to latest").click();
+        harness.run();
+        assert!(harness.state().view.follows_latest_output());
+        assert!(harness.query_by_label("Jump to latest").is_none());
+
+        harness.event(egui::Event::PointerMoved(center));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 2.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        harness.state_mut().terminal.ingest(b"another output\r\n");
+        harness.run();
+        assert!(harness.query_by_label("Jump to latest").is_some());
+
+        harness.event(egui::Event::Key {
+            key: egui::Key::End,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        });
+        harness.run();
+        assert!(harness.state().view.follows_latest_output());
+
+        harness.state_mut().terminal.ingest(b"\x1b[?1000h");
+        harness.event(egui::Event::PointerMoved(center));
+        harness.run();
+        let routed_before = harness.state().sink.0.len();
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 2.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert!(harness.state().view.follows_latest_output());
+        assert!(harness.state().sink.0.len() > routed_before);
+
+        let routed_before = harness.state().sink.0.len();
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 2.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        });
+        harness.run();
+        assert!(harness.state().view.history_offset_rows() > 0);
+        assert_eq!(harness.state().sink.0.len(), routed_before);
+
+        let track_rect = harness.get_by_label("Terminal history scrollbar").rect();
+        let track = egui::pos2(track_rect.center().x, track_rect.top() + 2.0);
+        harness.event(egui::Event::PointerMoved(track));
+        harness.run();
+        let offset_before = harness.state().view.history_offset_rows();
+        let routed_before = harness.state().sink.0.len();
+        harness.event(egui::Event::PointerButton {
+            pos: track,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: track,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert!(harness.state().view.history_offset_rows() > offset_before);
+        assert_eq!(harness.state().sink.0.len(), routed_before);
+
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert_eq!(harness.state().sink.0.len(), routed_before);
+    }
+
+    #[test]
+    fn terminal_context_menu_intercepts_local_right_click_without_pty_input() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+
+        harness.get_by_label("Terminal viewport").click_secondary();
+        harness.run();
+
+        assert!(harness.query_by_label("Paste").is_some());
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn terminal_context_menu_can_queue_history_snapshot_actions_without_pty_input() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            history_snapshot_actions: true,
+                            ..TerminalViewOptions::default()
+                        },
+                    );
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+
+        harness.get_by_label("Terminal viewport").click_secondary();
+        harness.run();
+
+        assert!(harness.query_by_label("Find in Terminal").is_some());
+        assert!(harness
+            .query_by_label("Open Terminal History in Editor")
+            .is_some());
+        assert!(harness
+            .query_by_label("Save Terminal History As…")
+            .is_some());
+        harness
+            .get_by_label("Open Terminal History in Editor")
+            .click();
+        harness.run();
+
+        assert_eq!(
+            harness.state_mut().view.take_history_actions(),
+            vec![TerminalHistoryAction::OpenInEditor]
+        );
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn terminal_context_menu_can_request_find_without_pty_input() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+
+        harness.get_by_label("Terminal viewport").click_secondary();
+        harness.run();
+        harness.get_by_label("Find in Terminal").click();
+        harness.run();
+
+        assert!(harness.state_mut().view.take_find_request());
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn terminal_history_snapshot_actions_hide_while_text_is_selected() {
+        let mut state = HeadlessViewState::new();
+        state.terminal.ingest(b"selectable");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            history_snapshot_actions: true,
+                            ..TerminalViewOptions::default()
+                        },
+                    );
+                },
+                state,
+            );
+        harness.run();
+        let grid = harness
+            .state()
+            .view
+            .diagnostics()
+            .grid_rect
+            .expect("rendered grid");
+        let start = grid.left_top() + egui::vec2(2.0, 2.0);
+        let end = start + egui::vec2(48.0, 0.0);
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerMoved(end));
+        harness.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        harness.get_by_label("Terminal viewport").click_secondary();
+        harness.run();
+
+        assert!(harness.query_by_label("Copy").is_some());
+        assert!(harness
+            .query_by_label("Open Terminal History in Editor")
+            .is_none());
+        assert!(harness
+            .query_by_label("Save Terminal History As…")
+            .is_none());
+    }
+
+    #[test]
+    fn shift_right_click_overrides_tui_mouse_reporting_without_leaking_bytes() {
+        for mode in [b"\x1b[?1000h".as_slice(), b"\x1b[?1002h", b"\x1b[?1003h"] {
+            for encoding in [b"".as_slice(), b"\x1b[?1006h", b"\x1b[?1015h"] {
+                let mut state = HeadlessViewState::new();
+                state.terminal.ingest(mode);
+                state.terminal.ingest(encoding);
+                let mut harness = Harness::builder()
+                    .with_size(Vec2::new(800.0, 600.0))
+                    .build_ui_state(
+                        |ui, state: &mut HeadlessViewState| {
+                            state.view.show(ui, &mut state.terminal, &mut state.sink);
+                        },
+                        state,
+                    );
+                harness.run();
+
+                harness.get_by_label("Terminal viewport").click_secondary();
+                harness.run();
+                assert!(harness.query_by_label("Paste").is_none());
+                assert!(!harness.state().sink.0.is_empty());
+                let reports_before_override = harness.state().sink.0.len();
+
+                let pos = harness.get_by_label("Terminal viewport").rect().center();
+                // Avoid synthesizing an unmodified move before the press: any-motion
+                // tracking legitimately forwards that separate event.
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::SHIFT,
+                    });
+                }
+                harness.run();
+
+                assert!(harness.query_by_label("Paste").is_some());
+                assert_eq!(harness.state().sink.0.len(), reports_before_override);
+            }
+        }
+    }
+
+    #[test]
+    fn secondary_gesture_ownership_is_latched_across_modifier_changes() {
+        let mut state = HeadlessViewState::new();
+        state.terminal.ingest(b"\x1b[?1000h");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                state,
+            );
+        harness.run();
+        let center = harness.get_by_label("Terminal viewport").rect().center();
+
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert!(harness.query_by_label("Paste").is_some());
+        assert!(harness.state().sink.0.is_empty());
+
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(harness.query_by_label("Paste").is_none());
+        assert!(harness.state().sink.0.is_empty());
+
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        harness.run();
+        assert!(harness.query_by_label("Paste").is_none());
+        assert!(!harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn middle_click_pastes_locally_without_leaking_a_mouse_report_when_the_tui_is_not_tracking() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+        let center = harness.get_by_label("Terminal viewport").rect().center();
+
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Middle,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Middle,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+
+        // The paste itself only arrives asynchronously via a later
+        // `Event::Paste` once the OS clipboard responds to the requested
+        // `ViewportCommand::RequestPaste`, so the only thing observable
+        // here is the absence of any mouse-report bytes: both the press
+        // and its matching release must be claimed locally rather than
+        // falling through to `route_pointer_event`.
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn middle_click_passes_through_to_tui_mouse_reporting_unless_shift_overrides() {
+        let mut state = HeadlessViewState::new();
+        state.terminal.ingest(b"\x1b[?1000h");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                state,
+            );
+        harness.run();
+        let center = harness.get_by_label("Terminal viewport").rect().center();
+
+        // A TUI that has turned on mouse tracking (e.g. vim, tmux) owns
+        // ordinary middle-click by default, since many such programs bind
+        // it to their own paste-buffer behavior.
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Middle,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Middle,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert!(!harness.state().sink.0.is_empty());
+        let reports_before_override = harness.state().sink.0.len();
+
+        // Shift is the stable local override, mirroring the right-click
+        // convention: it forces the local clipboard-paste handling even
+        // though the TUI is tracking the mouse.
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Middle,
+            pressed: true,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Middle,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert_eq!(harness.state().sink.0.len(), reports_before_override);
+    }
+
+    #[test]
+    fn escape_closes_terminal_context_menu_and_returns_input_to_terminal() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+        harness.get_by_label("Terminal viewport").click_secondary();
+        harness.run();
+
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(harness.query_by_label("Paste").is_none());
+        assert!(harness.state().sink.0.is_empty());
+
+        harness.event(egui::Event::Text("Q".to_owned()));
+        harness.run();
+        assert_eq!(harness.state().sink.0, vec![b"Q".to_vec()]);
+    }
+
+    #[test]
+    fn read_only_terminal_context_menu_omits_paste() {
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            paste_available: false,
+                            terminal_input_enabled: true,
+                            keyboard_input_enabled: true,
+                            persistent_keyboard_focus: false,
+                            defer_paste_to_application: false,
+                            scroll_speed_multiplier: 1.0,
+                            context_menu_action: None,
+                            history_snapshot_actions: false,
+                            expose_text_to_accessibility: false,
+                        },
+                    );
+                },
+                HeadlessViewState::new(),
+            );
+        harness.run();
+
+        harness.get_by_label("Terminal viewport").click_secondary();
+        harness.run();
+
+        assert!(harness.query_by_label("Paste").is_none());
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn disconnected_session_keeps_selection_copy_and_navigation_but_drops_keystrokes() {
+        // #51: once a session is exited/failed/stopped/disconnected, the
+        // application sets `keyboard_input_enabled: false` (distinct from
+        // the full-blackout `terminal_input_enabled` used for modal
+        // dialogs). Typed keystrokes must not reach the (dead) transport,
+        // but scrollback selection and Copy remain available so read-only
+        // history stays inspectable, per `docs/gui-action-graph.md`'s
+        // HIST-06/SSH-02 invariant.
+        let mut state = HeadlessViewState::new();
+        state.terminal.ingest(b"copy me");
+        // Retired TUI modes must not steal local gestures or emit focus reports.
+        state.terminal.ingest(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            paste_available: false,
+                            terminal_input_enabled: true,
+                            keyboard_input_enabled: false,
+                            persistent_keyboard_focus: false,
+                            defer_paste_to_application: false,
+                            scroll_speed_multiplier: 1.0,
+                            context_menu_action: None,
+                            history_snapshot_actions: false,
+                            expose_text_to_accessibility: false,
+                        },
+                    );
+                },
+                state,
+            );
+        harness.run();
+
+        // A keystroke sent to a read-only/dead session must not be encoded.
+        harness.get_by_label("Terminal viewport").click();
+        harness.run();
+        harness.event(egui::Event::Text("Q".to_owned()));
+        harness.run();
+        assert!(
+            harness.state().sink.0.is_empty(),
+            "keyboard_input_enabled: false must drop keystrokes bound for a dead transport"
+        );
+
+        // Selection and Copy must still work over the retained read-only
+        // history.
+        harness
+            .state_mut()
+            .view
+            .selection
+            .begin(CellPosition { column: 0, row: 0 });
+        harness
+            .state_mut()
+            .view
+            .selection
+            .extend(CellPosition { column: 6, row: 0 });
+        harness.state_mut().view.selection.finish();
+        assert!(harness.state().view.selection().range().is_some());
+
+        harness.get_by_label("Terminal viewport").click_secondary();
+        harness.run();
+        assert!(
+            harness.query_by_label("Copy").is_some(),
+            "Copy must remain available for a disconnected session's selected history"
+        );
+    }
+
+    #[test]
+    fn terminal_context_menu_exposes_copy_for_selection_without_clearing_it() {
+        let mut state = HeadlessViewState::new();
+        state.terminal.ingest(b"copy me");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                state,
+            );
+        harness.run();
+        harness
+            .state_mut()
+            .view
+            .selection
+            .begin(CellPosition { column: 0, row: 0 });
+        harness
+            .state_mut()
+            .view
+            .selection
+            .extend(CellPosition { column: 6, row: 0 });
+        harness.state_mut().view.selection.finish();
+
+        harness.get_by_label("Terminal viewport").click_secondary();
+        harness.run();
+
+        assert!(harness.query_by_label("Copy").is_some());
+        assert!(harness.state().view.selection().range().is_some());
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn terminal_context_menu_exposes_application_owned_action_requests() {
+        for viewport_width in [200.0, 800.0] {
+            struct State {
+                terminal: Terminal,
+                view: TerminalView,
+                sink: Sink,
+                copy_value: String,
+                copied: Vec<String>,
+            }
+            let state = State {
+                terminal: terminal(80, 24),
+                view: TerminalView::default(),
+                sink: Sink::default(),
+                copy_value: format!(
+                    "/srv/{}/report  name\t\u{202e}.md",
+                    "long-directory/".repeat(20)
+                ),
+                copied: Vec::new(),
+            };
+            let mut harness = Harness::builder()
+                .with_size(Vec2::new(viewport_width, 600.0))
+                .build_ui_state(
+                    |ui, state: &mut State| {
+                        state.view.show_with_options(
+                            ui,
+                            &mut state.terminal,
+                            &mut state.sink,
+                            TerminalViewOptions {
+                                paste_available: false,
+                                context_menu_action: Some(TerminalContextMenuAction {
+                                    label: "Open in viewer".to_owned(),
+                                    preview: format!("deploy@host · {}", state.copy_value),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                    copy: Some(("Copy path".to_owned(), state.copy_value.clone())),
+                                }),
+                                history_snapshot_actions: true,
+                                ..TerminalViewOptions::default()
+                            },
+                        );
+                        state.copied.extend(ui.ctx().output(|output| {
+                            output
+                                .commands
+                                .iter()
+                                .filter_map(|command| match command {
+                                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                        }));
+                    },
+                    state,
+                );
+            harness.run();
+
+            harness.get_by_label("Terminal viewport").click_secondary();
+            harness.run();
+            assert!(harness.query_by_label("Open in viewer").is_some());
+            assert!(harness.query_by_label("Copy path").is_some());
+            let (accessible_target, _) = context_target_text(
+                &format!("deploy@host · {}", harness.state().copy_value),
+                0.0,
+                |_| 1.0,
+            );
+            assert!(harness.query_by_label(&accessible_target).is_some());
+            assert!(harness.get_by_label("Copy path").rect().width() <= CONTEXT_MENU_MAX_WIDTH);
+            assert!(harness.get_by_label("Copy path").rect().left() >= 0.0);
+            assert!(harness.get_by_label("Copy path").rect().right() <= viewport_width);
+
+            harness.get_by_label("Open in viewer").click();
+            harness.run();
+
+            assert!(harness.state_mut().view.take_context_action_request());
+            assert!(harness.state_mut().view.take_history_actions().is_empty());
+            assert!(harness.state().sink.0.is_empty());
+
+            harness.get_by_label("Terminal viewport").click_secondary();
+            harness.run();
+            harness.get_by_label("Copy path").click();
+            harness.run();
+            assert!(!harness.state_mut().view.take_context_action_request());
+            assert!(harness.state().sink.0.is_empty());
+            assert_eq!(
+                harness.state().copied.last(),
+                Some(&harness.state().copy_value)
+            );
+
+            harness.get_by_label("Terminal viewport").click_secondary();
+            harness.run();
+            harness
+                .get_by_label("Open Terminal History in Editor")
+                .click();
+            harness.run();
+            assert_eq!(
+                harness.state_mut().view.take_history_actions(),
+                vec![TerminalHistoryAction::OpenInEditor]
+            );
+            assert!(!harness.state_mut().view.take_context_action_request());
+            assert!(harness.state().sink.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn terminal_context_menu_uses_explicit_link_under_pointer_only() {
+        struct State {
+            terminal: Terminal,
+            view: TerminalView,
+            sink: Sink,
+            copied: Vec<String>,
+        }
+        let mut state = State {
+            terminal: terminal(80, 24),
+            view: TerminalView::default(),
+            sink: Sink::default(),
+            copied: Vec::new(),
+        };
+        let address = format!(
+            "https://example.com/{}/report.md?token={}",
+            "long-directory/".repeat(10),
+            "value".repeat(30)
+        );
+        state
+            .terminal
+            .ingest(format!("\x1b]8;;{address}\x1b\\link\x1b]8;;\x1b\\").as_bytes());
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                    state.copied.extend(ui.ctx().output(|output| {
+                        output
+                            .commands
+                            .iter()
+                            .filter_map(|command| match command {
+                                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    }));
+                },
+                state,
+            );
+        harness.run();
+        let grid = harness
+            .state()
+            .view
+            .diagnostics()
+            .grid_rect
+            .expect("rendered grid");
+        let link_cell = grid.left_top() + egui::vec2(2.0, 2.0);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: link_cell,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+
+        assert!(harness.query_by_label("Open link").is_some());
+        assert!(harness.query_by_label("Copy link").is_some());
+        assert!(harness.query_by_label(&address).is_some());
+        assert!(harness.get_by_label("Copy link").rect().width() <= CONTEXT_MENU_MAX_WIDTH);
+        assert!(harness.state().sink.0.is_empty());
+        harness.get_by_label("Open link").click();
+        harness.run();
+        assert_eq!(
+            harness.state_mut().view.take_link_requests(),
+            vec![Arc::<str>::from(address.as_str())]
+        );
+
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: link_cell,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+        harness.get_by_label("Copy link").click();
+        harness.run();
+        assert_eq!(harness.state().copied.last(), Some(&address));
+        assert!(harness.state_mut().view.take_link_requests().is_empty());
+        assert!(harness.state().sink.0.is_empty());
+
+        let non_link_cell = grid.left_top()
+            + egui::vec2(
+                harness
+                    .state()
+                    .view
+                    .diagnostics()
+                    .grid_rect
+                    .unwrap()
+                    .width()
+                    / 10.0
+                    * 6.0,
+                2.0,
+            );
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: non_link_cell,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+        assert!(harness.query_by_label("Open link").is_none());
+    }
+
+    #[test]
+    fn ordinary_click_never_activates_an_osc8_link() {
+        let mut state = HeadlessViewState::new();
+        state
+            .terminal
+            .ingest(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                state,
+            );
+        harness.run();
+        let position = harness
+            .state()
+            .view
+            .diagnostics()
+            .grid_rect
+            .unwrap()
+            .left_top()
+            + egui::vec2(2.0, 2.0);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+
+        assert!(harness.state_mut().view.take_link_requests().is_empty());
+    }
+
+    #[test]
+    fn command_click_emits_link_intent_without_terminal_input() {
+        let mut state = HeadlessViewState::new();
+        state
+            .terminal
+            .ingest(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                state,
+            );
+        harness.run();
+        let position = harness
+            .state()
+            .view
+            .diagnostics()
+            .grid_rect
+            .unwrap()
+            .left_top()
+            + egui::vec2(2.0, 2.0);
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers,
+            });
+        }
+        harness.run();
+
+        assert_eq!(
+            harness.state_mut().view.take_link_requests(),
+            vec![Arc::<str>::from("https://example.com/")]
+        );
+        assert!(harness.state().sink.0.is_empty());
+    }
+
+    #[test]
+    fn file_link_gestures_preview_and_copy_use_the_decoded_destination() {
+        struct State {
+            terminal: HeadlessViewState,
+            copied: Vec<String>,
+        }
+        for local in [false, true] {
+            let mut terminal = HeadlessViewState::new();
+            terminal.view.set_file_link_context(4, local);
+            terminal
+                .terminal
+                .ingest(b"\x1b]8;;file:///C:/report%20one.md\x07misleading label\x1b]8;;\x07");
+            let mut harness = Harness::builder()
+                .with_size(Vec2::new(800.0, 600.0))
+                .build_ui_state(
+                    |ui, state: &mut State| {
+                        let state_view = &mut state.terminal;
+                        state_view
+                            .view
+                            .show(ui, &mut state_view.terminal, &mut state_view.sink);
+                        state.copied.extend(ui.ctx().output(|output| {
+                            output
+                                .commands
+                                .iter()
+                                .filter_map(|command| match command {
+                                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                        }));
+                    },
+                    State {
+                        terminal,
+                        copied: Vec::new(),
+                    },
+                );
+            harness.run();
+            let point = harness
+                .state()
+                .terminal
+                .view
+                .diagnostics()
+                .grid_rect
+                .unwrap()
+                .min
+                + egui::vec2(2.0, 2.0);
+            for modifiers in [egui::Modifiers::NONE, egui::Modifiers::COMMAND] {
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers,
+                    });
+                }
+                harness.run();
+                let expected = usize::from(local && modifiers.command);
+                assert_eq!(
+                    harness.state_mut().terminal.view.take_link_requests().len(),
+                    expected
+                );
+            }
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.run();
+            let expected_path = if cfg!(windows) {
+                r"C:\report one.md"
+            } else {
+                "/C:/report one.md"
+            };
+            assert!(harness.query_by_label(expected_path).is_some());
+            let open = harness.get_by_label("Open link").rect().center();
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: open,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.run();
+            assert_eq!(
+                harness.state_mut().terminal.view.take_link_requests().len(),
+                usize::from(local)
+            );
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.run();
+            harness.get_by_label("Copy path").click();
+            harness.run();
+            assert_eq!(
+                harness.state().copied.last().map(String::as_str),
+                Some(expected_path)
+            );
+            assert!(harness.state().terminal.sink.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn changing_file_link_generation_retires_press_menu_and_pending_activation() {
+        let mut state = HeadlessViewState::new();
+        state.view.set_file_link_context(0, true);
+        state
+            .terminal
+            .ingest(b"\x1b]8;;file:///tmp/report.md\x07link\x1b]8;;\x07");
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut HeadlessViewState| {
+                    state.view.show(ui, &mut state.terminal, &mut state.sink);
+                },
+                state,
+            );
+        harness.run();
+        let point =
+            harness.state().view.diagnostics().grid_rect.unwrap().min + egui::vec2(2.0, 2.0);
+        harness.event(egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run();
+        harness.state_mut().view.set_file_link_context(1, true);
+        harness.event(egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.run();
+        assert!(harness.state_mut().view.take_link_requests().is_empty());
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+        assert!(harness.state().view.context_link.is_some());
+        harness.get_by_label("Open link").click();
+        harness.run();
+        assert_eq!(harness.state().view.pending_link_requests.len(), 1);
+        harness.state_mut().view.set_file_link_context(2, true);
+        harness.run();
+        assert!(harness.state().view.context_link.is_none());
+        assert!(harness.state_mut().view.take_link_requests().is_empty());
+    }
+
+    #[test]
+    fn lost_command_click_release_cannot_arm_a_later_click() {
+        struct State {
+            terminal: Terminal,
+            view: TerminalView,
+            sink: Sink,
+            blocked: bool,
+        }
+        let mut terminal = terminal(80, 24);
+        terminal.ingest(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        let state = State {
+            terminal,
+            view: TerminalView::default(),
+            sink: Sink::default(),
+            blocked: false,
+        };
+        let mut harness = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    state.view.show_with_options(
+                        ui,
+                        &mut state.terminal,
+                        &mut state.sink,
+                        TerminalViewOptions {
+                            terminal_input_enabled: !state.blocked,
+                            ..TerminalViewOptions::default()
+                        },
+                    );
+                },
+                state,
+            );
+        harness.run();
+        let position = harness
+            .state()
+            .view
+            .diagnostics()
+            .grid_rect
+            .unwrap()
+            .left_top()
+            + egui::vec2(2.0, 2.0);
+        let command = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        };
+        harness.event(egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: command,
+        });
+        harness.run();
+
+        harness.state_mut().blocked = true;
+        harness.event(egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: command,
+        });
+        harness.run();
+
+        harness.state_mut().blocked = false;
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+
+        assert!(harness.state_mut().view.take_link_requests().is_empty());
+    }
+}

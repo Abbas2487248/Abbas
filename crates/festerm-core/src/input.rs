@@ -1,0 +1,911 @@
+use crate::modes::{MouseTrackingMode, TerminalModes};
+
+/// A named non-text terminal key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Key {
+    Character(char),
+    /// A Ctrl-chord over `character`, encoded as the C0/C1 control byte
+    /// xterm and other terminal emulators send for it (e.g. Ctrl+B sends
+    /// `0x02`). `character` is the base key as if Ctrl were not held (its
+    /// case does not matter: Ctrl+B and Ctrl+Shift+B send the same byte).
+    /// A UI only emits this for a `character` this crate can actually map;
+    /// see [`control_byte`].
+    Control(char),
+    Enter,
+    Tab,
+    Backspace,
+    Escape,
+    ArrowUp,
+    ArrowDown,
+    ArrowRight,
+    ArrowLeft,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Insert,
+    Delete,
+    /// A function key, `1..=12`; other numbers encode nothing.
+    Function(u8),
+    Keypad(KeypadKey),
+}
+
+/// A keypad key whose encoding depends on DECKPAM/DECKPNM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeypadKey {
+    Digit(u8),
+    Decimal,
+    Enter,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Equal,
+    Separator,
+}
+
+/// A focus change reported by `DECSET ?1004`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FocusEvent {
+    In,
+    Out,
+}
+
+/// Mouse buttons recognized by xterm-style mouse reporting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+/// Mouse-wheel direction recognized by xterm-style mouse reporting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseWheel {
+    Up,
+    Down,
+}
+
+/// Pointer activity received at the UI boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseEventKind {
+    Press(MouseButton),
+    Release(MouseButton),
+    /// `button` is the held button, if any, while the pointer moved.
+    Move {
+        button: Option<MouseButton>,
+    },
+    Wheel(MouseWheel),
+}
+
+/// Keyboard modifiers encoded in xterm mouse reports.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Modifiers {
+    bits: u8,
+}
+
+impl Modifiers {
+    pub const NONE: Self = Self { bits: 0 };
+    pub const SHIFT: Self = Self { bits: 1 << 0 };
+    pub const ALT: Self = Self { bits: 1 << 1 };
+    pub const CONTROL: Self = Self { bits: 1 << 2 };
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.bits & other.bits == other.bits
+    }
+
+    pub const fn with(self, other: Self) -> Self {
+        Self {
+            bits: self.bits | other.bits,
+        }
+    }
+
+    const fn mouse_bits(self) -> u8 {
+        (if self.contains(Self::SHIFT) { 4 } else { 0 })
+            | (if self.contains(Self::ALT) { 8 } else { 0 })
+            | (if self.contains(Self::CONTROL) { 16 } else { 0 })
+    }
+}
+
+/// A mouse event in zero-based terminal-cell coordinates.
+///
+/// `column` and `row` name the cell under the pointer. SGR reports add one to
+/// both values because its wire format is one based.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MouseEvent {
+    pub kind: MouseEventKind,
+    pub column: usize,
+    pub row: usize,
+    pub modifiers: Modifiers,
+}
+
+/// Typed UI input accepted by the terminal core.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InputEvent {
+    Key(Key),
+    /// Explicit modifiers from an input surface, including mobile sticky keys.
+    /// Characters already carry their layout/Shift-translated text.
+    ModifiedKey {
+        key: Key,
+        modifiers: Modifiers,
+    },
+    Paste(String),
+    Focus(FocusEvent),
+    Mouse(MouseEvent),
+}
+
+/// Observable result of handling a typed input event.
+///
+/// A UI may start local selection only after `SelectionAllowed`. An enabled
+/// terminal mouse mode claims every mouse event, including one that its
+/// tracking level does not report, so `SelectionClaimed` means no local
+/// selection even though no bytes were queued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputEventOutcome {
+    Encoded { bytes: usize },
+    SelectionAllowed,
+    SelectionClaimed,
+    QueueOverflow,
+    Rejected,
+}
+
+/// Maximum number of events that may form one prepared input batch.
+pub const MAX_PREPARED_INPUT_EVENTS: usize = 64;
+
+/// Why an input batch could not be prepared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputPreparationError {
+    Empty,
+    TooManyEvents,
+    TooLarge,
+    UnsupportedEvent,
+    Rejected,
+    Allocation,
+}
+
+/// Immutable bytes encoded against one snapshot of terminal modes.
+///
+/// This value does not reserve a transport position or authorize input.
+pub struct PreparedInput {
+    bytes: Vec<u8>,
+    modes: TerminalModes,
+}
+
+impl PreparedInput {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub const fn modes(&self) -> TerminalModes {
+        self.modes
+    }
+}
+
+impl crate::Terminal {
+    /// Encodes keyboard and paste events as one bounded, inert input batch.
+    ///
+    /// This does not mutate the input queue. A caller must bind the result to
+    /// the exact target and, while retaining its admission fences, recheck the
+    /// terminal modes before publishing the reserved bytes. The byte limit is
+    /// additionally capped at the terminal's transport queue watermark.
+    pub fn prepare_input(
+        &self,
+        events: &[InputEvent],
+        max_bytes: usize,
+    ) -> Result<PreparedInput, InputPreparationError> {
+        use InputPreparationError as Refusal;
+
+        if events.is_empty() {
+            return Err(Refusal::Empty);
+        }
+        if events.len() > MAX_PREPARED_INPUT_EVENTS {
+            return Err(Refusal::TooManyEvents);
+        }
+        let modes = self.modes();
+        let limit = max_bytes.min(crate::TRANSPORT_QUEUE_HIGH_WATERMARK);
+        let mut bytes = Vec::new();
+        for event in events {
+            let remaining = limit - bytes.len();
+            let encoded = match event {
+                InputEvent::Key(key) => encode_key(*key, modes).ok_or(Refusal::Rejected)?,
+                InputEvent::ModifiedKey { key, modifiers } => {
+                    encode_modified_key(*key, *modifiers, modes).ok_or(Refusal::Rejected)?
+                }
+                InputEvent::Paste(text) => {
+                    // Even unbracketed CRLF normalization can remove at most
+                    // one byte from each pair.
+                    if text.len() > remaining.saturating_mul(2)
+                        || paste_encoded_length(text, modes).ok_or(Refusal::TooLarge)? > remaining
+                    {
+                        return Err(Refusal::TooLarge);
+                    }
+                    let mut owned = String::new();
+                    owned
+                        .try_reserve_exact(text.len())
+                        .map_err(|_| Refusal::Allocation)?;
+                    owned.push_str(text);
+                    encode_paste(owned, modes).ok_or(Refusal::Allocation)?
+                }
+                InputEvent::Focus(_) | InputEvent::Mouse(_) => {
+                    return Err(Refusal::UnsupportedEvent);
+                }
+            };
+            if encoded.len() > remaining {
+                return Err(Refusal::TooLarge);
+            }
+            bytes
+                .try_reserve(encoded.len())
+                .map_err(|_| Refusal::Allocation)?;
+            bytes.extend_from_slice(&encoded);
+        }
+        if bytes.is_empty() {
+            return Err(Refusal::Empty);
+        }
+        Ok(PreparedInput { bytes, modes })
+    }
+}
+
+pub(crate) fn encode_key(key: Key, modes: TerminalModes) -> Option<Vec<u8>> {
+    if modes.keyboard_locked() {
+        // KAM locks the keyboard rather than discarding what it produces, so
+        // nothing is queued and nothing is owed to the program later.
+        return None;
+    }
+    let bytes = match key {
+        Key::Character(character) => character.to_string().into_bytes(),
+        Key::Control(character) => vec![control_byte(character)?],
+        Key::Enter => b"\r".to_vec(),
+        Key::Tab => b"\t".to_vec(),
+        Key::Backspace => vec![if modes.backarrow_sends_backspace() {
+            0x08
+        } else {
+            0x7f
+        }],
+        Key::Escape => vec![0x1b],
+        Key::ArrowUp => cursor_key_bytes(b'A', modes.application_cursor()),
+        Key::ArrowDown => cursor_key_bytes(b'B', modes.application_cursor()),
+        Key::ArrowRight => cursor_key_bytes(b'C', modes.application_cursor()),
+        Key::ArrowLeft => cursor_key_bytes(b'D', modes.application_cursor()),
+        Key::PageUp => b"\x1b[5~".to_vec(),
+        Key::PageDown => b"\x1b[6~".to_vec(),
+        Key::Home => cursor_key_bytes(b'H', modes.application_cursor()),
+        Key::End => cursor_key_bytes(b'F', modes.application_cursor()),
+        Key::Insert => b"\x1b[2~".to_vec(),
+        Key::Delete => b"\x1b[3~".to_vec(),
+        Key::Function(number) => match function_key_code(number)? {
+            FunctionCode::Ss3(final_byte) => vec![0x1b, b'O', final_byte],
+            FunctionCode::Tilde(code) => format!("\x1b[{code}~").into_bytes(),
+        },
+        Key::Keypad(key) => keypad_key_bytes(key, modes.application_keypad())?,
+    };
+    Some(bytes)
+}
+
+pub(crate) fn encode_modified_key(
+    key: Key,
+    modifiers: Modifiers,
+    modes: TerminalModes,
+) -> Option<Vec<u8>> {
+    if modes.keyboard_locked() {
+        return None;
+    }
+    if modifiers == Modifiers::NONE {
+        return encode_key(key, modes);
+    }
+    if key == Key::Tab && modifiers == Modifiers::SHIFT {
+        return Some(b"\x1b[Z".to_vec());
+    }
+    let cursor_final = match key {
+        Key::Home => Some('H'),
+        Key::End => Some('F'),
+        Key::Function(number) => match function_key_code(number)? {
+            FunctionCode::Ss3(final_byte) => Some(char::from(final_byte)),
+            FunctionCode::Tilde(_) => None,
+        },
+        Key::ArrowUp => Some('A'),
+        Key::ArrowDown => Some('B'),
+        Key::ArrowRight => Some('C'),
+        Key::ArrowLeft => Some('D'),
+        _ => None,
+    };
+    if let Some(final_byte) = cursor_final {
+        let parameter = 1
+            + u8::from(modifiers.contains(Modifiers::SHIFT))
+            + 2 * u8::from(modifiers.contains(Modifiers::ALT))
+            + 4 * u8::from(modifiers.contains(Modifiers::CONTROL));
+        return Some(format!("\x1b[1;{parameter}{final_byte}").into_bytes());
+    }
+    let tilde_code = match key {
+        Key::Insert => Some(2),
+        Key::Delete => Some(3),
+        Key::PageUp => Some(5),
+        Key::PageDown => Some(6),
+        Key::Function(number) => match function_key_code(number)? {
+            FunctionCode::Tilde(code) => Some(code),
+            FunctionCode::Ss3(_) => None,
+        },
+        _ => None,
+    };
+    if let Some(code) = tilde_code {
+        let parameter = 1
+            + u8::from(modifiers.contains(Modifiers::SHIFT))
+            + 2 * u8::from(modifiers.contains(Modifiers::ALT))
+            + 4 * u8::from(modifiers.contains(Modifiers::CONTROL));
+        return Some(format!("\x1b[{code};{parameter}~").into_bytes());
+    }
+    if modifiers.contains(Modifiers::SHIFT) && !matches!(key, Key::Character(_) | Key::Control(_)) {
+        // Other non-character Shift chords are not part of this additive API.
+        // Do not silently turn unsupported chords into unmodified keys.
+        return None;
+    }
+    let key = if modifiers.contains(Modifiers::CONTROL) {
+        match key {
+            Key::Character(character) | Key::Control(character) => Key::Control(character),
+            // Reject unsupported chords rather than sending a different key.
+            _ => return None,
+        }
+    } else {
+        key
+    };
+    let mut bytes = encode_key(key, modes)?;
+    if modifiers.contains(Modifiers::ALT) {
+        bytes.insert(0, 0x1b);
+    }
+    Some(bytes)
+}
+
+/// Maps a Ctrl-chord's base `character` to the C0/C1 control byte xterm
+/// sends for it: for a letter, its position in the alphabet (`Ctrl+A` is
+/// `0x01` through `Ctrl+Z` is `0x1a`); a few punctuation keys conventionally
+/// paired with Ctrl for the remaining low control codes; and space for NUL.
+/// Returns `None` for any `character` without an established control-byte
+/// mapping, which callers treat as "send nothing" rather than guessing.
+pub(crate) fn control_byte(character: char) -> Option<u8> {
+    match character {
+        'a'..='z' => Some(character.to_ascii_uppercase() as u8 - b'A' + 1),
+        'A'..='Z' => Some(character as u8 - b'A' + 1),
+        ' ' => Some(0x00),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        _ => None,
+    }
+}
+
+enum FunctionCode {
+    Ss3(u8),
+    Tilde(u8),
+}
+
+fn function_key_code(number: u8) -> Option<FunctionCode> {
+    Some(match number {
+        1..=4 => FunctionCode::Ss3(b'P' + number - 1),
+        5 => FunctionCode::Tilde(15),
+        6..=10 => FunctionCode::Tilde(11 + number),
+        11 | 12 => FunctionCode::Tilde(12 + number),
+        _ => return None,
+    })
+}
+
+fn cursor_key_bytes(final_byte: u8, application: bool) -> Vec<u8> {
+    if application {
+        vec![0x1b, b'O', final_byte]
+    } else {
+        vec![0x1b, b'[', final_byte]
+    }
+}
+
+fn keypad_key_bytes(key: KeypadKey, application: bool) -> Option<Vec<u8>> {
+    let normal = match key {
+        KeypadKey::Digit(digit @ 0..=9) => vec![b'0' + digit],
+        KeypadKey::Digit(_) => return None,
+        KeypadKey::Decimal => b".".to_vec(),
+        KeypadKey::Enter => b"\r".to_vec(),
+        KeypadKey::Add => b"+".to_vec(),
+        KeypadKey::Subtract => b"-".to_vec(),
+        KeypadKey::Multiply => b"*".to_vec(),
+        KeypadKey::Divide => b"/".to_vec(),
+        KeypadKey::Equal => b"=".to_vec(),
+        KeypadKey::Separator => b",".to_vec(),
+    };
+    if !application {
+        return Some(normal);
+    }
+
+    let final_byte = match key {
+        KeypadKey::Digit(0) => b'p',
+        KeypadKey::Digit(1) => b'q',
+        KeypadKey::Digit(2) => b'r',
+        KeypadKey::Digit(3) => b's',
+        KeypadKey::Digit(4) => b't',
+        KeypadKey::Digit(5) => b'u',
+        KeypadKey::Digit(6) => b'v',
+        KeypadKey::Digit(7) => b'w',
+        KeypadKey::Digit(8) => b'x',
+        KeypadKey::Digit(9) => b'y',
+        KeypadKey::Digit(_) => return None,
+        KeypadKey::Decimal => b'n',
+        KeypadKey::Enter => b'M',
+        KeypadKey::Add => b'k',
+        KeypadKey::Subtract => b'm',
+        KeypadKey::Multiply => b'j',
+        KeypadKey::Divide => b'o',
+        KeypadKey::Equal => b'X',
+        KeypadKey::Separator => b'l',
+    };
+    Some(vec![0x1b, b'O', final_byte])
+}
+
+pub(crate) fn encode_paste(text: String, modes: TerminalModes) -> Option<Vec<u8>> {
+    if !modes.bracketed_paste() {
+        let mut bytes = text.into_bytes();
+        let mut previous_was_cr = false;
+        // Ordinary line breaks are Enter, not LF control-key input.
+        bytes.retain_mut(|byte| {
+            let crlf_end = previous_was_cr && *byte == b'\n';
+            previous_was_cr = *byte == b'\r';
+            if *byte == b'\n' {
+                *byte = b'\r';
+            }
+            !crlf_end
+        });
+        return Some(bytes);
+    }
+
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let capacity = paste_encoded_length(&text, modes)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).ok()?;
+    bytes.extend_from_slice(START);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(END);
+    Some(bytes)
+}
+
+#[cfg(test)]
+mod prepared_input_tests {
+    use super::*;
+    use crate::{Dimensions, Terminal, TRANSPORT_QUEUE_HIGH_WATERMARK};
+
+    fn terminal() -> Terminal {
+        Terminal::new(Dimensions::new(20, 4).unwrap()).unwrap()
+    }
+
+    fn refusal(terminal: &Terminal, events: &[InputEvent], limit: usize) -> InputPreparationError {
+        match terminal.prepare_input(events, limit) {
+            Ok(_) => panic!("input preparation unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn prepared_input_matches_core_encoding_without_mutating_the_queue() {
+        for mode_sequence in [b"".as_slice(), b"\x1b[?1h\x1b=\x1b[?2004h"] {
+            let mut terminal = terminal();
+            terminal.ingest(mode_sequence);
+            terminal.queue_input(b"earlier");
+            let events = [
+                InputEvent::Key(Key::ArrowUp),
+                InputEvent::Key(Key::Keypad(KeypadKey::Digit(1))),
+                InputEvent::ModifiedKey {
+                    key: Key::ArrowLeft,
+                    modifiers: Modifiers::CONTROL.with(Modifiers::ALT),
+                },
+                InputEvent::Paste("first\r\nsecond\n".to_owned()),
+            ];
+            let prepared = terminal.prepare_input(&events, 16_384).unwrap();
+            assert_eq!(terminal.queued_input(), b"earlier");
+            assert_eq!(prepared.modes(), terminal.modes());
+
+            terminal.drain_input();
+            for event in events {
+                assert!(matches!(
+                    terminal.handle_input(event),
+                    InputEventOutcome::Encoded { .. }
+                ));
+            }
+            assert_eq!(prepared.bytes(), terminal.queued_input());
+
+            terminal.ingest(b"\x1b[?1l\x1b>");
+            if !mode_sequence.is_empty() {
+                assert_ne!(prepared.modes(), terminal.modes());
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_input_refuses_entire_invalid_batch_without_touching_input() {
+        let mut terminal = terminal();
+        terminal.queue_input(b"earlier");
+        let prefix = InputEvent::Key(Key::Character('x'));
+        for (events, expected) in [
+            (vec![], InputPreparationError::Empty),
+            (
+                vec![InputEvent::Paste(String::new())],
+                InputPreparationError::Empty,
+            ),
+            (
+                vec![prefix.clone(), InputEvent::Key(Key::Control('1'))],
+                InputPreparationError::Rejected,
+            ),
+            (
+                vec![prefix.clone(), InputEvent::Focus(FocusEvent::In)],
+                InputPreparationError::UnsupportedEvent,
+            ),
+            (
+                vec![
+                    prefix.clone(),
+                    InputEvent::Mouse(MouseEvent {
+                        kind: MouseEventKind::Press(MouseButton::Left),
+                        column: 0,
+                        row: 0,
+                        modifiers: Modifiers::NONE,
+                    }),
+                ],
+                InputPreparationError::UnsupportedEvent,
+            ),
+            (
+                vec![prefix.clone(), InputEvent::Paste("too long".to_owned())],
+                InputPreparationError::TooLarge,
+            ),
+            (
+                vec![prefix.clone(); MAX_PREPARED_INPUT_EVENTS + 1],
+                InputPreparationError::TooManyEvents,
+            ),
+        ] {
+            assert_eq!(refusal(&terminal, &events, 4), expected);
+            assert_eq!(terminal.queued_input(), b"earlier");
+        }
+        terminal.ingest(b"\x1b[2h");
+        assert_eq!(
+            refusal(&terminal, &[prefix], 4),
+            InputPreparationError::Rejected
+        );
+        assert_eq!(terminal.queued_input(), b"earlier");
+    }
+
+    #[test]
+    fn prepared_input_bounds_include_normalization_and_paste_markers() {
+        let mut terminal = terminal();
+        let text = InputEvent::Paste("\r\n".repeat(8_192));
+        let prepared = terminal.prepare_input(&[text], 8_192).unwrap();
+        assert_eq!(prepared.bytes(), vec![b'\r'; 8_192]);
+        let events = [
+            InputEvent::Paste("\r\n".repeat(8_191)),
+            InputEvent::Key(Key::Character('x')),
+        ];
+        let prepared = terminal.prepare_input(&events, 8_192).unwrap();
+        assert_eq!(prepared.bytes().len(), 8_192);
+        assert_eq!(prepared.bytes().last(), Some(&b'x'));
+        assert_eq!(
+            refusal(&terminal, &events, 8_191),
+            InputPreparationError::TooLarge
+        );
+        assert_eq!(
+            refusal(&terminal, &[InputEvent::Paste("\r\n".repeat(8_193))], 8_192,),
+            InputPreparationError::TooLarge
+        );
+
+        terminal.ingest(b"\x1b[?2004h");
+        let prepared = terminal
+            .prepare_input(&[InputEvent::Paste("x".repeat(16_384 - 12))], 16_384)
+            .unwrap();
+        assert_eq!(prepared.bytes().len(), 16_384);
+        assert!(prepared.bytes().starts_with(b"\x1b[200~"));
+        assert!(prepared.bytes().ends_with(b"\x1b[201~"));
+        assert_eq!(
+            refusal(
+                &terminal,
+                &[InputEvent::Paste("x".repeat(16_384 - 11))],
+                16_384,
+            ),
+            InputPreparationError::TooLarge
+        );
+
+        terminal.ingest(b"\x1b[?2004l");
+        assert_eq!(
+            refusal(
+                &terminal,
+                &[InputEvent::Paste(
+                    "x".repeat(TRANSPORT_QUEUE_HIGH_WATERMARK + 1)
+                )],
+                usize::MAX,
+            ),
+            InputPreparationError::TooLarge
+        );
+        assert!(terminal.queued_input().is_empty());
+    }
+}
+
+pub(crate) fn paste_encoded_length(text: &str, modes: TerminalModes) -> Option<usize> {
+    if modes.bracketed_paste() {
+        text.len()
+            .checked_add(b"\x1b[200~".len())?
+            .checked_add(b"\x1b[201~".len())
+    } else {
+        let crlf_pairs = text
+            .as_bytes()
+            .windows(2)
+            .filter(|pair| *pair == b"\r\n")
+            .count();
+        Some(text.len() - crlf_pairs)
+    }
+}
+
+pub(crate) fn mouse_event_is_reported(kind: MouseEventKind, tracking: MouseTrackingMode) -> bool {
+    match kind {
+        MouseEventKind::Press(_) | MouseEventKind::Wheel(_) => true,
+        MouseEventKind::Release(_) => tracking != MouseTrackingMode::X10,
+        MouseEventKind::Move {
+            button: Some(_), ..
+        } => matches!(
+            tracking,
+            MouseTrackingMode::ButtonMotion | MouseTrackingMode::AnyMotion
+        ),
+        MouseEventKind::Move { button: None, .. } => tracking == MouseTrackingMode::AnyMotion,
+    }
+}
+
+fn mouse_button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+fn mouse_code(event: MouseEvent, sgr: bool) -> (u8, u8) {
+    let modifiers = event.modifiers.mouse_bits();
+    match event.kind {
+        MouseEventKind::Press(button) => (mouse_button_code(button) | modifiers, b'M'),
+        MouseEventKind::Release(button) => (
+            (if sgr { mouse_button_code(button) } else { 3 }) | modifiers,
+            if sgr { b'm' } else { b'M' },
+        ),
+        MouseEventKind::Move { button } => {
+            (button.map_or(3, mouse_button_code) | modifiers | 32, b'M')
+        }
+        MouseEventKind::Wheel(MouseWheel::Up) => (64 | modifiers, b'M'),
+        MouseEventKind::Wheel(MouseWheel::Down) => (65 | modifiers, b'M'),
+    }
+}
+
+pub(crate) fn encode_sgr_mouse(event: MouseEvent) -> Option<Vec<u8>> {
+    let column = event.column.checked_add(1)?;
+    let row = event.row.checked_add(1)?;
+    let (code, final_byte) = mouse_code(event, true);
+    Some(format!("\x1b[<{code};{column};{row}{}", final_byte as char).into_bytes())
+}
+
+pub(crate) fn encode_legacy_mouse(event: MouseEvent) -> Option<Vec<u8>> {
+    const MAX_LEGACY_COORDINATE: usize = 222;
+    if event.column > MAX_LEGACY_COORDINATE || event.row > MAX_LEGACY_COORDINATE {
+        return None;
+    }
+    let (code, _) = mouse_code(event, false);
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        code + 32,
+        event.column as u8 + 33,
+        event.row as u8 + 33,
+    ])
+}
+
+#[cfg(test)]
+mod page_key_tests {
+    use super::*;
+    use crate::{Dimensions, Terminal, TRANSPORT_QUEUE_HIGH_WATERMARK};
+
+    #[test]
+    fn page_keys_encode_exact_sequences_in_primary_alternate_and_cursor_modes() {
+        for alternate in [false, true] {
+            for (application_cursor, application_keypad) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let mut terminal = Terminal::new(Dimensions::new(20, 4).unwrap()).unwrap();
+                if alternate {
+                    terminal.ingest(b"\x1b[?1049h");
+                }
+                if application_cursor {
+                    terminal.ingest(b"\x1b[?1h");
+                }
+                if application_keypad {
+                    terminal.ingest(b"\x1b=");
+                }
+                for (key, expected) in [(Key::PageUp, b"\x1b[5~"), (Key::PageDown, b"\x1b[6~")] {
+                    assert_eq!(
+                        terminal.handle_input(InputEvent::Key(key)),
+                        InputEventOutcome::Encoded { bytes: 4 }
+                    );
+                    assert_eq!(terminal.drain_input(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn page_keys_obey_keyboard_lock_and_atomic_queue_limits() {
+        for (key, expected) in [(Key::PageUp, b"\x1b[5~"), (Key::PageDown, b"\x1b[6~")] {
+            let mut terminal = Terminal::new(Dimensions::new(20, 4).unwrap()).unwrap();
+            terminal.ingest(b"\x1b[2h");
+            assert_eq!(
+                terminal.handle_input(InputEvent::Key(key)),
+                InputEventOutcome::Rejected
+            );
+            assert!(terminal.drain_input().is_empty());
+            terminal.ingest(b"\x1b[2l");
+            for remaining in [3, 4] {
+                let mut prefix = vec![b'x'; TRANSPORT_QUEUE_HIGH_WATERMARK - remaining];
+                terminal.queue_input(&prefix);
+                let outcome = terminal.handle_input(InputEvent::Key(key));
+                if remaining == 4 {
+                    assert_eq!(outcome, InputEventOutcome::Encoded { bytes: 4 });
+                    prefix.extend_from_slice(expected);
+                } else {
+                    assert_eq!(outcome, InputEventOutcome::QueueOverflow);
+                    assert!(terminal.take_input_queue_overflowed());
+                }
+                assert_eq!(terminal.drain_input(), prefix);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod modified_key_tests {
+    use super::*;
+    use crate::{Dimensions, Terminal, TRANSPORT_QUEUE_HIGH_WATERMARK};
+
+    #[test]
+    fn shift_tab_encodes_backtab_without_changing_plain_or_unsupported_chords() {
+        for alternate in [false, true] {
+            for application_modes in [false, true] {
+                let mut terminal = Terminal::new(Dimensions::new(20, 4).unwrap()).unwrap();
+                if alternate {
+                    terminal.ingest(b"\x1b[?1049h");
+                }
+                if application_modes {
+                    terminal.ingest(b"\x1b[?1h\x1b=");
+                }
+                for (modifiers, expected) in [
+                    (Modifiers::SHIFT, b"\x1b[Z".as_slice()),
+                    (Modifiers::NONE, b"\t".as_slice()),
+                ] {
+                    assert_eq!(
+                        terminal.handle_input(InputEvent::ModifiedKey {
+                            key: Key::Tab,
+                            modifiers,
+                        }),
+                        InputEventOutcome::Encoded {
+                            bytes: expected.len()
+                        }
+                    );
+                    assert_eq!(terminal.drain_input(), expected);
+                }
+                assert_eq!(
+                    terminal.handle_input(InputEvent::Key(Key::Tab)),
+                    InputEventOutcome::Encoded { bytes: 1 }
+                );
+                assert_eq!(terminal.drain_input(), b"\t");
+                assert_eq!(
+                    terminal.handle_input(InputEvent::ModifiedKey {
+                        key: Key::Tab,
+                        modifiers: Modifiers::ALT,
+                    }),
+                    InputEventOutcome::Encoded { bytes: 2 }
+                );
+                assert_eq!(terminal.drain_input(), b"\x1b\t");
+                for modifiers in [
+                    Modifiers::CONTROL,
+                    Modifiers::SHIFT.with(Modifiers::CONTROL),
+                    Modifiers::SHIFT.with(Modifiers::ALT),
+                    Modifiers::SHIFT
+                        .with(Modifiers::ALT)
+                        .with(Modifiers::CONTROL),
+                ] {
+                    assert_eq!(
+                        terminal.handle_input(InputEvent::ModifiedKey {
+                            key: Key::Tab,
+                            modifiers,
+                        }),
+                        InputEventOutcome::Rejected
+                    );
+                    assert!(terminal.drain_input().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_and_function_keys_use_xterm_sequences_with_modifiers() {
+        let mut terminal = Terminal::new(Dimensions::new(20, 4).unwrap()).unwrap();
+        let mut encode = |key, modifiers| {
+            terminal.handle_input(InputEvent::ModifiedKey { key, modifiers });
+            terminal.drain_input()
+        };
+        assert_eq!(encode(Key::Home, Modifiers::NONE), b"\x1b[H");
+        assert_eq!(encode(Key::End, Modifiers::NONE), b"\x1b[F");
+        assert_eq!(encode(Key::Insert, Modifiers::NONE), b"\x1b[2~");
+        assert_eq!(encode(Key::Delete, Modifiers::NONE), b"\x1b[3~");
+        assert_eq!(encode(Key::Function(1), Modifiers::NONE), b"\x1bOP");
+        assert_eq!(encode(Key::Function(5), Modifiers::NONE), b"\x1b[15~");
+        assert_eq!(encode(Key::Function(10), Modifiers::NONE), b"\x1b[21~");
+        assert_eq!(encode(Key::Function(12), Modifiers::NONE), b"\x1b[24~");
+        assert!(encode(Key::Function(13), Modifiers::NONE).is_empty());
+        assert_eq!(encode(Key::Home, Modifiers::CONTROL), b"\x1b[1;5H");
+        assert_eq!(encode(Key::Delete, Modifiers::ALT), b"\x1b[3;3~");
+        assert_eq!(encode(Key::PageUp, Modifiers::CONTROL), b"\x1b[5;5~");
+        assert_eq!(encode(Key::Function(2), Modifiers::ALT), b"\x1b[1;3Q");
+        assert_eq!(encode(Key::Function(6), Modifiers::CONTROL), b"\x1b[17;5~");
+    }
+
+    #[test]
+    fn shift_tab_obeys_keyboard_lock_and_atomic_queue_limits() {
+        let mut terminal = Terminal::new(Dimensions::new(20, 4).unwrap()).unwrap();
+        let backtab = InputEvent::ModifiedKey {
+            key: Key::Tab,
+            modifiers: Modifiers::SHIFT,
+        };
+        terminal.ingest(b"\x1b[2h");
+        assert_eq!(
+            terminal.handle_input(backtab.clone()),
+            InputEventOutcome::Rejected
+        );
+        assert!(terminal.drain_input().is_empty());
+        terminal.ingest(b"\x1b[2l");
+        for remaining in [2, 3] {
+            let mut prefix = vec![b'x'; TRANSPORT_QUEUE_HIGH_WATERMARK - remaining];
+            terminal.queue_input(&prefix);
+            if remaining == 3 {
+                assert_eq!(
+                    terminal.handle_input(backtab.clone()),
+                    InputEventOutcome::Encoded { bytes: 3 }
+                );
+                prefix.extend_from_slice(b"\x1b[Z");
+            } else {
+                assert_eq!(
+                    terminal.handle_input(backtab.clone()),
+                    InputEventOutcome::QueueOverflow
+                );
+                assert!(terminal.take_input_queue_overflowed());
+            }
+            assert_eq!(terminal.drain_input(), prefix);
+        }
+    }
+
+    #[test]
+    fn explicit_modifiers_encode_control_meta_and_cursor_chords_atomically() {
+        let mut terminal = Terminal::new(Dimensions::new(20, 4).unwrap()).unwrap();
+        for (key, modifiers, expected) in [
+            (Key::Character('c'), Modifiers::CONTROL, b"\x03".as_slice()),
+            (Key::Character('x'), Modifiers::ALT, b"\x1bx".as_slice()),
+            (
+                Key::Character('c'),
+                Modifiers::ALT.with(Modifiers::CONTROL),
+                b"\x1b\x03".as_slice(),
+            ),
+            (Key::ArrowUp, Modifiers::CONTROL, b"\x1b[1;5A".as_slice()),
+            (Key::ArrowLeft, Modifiers::ALT, b"\x1b[1;3D".as_slice()),
+        ] {
+            assert_eq!(
+                terminal.handle_input(InputEvent::ModifiedKey { key, modifiers }),
+                InputEventOutcome::Encoded {
+                    bytes: expected.len()
+                }
+            );
+            assert_eq!(terminal.drain_input(), expected);
+        }
+        terminal.ingest(b"\x1b[2h"); // KAM locks the whole chord, including Meta's prefix.
+        assert_eq!(
+            terminal.handle_input(InputEvent::ModifiedKey {
+                key: Key::Character('x'),
+                modifiers: Modifiers::ALT,
+            }),
+            InputEventOutcome::Rejected
+        );
+        assert!(terminal.drain_input().is_empty());
+    }
+}

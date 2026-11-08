@@ -1,0 +1,16 @@
+[package]
+name = "festerm-mobile-docs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Bounded shared document and Markdown viewer models for the iOS host."
+publish = false
+
+[dependencies]
+festerm-document = { path = "../festerm-document" }
+festerm-markdown = { path = "../festerm-markdown" }
+
+[lints]
+workspace = true

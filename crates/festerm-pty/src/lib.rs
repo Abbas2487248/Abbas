@@ -1,0 +1,3893 @@
+//! Local-shell session backend built on [`portable_pty`].
+//!
+//! `portable-pty` selects Unix PTYs on Unix platforms and Windows ConPTY on
+//! Windows. This crate never imports or mutates `festerm-core`; callers drain
+//! [`SessionEvent`] values and decide when to ingest terminal bytes.
+
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    fmt,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
+        Arc, Condvar, Mutex,
+    },
+    thread,
+    time::Duration,
+};
+
+#[cfg(any(test, unix))]
+use std::time::Instant;
+
+use festerm_session::{
+    automation_input_slot, noop_session_event_notifier, AutomationEpoch, AutomationInputStatus,
+    FlowDirection, PendingAutomationInput, ReserveAutomationInputError, ReservedAutomationInput,
+    Session, SessionError, SessionErrorKind, SessionEvent, SessionEventNotifier, SessionExit,
+    SessionId, SessionLifecycle, SessionMetrics, SessionOperation, SessionSendError,
+    SessionTryReceiveError, ShutdownError, ShutdownResult, TerminalSize,
+    DEFAULT_COMMAND_QUEUE_CAPACITY, DEFAULT_EVENT_QUEUE_CAPACITY, MAX_IO_CHUNK_BYTES,
+};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+
+#[cfg(unix)]
+use nix::{
+    errno::Errno,
+    sys::signal::{kill, Signal},
+    unistd::Pid,
+};
+
+#[cfg(windows)]
+use festerm_windows_job::WindowsJob;
+#[cfg(windows)]
+pub use festerm_windows_runtime::{
+    prepare_conpty_runtime as prepare_windows_conpty_runtime, ConptyRuntimeError,
+    ConptyRuntimeSelection,
+};
+
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Output bytes the reader may have queued but the consumer not yet taken.
+///
+/// The reader coalesces consecutive reads into chunks of up to
+/// `MAX_IO_CHUNK_BYTES`, so the event count alone no longer bounds memory or
+/// how far output can run ahead of input echo. This keeps the bound at what
+/// 128 events of the previous 16 KiB reads allowed.
+const MAX_QUEUED_OUTPUT_BYTES: usize = DEFAULT_EVENT_QUEUE_CAPACITY * 16 * 1024;
+/// Largest chunk the reader assembles from back-to-back readable data.
+const READ_CHUNK_BYTES: usize = MAX_IO_CHUNK_BYTES;
+/// How long the reader may keep a chunk open for more output, and only while
+/// earlier output is still queued unconsumed.
+const READ_COALESCE_WINDOW: Duration = Duration::from_millis(2);
+const READER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const PATH_SCAN_ENTRY_BUDGET: usize = 4_096;
+const PATH_SCAN_DIRECTORY_LIMIT: usize = 64;
+
+/// How the child process environment is established.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum EnvironmentPolicy {
+    /// Preserve the environment inherited by fesTerm.
+    #[default]
+    Inherit,
+    /// Start with an empty environment, then add these explicit variables.
+    Clear(BTreeMap<OsString, OsString>),
+    /// Preserve the inherited environment and override or add these variables.
+    InheritWith(BTreeMap<OsString, OsString>),
+}
+
+/// An explicit local command launch configuration.
+///
+/// Arguments are passed directly to the spawned executable. This type does
+/// not interpret a shell command string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalProfile {
+    executable: PathBuf,
+    arguments: Vec<OsString>,
+    working_directory: Option<PathBuf>,
+    environment: EnvironmentPolicy,
+    hangup_on_shutdown: bool,
+}
+
+impl LocalProfile {
+    pub fn new(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+            arguments: Vec::new(),
+            working_directory: None,
+            environment: EnvironmentPolicy::Inherit,
+            hangup_on_shutdown: false,
+        }
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub fn arguments(&self) -> &[OsString] {
+        &self.arguments
+    }
+
+    pub fn working_directory(&self) -> Option<&Path> {
+        self.working_directory.as_deref()
+    }
+
+    pub fn environment(&self) -> &EnvironmentPolicy {
+        &self.environment
+    }
+
+    pub fn hangup_on_shutdown(&self) -> bool {
+        self.hangup_on_shutdown
+    }
+
+    /// Requests a graceful Unix terminal hangup before bounded signal escalation.
+    /// Windows process-tree shutdown is unchanged.
+    pub fn with_unix_hangup_on_shutdown(mut self) -> Self {
+        self.hangup_on_shutdown = true;
+        self
+    }
+
+    pub fn with_arguments<I, S>(mut self, arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        self.arguments = arguments.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_working_directory(mut self, working_directory: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(expand_home_directory(working_directory.into()));
+        self
+    }
+
+    pub fn with_environment(mut self, environment: EnvironmentPolicy) -> Self {
+        self.environment = environment;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), LocalProfileError> {
+        if self.executable.as_os_str().is_empty() {
+            return Err(LocalProfileError::EmptyExecutable);
+        }
+        if let Some(working_directory) = &self.working_directory {
+            if !working_directory.is_dir() {
+                return Err(LocalProfileError::InvalidWorkingDirectory(
+                    working_directory.clone(),
+                ));
+            }
+        }
+        let environment = match &self.environment {
+            EnvironmentPolicy::Inherit => None,
+            EnvironmentPolicy::Clear(environment) | EnvironmentPolicy::InheritWith(environment) => {
+                Some(environment)
+            }
+        };
+        if let Some(environment) = environment {
+            if environment
+                .keys()
+                .any(|key| key.is_empty() || key.as_encoded_bytes().contains(&b'='))
+            {
+                return Err(LocalProfileError::InvalidEnvironmentKey);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Failure to discover, validate, or start a local shell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalProfileError {
+    EmptyExecutable,
+    InvalidWorkingDirectory(PathBuf),
+    InvalidEnvironmentKey,
+    NoDefaultShell,
+}
+
+impl fmt::Display for LocalProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyExecutable => formatter.write_str("local profile executable is empty"),
+            Self::InvalidWorkingDirectory(directory) => {
+                write!(
+                    formatter,
+                    "local profile working directory is not a directory: {directory:?}"
+                )
+            }
+            Self::InvalidEnvironmentKey => {
+                formatter.write_str("local profile contains an invalid environment variable name")
+            }
+            Self::NoDefaultShell => formatter.write_str("no safe platform default shell was found"),
+        }
+    }
+}
+
+impl std::error::Error for LocalProfileError {}
+
+/// Returns an interactive platform default shell without using command parsing.
+pub fn default_local_profile() -> Result<LocalProfile, LocalProfileError> {
+    default_local_profile_with_powershell_preference(true)
+}
+
+/// Returns the platform default shell, optionally preferring the per-user
+/// Windows app-execution alias for PowerShell over `%COMSPEC%`.
+pub fn default_local_profile_with_powershell_preference(
+    prefer_powershell: bool,
+) -> Result<LocalProfile, LocalProfileError> {
+    #[cfg(unix)]
+    {
+        let _ = prefer_powershell;
+        discover_unix_shell(std::env::var_os("SHELL").as_deref(), |path| {
+            path.is_absolute() && path.is_file()
+        })
+    }
+
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA");
+        let path = std::env::var_os("PATH");
+        let program_w6432 = std::env::var_os("ProgramW6432").unwrap_or_default();
+        let program_files = std::env::var_os("ProgramFiles").unwrap_or_default();
+        let comspec = std::env::var_os("COMSPEC");
+        let system_root = std::env::var_os("SystemRoot");
+        discover_windows_shell(
+            prefer_powershell,
+            WindowsShellEnvironment {
+                local_app_data: local_app_data.as_deref(),
+                path: path.as_deref(),
+                program_files: vec![program_w6432, program_files],
+                comspec: comspec.as_deref(),
+                system_root: system_root.as_deref(),
+            },
+            // App-execution aliases are reparse points that `metadata` cannot
+            // follow, so `is_file` would wrongly report them as missing.
+            |path| {
+                path.is_absolute()
+                    && path
+                        .symlink_metadata()
+                        .is_ok_and(|metadata| !metadata.is_dir())
+            },
+        )
+    }
+}
+
+#[cfg(unix)]
+fn discover_unix_shell(
+    shell: Option<&OsStr>,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<LocalProfile, LocalProfileError> {
+    if let Some(shell) = shell
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && exists(path))
+    {
+        return Ok(LocalProfile::new(shell).with_arguments(["-l"]));
+    }
+    let fallback = PathBuf::from("/bin/sh");
+    exists(&fallback)
+        .then(|| LocalProfile::new(fallback).with_arguments(["-l"]))
+        .ok_or(LocalProfileError::NoDefaultShell)
+}
+
+#[cfg(windows)]
+struct WindowsShellEnvironment<'a> {
+    local_app_data: Option<&'a OsStr>,
+    path: Option<&'a OsStr>,
+    program_files: Vec<OsString>,
+    comspec: Option<&'a OsStr>,
+    system_root: Option<&'a OsStr>,
+}
+
+/// PowerShell 7 locations in preference order: the per-user Store alias, any
+/// `pwsh.exe` on `PATH` (winget/MSI/scoop installs), then the standard
+/// `Program Files\PowerShell` installation directories.
+#[cfg(windows)]
+fn windows_pwsh_candidates(environment: &WindowsShellEnvironment<'_>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(root) = environment.local_app_data {
+        candidates.push(
+            PathBuf::from(root)
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("pwsh.exe"),
+        );
+    }
+    if let Some(path) = environment.path {
+        candidates.extend(std::env::split_paths(path).map(|directory| directory.join("pwsh.exe")));
+    }
+    for root in environment
+        .program_files
+        .iter()
+        .filter(|root| !root.is_empty())
+    {
+        let powershell = PathBuf::from(root).join("PowerShell");
+        candidates.push(powershell.join("7").join("pwsh.exe"));
+        candidates.push(powershell.join("7-preview").join("pwsh.exe"));
+    }
+    candidates
+}
+
+#[cfg(windows)]
+fn discover_windows_shell(
+    prefer_powershell: bool,
+    environment: WindowsShellEnvironment<'_>,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<LocalProfile, LocalProfileError> {
+    let WindowsShellEnvironment {
+        comspec,
+        system_root,
+        ..
+    } = environment;
+    if prefer_powershell {
+        if let Some(pwsh) = windows_pwsh_candidates(&environment)
+            .into_iter()
+            .find(|path| path.is_absolute() && exists(path))
+        {
+            return Ok(LocalProfile::new(pwsh).with_arguments(["-NoLogo"]));
+        }
+    }
+
+    if let Some(command_processor) = comspec
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && exists(path))
+    {
+        return Ok(LocalProfile::new(command_processor).with_arguments(["/Q"]));
+    }
+
+    let powershell = system_root.map(PathBuf::from).map(|root| {
+        root.join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+    });
+    powershell
+        .filter(|path| path.is_absolute() && exists(path))
+        .map(|path| LocalProfile::new(path).with_arguments(["-NoLogo"]))
+        .ok_or(LocalProfileError::NoDefaultShell)
+}
+
+/// Searches `PATH` for executables whose file name starts with `query`
+/// (case-insensitive), returning up to `limit` absolute paths in
+/// alphabetical order.
+///
+/// Intended for the Local profile editor's executable field: as the user
+/// types a bare command name (e.g. `cmd`), this offers the concrete
+/// absolute paths on `PATH` (e.g. `C:\Windows\System32\cmd.exe`) so the
+/// user can pin one down rather than relying on the search order in effect
+/// when fesTerm itself launched. Leaving the field as a bare name is still
+/// valid: the launched process resolves it against `PATH` at spawn time,
+/// exactly as it does today.
+pub fn search_path_executables(query: &str, limit: usize) -> Vec<PathBuf> {
+    search_path_executables_detailed(query, limit).into_suggestions()
+}
+
+/// Like [`search_path_executables`], but also reports whether the result set
+/// was truncated and any search-specific warning that should be surfaced in
+/// the UI.
+pub fn search_path_executables_detailed(query: &str, limit: usize) -> PathSearchResult {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    search_path_executables_in_with_budget(
+        query,
+        std::env::split_paths(&path_var),
+        limit,
+        PATH_SCAN_ENTRY_BUDGET,
+    )
+}
+
+/// Searches the directory named by the parent portion of `query` for child
+/// directories whose names begin with its final component. Relative input is
+/// resolved against the process working directory, and suggestions are
+/// returned as concrete absolute paths.
+pub fn search_working_directories(query: &str, limit: usize) -> Vec<PathBuf> {
+    search_working_directories_detailed(query, limit).into_suggestions()
+}
+
+/// Like [`search_working_directories`], but also reports whether the result
+/// set was truncated and any search-specific error that should be surfaced in
+/// the UI.
+pub fn search_working_directories_detailed(query: &str, limit: usize) -> PathSearchResult {
+    search_working_directories_from_current_directory(query, std::env::current_dir(), limit)
+}
+
+fn search_working_directories_from_current_directory(
+    query: &str,
+    current_directory: std::io::Result<PathBuf>,
+    limit: usize,
+) -> PathSearchResult {
+    let current_directory = match current_directory {
+        Ok(current_directory) => current_directory,
+        Err(error) => {
+            return PathSearchResult::new(
+                Vec::new(),
+                false,
+                false,
+                Some(format!("Could not resolve the current directory: {error}")),
+            );
+        }
+    };
+    search_working_directories_from_with_budget(
+        query,
+        &current_directory,
+        limit,
+        PATH_SCAN_ENTRY_BUDGET,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn search_working_directories_from(
+    query: &str,
+    current_directory: &Path,
+    limit: usize,
+) -> PathSearchResult {
+    search_working_directories_from_with_budget(
+        query,
+        current_directory,
+        limit,
+        PATH_SCAN_ENTRY_BUDGET,
+    )
+}
+
+fn search_working_directories_from_with_budget(
+    query: &str,
+    current_directory: &Path,
+    limit: usize,
+    scan_budget: usize,
+) -> PathSearchResult {
+    if query.is_empty() || limit == 0 {
+        return PathSearchResult::default();
+    }
+
+    let expanded_query = expand_home_directory(PathBuf::from(query));
+    let query_path = expanded_query.as_path();
+    let ends_with_separator = query.ends_with(['/', '\\']);
+    let parent = if ends_with_separator {
+        query_path
+    } else {
+        query_path.parent().unwrap_or_else(|| Path::new(""))
+    };
+    let prefix = if ends_with_separator {
+        ""
+    } else {
+        query_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+    }
+    .to_lowercase();
+    let resolved_parent = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        current_directory.join(parent)
+    };
+    let mut budget = ScanBudget::new(scan_budget);
+    let entries = match std::fs::read_dir(&resolved_parent) {
+        Ok(entries) => entries,
+        Err(error) => {
+            budget.consume_failure();
+            return PathSearchResult::new(
+                Vec::new(),
+                false,
+                budget.limited(),
+                Some(format!(
+                    "Could not read {}: {error}",
+                    resolved_parent.display()
+                )),
+            );
+        }
+    };
+
+    let mut matches = BoundedMatches::new(limit);
+    let mut error = None;
+    for entry in entries {
+        if !budget.try_take() {
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(entry_error) => {
+                error.get_or_insert_with(|| {
+                    format!(
+                        "Could not read {}: {entry_error}",
+                        resolved_parent.display()
+                    )
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if !name.to_lowercase().starts_with(&prefix) {
+            continue;
+        }
+        matches.push(path);
+    }
+    matches.finish(budget.limited(), error)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn search_path_executables_in(
+    query: &str,
+    directories: impl Iterator<Item = PathBuf>,
+    limit: usize,
+) -> PathSearchResult {
+    search_path_executables_in_with_budget(query, directories, limit, PATH_SCAN_ENTRY_BUDGET)
+}
+
+fn search_path_executables_in_with_budget(
+    query: &str,
+    directories: impl Iterator<Item = PathBuf>,
+    limit: usize,
+    scan_budget: usize,
+) -> PathSearchResult {
+    if query.is_empty() || limit == 0 {
+        return PathSearchResult::default();
+    }
+    let query = query.to_lowercase();
+    let mut budget = ScanBudget::new(scan_budget);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut matches = BoundedMatches::new(limit);
+    let mut error = None;
+    let mut scans = std::collections::VecDeque::new();
+    for (index, directory) in directories.enumerate() {
+        if index == PATH_SCAN_DIRECTORY_LIMIT {
+            budget.limited = true;
+            break;
+        }
+        if !budget.try_take() {
+            break;
+        }
+        match std::fs::read_dir(&directory) {
+            Ok(entries) => scans.push_back((directory, entries)),
+            Err(read_error) => {
+                error.get_or_insert_with(|| {
+                    format!("Could not read {}: {read_error}", directory.display())
+                });
+            }
+        }
+    }
+    // A large early PATH directory must not consume the entire search budget
+    // before later directories (for example, the user's tools) are considered.
+    while let Some((directory, mut entries)) = scans.pop_front() {
+        if !budget.try_take() {
+            break;
+        }
+        let entry = match entries.next() {
+            None => continue,
+            Some(Ok(entry)) => entry,
+            Some(Err(entry_error)) => {
+                error.get_or_insert_with(|| {
+                    format!("Could not read {}: {entry_error}", directory.display())
+                });
+                scans.push_back((directory, entries));
+                continue;
+            }
+        };
+        scans.push_back((directory, entries));
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if !name.to_lowercase().starts_with(&query) || !is_executable_candidate(&path) {
+            continue;
+        }
+        if seen.insert(path.clone()) {
+            matches.push(path);
+        }
+    }
+    matches.finish(budget.limited(), error)
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PathSearchResult {
+    suggestions: Vec<PathBuf>,
+    truncated: bool,
+    limited: bool,
+    error: Option<String>,
+}
+
+impl PathSearchResult {
+    pub fn new(
+        suggestions: Vec<PathBuf>,
+        truncated: bool,
+        limited: bool,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            suggestions,
+            truncated,
+            limited,
+            error,
+        }
+    }
+
+    pub fn suggestions(&self) -> &[PathBuf] {
+        &self.suggestions
+    }
+
+    pub fn into_suggestions(self) -> Vec<PathBuf> {
+        self.suggestions
+    }
+
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub const fn limited(&self) -> bool {
+        self.limited
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+struct ScanBudget {
+    remaining: usize,
+    limited: bool,
+}
+
+impl ScanBudget {
+    fn new(remaining: usize) -> Self {
+        Self {
+            remaining,
+            limited: false,
+        }
+    }
+
+    fn try_take(&mut self) -> bool {
+        if self.remaining == 0 {
+            self.limited = true;
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    fn consume_failure(&mut self) {
+        if !self.try_take() {
+            self.limited = true;
+        }
+    }
+
+    const fn limited(&self) -> bool {
+        self.limited
+    }
+}
+
+#[derive(Eq, PartialEq)]
+struct RankedPath {
+    sort_key: String,
+    path: PathBuf,
+}
+
+impl Ord for RankedPath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key
+            .cmp(&other.sort_key)
+            .then_with(|| self.path.cmp(&other.path))
+    }
+}
+
+impl PartialOrd for RankedPath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct BoundedMatches {
+    limit: usize,
+    kept: std::collections::BinaryHeap<RankedPath>,
+    truncated: bool,
+}
+
+impl BoundedMatches {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            kept: std::collections::BinaryHeap::new(),
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, path: PathBuf) {
+        let candidate = RankedPath {
+            sort_key: path.to_string_lossy().to_lowercase(),
+            path,
+        };
+        if self.kept.len() < self.limit {
+            self.kept.push(candidate);
+            return;
+        }
+        self.truncated = true;
+        if self.kept.peek().is_some_and(|largest| candidate < *largest) {
+            let _ = self.kept.pop();
+            self.kept.push(candidate);
+        }
+    }
+
+    fn finish(self, limited: bool, error: Option<String>) -> PathSearchResult {
+        let mut ranked = self.kept.into_vec();
+        ranked.sort();
+        PathSearchResult::new(
+            ranked.into_iter().map(|candidate| candidate.path).collect(),
+            self.truncated,
+            limited,
+            error,
+        )
+    }
+}
+
+/// Whether an executable literally named `name` (ignoring any extension, so
+/// `tmux` also matches a Windows-built `tmux.exe`) exists anywhere on
+/// `PATH`.
+///
+/// Intended for choosing a sensible default durable-session provider for a
+/// newly created Local profile -- prefer tmux, then GNU screen, then
+/// fesTerm's own bundled session daemon -- without requiring the user to
+/// already know what's installed. Unlike [`search_path_executables`], this
+/// matches the exact name rather than a prefix, so a same-prefixed
+/// unrelated file (e.g. `tmux-mux`) never counts as `tmux` being present.
+pub fn is_executable_on_path(name: &str) -> bool {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    is_executable_on_path_in(name, std::env::split_paths(&path_var))
+}
+
+fn is_executable_on_path_in(name: &str, directories: impl Iterator<Item = PathBuf>) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let name = name.to_lowercase();
+    for directory in directories {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            let stem = Path::new(file_name)
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .unwrap_or(file_name);
+            if stem.to_lowercase() != name {
+                continue;
+            }
+            if is_executable_candidate(&path) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn is_executable_candidate(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_executable_candidate(path: &Path) -> bool {
+    // Windows has no execute permission bit; instead an executable is any
+    // file whose extension appears in `PATHEXT` (falling back to the
+    // standard default if the environment variable is unset), mirroring
+    // how `cmd.exe`/`CreateProcess` resolve a bare command name. Without
+    // this check, any same-prefixed file (e.g. `cmd-readme.txt`) would be
+    // offered as a launchable suggestion.
+    if !path.is_file() {
+        return false;
+    }
+    let Some(extension) = path.extension().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    pathext.split(';').any(|candidate| {
+        candidate
+            .trim_start_matches('.')
+            .eq_ignore_ascii_case(extension)
+    })
+}
+
+/// Errors returned while allocating or launching a local PTY session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalPtyError {
+    message: String,
+}
+
+impl LocalPtyError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for LocalPtyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LocalPtyError {}
+
+enum SessionCommand {
+    Input(Vec<u8>),
+    AutomationInput(PendingAutomationInput),
+    Resize(TerminalSize),
+    Shutdown,
+}
+
+/// Platform-owned process tree for one local session.
+///
+/// `portable-pty` creates a new Unix session before `exec`; the initial
+/// foreground process group is consequently the shell's process group. Its
+/// descendants inherit that group unless a program explicitly opts out. On
+/// Windows, a Job Object owns all descendants created by the assigned process.
+struct ProcessTree {
+    #[cfg(unix)]
+    process_group: i32,
+    #[cfg(unix)]
+    hangup_on_shutdown: bool,
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+impl ProcessTree {
+    #[cfg(unix)]
+    fn from_master(
+        master: &dyn MasterPty,
+        hangup_on_shutdown: bool,
+    ) -> Result<Self, LocalPtyError> {
+        master
+            .process_group_leader()
+            .map(|process_group| Self {
+                process_group,
+                hangup_on_shutdown,
+            })
+            .ok_or_else(|| {
+                LocalPtyError::new(
+                    "could not determine the local PTY session process group for shutdown",
+                )
+            })
+    }
+
+    #[cfg(windows)]
+    fn from_child(child: &dyn Child) -> Result<Self, LocalPtyError> {
+        let handle = child.as_raw_handle().ok_or_else(|| {
+            LocalPtyError::new("could not obtain the ConPTY child process handle for Job Object")
+        })?;
+        WindowsJob::assign_to_process(handle)
+            .map(|job| Self { job })
+            .map_err(|error| {
+                LocalPtyError::new(format!(
+                    "could not assign the ConPTY child to a Windows Job Object: {error}"
+                ))
+            })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn unsupported() -> Result<Self, LocalPtyError> {
+        Err(LocalPtyError::new(
+            "local PTY process-tree ownership is unsupported on this platform",
+        ))
+    }
+
+    fn terminate(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            self.signal(if self.hangup_on_shutdown {
+                Signal::SIGHUP
+            } else {
+                Signal::SIGTERM
+            })
+        }
+
+        #[cfg(windows)]
+        {
+            self.job.terminate().map_err(|error| error.to_string())
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err("local PTY process-tree ownership is unsupported on this platform".to_owned())
+        }
+    }
+}
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn signal(&self, signal: Signal) -> Result<(), String> {
+        match kill(Pid::from_raw(-self.process_group), signal) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TerminalDelivery {
+    closed: bool,
+    error: Option<SessionError>,
+    lifecycle: Option<SessionLifecycle>,
+}
+
+struct Shared {
+    id: SessionId,
+    automation_epoch: Arc<AutomationEpoch>,
+    lifecycle_transition: Mutex<()>,
+    lifecycle: Mutex<SessionLifecycle>,
+    terminal_delivery: Mutex<TerminalDelivery>,
+    metrics: Mutex<SessionMetrics>,
+    output_available: Condvar,
+    output_waiting: AtomicBool,
+    event_sender: SyncSender<SessionEvent>,
+    event_notifier: Arc<dyn SessionEventNotifier>,
+    cancel: AtomicBool,
+    queued_output_bytes: AtomicUsize,
+    termination_requested: AtomicBool,
+    process_tree: Option<ProcessTree>,
+    completion_receiver: Mutex<Receiver<Result<ShutdownResult, SessionError>>>,
+    completion: Mutex<Option<Result<ShutdownResult, SessionError>>>,
+}
+
+impl Shared {
+    fn lifecycle(&self) -> SessionLifecycle {
+        self.lifecycle
+            .lock()
+            .expect("session lifecycle lock is not poisoned")
+            .clone()
+    }
+
+    fn set_lifecycle(&self, lifecycle: SessionLifecycle) {
+        let delivery = self
+            .terminal_delivery
+            .lock()
+            .expect("terminal delivery lock is not poisoned");
+        if delivery.closed {
+            return;
+        }
+        self.update_lifecycle(lifecycle.clone());
+        let sent = self
+            .enqueue_event(SessionEvent::Lifecycle(lifecycle))
+            .is_ok();
+        drop(delivery);
+        if sent {
+            self.event_notifier.notify();
+        }
+    }
+
+    fn update_lifecycle(&self, lifecycle: SessionLifecycle) {
+        {
+            let transition = self.lifecycle_transition.lock();
+            let healthy = transition.is_ok();
+            let _transition = transition.unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.automation_epoch
+                .transition(healthy && matches!(&lifecycle, SessionLifecycle::Running));
+            *self
+                .lifecycle
+                .lock()
+                .expect("session lifecycle lock is not poisoned") = lifecycle;
+        }
+    }
+
+    fn publish_terminal(&self, lifecycle: SessionLifecycle) {
+        let mut delivery = self
+            .terminal_delivery
+            .lock()
+            .expect("terminal delivery lock is not poisoned");
+        delivery.closed = true;
+        if let SessionLifecycle::Failed(error) = &lifecycle {
+            let mut metrics = self
+                .metrics
+                .lock()
+                .expect("session metrics lock is not poisoned");
+            metrics.error_count = metrics.error_count.saturating_add(1);
+            delivery.error = Some(error.clone());
+        }
+        self.update_lifecycle(lifecycle.clone());
+        delivery.lifecycle = Some(lifecycle);
+        drop(delivery);
+        self.event_notifier.notify();
+    }
+
+    fn invalidate_automation_epoch(&self) {
+        let _transition = self
+            .lifecycle_transition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.automation_epoch.transition(false);
+    }
+
+    fn record_error(&self, error: SessionError) {
+        {
+            let mut metrics = self
+                .metrics
+                .lock()
+                .expect("session metrics lock is not poisoned");
+            metrics.error_count = metrics.error_count.saturating_add(1);
+        }
+        let _ = self.try_emit(SessionEvent::Error(error));
+    }
+
+    fn try_emit(&self, event: SessionEvent) -> bool {
+        let delivery = self
+            .terminal_delivery
+            .lock()
+            .expect("terminal delivery lock is not poisoned");
+        if delivery.closed {
+            return false;
+        }
+        let sent = self.enqueue_event(event).is_ok();
+        drop(delivery);
+        if sent {
+            self.event_notifier.notify();
+        }
+        sent
+    }
+
+    fn enqueue_event(&self, event: SessionEvent) -> Result<(), TrySendError<SessionEvent>> {
+        let mut metrics = self
+            .metrics
+            .lock()
+            .expect("session metrics lock is not poisoned");
+        match self.event_sender.try_send(event) {
+            Ok(()) => {
+                metrics.event_queue_depth = metrics.event_queue_depth.saturating_add(1);
+                metrics.event_queue_high_watermark = metrics
+                    .event_queue_high_watermark
+                    .max(metrics.event_queue_depth);
+                Ok(())
+            }
+            Err(TrySendError::Full(event)) => {
+                metrics.backpressure_count = metrics.backpressure_count.saturating_add(1);
+                Err(TrySendError::Full(event))
+            }
+            Err(TrySendError::Disconnected(event)) => Err(TrySendError::Disconnected(event)),
+        }
+    }
+
+    fn wait_for_output_room(&self, output_len: Option<usize>) -> bool {
+        let mut metrics = self
+            .metrics
+            .lock()
+            .expect("session metrics lock is not poisoned");
+        loop {
+            if self.cancel.load(Ordering::Acquire) {
+                return false;
+            }
+            let queue_full = metrics.event_queue_depth >= metrics.event_queue_capacity;
+            let bytes_full = output_len.is_some_and(|len| {
+                let queued = self.queued_output_bytes.load(Ordering::Acquire);
+                queued != 0 && queued.saturating_add(len) > MAX_QUEUED_OUTPUT_BYTES
+            });
+            if !queue_full && !bytes_full {
+                return true;
+            }
+            // Consumers and cancellation signal under this same lock, so a
+            // freed slot cannot be missed between the check and the wait.
+            self.output_waiting.store(true, Ordering::Relaxed);
+            metrics = self
+                .output_available
+                .wait(metrics)
+                .expect("session metrics lock is not poisoned");
+            self.output_waiting.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn event_received(&self, event: &SessionEvent) {
+        let mut metrics = self
+            .metrics
+            .lock()
+            .expect("session metrics lock is not poisoned");
+        metrics.event_queue_depth = metrics.event_queue_depth.saturating_sub(1);
+        if let SessionEvent::Output(bytes) = event {
+            self.queued_output_bytes
+                .fetch_sub(bytes.len(), Ordering::AcqRel);
+        }
+        if self.output_waiting.load(Ordering::Relaxed) {
+            self.output_available.notify_one();
+        }
+    }
+
+    fn cancel_and_wake_reader(&self) {
+        let _metrics = self
+            .metrics
+            .lock()
+            .expect("session metrics lock is not poisoned");
+        self.cancel.store(true, Ordering::Release);
+        if self.output_waiting.load(Ordering::Relaxed) {
+            self.output_available.notify_one();
+        }
+    }
+
+    fn emit_output(&self, bytes: Vec<u8>) -> bool {
+        let output_len = bytes.len();
+        let mut output_event = SessionEvent::Output(bytes);
+        let mut backpressure_pending = false;
+        let mut backpressure_event_sent = false;
+        loop {
+            let delivery = self
+                .terminal_delivery
+                .lock()
+                .expect("terminal delivery lock is not poisoned");
+            if delivery.closed || self.cancel.load(Ordering::Acquire) {
+                return false;
+            }
+
+            if backpressure_pending && !backpressure_event_sent {
+                let metrics = self.metrics();
+                let sent = self.enqueue_event(SessionEvent::Backpressure {
+                    direction: FlowDirection::Output,
+                    queued: metrics.event_queue_depth,
+                    capacity: metrics.event_queue_capacity,
+                });
+                drop(delivery);
+                match sent {
+                    Ok(()) => {
+                        backpressure_event_sent = true;
+                        self.event_notifier.notify();
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        if !self.wait_for_output_room(None) {
+                            return false;
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => return false,
+                }
+                // The notice has to win the first slot that frees. Falling
+                // through to the output send here lets the consumer drain
+                // between the two attempts, which resumes output while the
+                // stall that held it up goes unreported - the consumer then
+                // sees an unexplained gap rather than backpressure.
+                continue;
+            }
+
+            let mut metrics = self
+                .metrics
+                .lock()
+                .expect("session metrics lock is not poisoned");
+            // Charged before sending so the consumer's release can never
+            // run ahead of it; refunded if the send does not happen.
+            let queued = self
+                .queued_output_bytes
+                .fetch_add(output_len, Ordering::AcqRel);
+            let sent = if queued != 0 && queued.saturating_add(output_len) > MAX_QUEUED_OUTPUT_BYTES
+            {
+                Err(TrySendError::Full(output_event))
+            } else {
+                self.event_sender.try_send(output_event)
+            };
+            if sent.is_err() {
+                self.queued_output_bytes
+                    .fetch_sub(output_len, Ordering::AcqRel);
+            }
+            match sent {
+                Ok(()) => {
+                    metrics.output_bytes = metrics.output_bytes.saturating_add(output_len as u64);
+                    metrics.event_queue_depth = metrics.event_queue_depth.saturating_add(1);
+                    metrics.event_queue_high_watermark = metrics
+                        .event_queue_high_watermark
+                        .max(metrics.event_queue_depth);
+                    drop(metrics);
+                    drop(delivery);
+                    self.event_notifier.notify();
+                    return true;
+                }
+                Err(TrySendError::Full(event)) => {
+                    output_event = event;
+                    metrics.backpressure_count = metrics.backpressure_count.saturating_add(1);
+                    drop(metrics);
+                    drop(delivery);
+                    if backpressure_event_sent {
+                        if !self.wait_for_output_room(Some(output_len)) {
+                            return false;
+                        }
+                    } else {
+                        backpressure_pending = true;
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+    }
+
+    fn metrics(&self) -> SessionMetrics {
+        *self
+            .metrics
+            .lock()
+            .expect("session metrics lock is not poisoned")
+    }
+
+    fn request_stop(&self) {
+        let lifecycle = self.lifecycle();
+        if matches!(lifecycle, SessionLifecycle::Stopped) {
+            return;
+        }
+        if matches!(
+            lifecycle,
+            SessionLifecycle::Starting | SessionLifecycle::Running
+        ) {
+            self.set_lifecycle(SessionLifecycle::Stopping);
+        }
+        self.cancel_and_wake_reader();
+        self.terminate_process_tree();
+    }
+
+    fn terminate_process_tree(&self) {
+        if self.termination_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(process_tree) = &self.process_tree else {
+            return;
+        };
+        if let Err(error) = process_tree.terminate() {
+            self.record_error(SessionError::new(
+                SessionErrorKind::Shutdown,
+                format!("could not terminate the local process tree: {error}"),
+            ));
+        }
+    }
+
+    fn complete(
+        &self,
+        result: Result<ShutdownResult, SessionError>,
+        sender: &mpsc::SyncSender<Result<ShutdownResult, SessionError>>,
+    ) {
+        let _ = sender.send(result);
+    }
+}
+
+/// A native local-shell session driven by bounded worker queues.
+pub struct LocalPtySession {
+    process_id: Option<u32>,
+    terminal_device: Option<PathBuf>,
+    shared: Arc<Shared>,
+    command_sender: SyncSender<SessionCommand>,
+    event_receiver: Mutex<Receiver<SessionEvent>>,
+}
+
+impl LocalPtySession {
+    pub fn start(profile: LocalProfile, size: TerminalSize) -> Result<Self, LocalPtyError> {
+        Self::start_with_notifier(profile, size, noop_session_event_notifier())
+    }
+
+    /// Starts a local PTY session and wakes `notifier` whenever an event arrives.
+    pub fn start_with_notifier(
+        profile: LocalProfile,
+        size: TerminalSize,
+        event_notifier: Arc<dyn SessionEventNotifier>,
+    ) -> Result<Self, LocalPtyError> {
+        profile
+            .validate()
+            .map_err(|error| LocalPtyError::new(error.to_string()))?;
+
+        #[cfg(windows)]
+        {
+            prepare_windows_conpty_runtime().map_err(|error| {
+                LocalPtyError::new(format!(
+                    "could not safely select the Windows ConPTY runtime: {error}"
+                ))
+            })?;
+        }
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(to_portable_size(size))
+            .map_err(|error| {
+                LocalPtyError::new(format!("could not allocate local PTY: {error}"))
+            })?;
+        let mut command = command_builder(&profile);
+        command.set_controlling_tty(true);
+        let reader = pair.master.try_clone_reader().map_err(|error| {
+            LocalPtyError::new(format!("could not open local PTY reader: {error}"))
+        })?;
+        let readable = pty_readable_probe(&*pair.master);
+        let writer = local_pty_writer(&*pair.master).map_err(|error| {
+            LocalPtyError::new(format!("could not open local PTY writer: {error}"))
+        })?;
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| LocalPtyError::new(format!("could not start local shell: {error}")))?;
+        let process_id = child.process_id();
+        #[cfg(unix)]
+        let terminal_device = pair.master.tty_name();
+        #[cfg(not(unix))]
+        let terminal_device = None;
+        let process_tree_result = {
+            #[cfg(unix)]
+            {
+                ProcessTree::from_master(&*pair.master, profile.hangup_on_shutdown())
+            }
+            #[cfg(windows)]
+            {
+                ProcessTree::from_child(&*child)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                ProcessTree::unsupported()
+            }
+        };
+        let process_tree = match process_tree_result {
+            Ok(process_tree) => process_tree,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
+
+        let (event_sender, event_receiver) = mpsc::sync_channel(DEFAULT_EVENT_QUEUE_CAPACITY);
+        let (command_sender, command_receiver) = mpsc::sync_channel(DEFAULT_COMMAND_QUEUE_CAPACITY);
+        let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let (reader_done_sender, reader_done_receiver) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared {
+            id: SessionId::next(),
+            automation_epoch: Arc::new(AutomationEpoch::new()),
+            lifecycle_transition: Mutex::new(()),
+            lifecycle: Mutex::new(SessionLifecycle::Starting),
+            terminal_delivery: Mutex::new(TerminalDelivery::default()),
+            metrics: Mutex::new(SessionMetrics {
+                event_queue_capacity: DEFAULT_EVENT_QUEUE_CAPACITY,
+                ..SessionMetrics::default()
+            }),
+            output_available: Condvar::new(),
+            output_waiting: AtomicBool::new(false),
+            event_sender,
+            event_notifier,
+            cancel: AtomicBool::new(false),
+            queued_output_bytes: AtomicUsize::new(0),
+            termination_requested: AtomicBool::new(false),
+            process_tree: Some(process_tree),
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        });
+        shared.set_lifecycle(SessionLifecycle::Starting);
+        shared.set_lifecycle(SessionLifecycle::Running);
+
+        let control_shared = Arc::clone(&shared);
+        let master = pair.master;
+        let control_worker = thread::Builder::new()
+            .name(format!("festerm-pty-control-{}", shared.id))
+            .spawn(move || {
+                control_worker(
+                    control_shared,
+                    command_receiver,
+                    master,
+                    writer,
+                    child,
+                    reader_done_receiver,
+                    completion_sender,
+                );
+            })
+            .map_err(|error| {
+                LocalPtyError::new(format!("could not start local PTY worker: {error}"))
+            });
+        if let Err(error) = control_worker {
+            shared.request_stop();
+            return Err(error);
+        }
+
+        let reader_shared = Arc::clone(&shared);
+        thread::Builder::new()
+            .name(format!("festerm-pty-reader-{}", shared.id))
+            .spawn(move || reader_worker(reader_shared, reader, readable, reader_done_sender))
+            .map_err(|error| {
+                shared.request_stop();
+                LocalPtyError::new(format!("could not start local PTY reader worker: {error}"))
+            })?;
+
+        Ok(Self {
+            process_id,
+            terminal_device,
+            shared,
+            command_sender,
+            event_receiver: Mutex::new(event_receiver),
+        })
+    }
+
+    /// Starts the safe platform default interactive shell.
+    pub fn start_default(size: TerminalSize) -> Result<Self, LocalPtyError> {
+        Self::start_default_with_preference(size, true)
+    }
+
+    /// Identity of the directly owned client process (not its persistent server).
+    pub fn process_id(&self) -> Option<u32> {
+        self.process_id
+    }
+
+    /// The Unix slave device allocated for this client, not its server's PTY.
+    pub fn terminal_device(&self) -> Option<&Path> {
+        self.terminal_device.as_deref()
+    }
+
+    /// Starts the safe platform default shell with the caller's Windows
+    /// PowerShell preference.
+    pub fn start_default_with_preference(
+        size: TerminalSize,
+        prefer_powershell: bool,
+    ) -> Result<Self, LocalPtyError> {
+        Self::start_default_with_powershell_preference(
+            size,
+            noop_session_event_notifier(),
+            prefer_powershell,
+        )
+    }
+
+    /// Starts the default local shell and wakes `notifier` for each session event.
+    pub fn start_default_with_notifier(
+        size: TerminalSize,
+        event_notifier: Arc<dyn SessionEventNotifier>,
+    ) -> Result<Self, LocalPtyError> {
+        Self::start_default_with_powershell_preference(size, event_notifier, true)
+    }
+
+    /// Starts the default local shell with the caller's Windows PowerShell
+    /// preference and wakes `event_notifier` for each session event.
+    pub fn start_default_with_powershell_preference(
+        size: TerminalSize,
+        event_notifier: Arc<dyn SessionEventNotifier>,
+        prefer_powershell: bool,
+    ) -> Result<Self, LocalPtyError> {
+        let profile = default_local_profile_with_powershell_preference(prefer_powershell)
+            .map_err(|error| LocalPtyError::new(error.to_string()))?;
+        Self::start_with_notifier(profile, size, event_notifier)
+    }
+}
+
+impl Session for LocalPtySession {
+    fn id(&self) -> SessionId {
+        self.shared.id
+    }
+
+    fn lifecycle(&self) -> SessionLifecycle {
+        self.shared.lifecycle()
+    }
+
+    fn automation_epoch(&self) -> Option<Arc<AutomationEpoch>> {
+        Some(Arc::clone(&self.shared.automation_epoch))
+    }
+
+    fn metrics(&self) -> SessionMetrics {
+        self.shared.metrics()
+    }
+
+    fn try_send_input(&self, bytes: &[u8]) -> Result<(), SessionSendError> {
+        if bytes.len() > MAX_IO_CHUNK_BYTES {
+            return Err(SessionSendError::TooLarge {
+                operation: SessionOperation::Input,
+                maximum: MAX_IO_CHUNK_BYTES,
+                actual: bytes.len(),
+            });
+        }
+        send_command(
+            &self.command_sender,
+            SessionCommand::Input(bytes.to_vec()),
+            SessionOperation::Input,
+        )
+    }
+
+    fn reserve_automation_input(
+        &self,
+        controller_instance: u64,
+        bytes: &[u8],
+    ) -> Result<ReservedAutomationInput, ReserveAutomationInputError> {
+        let (reservation, pending) = automation_input_slot(
+            bytes,
+            controller_instance,
+            Arc::clone(&self.shared.automation_epoch),
+        )?;
+        send_command(
+            &self.command_sender,
+            SessionCommand::AutomationInput(pending),
+            SessionOperation::Input,
+        )
+        .map_err(ReserveAutomationInputError::Rejected)?;
+        Ok(reservation)
+    }
+
+    fn try_resize(&self, size: TerminalSize) -> Result<(), SessionSendError> {
+        send_command(
+            &self.command_sender,
+            SessionCommand::Resize(size),
+            SessionOperation::Resize,
+        )
+    }
+
+    fn try_shutdown(&self) -> Result<(), SessionSendError> {
+        self.shared.request_stop();
+        send_command(
+            &self.command_sender,
+            SessionCommand::Shutdown,
+            SessionOperation::Shutdown,
+        )
+    }
+
+    fn try_recv_event(&self) -> Result<SessionEvent, SessionTryReceiveError> {
+        let mut delivery = self
+            .shared
+            .terminal_delivery
+            .lock()
+            .expect("terminal delivery lock is not poisoned");
+        match self
+            .event_receiver
+            .lock()
+            .expect("session event receiver lock is not poisoned")
+            .try_recv()
+        {
+            Ok(event) => {
+                self.shared.event_received(&event);
+                Ok(event)
+            }
+            Err(error) => {
+                if let Some(error) = delivery.error.take() {
+                    Ok(SessionEvent::Error(error))
+                } else if let Some(lifecycle) = delivery.lifecycle.take() {
+                    Ok(SessionEvent::Lifecycle(lifecycle))
+                } else {
+                    Err(match error {
+                        TryRecvError::Empty => SessionTryReceiveError::Empty,
+                        TryRecvError::Disconnected => SessionTryReceiveError::Closed,
+                    })
+                }
+            }
+        }
+    }
+
+    fn shutdown(&self, timeout: Duration) -> Result<ShutdownResult, ShutdownError> {
+        let _ = self.try_shutdown();
+        let mut completion = self
+            .shared
+            .completion
+            .lock()
+            .expect("session completion lock is not poisoned");
+        if let Some(result) = completion.clone() {
+            return result.map_err(ShutdownError::Failed);
+        }
+        match self
+            .shared
+            .completion_receiver
+            .lock()
+            .expect("session completion receiver lock is not poisoned")
+            .recv_timeout(timeout)
+        {
+            Ok(result) => {
+                *completion = Some(result.clone());
+                result.map_err(ShutdownError::Failed)
+            }
+            Err(RecvTimeoutError::Timeout) => Err(ShutdownError::TimedOut { timeout }),
+            Err(RecvTimeoutError::Disconnected) => Err(ShutdownError::Failed(SessionError::new(
+                SessionErrorKind::Shutdown,
+                "local PTY worker ended without reporting shutdown completion",
+            ))),
+        }
+    }
+}
+
+impl Drop for LocalPtySession {
+    fn drop(&mut self) {
+        // Never block destructors. Explicit `Session::shutdown` performs the
+        // bounded wait; this wake-up and child termination keeps detached
+        // workers from retaining a local shell after the application exits.
+        let _ = self.try_shutdown();
+    }
+}
+
+/// Expands a leading `~` or `~/` to the user's home directory, as a shell
+/// would; the OS never does this for a `cwd`. `~user` and a missing home
+/// directory are left untouched.
+fn expand_home_directory(path: PathBuf) -> PathBuf {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .filter(|home| !home.is_empty());
+    expand_home_directory_with(path, home.as_deref().map(Path::new))
+}
+
+fn expand_home_directory_with(path: PathBuf, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return path;
+    };
+    match path.strip_prefix("~") {
+        Ok(rest)
+            if path.to_str().is_some_and(|text| {
+                text == "~" || text.starts_with("~/") || text.starts_with("~\\")
+            }) =>
+        {
+            home.join(rest)
+        }
+        _ => path,
+    }
+}
+
+fn command_builder(profile: &LocalProfile) -> CommandBuilder {
+    let mut command = CommandBuilder::new(&profile.executable);
+    command.args(profile.arguments.iter());
+    if let Some(working_directory) = &profile.working_directory {
+        command.cwd(working_directory);
+    }
+    match &profile.environment {
+        EnvironmentPolicy::Inherit => {}
+        EnvironmentPolicy::Clear(environment) => {
+            command.env_clear();
+            for (key, value) in environment {
+                command.env(key, value);
+            }
+        }
+        EnvironmentPolicy::InheritWith(environment) => {
+            for (key, value) in environment {
+                command.env(key, value);
+            }
+        }
+    }
+    // M5's core implements the currently selected xterm-compatible subset.
+    // This is an argv/environment assignment, never shell interpolation.
+    command.env("TERM", "xterm-256color");
+    // A GUI-launched fesTerm can inherit another terminal's identity. On
+    // macOS, inheriting `TERM_PROGRAM=Apple_Terminal` makes Apple's zsh
+    // startup hooks load that terminal's saved shell-session transcript and
+    // print "Restored session" in an otherwise fresh fesTerm shell. Identify
+    // the actual terminal owner and clear the stale source-session ID.
+    command.env("TERM_PROGRAM", "fesTerm");
+    // Advertise 24-bit color so TUIs choose their full-color layout.
+    command.env("COLORTERM", "truecolor");
+    command.env_remove("TERM_SESSION_ID");
+    command
+}
+
+fn to_portable_size(size: TerminalSize) -> PtySize {
+    PtySize {
+        rows: size.rows(),
+        cols: size.columns(),
+        pixel_width: size.pixel_width().unwrap_or(0),
+        pixel_height: size.pixel_height().unwrap_or(0),
+    }
+}
+
+fn send_command(
+    sender: &SyncSender<SessionCommand>,
+    command: SessionCommand,
+    operation: SessionOperation,
+) -> Result<(), SessionSendError> {
+    match sender.try_send(command) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(SessionSendError::Full {
+            operation,
+            capacity: DEFAULT_COMMAND_QUEUE_CAPACITY,
+        }),
+        Err(TrySendError::Disconnected(_)) => Err(SessionSendError::Closed { operation }),
+    }
+}
+
+fn receive_command(
+    receiver: &Receiver<SessionCommand>,
+    pending: &mut Option<PendingAutomationInput>,
+) -> Result<SessionCommand, RecvTimeoutError> {
+    if let Some(reservation) = pending {
+        match reservation.poll() {
+            AutomationInputStatus::Pending => {
+                thread::sleep(POLL_INTERVAL);
+                Err(RecvTimeoutError::Timeout)
+            }
+            AutomationInputStatus::Ready(bytes) => {
+                *pending = None;
+                Ok(SessionCommand::Input(bytes.to_vec()))
+            }
+            AutomationInputStatus::Cancelled => {
+                *pending = None;
+                Err(RecvTimeoutError::Timeout)
+            }
+        }
+    } else {
+        match receiver.recv_timeout(POLL_INTERVAL)? {
+            SessionCommand::AutomationInput(reservation) => {
+                *pending = Some(reservation);
+                Err(RecvTimeoutError::Timeout)
+            }
+            command => Ok(command),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn local_pty_writer(master: &dyn MasterPty) -> Result<Box<dyn Write + Send>, LocalPtyError> {
+    // portable-pty's Unix writer injects newline/VEOF on Drop. A multiplexer
+    // can still own the slave after its client exits; shutdown must send no input.
+    let descriptor = master
+        .as_raw_fd()
+        .ok_or_else(|| LocalPtyError::new("local PTY master has no Unix descriptor"))?;
+    let writer = filedescriptor::FileDescriptor::dup(&descriptor)
+        .map_err(|error| LocalPtyError::new(error.to_string()))?;
+    Ok(Box::new(writer))
+}
+
+#[cfg(not(unix))]
+fn local_pty_writer(master: &dyn MasterPty) -> Result<Box<dyn Write + Send>, LocalPtyError> {
+    master
+        .take_writer()
+        .map_err(|error| LocalPtyError::new(error.to_string()))
+}
+
+/// Reads PTY output and publishes it as session events.
+///
+/// `readable(wait)` reports whether another read would return without
+/// blocking, waiting at most `wait` for that to become true. macOS PTYs hand
+/// out about 1 KiB per read and a writer only refills the buffer after it is
+/// read, so each read used to become its own event and a frame-bounded
+/// consumer draining a fixed number of events capped `cat` throughput near
+/// 7 MiB/s regardless of CPU. Reads are now appended to the same chunk, up to
+/// [`READ_CHUNK_BYTES`]. When the consumer has drained everything queued, the
+/// chunk is published as soon as the PTY has no more ready data, so
+/// interactive echo is never delayed. Only while earlier output is still
+/// queued, and so could not be consumed sooner anyway, does the reader wait
+/// up to [`READ_COALESCE_WINDOW`] for more.
+fn reader_worker(
+    shared: Arc<Shared>,
+    mut reader: Box<dyn Read + Send>,
+    mut readable: impl FnMut(Duration) -> bool,
+    done_sender: SyncSender<Result<(), SessionError>>,
+) {
+    let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+    loop {
+        let mut filled = 0;
+        let mut ended = None;
+        let mut chunk_started = None;
+        loop {
+            match reader.read(&mut buffer[filled..]) {
+                Ok(0) => {
+                    ended = Some(Ok(()));
+                    break;
+                }
+                Ok(read) => {
+                    filled += read;
+                    chunk_started.get_or_insert_with(std::time::Instant::now);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    if filled == 0 {
+                        continue;
+                    }
+                    break;
+                }
+                Err(error) => {
+                    ended = Some(Err(error));
+                    break;
+                }
+            }
+            if filled == buffer.len() {
+                break;
+            }
+            let wait = if shared.queued_output_bytes.load(Ordering::Acquire) == 0 {
+                Duration::ZERO
+            } else {
+                chunk_started.map_or(Duration::ZERO, |started: std::time::Instant| {
+                    READ_COALESCE_WINDOW.saturating_sub(started.elapsed())
+                })
+            };
+            if !readable(wait) {
+                break;
+            }
+        }
+
+        // Keep draining after cancellation, without publishing events:
+        // a terminal client can need its last output drained to exit.
+        if filled > 0
+            && !shared.cancel.load(Ordering::Acquire)
+            && !shared.emit_output(buffer[..filled].to_vec())
+            && !shared.cancel.load(Ordering::Acquire)
+        {
+            let _ = done_sender.send(Ok(()));
+            return;
+        }
+
+        match ended {
+            None => {}
+            Some(Ok(())) => {
+                shared.invalidate_automation_epoch();
+                let _ = done_sender.send(Ok(()));
+                return;
+            }
+            Some(Err(error)) => {
+                if shared.cancel.load(Ordering::Acquire) {
+                    let _ = done_sender.send(Ok(()));
+                    return;
+                }
+                let error = SessionError::new(
+                    SessionErrorKind::Output,
+                    format!("local PTY read failed: {error}"),
+                );
+                shared.invalidate_automation_epoch();
+                shared.cancel_and_wake_reader();
+                let _ = done_sender.send(Err(error));
+                return;
+            }
+        }
+    }
+}
+
+/// A non-blocking "is more output ready?" probe for [`reader_worker`].
+///
+/// It owns its own duplicate of the master descriptor so that it stays valid
+/// for as long as the reader thread runs, independent of when the control
+/// worker drops the master.
+#[cfg(unix)]
+fn pty_readable_probe(master: &dyn MasterPty) -> impl FnMut(Duration) -> bool + Send + 'static {
+    let descriptor = master
+        .as_raw_fd()
+        .and_then(|descriptor| filedescriptor::FileDescriptor::dup(&descriptor).ok());
+    move |wait| {
+        let Some(descriptor) = descriptor.as_ref() else {
+            return false;
+        };
+        let mut poll = [filedescriptor::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(descriptor),
+            events: filedescriptor::POLLIN,
+            revents: 0,
+        }];
+        matches!(filedescriptor::poll(&mut poll, Some(wait)), Ok(ready) if ready > 0)
+            && poll[0].revents & filedescriptor::POLLIN != 0
+    }
+}
+
+/// ConPTY output arrives through a pipe whose reads are already as large as
+/// the buffer allows, so Windows reads are published as they come.
+#[cfg(not(unix))]
+fn pty_readable_probe(_master: &dyn MasterPty) -> impl FnMut(Duration) -> bool + Send + 'static {
+    |_| false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn control_worker(
+    shared: Arc<Shared>,
+    command_receiver: Receiver<SessionCommand>,
+    master: Box<dyn MasterPty + Send>,
+    mut writer: Box<dyn Write + Send>,
+    mut child: Box<dyn Child + Send + Sync>,
+    reader_done_receiver: Receiver<Result<(), SessionError>>,
+    completion_sender: SyncSender<Result<ShutdownResult, SessionError>>,
+) {
+    let mut stopping = false;
+    let mut worker_failure = None;
+    let mut exited = None;
+    let mut pending_automation_input = None;
+    #[cfg(unix)]
+    let mut hangup_progress = None;
+    loop {
+        if shared.cancel.load(Ordering::Acquire) {
+            stopping = true;
+            pending_automation_input = None;
+            shared.terminate_process_tree();
+        }
+
+        match receive_command(&command_receiver, &mut pending_automation_input) {
+            Ok(SessionCommand::Input(bytes)) if !stopping => {
+                if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+                    let error = SessionError::new(
+                        SessionErrorKind::Input,
+                        format!("local PTY write failed: {error}"),
+                    );
+                    shared.update_lifecycle(SessionLifecycle::Failed(error.clone()));
+                    worker_failure = Some(error);
+                    shared.cancel_and_wake_reader();
+                    stopping = true;
+                    shared.terminate_process_tree();
+                } else {
+                    let mut metrics = shared
+                        .metrics
+                        .lock()
+                        .expect("session metrics lock is not poisoned");
+                    metrics.input_bytes = metrics.input_bytes.saturating_add(bytes.len() as u64);
+                }
+            }
+            Ok(SessionCommand::Resize(size)) if !stopping => {
+                match master.resize(to_portable_size(size)) {
+                    Ok(()) => {
+                        let mut metrics = shared
+                            .metrics
+                            .lock()
+                            .expect("session metrics lock is not poisoned");
+                        metrics.resize_count = metrics.resize_count.saturating_add(1);
+                        drop(metrics);
+                        let _ = shared.try_emit(SessionEvent::ResizeApplied(size));
+                    }
+                    Err(error) => shared.record_error(SessionError::new(
+                        SessionErrorKind::Resize,
+                        format!("local PTY resize failed: {error}"),
+                    )),
+                }
+            }
+            Ok(SessionCommand::Shutdown) => {
+                stopping = true;
+                shared.cancel_and_wake_reader();
+                shared.terminate_process_tree();
+            }
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                stopping = true;
+                shared.invalidate_automation_epoch();
+                shared.cancel_and_wake_reader();
+                shared.terminate_process_tree();
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let terminal_exit = match status.signal() {
+                    Some(signal) => SessionExit::with_signal(status.exit_code(), signal),
+                    None => SessionExit::with_exit_code(status.exit_code()),
+                };
+                if !stopping {
+                    shared.update_lifecycle(SessionLifecycle::Exited(terminal_exit.clone()));
+                    exited = Some(terminal_exit);
+                }
+                shared.terminate_process_tree();
+                break;
+            }
+            Ok(None) if stopping => {
+                #[cfg(unix)]
+                if let Some(tree) = shared
+                    .process_tree
+                    .as_ref()
+                    .filter(|tree| tree.hangup_on_shutdown)
+                {
+                    let (started, phase) = hangup_progress.get_or_insert((Instant::now(), 0));
+                    let next = if started.elapsed() >= Duration::from_secs(1) {
+                        2
+                    } else if started.elapsed() >= Duration::from_millis(250) {
+                        1
+                    } else {
+                        0
+                    };
+                    if next > *phase {
+                        *phase = next;
+                        let signal = if next == 1 {
+                            Signal::SIGTERM
+                        } else {
+                            Signal::SIGKILL
+                        };
+                        if let Err(error) = tree.signal(signal) {
+                            shared.record_error(SessionError::new(
+                                SessionErrorKind::Shutdown,
+                                format!("could not escalate local client shutdown: {error}"),
+                            ));
+                        }
+                    }
+                }
+                // A disconnected command channel returns immediately.
+                thread::sleep(POLL_INTERVAL);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let error = SessionError::new(
+                    SessionErrorKind::Internal,
+                    format!("could not observe local child exit: {error}"),
+                );
+                shared.update_lifecycle(SessionLifecycle::Failed(error.clone()));
+                worker_failure = Some(error);
+                shared.cancel_and_wake_reader();
+                shared.terminate_process_tree();
+                break;
+            }
+        }
+    }
+
+    drop(writer);
+    drop(master);
+    let reader_result = reader_done_receiver.recv_timeout(READER_STOP_TIMEOUT);
+    let result = if let Some(error) = worker_failure {
+        shared.publish_terminal(SessionLifecycle::Failed(error.clone()));
+        Err(error)
+    } else {
+        match reader_result {
+            Ok(Ok(())) if stopping || shared.cancel.load(Ordering::Acquire) => {
+                shared.publish_terminal(SessionLifecycle::Stopped);
+                Ok(ShutdownResult::Stopped)
+            }
+            Ok(Ok(())) => {
+                if let Some(exit) = exited {
+                    shared.publish_terminal(SessionLifecycle::Exited(exit));
+                    Ok(ShutdownResult::AlreadyStopped)
+                } else {
+                    let error = SessionError::new(
+                        SessionErrorKind::Internal,
+                        "local PTY ended without a child exit",
+                    );
+                    shared.publish_terminal(SessionLifecycle::Failed(error.clone()));
+                    Err(error)
+                }
+            }
+            Ok(Err(error)) => {
+                shared.publish_terminal(SessionLifecycle::Failed(error.clone()));
+                Err(error)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                shared.cancel_and_wake_reader();
+                let error = SessionError::new(
+                    SessionErrorKind::Shutdown,
+                    "local PTY reader did not stop within the bounded shutdown interval",
+                );
+                shared.publish_terminal(SessionLifecycle::Failed(error.clone()));
+                Err(error)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let error = SessionError::new(
+                    SessionErrorKind::Internal,
+                    "local PTY reader ended without reporting completion",
+                );
+                shared.cancel.store(true, Ordering::Release);
+                shared.publish_terminal(SessionLifecycle::Failed(error.clone()));
+                Err(error)
+            }
+        }
+    };
+    shared.complete(result, &completion_sender);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_default_shell_requires_an_absolute_existing_shell() {
+        let shell =
+            discover_unix_shell(Some(OsStr::new("sh")), |path| path == Path::new("/bin/sh"))
+                .unwrap();
+        assert_eq!(shell.executable(), Path::new("/bin/sh"));
+
+        let shell = discover_unix_shell(Some(OsStr::new("sh")), |_| false);
+        assert_eq!(shell, Err(LocalProfileError::NoDefaultShell));
+
+        let shell = discover_unix_shell(Some(OsStr::new("/custom/sh")), |path| {
+            path == Path::new("/custom/sh")
+        })
+        .unwrap();
+        assert_eq!(shell.executable(), Path::new("/custom/sh"));
+        assert_eq!(shell.arguments(), [OsString::from("-l")]);
+    }
+
+    #[cfg(windows)]
+    fn test_windows_environment(path: Option<&OsStr>) -> WindowsShellEnvironment<'_> {
+        WindowsShellEnvironment {
+            local_app_data: Some(OsStr::new(r"C:\Users\example\AppData\Local")),
+            path,
+            program_files: vec![OsString::from(r"C:\Program Files")],
+            comspec: Some(OsStr::new(r"C:\Windows\System32\cmd.exe")),
+            system_root: Some(OsStr::new(r"C:\Windows")),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_shell_finds_pwsh_on_path_or_in_program_files_before_cmd() {
+        for installed in [
+            r"C:\Tools\pwsh.exe",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+        ] {
+            let shell = discover_windows_shell(
+                true,
+                test_windows_environment(Some(OsStr::new(r"C:\Other;C:\Tools"))),
+                |path| path == Path::new(installed) || path.ends_with("cmd.exe"),
+            )
+            .unwrap();
+            assert_eq!(shell.executable(), Path::new(installed));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_shell_prefers_the_user_powershell_alias_when_enabled() {
+        let powershell = discover_windows_shell(
+            true,
+            test_windows_environment(Some(OsStr::new(r"C:\Tools"))),
+            |path| {
+                path == Path::new(r"C:\Users\example\AppData\Local\Microsoft\WindowsApps\pwsh.exe")
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            powershell.executable(),
+            Path::new(r"C:\Users\example\AppData\Local\Microsoft\WindowsApps\pwsh.exe")
+        );
+        assert_eq!(powershell.arguments(), [OsString::from("-NoLogo")]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_shell_falls_back_to_comspec_then_windows_powershell() {
+        let command_processor = discover_windows_shell(
+            true,
+            test_windows_environment(Some(OsStr::new(r"C:\Tools"))),
+            |path| path == Path::new(r"C:\Windows\System32\cmd.exe"),
+        )
+        .unwrap();
+        assert_eq!(
+            command_processor.executable(),
+            Path::new(r"C:\Windows\System32\cmd.exe")
+        );
+        assert_eq!(command_processor.arguments(), [OsString::from("/Q")]);
+
+        let powershell = discover_windows_shell(
+            false,
+            WindowsShellEnvironment {
+                comspec: Some(OsStr::new("cmd.exe")),
+                ..test_windows_environment(None)
+            },
+            |path| path.ends_with(r"WindowsPowerShell\v1.0\powershell.exe"),
+        )
+        .unwrap();
+        assert_eq!(powershell.arguments(), [OsString::from("-NoLogo")]);
+    }
+
+    #[test]
+    fn working_directory_expands_leading_tilde_only() {
+        let home = Path::new("/home/u");
+        let expand = |text: &str| expand_home_directory_with(PathBuf::from(text), Some(home));
+        assert_eq!(expand("~"), PathBuf::from("/home/u"));
+        assert_eq!(expand("~/src"), PathBuf::from("/home/u/src"));
+        assert_eq!(expand("~other/src"), PathBuf::from("~other/src"));
+        assert_eq!(expand("/a/~/b"), PathBuf::from("/a/~/b"));
+        assert_eq!(
+            expand_home_directory_with(PathBuf::from("~/src"), None),
+            PathBuf::from("~/src")
+        );
+    }
+
+    #[test]
+    fn profile_rejects_invalid_working_directory() {
+        let profile =
+            LocalProfile::new("shell").with_working_directory("definitely-not-a-directory");
+        assert!(matches!(
+            profile.validate(),
+            Err(LocalProfileError::InvalidWorkingDirectory(_))
+        ));
+    }
+
+    #[test]
+    fn local_children_identify_festerm_and_drop_an_inherited_terminal_session() {
+        let command = command_builder(&LocalProfile::new("shell"));
+
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+        assert_eq!(command.get_env("TERM_PROGRAM"), Some(OsStr::new("fesTerm")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(command.get_env("TERM_SESSION_ID"), None);
+    }
+
+    fn make_executable(path: &Path) {
+        std::fs::write(path, b"#!/bin/sh\n").expect("test file can be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("test file permissions can be set");
+        }
+    }
+
+    /// Appends the platform's recognized executable extension to a bare
+    /// test fixture name (`.exe` on Windows, where `PATHEXT` — not a
+    /// permission bit — decides whether a file is launchable; unchanged
+    /// elsewhere, where the Unix execute-permission bit already suffices).
+    fn executable_fixture_name(base: &str) -> String {
+        if cfg!(windows) {
+            format!("{base}.exe")
+        } else {
+            base.to_owned()
+        }
+    }
+
+    #[test]
+    fn path_search_matches_case_insensitive_prefixes_across_directories_and_is_sorted_and_capped() {
+        let root = std::env::temp_dir().join(format!(
+            "festerm-path-search-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).expect("test directory can be created");
+        std::fs::create_dir_all(&second).expect("test directory can be created");
+
+        let cargo_name = executable_fixture_name("cargo");
+        let cmdlet_name = executable_fixture_name("cmdlet");
+        make_executable(&first.join("Cmd.exe"));
+        make_executable(&first.join(&cargo_name));
+        make_executable(&second.join(&cmdlet_name));
+        // Not executable: must be excluded even though the name matches.
+        std::fs::write(second.join("cmd-readme.txt"), b"not executable")
+            .expect("test file can be created");
+
+        let directories = [first.clone(), second.clone()].into_iter();
+        let matches = search_path_executables_in("cmd", directories, 10);
+        assert_eq!(
+            matches.suggestions(),
+            vec![first.join("Cmd.exe"), second.join(&cmdlet_name)],
+            "matches are case-insensitive-prefix filtered, executable-only, and sorted"
+        );
+        assert!(
+            !matches.limited(),
+            "full scans within budget should not be marked limited"
+        );
+
+        let directories = [first.clone(), second.clone()].into_iter();
+        let capped = search_path_executables_in("cmd", directories, 1);
+        assert_eq!(
+            capped.suggestions().len(),
+            1,
+            "the limit truncates the result set"
+        );
+        assert!(capped.truncated(), "truncated results are reported");
+
+        let directories = [first, second].into_iter();
+        assert!(
+            search_path_executables_in("", directories, 10)
+                .suggestions()
+                .is_empty(),
+            "an empty query returns no suggestions"
+        );
+
+        std::fs::remove_dir_all(&root).expect("test directory can be removed");
+    }
+
+    #[test]
+    fn working_directory_search_matches_relative_and_absolute_prefixes_and_excludes_files() {
+        let root = std::env::temp_dir().join(format!(
+            "festerm-directory-search-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let alpha = root.join("Alpha");
+        let alpine = root.join("alpine");
+        std::fs::create_dir_all(alpha.join("nested")).expect("test directory can be created");
+        std::fs::create_dir_all(&alpine).expect("test directory can be created");
+        std::fs::write(root.join("also-a-file"), b"not a directory")
+            .expect("test file can be created");
+
+        assert_eq!(
+            search_working_directories_from("al", &root, 10),
+            PathSearchResult::new(vec![alpha.clone(), alpine], false, false, None),
+            "relative matches are absolute, case-insensitive, sorted, and directory-only"
+        );
+        let absolute_query = format!("{}al", root.join("").display());
+        assert_eq!(
+            search_working_directories_from(&absolute_query, &root, 1),
+            PathSearchResult::new(vec![alpha.clone()], true, false, None),
+            "absolute matches honor the result limit"
+        );
+        assert_eq!(
+            search_working_directories_from(
+                &format!("{}{}", alpha.display(), std::path::MAIN_SEPARATOR),
+                &root,
+                10,
+            ),
+            PathSearchResult::new(vec![alpha.join("nested")], false, false, None),
+            "a trailing separator lists children of the typed directory"
+        );
+        assert!(search_working_directories_from("", &root, 10)
+            .suggestions()
+            .is_empty());
+
+        std::fs::remove_dir_all(&root).expect("test directory can be removed");
+    }
+
+    #[test]
+    fn working_directory_search_reports_truncation_and_read_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "festerm-directory-search-truncation-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        for name in ["gamma-2", "gamma-1", "gamma-0"] {
+            std::fs::create_dir_all(root.join(name)).expect("test directory can be created");
+        }
+
+        let result = search_working_directories_from("gamma", &root, 2);
+        assert_eq!(
+            result.suggestions(),
+            &[root.join("gamma-0"), root.join("gamma-1")],
+            "bounded searches keep the earliest sorted matches"
+        );
+        assert!(
+            result.truncated(),
+            "extra matches are reported as truncated"
+        );
+        assert!(
+            result.error().is_none(),
+            "successful searches have no error"
+        );
+        assert!(
+            !result.limited(),
+            "small scans stay within the entry budget"
+        );
+
+        let missing = root.join("missing");
+        let error = search_working_directories_from(
+            &format!("{}{}", missing.display(), std::path::MAIN_SEPARATOR),
+            &root,
+            2,
+        );
+        assert!(
+            error.suggestions().is_empty(),
+            "failed searches yield no suggestions"
+        );
+        assert!(
+            error
+                .error()
+                .is_some_and(|message| message.contains("Could not read")),
+            "read failures are surfaced to the caller"
+        );
+
+        std::fs::remove_dir_all(&root).expect("test directory can be removed");
+    }
+
+    #[test]
+    fn path_and_directory_searches_report_scan_limits() {
+        let root = std::env::temp_dir().join(format!(
+            "festerm-directory-search-budget-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let executable_dir = root.join("bin");
+        let working_dir = root.join("work");
+        std::fs::create_dir_all(&executable_dir).expect("test directory can be created");
+        std::fs::create_dir_all(&working_dir).expect("test directory can be created");
+        for index in 0..8 {
+            make_executable(&executable_dir.join(executable_fixture_name(&format!("cmd-{index}"))));
+            std::fs::create_dir_all(working_dir.join(format!("project-{index}")))
+                .expect("test directory can be created");
+        }
+
+        let executable_result =
+            search_path_executables_in_with_budget("cmd", [executable_dir].into_iter(), 6, 3);
+        assert!(
+            executable_result.limited(),
+            "PATH scans that stop at the entry budget must report a limited search"
+        );
+        assert!(
+            executable_result.suggestions().len() <= 3,
+            "the limited search must stop at the budget rather than enumerate the whole directory"
+        );
+
+        let directory_result =
+            search_working_directories_from_with_budget("project", &working_dir, 6, 3);
+        assert!(
+            directory_result.limited(),
+            "directory scans that stop at the entry budget must report a limited search"
+        );
+        assert!(
+            directory_result.suggestions().len() <= 3,
+            "the limited search must stop at the budget rather than enumerate the whole directory"
+        );
+
+        std::fs::remove_dir_all(&root).expect("test directory can be removed");
+    }
+
+    #[test]
+    fn working_directory_search_surfaces_current_directory_failures() {
+        let error = search_working_directories_from_current_directory(
+            "alpha",
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "current directory unavailable",
+            )),
+            6,
+        );
+        assert!(error.suggestions().is_empty());
+        assert!(
+            error
+                .error()
+                .is_some_and(|message| message.contains("Could not resolve the current directory")),
+            "current-directory lookup failures must surface to the caller"
+        );
+    }
+
+    #[test]
+    fn path_search_budget_is_shared_fairly_between_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "festerm-path-fairness-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let large = root.join("large");
+        let tools = root.join("tools");
+        std::fs::create_dir_all(&large).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        for index in 0..32 {
+            std::fs::write(large.join(format!("unrelated-{index}")), b"").unwrap();
+        }
+        let expected = tools.join(executable_fixture_name("cargo"));
+        make_executable(&expected);
+
+        let result =
+            search_path_executables_in_with_budget("cargo", [large, tools].into_iter(), 6, 8);
+        assert_eq!(result.suggestions(), &[expected]);
+        assert!(
+            result.limited(),
+            "the large directory still exhausts the total budget"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_matches_keep_only_the_smallest_requested_paths() {
+        let mut bounded = BoundedMatches::new(2);
+        bounded.push(PathBuf::from("/zeta"));
+        bounded.push(PathBuf::from("/beta"));
+        bounded.push(PathBuf::from("/alpha"));
+
+        let result = bounded.finish(false, None);
+        assert_eq!(
+            result.suggestions(),
+            &[PathBuf::from("/alpha"), PathBuf::from("/beta")],
+            "candidate memory stays bounded while preserving sorted output"
+        );
+        assert!(result.truncated());
+    }
+
+    #[test]
+    fn is_executable_on_path_matches_the_exact_name_ignoring_extension_and_case() {
+        let root = std::env::temp_dir().join(format!(
+            "festerm-exact-path-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).expect("test directory can be created");
+        std::fs::create_dir_all(&second).expect("test directory can be created");
+
+        let tmux_name = executable_fixture_name("Tmux");
+        make_executable(&second.join(&tmux_name));
+        // A same-prefixed but distinct name must not count as a match.
+        make_executable(&first.join(executable_fixture_name("tmux-mux")));
+        // Present but not executable: must not count as a match either.
+        std::fs::write(first.join("screen"), b"not executable").expect("test file can be created");
+
+        let directories = [first.clone(), second.clone()].into_iter();
+        assert!(
+            is_executable_on_path_in("tmux", directories),
+            "an executable matching the name case-insensitively, ignoring extension, counts"
+        );
+
+        let directories = [first.clone(), second.clone()].into_iter();
+        assert!(
+            !is_executable_on_path_in("screen", directories),
+            "a same-named but non-executable file does not count"
+        );
+
+        let directories = [first.clone(), second.clone()].into_iter();
+        assert!(
+            !is_executable_on_path_in("nonexistent-multiplexer", directories),
+            "an executable absent from every directory is reported as unavailable"
+        );
+
+        let directories = [first, second].into_iter();
+        assert!(
+            !is_executable_on_path_in("", directories),
+            "an empty name never matches"
+        );
+
+        std::fs::remove_dir_all(&root).expect("test directory can be removed");
+    }
+
+    #[test]
+    fn bounded_output_queue_reports_pressure_before_resuming_output() {
+        let (event_sender, event_receiver) = mpsc::sync_channel(1);
+        let (_completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let notifier = Arc::new(CountingNotifier::default());
+        let shared = Arc::new(Shared {
+            id: SessionId::next(),
+            automation_epoch: Arc::new(AutomationEpoch::new()),
+            lifecycle_transition: Mutex::new(()),
+            lifecycle: Mutex::new(SessionLifecycle::Running),
+            terminal_delivery: Mutex::new(TerminalDelivery::default()),
+            metrics: Mutex::new(SessionMetrics {
+                event_queue_capacity: 1,
+                ..SessionMetrics::default()
+            }),
+            output_available: Condvar::new(),
+            output_waiting: AtomicBool::new(false),
+            event_sender,
+            event_notifier: notifier.clone(),
+            cancel: AtomicBool::new(false),
+            queued_output_bytes: AtomicUsize::new(0),
+            termination_requested: AtomicBool::new(false),
+            process_tree: None,
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        });
+        assert!(shared.emit_output(b"first".to_vec()));
+
+        let producer_shared = Arc::clone(&shared);
+        let producer = thread::spawn(move || producer_shared.emit_output(b"second".to_vec()));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while shared.metrics().backpressure_count == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(shared.metrics().backpressure_count > 0);
+        let first = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(&first, SessionEvent::Output(bytes) if bytes == b"first"));
+        shared.event_received(&first);
+        let notice = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            &notice,
+            SessionEvent::Backpressure {
+                direction: FlowDirection::Output,
+                capacity: 1,
+                ..
+            }
+        ));
+        shared.event_received(&notice);
+        assert!(matches!(
+            event_receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(SessionEvent::Output(bytes)) if bytes == b"second"
+        ));
+        assert!(producer.join().expect("producer joins"));
+        assert!(shared.metrics().backpressure_count > 0);
+        assert_eq!(notifier.notifications(), 3);
+    }
+
+    #[test]
+    fn automation_epoch_closes_when_local_stop_event_is_lost() {
+        let (event_sender, event_receiver) = mpsc::sync_channel(1);
+        let (command_sender, _command_receiver) = mpsc::sync_channel(1);
+        let (_completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared {
+            id: SessionId::next(),
+            automation_epoch: Arc::new(AutomationEpoch::new()),
+            lifecycle_transition: Mutex::new(()),
+            lifecycle: Mutex::new(SessionLifecycle::Starting),
+            terminal_delivery: Mutex::new(TerminalDelivery::default()),
+            metrics: Mutex::new(SessionMetrics {
+                event_queue_capacity: 1,
+                ..SessionMetrics::default()
+            }),
+            output_available: Condvar::new(),
+            output_waiting: AtomicBool::new(false),
+            event_sender,
+            event_notifier: noop_session_event_notifier(),
+            cancel: AtomicBool::new(false),
+            queued_output_bytes: AtomicUsize::new(0),
+            termination_requested: AtomicBool::new(false),
+            process_tree: None,
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        });
+        let session = LocalPtySession {
+            process_id: None,
+            terminal_device: None,
+            shared: Arc::clone(&shared),
+            command_sender,
+            event_receiver: Mutex::new(event_receiver),
+        };
+        shared.set_lifecycle(SessionLifecycle::Running);
+        let epoch = session.automation_epoch().unwrap();
+        let generation = epoch.capture().unwrap();
+
+        session.try_shutdown().unwrap();
+        assert_eq!(session.lifecycle(), SessionLifecycle::Stopping);
+        assert_eq!(epoch.capture(), None);
+        {
+            let _guard = festerm_session::automation_admission_lock().unwrap();
+            assert!(!epoch.is_current(generation));
+        }
+        assert!(matches!(
+            session.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Running))
+        ));
+        assert_eq!(session.try_recv_event(), Err(SessionTryReceiveError::Empty));
+    }
+
+    #[test]
+    fn pty_reader_eof_invalidates_epoch_before_exit_is_reported() {
+        let (event_sender, _event_receiver) = mpsc::sync_channel(1);
+        let (_completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let (reader_done, reader_completion) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared {
+            id: SessionId::next(),
+            automation_epoch: Arc::new(AutomationEpoch::new()),
+            lifecycle_transition: Mutex::new(()),
+            lifecycle: Mutex::new(SessionLifecycle::Starting),
+            terminal_delivery: Mutex::new(TerminalDelivery::default()),
+            metrics: Mutex::new(SessionMetrics {
+                event_queue_capacity: 1,
+                ..SessionMetrics::default()
+            }),
+            output_available: Condvar::new(),
+            output_waiting: AtomicBool::new(false),
+            event_sender,
+            event_notifier: noop_session_event_notifier(),
+            cancel: AtomicBool::new(false),
+            queued_output_bytes: AtomicUsize::new(0),
+            termination_requested: AtomicBool::new(false),
+            process_tree: None,
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        });
+        shared.set_lifecycle(SessionLifecycle::Running);
+        let generation = shared.automation_epoch.capture().unwrap();
+
+        reader_worker(
+            Arc::clone(&shared),
+            Box::new(std::io::empty()),
+            |_| false,
+            reader_done,
+        );
+        assert_eq!(reader_completion.try_recv(), Ok(Ok(())));
+        assert_eq!(shared.lifecycle(), SessionLifecycle::Running);
+        assert_eq!(shared.automation_epoch.capture(), None);
+        let _guard = festerm_session::automation_admission_lock().unwrap();
+        assert!(!shared.automation_epoch.is_current(generation));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_exit_event_follows_the_readers_last_output_even_when_the_queue_is_full() {
+        struct GatedReader {
+            release: Receiver<()>,
+            done: bool,
+        }
+
+        impl Read for GatedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.done {
+                    return Ok(0);
+                }
+                self.release.recv().map_err(std::io::Error::other)?;
+                self.done = true;
+                buffer[..4].copy_from_slice(b"last");
+                Ok(4)
+            }
+        }
+
+        let pair = native_pty_system()
+            .openpty(to_portable_size(TerminalSize::new(80, 24).unwrap()))
+            .unwrap();
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("/usr/bin/true"))
+            .unwrap();
+        let writer = local_pty_writer(&*pair.master).unwrap();
+        drop(pair.slave);
+        let (events, received) = mpsc::sync_channel(1);
+        let (commands, command_receiver) = mpsc::sync_channel(1);
+        let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let (reader_done, reader_completion) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            id: SessionId::next(),
+            automation_epoch: Arc::new(AutomationEpoch::new()),
+            lifecycle_transition: Mutex::new(()),
+            lifecycle: Mutex::new(SessionLifecycle::Running),
+            terminal_delivery: Mutex::new(TerminalDelivery::default()),
+            metrics: Mutex::new(SessionMetrics {
+                event_queue_capacity: 1,
+                ..SessionMetrics::default()
+            }),
+            output_available: Condvar::new(),
+            output_waiting: AtomicBool::new(false),
+            event_sender: events,
+            event_notifier: noop_session_event_notifier(),
+            cancel: AtomicBool::new(false),
+            queued_output_bytes: AtomicUsize::new(0),
+            termination_requested: AtomicBool::new(false),
+            process_tree: None,
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        });
+        let session = LocalPtySession {
+            process_id: None,
+            terminal_device: None,
+            shared: Arc::clone(&shared),
+            command_sender: commands,
+            event_receiver: Mutex::new(received),
+        };
+        let reader_shared = Arc::clone(&shared);
+        let reader = thread::spawn(move || {
+            reader_worker(
+                reader_shared,
+                Box::new(GatedReader {
+                    release: gate,
+                    done: false,
+                }),
+                |_| false,
+                reader_done,
+            );
+        });
+        let controller_shared = Arc::clone(&shared);
+        let controller = thread::spawn(move || {
+            control_worker(
+                controller_shared,
+                command_receiver,
+                pair.master,
+                writer,
+                child,
+                reader_completion,
+                completion_sender,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(shared.lifecycle(), SessionLifecycle::Exited(_)) {
+            assert!(Instant::now() < deadline, "child exit was not observed");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.try_recv_event(), Err(SessionTryReceiveError::Empty));
+        release.send(()).unwrap();
+        assert!(matches!(
+            shared
+                .completion_receiver
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2)),
+            Ok(Ok(ShutdownResult::AlreadyStopped))
+        ));
+        assert!(matches!(
+            session.try_recv_event(),
+            Ok(SessionEvent::Output(bytes)) if bytes == b"last"
+        ));
+        assert!(matches!(
+            session.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Exited(_)))
+        ));
+        reader.join().unwrap();
+        controller.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn terminal_delivery_workers(
+        reader: Box<dyn Read + Send>,
+        queued: Option<&[u8]>,
+    ) -> (
+        LocalPtySession,
+        Arc<Shared>,
+        thread::JoinHandle<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let pair = native_pty_system()
+            .openpty(to_portable_size(TerminalSize::new(80, 24).unwrap()))
+            .unwrap();
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("/usr/bin/true"))
+            .unwrap();
+        let writer = local_pty_writer(&*pair.master).unwrap();
+        drop(pair.slave);
+        let (events, received) = mpsc::sync_channel(1);
+        let (commands, command_receiver) = mpsc::sync_channel(1);
+        let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let (reader_done, reader_completion) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared {
+            id: SessionId::next(),
+            automation_epoch: Arc::new(AutomationEpoch::new()),
+            lifecycle_transition: Mutex::new(()),
+            lifecycle: Mutex::new(SessionLifecycle::Running),
+            terminal_delivery: Mutex::new(TerminalDelivery::default()),
+            metrics: Mutex::new(SessionMetrics {
+                event_queue_capacity: 1,
+                ..SessionMetrics::default()
+            }),
+            output_available: Condvar::new(),
+            output_waiting: AtomicBool::new(false),
+            event_sender: events,
+            event_notifier: noop_session_event_notifier(),
+            cancel: AtomicBool::new(false),
+            queued_output_bytes: AtomicUsize::new(0),
+            termination_requested: AtomicBool::new(false),
+            process_tree: None,
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        });
+        if let Some(bytes) = queued {
+            assert!(shared.emit_output(bytes.to_vec()));
+        }
+        let session = LocalPtySession {
+            process_id: None,
+            terminal_device: None,
+            shared: Arc::clone(&shared),
+            command_sender: commands,
+            event_receiver: Mutex::new(received),
+        };
+        let reader_shared = Arc::clone(&shared);
+        let reader = thread::spawn(move || {
+            reader_worker(reader_shared, reader, |_| false, reader_done);
+        });
+        let controller_shared = Arc::clone(&shared);
+        let controller = thread::spawn(move || {
+            control_worker(
+                controller_shared,
+                command_receiver,
+                pair.master,
+                writer,
+                child,
+                reader_completion,
+                completion_sender,
+            );
+        });
+        (session, shared, reader, controller)
+    }
+
+    #[cfg(unix)]
+    fn assert_terminal_failure_after_output(
+        session: &LocalPtySession,
+        shared: &Shared,
+        expected_output: &[u8],
+        kind: SessionErrorKind,
+    ) {
+        let result = shared
+            .completion_receiver
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(matches!(result, Err(error) if error.kind() == kind));
+        assert!(matches!(
+            session.try_recv_event(),
+            Ok(SessionEvent::Output(bytes)) if bytes == expected_output
+        ));
+        assert!(matches!(
+            session.try_recv_event(),
+            Ok(SessionEvent::Error(error)) if error.kind() == kind
+        ));
+        assert!(matches!(
+            session.try_recv_event(),
+            Ok(SessionEvent::Lifecycle(SessionLifecycle::Failed(error))) if error.kind() == kind
+        ));
+        assert!(!shared.emit_output(b"after failure".to_vec()));
+        assert_eq!(session.try_recv_event(), Err(SessionTryReceiveError::Empty));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_failure_follows_admitted_output_when_the_queue_is_full() {
+        struct FailingReader(bool);
+        impl Read for FailingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("injected reader failure"));
+                }
+                self.0 = true;
+                buffer[..4].copy_from_slice(b"last");
+                Ok(4)
+            }
+        }
+        let (session, shared, reader, controller) =
+            terminal_delivery_workers(Box::new(FailingReader(false)), None);
+        assert_terminal_failure_after_output(&session, &shared, b"last", SessionErrorKind::Output);
+        reader.join().unwrap();
+        controller.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_reader_cannot_publish_after_terminal_failure() {
+        struct GatedReader {
+            gate: Receiver<()>,
+            done: bool,
+        }
+        impl Read for GatedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.done {
+                    return Ok(0);
+                }
+                self.gate.recv().map_err(std::io::Error::other)?;
+                self.done = true;
+                buffer[..4].copy_from_slice(b"late");
+                Ok(4)
+            }
+        }
+        let (release, gate) = mpsc::channel();
+        let (session, shared, reader, controller) =
+            terminal_delivery_workers(Box::new(GatedReader { gate, done: false }), Some(b"before"));
+        assert_terminal_failure_after_output(
+            &session,
+            &shared,
+            b"before",
+            SessionErrorKind::Shutdown,
+        );
+        release.send(()).unwrap();
+        reader.join().unwrap();
+        controller.join().unwrap();
+        assert_eq!(session.try_recv_event(), Err(SessionTryReceiveError::Empty));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_reader_is_cancelled_before_terminal_failure_follows_queued_output() {
+        let reader = Box::new(std::io::Cursor::new(b"late".to_vec()));
+        let (session, shared, reader, controller) =
+            terminal_delivery_workers(reader, Some(b"before"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !shared.output_waiting.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(shared.output_waiting.load(Ordering::Acquire));
+        assert_terminal_failure_after_output(
+            &session,
+            &shared,
+            b"before",
+            SessionErrorKind::Shutdown,
+        );
+        reader.join().unwrap();
+        controller.join().unwrap();
+        assert_eq!(session.try_recv_event(), Err(SessionTryReceiveError::Empty));
+    }
+
+    #[test]
+    fn queued_output_bytes_apply_backpressure_before_the_event_queue_fills() {
+        let (event_sender, event_receiver) = mpsc::sync_channel(8);
+        let (_completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared {
+            id: SessionId::next(),
+            automation_epoch: Arc::new(AutomationEpoch::new()),
+            lifecycle_transition: Mutex::new(()),
+            lifecycle: Mutex::new(SessionLifecycle::Running),
+            terminal_delivery: Mutex::new(TerminalDelivery::default()),
+            metrics: Mutex::new(SessionMetrics {
+                event_queue_capacity: 8,
+                ..SessionMetrics::default()
+            }),
+            output_available: Condvar::new(),
+            output_waiting: AtomicBool::new(false),
+            event_sender,
+            event_notifier: noop_session_event_notifier(),
+            cancel: AtomicBool::new(false),
+            queued_output_bytes: AtomicUsize::new(0),
+            termination_requested: AtomicBool::new(false),
+            process_tree: None,
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        });
+        // A lone oversized chunk is always admitted so output cannot wedge.
+        assert!(shared.emit_output(vec![b'a'; MAX_QUEUED_OUTPUT_BYTES]));
+
+        let producer_shared = Arc::clone(&shared);
+        let producer = thread::spawn(move || producer_shared.emit_output(b"b".to_vec()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.metrics().backpressure_count == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(shared.metrics().backpressure_count > 0);
+        let first = event_receiver.try_recv().unwrap();
+        assert!(
+            matches!(&first, SessionEvent::Output(bytes) if bytes.len() == MAX_QUEUED_OUTPUT_BYTES)
+        );
+        let notice = event_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            &notice,
+            SessionEvent::Backpressure {
+                direction: FlowDirection::Output,
+                ..
+            }
+        ));
+        shared.event_received(&notice);
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "byte bound must hold output back"
+        );
+
+        shared.event_received(&first);
+        assert!(matches!(
+            event_receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(SessionEvent::Output(bytes)) if bytes == b"b"
+        ));
+        assert!(producer.join().expect("producer joins"));
+        assert_eq!(shared.queued_output_bytes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn pty_reader_coalesces_ready_reads_and_waits_only_behind_a_backlog() {
+        struct Chunks(Arc<Mutex<std::collections::VecDeque<&'static [u8]>>>);
+        impl Read for Chunks {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let Some(chunk) = self.0.lock().unwrap().pop_front() else {
+                    return Ok(0);
+                };
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        for backlog in [0, 1] {
+            let (event_sender, event_receiver) = mpsc::sync_channel(4);
+            let (_completion_sender, completion_receiver) = mpsc::sync_channel(1);
+            let (reader_done, reader_completion) = mpsc::sync_channel(1);
+            let shared = Arc::new(Shared {
+                id: SessionId::next(),
+                automation_epoch: Arc::new(AutomationEpoch::new()),
+                lifecycle_transition: Mutex::new(()),
+                lifecycle: Mutex::new(SessionLifecycle::Running),
+                terminal_delivery: Mutex::new(TerminalDelivery::default()),
+                metrics: Mutex::new(SessionMetrics {
+                    event_queue_capacity: 4,
+                    ..SessionMetrics::default()
+                }),
+                output_available: Condvar::new(),
+                output_waiting: AtomicBool::new(false),
+                event_sender,
+                event_notifier: noop_session_event_notifier(),
+                cancel: AtomicBool::new(false),
+                queued_output_bytes: AtomicUsize::new(backlog),
+                termination_requested: AtomicBool::new(false),
+                process_tree: None,
+                completion_receiver: Mutex::new(completion_receiver),
+                completion: Mutex::new(None),
+            });
+            let chunks = Arc::new(Mutex::new(std::collections::VecDeque::from([
+                b"ab".as_slice(),
+                b"cd".as_slice(),
+                b"ef".as_slice(),
+            ])));
+            let mut waits = Vec::new();
+            let pending = Arc::clone(&chunks);
+            reader_worker(
+                Arc::clone(&shared),
+                Box::new(Chunks(chunks)),
+                |wait| {
+                    waits.push(wait);
+                    !pending.lock().unwrap().is_empty()
+                },
+                reader_done,
+            );
+
+            assert_eq!(reader_completion.try_recv(), Ok(Ok(())));
+            assert!(matches!(
+                event_receiver.try_recv(),
+                Ok(SessionEvent::Output(bytes)) if bytes == b"abcdef"
+            ));
+            assert_eq!(waits.len(), 3);
+            if backlog == 0 {
+                assert!(waits.iter().all(Duration::is_zero), "{waits:?}");
+            } else {
+                assert!(
+                    waits
+                        .iter()
+                        .all(|wait| !wait.is_zero() && *wait <= READ_COALESCE_WINDOW),
+                    "{waits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_never_resumes_ahead_of_the_pressure_that_stalled_it() {
+        // The ordering above is only interesting when the consumer drains at
+        // the worst possible moment: while the producer is between failing to
+        // queue the backpressure notice and retrying the output. Freeing the
+        // slot the instant the failure is observable lands in that window
+        // often enough to catch a producer that races output into it.
+        for attempt in 0..256 {
+            let (event_sender, event_receiver) = mpsc::sync_channel(1);
+            let (_completion_sender, completion_receiver) = mpsc::sync_channel(1);
+            let shared = Arc::new(Shared {
+                id: SessionId::next(),
+                automation_epoch: Arc::new(AutomationEpoch::new()),
+                lifecycle_transition: Mutex::new(()),
+                lifecycle: Mutex::new(SessionLifecycle::Running),
+                terminal_delivery: Mutex::new(TerminalDelivery::default()),
+                metrics: Mutex::new(SessionMetrics {
+                    event_queue_capacity: 1,
+                    ..SessionMetrics::default()
+                }),
+                output_available: Condvar::new(),
+                output_waiting: AtomicBool::new(false),
+                event_sender,
+                event_notifier: Arc::new(CountingNotifier::default()),
+                cancel: AtomicBool::new(false),
+                queued_output_bytes: AtomicUsize::new(0),
+                termination_requested: AtomicBool::new(false),
+                process_tree: None,
+                completion_receiver: Mutex::new(completion_receiver),
+                completion: Mutex::new(None),
+            });
+            assert!(shared.emit_output(b"first".to_vec()));
+
+            let producer_shared = Arc::clone(&shared);
+            let producer = thread::spawn(move || producer_shared.emit_output(b"second".to_vec()));
+
+            // The second increment means the notice could not be queued and
+            // is still owed when the consumer frees a slot.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while shared.metrics().backpressure_count < 2 && Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            assert!(
+                shared.metrics().backpressure_count >= 2,
+                "attempt {attempt}: the producer never encountered a blocked notice"
+            );
+            // Drain with a bare `try_recv` rather than a blocking receive so
+            // the slot frees as close as possible to the failure that was
+            // just observed, which is where the window is.
+            let first = loop {
+                if let Ok(event) = event_receiver.try_recv() {
+                    break event;
+                }
+                std::hint::spin_loop();
+            };
+            shared.event_received(&first);
+
+            let second = event_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the stalled producer makes progress once a slot frees");
+            assert!(
+                matches!(
+                    &second,
+                    SessionEvent::Backpressure {
+                        direction: FlowDirection::Output,
+                        ..
+                    }
+                ),
+                "attempt {attempt}: output resumed before the stall was reported: {second:?}"
+            );
+            shared.event_received(&second);
+            assert!(producer.join().expect("producer joins"));
+        }
+    }
+
+    fn output_test_session(
+        event_capacity: usize,
+    ) -> (Arc<Shared>, LocalPtySession, Receiver<SessionCommand>) {
+        let (event_sender, event_receiver) = mpsc::sync_channel(event_capacity);
+        let (command_sender, command_receiver) = mpsc::sync_channel(1);
+        let (_completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared {
+            id: SessionId::next(),
+            automation_epoch: Arc::new(AutomationEpoch::new()),
+            lifecycle_transition: Mutex::new(()),
+            lifecycle: Mutex::new(SessionLifecycle::Running),
+            terminal_delivery: Mutex::new(TerminalDelivery::default()),
+            metrics: Mutex::new(SessionMetrics {
+                event_queue_capacity: event_capacity,
+                ..SessionMetrics::default()
+            }),
+            output_available: Condvar::new(),
+            output_waiting: AtomicBool::new(false),
+            event_sender,
+            event_notifier: noop_session_event_notifier(),
+            cancel: AtomicBool::new(false),
+            queued_output_bytes: AtomicUsize::new(0),
+            termination_requested: AtomicBool::new(false),
+            process_tree: None,
+            completion_receiver: Mutex::new(completion_receiver),
+            completion: Mutex::new(None),
+        });
+        let session = LocalPtySession {
+            process_id: None,
+            terminal_device: None,
+            shared: Arc::clone(&shared),
+            command_sender,
+            event_receiver: Mutex::new(event_receiver),
+        };
+        (shared, session, command_receiver)
+    }
+
+    fn wait_for_blocked_output(shared: &Shared) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shared.output_waiting.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "output did not block");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn blocked_output_wakes_on_shutdown_with_a_full_command_queue() {
+        for bytes_full in [false, true] {
+            let (shared, session, _command_receiver) =
+                output_test_session(if bytes_full { 8 } else { 1 });
+            let first = if bytes_full {
+                vec![b'a'; MAX_QUEUED_OUTPUT_BYTES]
+            } else {
+                b"first".to_vec()
+            };
+            assert!(shared.emit_output(first));
+            session.try_send_input(b"occupied").unwrap();
+
+            let producer_shared = Arc::clone(&shared);
+            let (finished, result) = mpsc::sync_channel(1);
+            let producer = thread::spawn(move || {
+                finished
+                    .send(producer_shared.emit_output(b"second".to_vec()))
+                    .unwrap();
+            });
+            wait_for_blocked_output(&shared);
+            assert!(matches!(
+                session.try_shutdown(),
+                Err(SessionSendError::Full {
+                    operation: SessionOperation::Shutdown,
+                    ..
+                })
+            ));
+            assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(false));
+            producer.join().unwrap();
+        }
+    }
+
+    struct TestChunks {
+        chunks: std::collections::VecDeque<&'static [u8]>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for TestChunks {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let chunk = self.chunks.pop_front().unwrap_or_default();
+            buffer[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    #[test]
+    fn reader_drains_without_publishing_after_blocked_output_is_cancelled() {
+        let (shared, session, _command_receiver) = output_test_session(1);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = TestChunks {
+            chunks: [b"first".as_slice(), b"blocked", b"after"].into(),
+            reads: Arc::clone(&reads),
+        };
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let reader_shared = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            reader_worker(reader_shared, Box::new(reader), |_| false, done_sender);
+        });
+        wait_for_blocked_output(&shared);
+        session.try_shutdown().unwrap();
+        assert_eq!(
+            done_receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(Ok(()))
+        );
+        worker.join().unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 4);
+        assert!(matches!(
+            session.try_recv_event(),
+            Ok(SessionEvent::Output(bytes)) if bytes == b"first"
+        ));
+        assert_eq!(session.try_recv_event(), Err(SessionTryReceiveError::Empty));
+    }
+
+    #[test]
+    fn blocked_reader_delivers_queued_output_then_observes_eof() {
+        let (shared, session, _command_receiver) = output_test_session(1);
+        shared.automation_epoch.transition(true);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = TestChunks {
+            chunks: [b"first".as_slice(), b"last"].into(),
+            reads: Arc::clone(&reads),
+        };
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let reader_shared = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            reader_worker(reader_shared, Box::new(reader), |_| false, done_sender);
+        });
+        wait_for_blocked_output(&shared);
+
+        let next_event = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match session.try_recv_event() {
+                    Ok(event) => break event,
+                    Err(SessionTryReceiveError::Empty) if Instant::now() < deadline => {
+                        thread::yield_now();
+                    }
+                    other => panic!("expected output event, got {other:?}"),
+                }
+            }
+        };
+        assert!(matches!(next_event(), SessionEvent::Output(bytes) if bytes == b"first"));
+        assert!(matches!(
+            next_event(),
+            SessionEvent::Backpressure {
+                direction: FlowDirection::Output,
+                ..
+            }
+        ));
+        assert!(matches!(next_event(), SessionEvent::Output(bytes) if bytes == b"last"));
+        assert_eq!(
+            done_receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(Ok(()))
+        );
+        worker.join().unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+        assert_eq!(shared.automation_epoch.capture(), None);
+    }
+
+    #[derive(Default)]
+    struct CountingNotifier(AtomicUsize);
+
+    impl CountingNotifier {
+        fn notifications(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    impl SessionEventNotifier for CountingNotifier {
+        fn notify(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn retry_automation_reservation<T>(
+        mut reserve: impl FnMut() -> Result<T, ReserveAutomationInputError>,
+    ) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match reserve() {
+                Err(ReserveAutomationInputError::Busy) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                result => return result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn automation_reservation_preserves_order_and_releases_cancelled_slots() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let attachment = Arc::new(AutomationEpoch::new());
+        attachment.transition(true);
+        let (reservation, pending) = retry_automation_reservation(|| {
+            automation_input_slot(b"automation-", 1, attachment.clone())
+        });
+        assert!(sender
+            .try_send(SessionCommand::AutomationInput(pending))
+            .is_ok());
+        assert!(sender
+            .try_send(SessionCommand::Input(b"human".to_vec()))
+            .is_ok());
+        let mut held = None;
+        assert!(matches!(
+            receive_command(&receiver, &mut held),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        reservation.commit_with(|_| Ok::<_, ()>(())).unwrap();
+        assert!(matches!(
+            receive_command(&receiver, &mut held),
+            Ok(SessionCommand::Input(bytes)) if bytes == b"automation-"
+        ));
+        assert!(matches!(
+            receive_command(&receiver, &mut held),
+            Ok(SessionCommand::Input(bytes)) if bytes == b"human"
+        ));
+
+        let (reservation, pending) = retry_automation_reservation(|| {
+            automation_input_slot(b"must-not-send", 1, attachment.clone())
+        });
+        assert!(sender
+            .try_send(SessionCommand::AutomationInput(pending))
+            .is_ok());
+        assert!(sender
+            .try_send(SessionCommand::Input(b"takeover".to_vec()))
+            .is_ok());
+        drop(reservation);
+        assert!(matches!(
+            receive_command(&receiver, &mut held),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            receive_command(&receiver, &mut held),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            receive_command(&receiver, &mut held),
+            Ok(SessionCommand::Input(bytes)) if bytes == b"takeover"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_pty_automation_reservation_cannot_send_cancelled_bytes() {
+        for committed in [false, true] {
+            let profile = LocalProfile::new(test_child_path()).with_arguments([
+                "emit:READY",
+                "read-line",
+                "echo:INPUT",
+                "exit:0",
+            ]);
+            let session =
+                LocalPtySession::start(profile, TerminalSize::new(80, 24).unwrap()).unwrap();
+            let mut output = Vec::new();
+            wait_for(&session, Duration::from_secs(4), &mut output, |bytes| {
+                bytes
+                    .windows(b"READY".len())
+                    .any(|window| window == b"READY")
+            });
+            let reservation =
+                retry_automation_reservation(|| session.reserve_automation_input(7, b"automated-"));
+            let attachment = session.automation_epoch().unwrap();
+            let generation = attachment.capture().unwrap();
+            {
+                let guard = festerm_session::automation_admission_lock().unwrap();
+                assert!(reservation.matches_attachment(7, &attachment, generation, &guard));
+                assert!(!reservation.matches_attachment(8, &attachment, generation, &guard));
+            }
+            session.try_send_input(b"human\n").unwrap();
+            if committed {
+                reservation.commit_with(|_| Ok::<_, ()>(())).unwrap();
+            } else {
+                drop(reservation);
+            }
+            let expected = if committed {
+                b"INPUT:automated-human".as_slice()
+            } else {
+                b"INPUT:human".as_slice()
+            };
+            wait_for(&session, Duration::from_secs(4), &mut output, |bytes| {
+                bytes
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+            });
+            if !committed {
+                assert!(!output
+                    .windows(b"automated-".len())
+                    .any(|window| window == b"automated-"));
+            }
+            assert!(matches!(
+                session.shutdown(Duration::from_secs(4)),
+                Ok(ShutdownResult::AlreadyStopped) | Ok(ShutdownResult::Stopped)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_shell_transfers_bytes_resizes_exits_and_stops() {
+        // Uses the repository-owned test child instead of shell built-ins.
+        let profile = LocalProfile::new(test_child_path()).with_arguments([
+            "emit:READY",
+            "read-line",
+            "echo:INPUT",
+            "report-size",
+            "exit:0",
+        ]);
+        let session = LocalPtySession::start(profile, TerminalSize::new(80, 24).unwrap()).unwrap();
+
+        let mut output = Vec::new();
+        wait_for(&session, Duration::from_secs(4), &mut output, |bytes| {
+            bytes
+                .windows(b"READY".len())
+                .any(|window| window == b"READY")
+        });
+        session
+            .try_resize(TerminalSize::new(100, 40).unwrap())
+            .unwrap();
+        session.try_send_input(b"hello\n").unwrap();
+        wait_for(&session, Duration::from_secs(4), &mut output, |bytes| {
+            bytes
+                .windows(b"INPUT:hello".len())
+                .any(|window| window == b"INPUT:hello")
+                && bytes
+                    .windows(b"40 100".len())
+                    .any(|window| window == b"40 100")
+        });
+        assert!(session.metrics().resize_count >= 1);
+        assert!(matches!(
+            session.shutdown(Duration::from_secs(4)),
+            Ok(ShutdownResult::AlreadyStopped) | Ok(ShutdownResult::Stopped)
+        ));
+        assert!(output
+            .windows(b"INPUT:hello".len())
+            .any(|window| window == b"INPUT:hello"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_shell_preserves_output_between_consecutive_resizes() {
+        // Uses the repository-owned test child instead of shell built-ins.
+        let profile = LocalProfile::new(test_child_path()).with_arguments([
+            "emit:READY",
+            "read-line",
+            "echo:FRAME",
+            "report-size",
+            "read-line",
+            "echo:FRAME",
+            "report-size",
+            "exit:0",
+        ]);
+        let session = LocalPtySession::start(profile, TerminalSize::new(80, 24).unwrap()).unwrap();
+        let mut output = Vec::new();
+        wait_for(&session, Duration::from_secs(4), &mut output, |bytes| {
+            bytes
+                .windows(b"READY".len())
+                .any(|window| window == b"READY")
+        });
+
+        for (size, input, expected_size) in [
+            (
+                TerminalSize::new(37, 13).unwrap(),
+                b"first\n".as_slice(),
+                b"13 37".as_slice(),
+            ),
+            (
+                TerminalSize::new(73, 26).unwrap(),
+                b"second\n".as_slice(),
+                b"26 73".as_slice(),
+            ),
+        ] {
+            session.try_resize(size).unwrap();
+            session.try_send_input(input).unwrap();
+            wait_for(&session, Duration::from_secs(4), &mut output, |bytes| {
+                bytes
+                    .windows(expected_size.len())
+                    .any(|window| window == expected_size)
+            });
+        }
+
+        assert!(output
+            .windows(b"FRAME:first".len())
+            .any(|window| window == b"FRAME:first"));
+        assert!(output
+            .windows(b"FRAME:second".len())
+            .any(|window| window == b"FRAME:second"));
+        assert!(matches!(
+            session.shutdown(Duration::from_secs(4)),
+            Ok(ShutdownResult::AlreadyStopped) | Ok(ShutdownResult::Stopped)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_terminates_a_running_controlled_shell() {
+        // Uses the repository-owned test child instead of a shell spin loop.
+        let profile = LocalProfile::new(test_child_path()).with_arguments(["emit:RUNNING", "spin"]);
+        let session = LocalPtySession::start(profile, TerminalSize::new(80, 24).unwrap()).unwrap();
+        let mut output = Vec::new();
+        wait_for(&session, Duration::from_secs(4), &mut output, |bytes| {
+            bytes
+                .windows(b"RUNNING".len())
+                .any(|window| window == b"RUNNING")
+        });
+
+        assert_eq!(
+            session.shutdown(Duration::from_secs(2)),
+            Ok(ShutdownResult::Stopped)
+        );
+        assert_eq!(session.lifecycle(), SessionLifecycle::Stopped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_client_with_pending_terminal_output_retires_its_workers() {
+        let profile = LocalProfile::new("/bin/sh").with_arguments([
+            "-c",
+            "trap 'printf \"%65536s\" closing; exit 0' TERM; printf 'READY\\n'; while IFS= read -r line; do :; done",
+        ]);
+        let session = LocalPtySession::start(profile, TerminalSize::new(80, 24).unwrap()).unwrap();
+        let mut output = Vec::new();
+        wait_for(&session, Duration::from_secs(4), &mut output, |bytes| {
+            bytes.windows(5).any(|window| window == b"READY")
+        });
+        let shared = Arc::clone(&session.shared);
+        drop(session);
+        assert_eq!(
+            shared
+                .completion_receiver
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2)),
+            Ok(Ok(ShutdownResult::Stopped))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_terminates_a_shell_descendant_in_its_process_group() {
+        // Uses the repository-owned test child instead of /bin/sh + sleep.
+        let profile = LocalProfile::new(test_child_path()).with_arguments(["spawn"]);
+        let session = LocalPtySession::start(profile, TerminalSize::new(80, 24).unwrap()).unwrap();
+        let mut output = Vec::new();
+        wait_for(&session, Duration::from_secs(4), &mut output, |bytes| {
+            bytes
+                .windows(b"CHILD:".len())
+                .any(|window| window == b"CHILD:")
+        });
+        let child = child_pid(&output).expect("test child reports its descendant PID");
+
+        assert_eq!(
+            session.shutdown(Duration::from_secs(2)),
+            Ok(ShutdownResult::Stopped)
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_is_running(child) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_is_running(child),
+            "descendant process {child} remained after session shutdown"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn controlled_conpty_transfers_bytes_resizes_exits_and_stops() {
+        // Uses the repository-owned test child instead of cmd.exe built-ins.
+        let profile = LocalProfile::new(test_child_path()).with_arguments([
+            "emit:READY",
+            "read-line",
+            "echo:INPUT",
+            "exit:0",
+        ]);
+        let session = LocalPtySession::start(profile, TerminalSize::new(80, 24).unwrap()).unwrap();
+        let mut output = Vec::new();
+        wait_for_windows(&session, Duration::from_secs(5), &mut output, |_, bytes| {
+            bytes
+                .windows(b"READY".len())
+                .any(|window| window == b"READY")
+        });
+
+        session
+            .try_resize(TerminalSize::new(100, 40).unwrap())
+            .unwrap();
+        wait_for_windows(&session, Duration::from_secs(5), &mut output, |event, _| {
+            matches!(
+                event,
+                SessionEvent::ResizeApplied(size)
+                    if size.columns() == 100 && size.rows() == 40
+            )
+        });
+        session.try_send_input(b"hello\r\n").unwrap();
+        wait_for_windows(&session, Duration::from_secs(5), &mut output, |_, bytes| {
+            bytes
+                .windows(b"INPUT:hello".len())
+                .any(|window| window == b"INPUT:hello")
+        });
+        wait_for_windows_exit(&session, Duration::from_secs(3));
+        assert!(
+            matches!(
+                session.shutdown(Duration::from_secs(2)),
+                Ok(ShutdownResult::AlreadyStopped | ShutdownResult::Stopped)
+            ),
+            "ConPTY cleanup completes whether the exit worker or shutdown request wins"
+        );
+    }
+
+    /// Returns the path to the `festerm-pty-test-child` binary built by cargo.
+    ///
+    /// Cargo places all workspace binaries in the same `target/{profile}/`
+    /// directory as the test executable.  The test executable itself lives in
+    /// `target/{profile}/deps/`, so we walk up one level when necessary.
+    ///
+    /// `festerm-pty-test-child` is a subprocess dependency of these tests,
+    /// not a linked (`[dev-dependencies]`) one -- it is a bin-only crate, and
+    /// Cargo has no build-graph edge to force it to finish building before
+    /// this package's own tests start running. `cargo test --workspace`
+    /// pipelines package builds and test runs, so it may start these tests
+    /// while that unrelated package is still linking, especially under CI's
+    /// noisier, more contended build parallelism (this was observed causing
+    /// intermittent failures here). If the binary isn't there yet, build it
+    /// on demand instead of assuming a race-free ordering; Cargo's own
+    /// target-directory locking makes this safe to call even if that
+    /// package's own build is still in flight elsewhere.
+    #[cfg(any(unix, windows))]
+    fn test_child_path() -> std::path::PathBuf {
+        let mut path = std::env::current_exe()
+            .expect("test executable has a known path")
+            .canonicalize()
+            .expect("test executable path is accessible");
+        path.pop(); // remove the test executable name
+        if path.ends_with("deps") {
+            path.pop(); // step up from target/{profile}/deps/ to target/{profile}/
+        }
+        let name = if cfg!(windows) {
+            "festerm-pty-test-child.exe"
+        } else {
+            "festerm-pty-test-child"
+        };
+        path.push(name);
+        if !path.exists() {
+            static BUILD_ON_DEMAND: std::sync::Once = std::sync::Once::new();
+            BUILD_ON_DEMAND.call_once(|| {
+                let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+                let status = std::process::Command::new(cargo)
+                    .args(["build", "--package", "festerm-pty-test-child"])
+                    .status();
+                assert!(
+                    matches!(status, Ok(status) if status.success()),
+                    "on-demand `cargo build --package festerm-pty-test-child` failed: {status:?}"
+                );
+            });
+        }
+        assert!(
+            path.exists(),
+            "festerm-pty-test-child not found at {path:?} even after an \
+             on-demand build; run `cargo build -p festerm-pty-test-child` \
+             manually and re-run these tests"
+        );
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graceful_client_shutdown_uses_hangup_and_bounds_signal_escalation() {
+        for script in [
+            "trap 'exit 0' HUP; trap '' TERM; printf READY; sleep 5",
+            "trap '' HUP TERM; printf READY; exec sleep 5",
+        ] {
+            let profile = LocalProfile::new("/bin/sh").with_arguments(["-c", script]);
+            assert!(!profile.hangup_on_shutdown());
+            let session = LocalPtySession::start(
+                profile.with_unix_hangup_on_shutdown(),
+                TerminalSize::new(80, 24).unwrap(),
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            wait_for(&session, Duration::from_secs(2), &mut output, |bytes| {
+                bytes.windows(5).any(|window| window == b"READY")
+            });
+            session.shutdown(Duration::from_secs(3)).unwrap();
+            assert!(matches!(session.lifecycle(), SessionLifecycle::Stopped));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_pty_writer_does_not_send_input_to_a_retained_terminal() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let pair = native_pty_system()
+            .openpty(to_portable_size(TerminalSize::new(80, 24).unwrap()))
+            .unwrap();
+        let mut retained = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NOCTTY | nix::libc::O_NONBLOCK)
+            .open(pair.master.tty_name().unwrap())
+            .unwrap();
+        let writer = local_pty_writer(&*pair.master).unwrap();
+        let mut barrier =
+            filedescriptor::FileDescriptor::dup(&pair.master.as_raw_fd().unwrap()).unwrap();
+
+        // Model Screen retaining the client terminal after its attacher exits.
+        // A later explicit write orders the assertion without an absence timer.
+        drop(writer);
+        barrier.write_all(b"after-drop\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed = Vec::new();
+        let mut buffer = [0; 64];
+        while !observed.ends_with(b"after-drop\n") {
+            match retained.read(&mut buffer) {
+                Ok(0) => panic!("writer teardown injected EOF into the retained terminal"),
+                Ok(count) => observed.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "terminal barrier timed out");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("retained terminal read failed: {error}"),
+            }
+            assert!(
+                observed.len() <= 64,
+                "unexpected terminal input: {observed:?}"
+            );
+        }
+        assert_eq!(observed, b"after-drop\n");
+    }
+
+    #[cfg(unix)]
+    fn wait_for(
+        session: &LocalPtySession,
+        timeout: Duration,
+        output: &mut Vec<u8>,
+        matches: impl Fn(&[u8]) -> bool,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match session.try_recv_event() {
+                Ok(SessionEvent::Output(bytes)) => {
+                    output.extend(bytes);
+                    if matches(output) {
+                        return;
+                    }
+                }
+                Ok(_) | Err(SessionTryReceiveError::Empty) => {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                Err(SessionTryReceiveError::Closed) => break,
+            }
+        }
+        panic!("timed out waiting for controlled PTY output: {output:?}");
+    }
+
+    #[cfg(unix)]
+    fn child_pid(output: &[u8]) -> Option<u32> {
+        let prefix = b"CHILD:";
+        let start = output
+            .windows(prefix.len())
+            .position(|window| window == prefix)?
+            .saturating_add(prefix.len());
+        let digits = output[start..]
+            .iter()
+            .copied()
+            .take_while(|byte| byte.is_ascii_digit())
+            .collect::<Vec<_>>();
+        std::str::from_utf8(&digits).ok()?.parse().ok()
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(process: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &process.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("platform supplies kill")
+            .success()
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows(
+        session: &LocalPtySession,
+        timeout: Duration,
+        output: &mut Vec<u8>,
+        matches: impl Fn(&SessionEvent, &[u8]) -> bool,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match session.try_recv_event() {
+                Ok(event) => {
+                    if let SessionEvent::Output(bytes) = &event {
+                        respond_to_cursor_position_queries(session, bytes);
+                        output.extend(bytes);
+                    }
+                    if matches(&event, output) {
+                        return;
+                    }
+                }
+                Err(SessionTryReceiveError::Empty) => thread::sleep(Duration::from_millis(5)),
+                Err(SessionTryReceiveError::Closed) => break,
+            }
+        }
+        panic!("timed out waiting for controlled ConPTY event: {output:?}");
+    }
+
+    #[cfg(windows)]
+    fn respond_to_cursor_position_queries(session: &LocalPtySession, bytes: &[u8]) {
+        for _ in bytes.windows(4).filter(|sequence| *sequence == b"\x1b[6n") {
+            session
+                .try_send_input(b"\x1b[1;1R")
+                .expect("ConPTY cursor-position reply fits the command queue");
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_windows_exit(session: &LocalPtySession, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if matches!(
+                session.lifecycle(),
+                SessionLifecycle::Exited(exit) if exit.success()
+            ) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "timed out waiting for controlled ConPTY exit: {:?}",
+            session.lifecycle()
+        );
+    }
+}
