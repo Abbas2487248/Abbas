@@ -1,0 +1,83 @@
+name: SSH via Tailscale (6 hours)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ssh:
+    name: Temporary private SSH session
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out this repository only
+        uses: actions/checkout@v4
+
+      - name: Connect this runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Install and configure OpenSSH
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SSH_PUBLIC_KEY//[[:space:]]/}" ]]; then
+            echo "::error::SSH_PUBLIC_KEY secret is empty."
+            exit 1
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+
+          TS_IP="$(tailscale ip -4 | head -n 1)"
+          if [[ -z "$TS_IP" ]]; then
+            echo "::error::Could not determine the Tailscale IPv4 address."
+            exit 1
+          fi
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PUBLIC_KEY" > "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+
+          sudo ssh-keygen -A
+
+          sudo tee /etc/ssh/sshd_config.d/99-tailscale-only.conf >/dev/null <<EOF
+          AddressFamily inet
+          ListenAddress $TS_IP
+          Port 22
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          AllowUsers runner
+          AuthorizedKeysFile .ssh/authorized_keys
+          X11Forwarding no
+          AllowTcpForwarding yes
+          PermitTunnel no
+          GatewayPorts no
+          ClientAliveInterval 60
+          ClientAliveCountMax 3
+          EOF
+
+          sudo /usr/sbin/sshd -t
+          sudo systemctl restart ssh
+
+          echo "SSH is listening only on this temporary Tailscale address:"
+          echo "$TS_IP"
+          echo "Connect with username: runner"
+          echo "Port: 22"
+
+      - name: Keep the temporary runner available
+        shell: bash
+        run: |
+          echo "The SSH runner will stop automatically when this job reaches its 6-hour limit."
+          sleep 21000
