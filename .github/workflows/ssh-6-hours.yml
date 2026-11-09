@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   ssh:
-    name: Temporary private SSH session
+    name: Temporary SSH session and status dashboard
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -76,8 +76,139 @@ jobs:
           echo "Connect with username: runner"
           echo "Port: 22"
 
+      - name: Start read-only public status dashboard
+        shell: bash
+        env:
+          WEB_CONTROL_TOKEN: ${{ secrets.WEB_CONTROL_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${WEB_CONTROL_TOKEN//[[:space:]]/}" ]]; then
+            echo "::error::Create the WEB_CONTROL_TOKEN repository secret before running this workflow."
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/dashboard.py" <<'PY'
+          import json
+          import os
+          import shutil
+          import subprocess
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          TOKEN = os.environ["WEB_CONTROL_TOKEN"]
+
+          PAGE = """<!doctype html>
+          <html lang="ar" dir="rtl">
+          <head>
+          <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>لوحة السيرفر</title>
+          <style>
+          body{font-family:Arial,sans-serif;background:#101827;color:#f4f7fb;margin:0;padding:22px}
+          main{max-width:680px;margin:auto}h1{font-size:25px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+          section{background:#1d2a3d;padding:18px;border-radius:14px;margin:10px 0}
+          .value{font-size:24px;font-weight:bold;margin-top:10px}.muted{color:#b8c5d6}
+          button,input{font-size:16px;padding:12px;border-radius:9px;border:0;margin:5px 0}
+          button{background:#e5a23b;color:#161616;font-weight:bold}input{width:min(90%,320px)}
+          </style></head><body><main>
+          <h1>لوحة حالة السيرفر</h1><p class="muted">معلومات مباشرة عن جلسة GitHub Actions المؤقتة</p>
+          <div class="grid">
+          <section>الحالة<div class="value" id="status">جارٍ التحميل</div></section>
+          <section>المعالج<div class="value" id="cpu">—</div></section>
+          <section>الذاكرة RAM<div class="value" id="ram">—</div></section>
+          <section>التخزين<div class="value" id="disk">—</div></section>
+          </div>
+          <section><b>إعادة تشغيل خدمة SSH</b><p class="muted">هذا لا يعيد تشغيل جهاز GitHub Actions نفسه.</p>
+          <input id="token" type="password" placeholder="رمز التحكم السري" autocomplete="off">
+          <br><button onclick="restartService()">إعادة تشغيل خدمة SSH</button><p id="result" class="muted"></p></section>
+          <p class="muted">تتحدث المعلومات تلقائياً كل 5 ثوانٍ.</p>
+          </main>
+          <script>
+          async function refresh(){try{let r=await fetch('/api/status');let d=await r.json();
+          status.textContent=d.status;cpu.textContent=d.cpu;ram.textContent=d.ram;disk.textContent=d.disk;
+          }catch(e){status.textContent='غير متاح';}}
+          async function restartService(){let out=document.getElementById('result');out.textContent='جارٍ التنفيذ...';
+          try{let r=await fetch('/api/restart-ssh',{method:'POST',headers:{'Authorization':'Bearer '+document.getElementById('token').value}});
+          let d=await r.json();out.textContent=d.message;}catch(e){out.textContent='تعذر تنفيذ الطلب';}}
+          refresh();setInterval(refresh,5000);
+          </script></body></html>"""
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, *args):
+                  pass
+
+              def send_data(self, code, data, kind="application/json; charset=utf-8"):
+                  body = data.encode() if isinstance(data, str) else json.dumps(data).encode()
+                  self.send_response(code)
+                  self.send_header("Content-Type", kind)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.send_header("Cache-Control", "no-store")
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  if self.path == "/":
+                      return self.send_data(200, PAGE, "text/html; charset=utf-8")
+                  if self.path == "/api/status":
+                      mem = {}
+                      with open("/proc/meminfo") as f:
+                          for line in f:
+                              k, v = line.split(":", 1)
+                              mem[k] = int(v.strip().split()[0])
+                      total = mem.get("MemTotal", 1)
+                      available = mem.get("MemAvailable", 0)
+                      used = total - available
+                      du = shutil.disk_usage("/")
+                      load = os.getloadavg()[0]
+                      cpus = os.cpu_count() or 1
+                      return self.send_data(200, {
+                          "status": "يعمل",
+                          "cpu": f"{min(100, load / cpus * 100):.1f}% (متوسط الحمل)",
+                          "ram": f"{used/1024:.0f} / {total/1024:.0f} MB",
+                          "disk": f"{(du.used/du.total)*100:.1f}% مستخدم ({du.used//(1024**3)} / {du.total//(1024**3)} GB)"
+                      })
+                  return self.send_data(404, {"message":"Not found"})
+
+              def do_POST(self):
+                  if self.path != "/api/restart-ssh":
+                      return self.send_data(404, {"message":"Not found"})
+                  if self.headers.get("Authorization", "") != "Bearer " + TOKEN:
+                      return self.send_data(401, {"message":"رمز التحكم غير صحيح"})
+                  try:
+                      subprocess.run(["sudo", "-n", "systemctl", "restart", "ssh"], check=True, timeout=20)
+                      return self.send_data(200, {"message":"تمت إعادة تشغيل خدمة SSH بنجاح"})
+                  except Exception:
+                      return self.send_data(500, {"message":"فشل إعادة تشغيل خدمة SSH"})
+
+          ThreadingHTTPServer(("127.0.0.1", 8765), Handler).serve_forever()
+          PY
+
+          nohup python3 "$RUNNER_TEMP/dashboard.py" > "$RUNNER_TEMP/dashboard.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/dashboard.pid"
+
+          curl -fsS http://127.0.0.1:8765/api/status >/dev/null
+
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o "$RUNNER_TEMP/cloudflared"
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          nohup "$RUNNER_TEMP/cloudflared" tunnel --no-autoupdate --url http://127.0.0.1:8765 > "$RUNNER_TEMP/cloudflared.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/cloudflared.pid"
+
+          for i in $(seq 1 60); do
+            URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$RUNNER_TEMP/cloudflared.log" | head -n 1 || true)"
+            if [[ -n "$URL" ]]; then
+              echo "PUBLIC_DASHBOARD_URL=$URL" >> "$GITHUB_ENV"
+              echo "::notice title=Dashboard URL::$URL"
+              echo "Public dashboard: $URL"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::Cloudflare Quick Tunnel did not provide a URL."
+          cat "$RUNNER_TEMP/cloudflared.log"
+          exit 1
+
       - name: Keep the temporary runner available
         shell: bash
         run: |
-          echo "The SSH runner will stop automatically when this job reaches its 6-hour limit."
+          echo "The SSH runner and dashboard stop automatically when this job reaches its 6-hour limit."
           sleep 21000
