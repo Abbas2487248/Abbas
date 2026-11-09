@@ -125,7 +125,19 @@ public final class FestermActivity extends NativeActivity {
      * Installs the packaged PTY executable into app-private storage and starts
      * one isolated helper process. Rust connects to the returned Unix socket.
      */
-    public String startLocalPty(long sessionId) throws IOException {
+    public String startLocalPty(long sessionId) {
+        try {
+            return startLocalPtyInternal(sessionId);
+        } catch (IOException error) {
+            String detail = error.getMessage();
+            if (detail == null || detail.isEmpty()) detail = error.getClass().getSimpleName();
+            detail = detail.replaceAll("[\\p{Cntrl}&&[^\\t]]", " ");
+            if (detail.length() > 512) detail = detail.substring(0, 512);
+            return "\u0001FESTERM_PTY_ERROR:" + detail;
+        }
+    }
+
+    private String startLocalPtyInternal(long sessionId) throws IOException {
         if (sessionId <= 0 || destroyed) throw new IOException("Local terminal unavailable");
         synchronized (ptyLock) {
             java.lang.Process previous = ptyHelpers.get(sessionId);
