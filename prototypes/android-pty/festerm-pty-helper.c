@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -76,16 +77,19 @@ static int send_frame(int fd, unsigned char type,
     return length ? write_full(fd, payload, length) : 0;
 }
 
-static void terminate_child(pid_t child) {
-    if (child <= 0) return;
+static int terminate_child(pid_t child, int *status) {
+    if (child <= 0) return 0;
     (void)kill(-child, SIGHUP);
     for (int i = 0; i < 20; ++i) {
-        pid_t r = waitpid(child, NULL, WNOHANG);
-        if (r == child || (r < 0 && errno == ECHILD)) return;
+        pid_t r = waitpid(child, status, WNOHANG);
+        if (r == child || (r < 0 && errno == ECHILD)) return 1;
+        if (r < 0 && errno != EINTR) return 0;
         usleep(50000);
     }
     (void)kill(-child, SIGKILL);
-    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+    pid_t r;
+    do { r = waitpid(child, status, 0); } while (r < 0 && errno == EINTR);
+    return r == child || (r < 0 && errno == ECHILD);
 }
 
 static int run_session(int client) {
@@ -194,13 +198,8 @@ static int run_session(int client) {
         }
     }
 
-    if (!child_reaped) {
-        terminate_child(child);
-        pid_t w;
-        do { w = waitpid(child, &child_status, WNOHANG); }
-        while (w < 0 && errno == EINTR);
-        child_reaped = (w == child || (w < 0 && errno == ECHILD));
-    }
+    if (!child_reaped)
+        child_reaped = terminate_child(child, &child_status);
     if (child_reaped) {
         int32_t status = (int32_t)child_status;
         unsigned char encoded[4];
