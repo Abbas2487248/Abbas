@@ -117,6 +117,14 @@ def build(args):
     run("cargo", "build", "--locked", "-p", "festerm-android", "--target", target,
         *features, *(["--release"] if args.release else []), env=env)
     library = cargo_target / target / mode / "libfesterm_android.so"
+
+    # Build the isolated PTY helper as a standalone Android PIE executable.
+    # It is packaged in the ABI native-library directory so PackageManager
+    # extracts it with the app's native libraries; it is never linked into Rust.
+    helper_source = ROOT / "prototypes" / "android-pty" / "festerm-pty-helper.c"
+    helper_binary = output / "libfesterm_pty_helper.so"
+    run(linker, "-Wall", "-Wextra", "-Werror", "-O2", "-fPIE", "-pie",
+        "-Wl,-z,max-page-size=16384", helper_source, "-o", helper_binary, env=env)
     keystore = ROOT / "target" / "android" / "development.keystore"
     if not keystore.exists():
         run("keytool", "-genkeypair", "-keystore", keystore, "-storepass", "android",
@@ -160,6 +168,7 @@ def build(args):
         with zipfile.ZipFile(unsigned, "a", compression=zipfile.ZIP_DEFLATED) as package:
             package.write(dex / "classes.dex", "classes.dex")
             package.write(library, f"lib/{args.abi}/libfesterm_android.so")
+            package.write(helper_binary, f"lib/{args.abi}/libfesterm_pty_helper.so")
             package.write(APP / "NOTICE.txt", "assets/NOTICE.txt")
             package.write(ROOT / "vendor/egui-winit/LICENSE-APACHE", "assets/licenses/Apache-2.0.txt")
         aligned = work / "aligned.apk"
@@ -176,6 +185,7 @@ def build(args):
         "live_ssh": not args.offline, "signing": "development-only",
         "recording_validation": args.recording_validation,
         "profile": mode, "ndk": NDK, "build_tools": BUILD_TOOLS,
+        "local_pty_helper": "standalone-pie-in-native-lib-dir",
         "sha256": digest,
     }
     (output / "build-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
