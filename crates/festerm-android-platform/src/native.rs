@@ -261,6 +261,41 @@ pub fn storage_directory() -> Result<PathBuf, &'static str> {
     })
 }
 
+/// Starts the app-private local PTY helper for one tab and returns its socket path.
+pub fn start_local_pty(session_id: u64) -> Result<PathBuf, &'static str> {
+    if session_id == 0 || session_id > i64::MAX as u64 {
+        return Err("Invalid local terminal session");
+    }
+    bridge()?.call(|env, activity| {
+        let value = env
+            .call_method(
+                activity,
+                "startLocalPty",
+                "(J)Ljava/lang/String;",
+                &[JValue::Long(session_id as i64)],
+            )?
+            .l()?;
+        let text: String = env.get_string(&JString::from(value))?.into();
+        Ok(PathBuf::from(text))
+    })
+}
+
+/// Stops the helper associated with a tab. Safe to call more than once.
+pub fn stop_local_pty(session_id: u64) -> Result<(), &'static str> {
+    if session_id == 0 || session_id > i64::MAX as u64 {
+        return Err("Invalid local terminal session");
+    }
+    bridge()?.call(|env, activity| {
+        env.call_method(
+            activity,
+            "stopLocalPty",
+            "(J)V",
+            &[JValue::Long(session_id as i64)],
+        )?;
+        Ok(())
+    })
+}
+
 /// App-private recording storage excluded from Android Auto Backup.
 pub fn recording_directory() -> Result<PathBuf, &'static str> {
     bridge()?.call(|env, activity| {
