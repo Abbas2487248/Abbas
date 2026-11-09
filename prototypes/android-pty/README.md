@@ -9,7 +9,7 @@ fesTerm and does not remove the Android dependency guard for `festerm-pty`.
 - controlling-terminal setup in a child session (`setsid`, `TIOCSCTTY`)
 - execution of Android's `/system/bin/sh`
 - output flowing from the PTY master
-- terminal dimensions set to 40 rows x 100 columns
+- terminal dimensions changed at runtime from 40x100 to 50x120\n- interactive input sent from the PTY master and echoed by the shell\n- child process exit and `waitpid` reaping
 
 The probe uses `fork()` only in its own single-purpose process. Do not copy this
 fork/exec sequence into the multithreaded Android app process.
