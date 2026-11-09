@@ -22,6 +22,8 @@ pub(super) struct SessionTab {
     pub reconnect_armed: bool,
     /// Output arrived while parked; cleared when the tab is shown again.
     pub has_new_output: bool,
+    #[cfg(target_os = "android")]
+    pub(super) local_pty: Option<Rc<RefCell<festerm_android_platform::LocalPty>>>,
     pub(super) parked: Option<(Terminal, TerminalView)>,
 }
 
@@ -89,6 +91,8 @@ impl MobileApp {
         if let Some(live) = self.sink.live.connection.borrow_mut().take() {
             self.sink.live.background.borrow_mut().push((id, live));
         }
+        #[cfg(target_os = "android")]
+        { self.sink.local_pty = None; }
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
             tab.parked = Some((terminal, view));
         }
@@ -116,6 +120,8 @@ impl MobileApp {
         };
         self.terminal = terminal;
         self.view = view;
+        #[cfg(target_os = "android")]
+        { self.sink.local_pty = self.tabs[position].local_pty.as_ref().map(Rc::downgrade); }
         #[cfg(feature = "live-ssh")]
         {
             let mut background = self.sink.live.background.borrow_mut();
@@ -148,6 +154,8 @@ impl MobileApp {
             #[cfg(feature = "live-ssh")]
             reconnect_armed: false,
             has_new_output: false,
+            #[cfg(target_os = "android")]
+            local_pty: None,
             parked: None,
         });
         id
@@ -164,8 +172,29 @@ impl MobileApp {
             return;
         }
         self.park_active();
-        let id = self.push_tab("Offline demo".to_owned(), None);
-        self.terminal = fixture_terminal();
+        let id = self.push_tab("Local shell".to_owned(), None);
+        #[cfg(target_os = "android")]
+        {
+            match festerm_android_platform::connect_local_pty(id) {
+                Ok(pty) => {
+                    let pty = Rc::new(RefCell::new(pty));
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                        tab.local_pty = Some(Rc::clone(&pty));
+                    }
+                    self.sink.local_pty = Some(Rc::downgrade(&pty));
+                    self.terminal = Terminal::with_scrollback_limit(
+                        self.terminal.dimensions(), SCROLLBACK_LIMIT
+                    ).expect("existing valid bounded grid");
+                    self.terminal.ingest(b"fesTerm local shell\\r\\n");
+                }
+                Err(error) => {
+                    self.terminal = fixture_terminal();
+                    self.notice = Some(error.to_owned());
+                }
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        { self.terminal = fixture_terminal(); }
         self.view = self.fresh_view();
         self.active_tab = Some(id);
         self.workspace = workspaces::Workspace::Terminal;
@@ -350,6 +379,8 @@ impl MobileApp {
             }
             self.terminal = self.blank_terminal();
             self.view = self.fresh_view();
+            #[cfg(target_os = "android")]
+            { self.sink.local_pty = None; }
             self.active_tab = None;
             self.surface = Surface::Tabs;
         } else {
@@ -395,12 +426,17 @@ impl MobileApp {
                             .unwrap_or_default();
                         (SurfaceKind::DevTunnel, detail, state, status)
                     }
-                    None => (
-                        SurfaceKind::Local,
-                        "Local fixture · no shell".to_owned(),
-                        SurfaceState::Disconnected,
-                        "Input is discarded".to_owned(),
-                    ),
+                    None => {
+                        #[cfg(target_os = "android")]
+                        let running = tab.local_pty.is_some();
+                        #[cfg(not(target_os = "android"))]
+                        let running = false;
+                        if running {
+                            (SurfaceKind::Local, "Android local PTY".to_owned(), SurfaceState::Connected, "Local shell running".to_owned())
+                        } else {
+                            (SurfaceKind::Local, "Local fixture · no shell".to_owned(), SurfaceState::Disconnected, "Input is discarded".to_owned())
+                        }
+                    },
                     Some(spec) => {
                         let (state, status) = self.tab_connection(tab.id, active);
                         let mut detail = spec.detail();
