@@ -88,6 +88,8 @@ jobs:
             exit 1
           fi
 
+          sudo apt-get install -y nginx ttyd
+
           cat > "$RUNNER_TEMP/dashboard.py" <<'PY'
           import json
           import os
@@ -117,6 +119,7 @@ jobs:
           <section>الذاكرة RAM<div class="value" id="ram">—</div></section>
           <section>التخزين<div class="value" id="disk">—</div></section>
           </div>
+          <section><b>الطرفية Terminal</b><p class="muted">تنفيذ أوامر Linux بعد تسجيل الدخول.</p><a href="/terminal/">فتح الطرفية</a></section>
           <section><b>إعادة تشغيل خدمة SSH</b><p class="muted">هذا لا يعيد تشغيل جهاز GitHub Actions نفسه.</p>
           <input id="token" type="password" placeholder="رمز التحكم السري" autocomplete="off">
           <br><button onclick="restartService()">إعادة تشغيل خدمة SSH</button><p id="result" class="muted"></p></section>
@@ -207,9 +210,37 @@ jobs:
           fi
           echo "Dashboard is responding."
 
+          nohup ttyd -i 127.0.0.1 -p 7681 -c "admin:${WEB_CONTROL_TOKEN}" -W -b /terminal bash > "$RUNNER_TEMP/ttyd.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/ttyd.pid"
+
+          sudo tee /etc/nginx/sites-available/default >/dev/null <<'NGINX'
+          server {
+              listen 127.0.0.1:8080;
+              server_name _;
+              location /terminal/ {
+                  proxy_pass http://127.0.0.1:7681/terminal/;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_read_timeout 3600s;
+              }
+              location / {
+                  proxy_pass http://127.0.0.1:8765;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+          NGINX
+          sudo nginx -t
+          sudo systemctl restart nginx
+
+          curl -fsS http://127.0.0.1:8080/api/status >/dev/null
+          echo "Dashboard and authenticated terminal are responding."
+
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o "$RUNNER_TEMP/cloudflared"
           chmod +x "$RUNNER_TEMP/cloudflared"
-          nohup "$RUNNER_TEMP/cloudflared" tunnel --no-autoupdate --url http://127.0.0.1:8765 > "$RUNNER_TEMP/cloudflared.log" 2>&1 &
+          nohup "$RUNNER_TEMP/cloudflared" tunnel --no-autoupdate --url http://127.0.0.1:8080 > "$RUNNER_TEMP/cloudflared.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/cloudflared.pid"
 
           for i in $(seq 1 60); do
