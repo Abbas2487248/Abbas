@@ -4,7 +4,7 @@
  * This executable is intended to run as a dedicated process. Do not link it
  * into the Android UI library and do not call its fork/exec path from the UI.
  *
- * Usage: festerm-pty-helper SOCKET_PATH
+ * Usage: festerm-pty-helper SOCKET_PATH APP_PRIVATE_HOME
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -92,7 +92,7 @@ static int terminate_child(pid_t child, int *status) {
     return r == child || (r < 0 && errno == ECHILD);
 }
 
-static int run_session(int client) {
+static int run_session(int client, const char *home_path) {
     int master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0) {
         if (master >= 0) close(master);
@@ -126,7 +126,7 @@ static int run_session(int client) {
             dup2(slave, STDERR_FILENO) < 0) _exit(123);
         if (slave > STDERR_FILENO) close(slave);
         (void)setenv("TERM", "xterm-256color", 1);
-        (void)setenv("HOME", "/data/data/io.github.fes.festerm/files", 1);
+        (void)setenv("HOME", home_path, 1);
         char *const argv[] = {(char *)"/system/bin/sh", (char *)"-i", NULL};
         execv(argv[0], argv);
         _exit(127);
@@ -211,8 +211,9 @@ static int run_session(int client) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2 || strlen(argv[1]) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-        fprintf(stderr, "usage: festerm-pty-helper SOCKET_PATH\n");
+    if (argc != 3 || argv[1][0] != '/' || argv[2][0] != '/' ||
+        strlen(argv[1]) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        fprintf(stderr, "usage: festerm-pty-helper SOCKET_PATH APP_PRIVATE_HOME\n");
         return 2;
     }
     struct sockaddr_un address;
@@ -232,7 +233,7 @@ int main(int argc, char **argv) {
     int client;
     do { client = accept4(server, NULL, NULL, SOCK_CLOEXEC); }
     while (client < 0 && errno == EINTR);
-    int result = client < 0 ? 5 : run_session(client);
+    int result = client < 0 ? 5 : run_session(client, argv[2]);
     if (client >= 0) close(client);
     close(server);
     (void)unlink(address.sun_path);
