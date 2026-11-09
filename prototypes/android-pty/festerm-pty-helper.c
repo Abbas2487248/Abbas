@@ -92,6 +92,41 @@ static int terminate_child(pid_t child, int *status) {
     return r == child || (r < 0 && errno == ECHILD);
 }
 
+static int prepare_socket_path(const struct sockaddr_un *address) {
+    struct stat before;
+    if (lstat(address->sun_path, &before) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISSOCK(before.st_mode)) {
+        errno = EEXIST;
+        return -1;
+    }
+
+    int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (probe < 0) return -1;
+    int connected = connect(probe, (const struct sockaddr *)address,
+                            sizeof(*address));
+    int connect_error = errno;
+    close(probe);
+    if (connected == 0) {
+        errno = EADDRINUSE;
+        return -1;
+    }
+    if (connect_error != ECONNREFUSED && connect_error != ENOENT) {
+        errno = connect_error;
+        return -1;
+    }
+
+    struct stat after;
+    if (lstat(address->sun_path, &after) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISSOCK(after.st_mode) || before.st_dev != after.st_dev ||
+        before.st_ino != after.st_ino) {
+        errno = EAGAIN;
+        return -1;
+    }
+    return unlink(address->sun_path);
+}
+
 static int run_session(int client, const char *home_path) {
     int master = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0) {
@@ -223,10 +258,11 @@ int main(int argc, char **argv) {
     address.sun_family = AF_UNIX;
     memcpy(address.sun_path, argv[1], strlen(argv[1]) + 1);
 
+    (void)signal(SIGPIPE, SIG_IGN);
     int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server < 0) return 3;
-    (void)unlink(address.sun_path);
-    if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+    if (prepare_socket_path(&address) != 0 ||
+        bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 ||
         chmod(address.sun_path, 0600) != 0 || listen(server, 1) != 0) {
         close(server);
         (void)unlink(address.sun_path);
