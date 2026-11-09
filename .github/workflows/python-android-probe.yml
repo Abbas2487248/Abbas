@@ -1,6 +1,11 @@
 name: Python Android runtime probe
 
 on:
+  push:
+    branches:
+      - android-pty-launch-proof
+    paths:
+      - '.github/workflows/python-android-probe.yml'
   workflow_dispatch:
 
 permissions:
@@ -69,6 +74,3 @@ jobs:
           echo "Python shared-library dependencies:"
           "$NDK/llvm-readelf" -d "$PREFIX/lib/libpython3.14.so"
           file python-probe "$PREFIX/lib/libpython3.14.so"
-          mkdir -p probe-output
-          cp python-probe "$PREFIX/lib/libpython3.14.so" probe-output/
-          cp "$PREFIX/lib/libpython3.so" probe-output/ || true
