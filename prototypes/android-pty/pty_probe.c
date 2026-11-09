@@ -1,9 +1,9 @@
 /*
  * Standalone Android PTY feasibility probe.
  *
- * This intentionally runs as a separate process, not inside the multithreaded
- * Android app. It tests Bionic PTY allocation, controlling-TTY setup, shell
- * execution, PTY output, and terminal sizing without changing app dependencies.
+ * Run only as a separate single-purpose process, never by forking from the
+ * multithreaded Android app. This tests Bionic PTY setup, shell input/output,
+ * runtime terminal resizing, and child exit/reaping.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -35,7 +35,7 @@ int main(void) {
         fail("ptsname_r");
 
     struct winsize ws = {.ws_row = 40, .ws_col = 100};
-    if (ioctl(master, TIOCSWINSZ, &ws) != 0) fail("TIOCSWINSZ");
+    if (ioctl(master, TIOCSWINSZ, &ws) != 0) fail("initial TIOCSWINSZ");
 
     pid_t child = fork();
     if (child < 0) fail("fork");
@@ -56,7 +56,7 @@ int main(void) {
         char *const argv[] = {
             (char *)"/system/bin/sh",
             (char *)"-c",
-            (char *)"printf 'FESTERM_PTY_OK\\n'; stty size",
+            (char *)"IFS= read -r line; printf 'INPUT_OK:%s\\n' \"$line\"; stty size",
             NULL
         };
         execv(argv[0], argv);
@@ -64,9 +64,28 @@ int main(void) {
     }
 
     fprintf(stderr, "PTY slave: %s\n", slave_name);
+
+    /* Change dimensions after the child starts, then send interactive input. */
+    ws.ws_row = 50;
+    ws.ws_col = 120;
+    if (ioctl(master, TIOCSWINSZ, &ws) != 0) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        fail("runtime TIOCSWINSZ");
+    }
+
+    static const char input[] = "fesTerm-input-test\n";
+    ssize_t written = write(master, input, sizeof(input) - 1);
+    if (written != (ssize_t)(sizeof(input) - 1)) {
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        fail("write PTY input");
+    }
+
     struct pollfd pfd = {.fd = master, .events = POLLIN | POLLHUP};
-    char buffer[1024];
-    int saw_marker = 0;
+    char chunk[512];
+    char output[4096];
+    size_t used = 0;
 
     for (;;) {
         int pr = poll(&pfd, 1, 5000);
@@ -80,11 +99,22 @@ int main(void) {
             return 2;
         }
 
-        ssize_t n = read(master, buffer, sizeof(buffer));
+        ssize_t n = read(master, chunk, sizeof(chunk));
         if (n > 0) {
-            if (memmem(buffer, (size_t)n, "FESTERM_PTY_OK", 13))
-                saw_marker = 1;
-            (void)write(STDOUT_FILENO, buffer, (size_t)n);
+            size_t copy = (size_t)n;
+            if (copy > sizeof(output) - 1 - used)
+                copy = sizeof(output) - 1 - used;
+            memcpy(output + used, chunk, copy);
+            used += copy;
+            output[used] = '\0';
+            (void)write(STDOUT_FILENO, chunk, (size_t)n);
+            if (used == sizeof(output) - 1) {
+                fprintf(stderr, "FAIL: output buffer limit reached\n");
+                kill(child, SIGKILL);
+                waitpid(child, NULL, 0);
+                close(master);
+                return 4;
+            }
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
@@ -97,13 +127,16 @@ int main(void) {
     int status = 0;
     if (waitpid(child, &status, 0) < 0) fail("waitpid");
 
-    if (!saw_marker || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        fprintf(stderr, "FAIL: marker=%d child_status=%d\n",
-                saw_marker, status);
+    int input_ok = strstr(output, "INPUT_OK:fesTerm-input-test") != NULL;
+    int resize_ok = strstr(output, "50 120") != NULL;
+    if (!input_ok || !resize_ok || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        fprintf(stderr,
+                "FAIL: input_ok=%d resize_ok=%d child_status=%d\n",
+                input_ok, resize_ok, status);
         return 3;
     }
 
-    puts("PASS: Bionic PTY allocation, controlling TTY, shell exec, output");
-    puts("NOTE: verify the reported size is 40 100.");
+    puts("PASS: PTY input, output, runtime resize, shell exit and waitpid");
     return 0;
 }
