@@ -262,22 +262,31 @@ pub fn storage_directory() -> Result<PathBuf, &'static str> {
 }
 
 /// Starts the app-private local PTY helper for one tab and returns its socket path.
-pub fn start_local_pty(session_id: u64) -> Result<PathBuf, &'static str> {
+pub fn start_local_pty(session_id: u64) -> Result<PathBuf, String> {
     if session_id == 0 || session_id > i64::MAX as u64 {
-        return Err("Invalid local terminal session");
+        return Err("Invalid local terminal session".to_owned());
     }
-    bridge()?.call(|env, activity| {
-        let value = env
-            .call_method(
-                activity,
-                "startLocalPty",
-                "(J)Ljava/lang/String;",
-                &[JValue::Long(session_id as i64)],
-            )?
-            .l()?;
-        let text: String = env.get_string(&JString::from(value))?.into();
-        Ok(PathBuf::from(text))
-    })
+    let bridge = bridge().map_err(str::to_owned)?;
+    let text: String = bridge
+        .call(|env, activity| {
+            let value = env
+                .call_method(
+                    activity,
+                    "startLocalPty",
+                    "(J)Ljava/lang/String;",
+                    &[JValue::Long(session_id as i64)],
+                )?
+                .l()?;
+            Ok(env.get_string(&JString::from(value))?.into())
+        })
+        .map_err(str::to_owned)?;
+    if let Some(detail) = text.strip_prefix("\u{1}FESTERM_PTY_ERROR:") {
+        return Err(format!("Local PTY startup failed: {detail}"));
+    }
+    if text.is_empty() {
+        return Err("Local PTY startup returned an empty socket path".to_owned());
+    }
+    Ok(PathBuf::from(text))
 }
 
 /// Stops the helper associated with a tab. Safe to call more than once.
@@ -396,7 +405,7 @@ impl Drop for LocalPty {
 }
 
 /// Starts a PTY helper, then connects to its private Unix socket.
-pub fn connect_local_pty(session_id: u64) -> Result<LocalPty, &'static str> {
+pub fn connect_local_pty(session_id: u64) -> Result<LocalPty, String> {
     use std::{os::unix::net::UnixStream, thread, time::{Duration, Instant}};
     let socket = start_local_pty(session_id)?;
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -406,13 +415,13 @@ pub fn connect_local_pty(session_id: u64) -> Result<LocalPty, &'static str> {
             Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(30)),
             Err(_) => {
                 let _ = stop_local_pty(session_id);
-                return Err("Local terminal helper did not become ready");
+                return Err("Local terminal helper did not become ready".to_owned());
             }
         }
     };
     stream.set_nonblocking(true).map_err(|_| {
         let _ = stop_local_pty(session_id);
-        "Could not configure local terminal connection"
+        "Could not configure local terminal connection".to_owned()
     })?;
     Ok(LocalPty { session_id, stream, pending: Vec::new(), exited: false })
 }
