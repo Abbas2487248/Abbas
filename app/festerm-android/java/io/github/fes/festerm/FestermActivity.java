@@ -50,7 +50,7 @@ public final class FestermActivity extends NativeActivity {
     private static final String KEY_ALIAS = "io.github.fes.festerm.secrets.v1";
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService files = Executors.newSingleThreadExecutor();
-    private final ConcurrentMap<Long, Process> ptyHelpers = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Long, java.lang.Process> ptyHelpers = new ConcurrentHashMap<>();
     private final Object ptyLock = new Object();
     private InputView input;
     private View shield, accessibilityHost;
@@ -128,7 +128,7 @@ public final class FestermActivity extends NativeActivity {
     public String startLocalPty(long sessionId) throws IOException {
         if (sessionId <= 0 || destroyed) throw new IOException("Local terminal unavailable");
         synchronized (ptyLock) {
-            Process previous = ptyHelpers.get(sessionId);
+            java.lang.Process previous = ptyHelpers.get(sessionId);
             if (previous != null && previous.isAlive()) {
                 throw new IOException("Local terminal already running");
             }
@@ -150,7 +150,7 @@ public final class FestermActivity extends NativeActivity {
             File temporary = new File(root, "festerm-pty-helper.tmp");
             if (!source.isFile() || !source.canRead()) throw new IOException("PTY helper is missing");
             try (InputStream in = new FileInputStream(source);
-                 OutputStream out = new FileOutputStream(temporary, false)) {
+                 FileOutputStream out = new FileOutputStream(temporary, false)) {
                 byte[] buffer = new byte[16384];
                 int count;
                 while ((count = in.read(buffer)) != -1) out.write(buffer, 0, count);
@@ -170,7 +170,7 @@ public final class FestermActivity extends NativeActivity {
             }
 
             String socket = new File(root, "session-" + sessionId + ".sock").getAbsolutePath();
-            Process process = new ProcessBuilder(executable.getAbsolutePath(), socket, root.getAbsolutePath())
+            java.lang.Process process = new ProcessBuilder(executable.getAbsolutePath(), socket, root.getAbsolutePath())
                     .redirectError(new File(root, "session-" + sessionId + ".log"))
                     .redirectOutput(new File(root, "session-" + sessionId + ".log"))
                     .start();
@@ -182,7 +182,7 @@ public final class FestermActivity extends NativeActivity {
     /** Stops the helper and its PTY shell when a local tab is closed. */
     public void stopLocalPty(long sessionId) {
         synchronized (ptyLock) {
-            Process process = ptyHelpers.remove(sessionId);
+            java.lang.Process process = ptyHelpers.remove(sessionId);
             if (process == null) return;
             process.destroy();
             try {
