@@ -14,6 +14,12 @@ fesTerm and does not remove the Android dependency guard for `festerm-pty`.
 The probe uses `fork()` only in its own single-purpose process. Do not copy this
 fork/exec sequence into the multithreaded Android app process.
 
+The helper accepts an optional second argument for the shell's `HOME` directory:
+`festerm-pty-helper SOCKET_PATH APP_PRIVATE_HOME`. The Android activity's
+`privateDirectory()` currently returns the app-private `files/festerm` directory;
+the app must pass that exact runtime value rather than hardcoding a package path.
+When omitted during local Termux testing, the helper uses the inherited `HOME`.
+
 ## Build on a computer with Android NDK
 
 From the repository root, set `NDK` to your installed NDK directory:
