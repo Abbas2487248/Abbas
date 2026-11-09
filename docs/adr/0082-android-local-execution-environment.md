@@ -25,6 +25,15 @@ Android application sandboxing, ABI compatibility, process lifecycle,
 storage permissions, terminal job control, and PRoot/ptrace restrictions are
 hard constraints. A VPN is not part of local execution.
 
+The existing `docs/mobile-port-plan.md` explicitly describes arbitrary local
+process execution as unavailable or heavily constrained on mobile and lists
+local PTY sessions as deferred. ADR 0073 likewise excludes local shells and
+background services. This proposal does not silently overturn those decisions:
+it requests a bounded Android feasibility investigation. Any production
+implementation must explicitly amend the applicable mobile architecture
+decision after evidence demonstrates what Android permits within the app
+sandbox. iOS remains out of scope.
+
 ## Decision
 
 Keep the existing Android dependency guard until a dedicated Android
