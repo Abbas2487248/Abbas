@@ -34,6 +34,16 @@ implementation must explicitly amend the applicable mobile architecture
 decision after evidence demonstrates what Android permits within the app
 sandbox. iOS remains out of scope.
 
+## Feasibility evidence
+
+Android Bionic exposes `openpty` and `forkpty` from API level 23; the
+application's current minimum API is 29. This establishes that the platform
+libc has PTY entry points on the supported API floor, but does not establish
+that the existing `portable-pty` crate compiles for Android or that calling
+`forkpty` from the multithreaded Rust host is safe. A dedicated Android
+prototype must still verify spawn/exec, controlling-terminal setup, I/O,
+resize, signals, child reaping, and shutdown on ARM64.
+
 ## Decision
 
 Keep the existing Android dependency guard until a dedicated Android
