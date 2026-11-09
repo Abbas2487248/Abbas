@@ -146,9 +146,10 @@ jobs:
                   self.wfile.write(body)
 
               def do_GET(self):
-                  if self.path == "/":
+                  path = self.path.split("?", 1)[0].rstrip("/") or "/"
+                  if path == "/":
                       return self.send_data(200, PAGE, "text/html; charset=utf-8")
-                  if self.path == "/api/status":
+                  if path == "/api/status":
                       mem = {}
                       with open("/proc/meminfo") as f:
                           for line in f:
