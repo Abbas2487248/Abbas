@@ -296,6 +296,127 @@ pub fn stop_local_pty(session_id: u64) -> Result<(), &'static str> {
     })
 }
 
+/// One nonblocking connection to an app-private PTY helper.
+pub struct LocalPty {
+    session_id: u64,
+    stream: std::os::unix::net::UnixStream,
+    pending: Vec<u8>,
+    exited: bool,
+}
+
+impl LocalPty {
+    /// Sends terminal input bytes to the shell.
+    pub fn send_input(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+        self.write_frame(0x01, bytes)
+    }
+
+    /// Updates the PTY window size (rows, columns).
+    pub fn resize(&mut self, rows: u16, columns: u16) -> Result<(), &'static str> {
+        let mut payload = [0u8; 4];
+        payload[..2].copy_from_slice(&rows.to_be_bytes());
+        payload[2..].copy_from_slice(&columns.to_be_bytes());
+        self.write_frame(0x02, &payload)
+    }
+
+    /// Requests a clean shell close.
+    pub fn close(&mut self) -> Result<(), &'static str> {
+        self.write_frame(0x03, &[])
+    }
+
+    fn write_frame(&mut self, kind: u8, payload: &[u8]) -> Result<(), &'static str> {
+        use std::io::Write;
+        if self.exited || payload.len() > 65_536 {
+            return Err("Local terminal is not available");
+        }
+        let mut header = [0u8; 5];
+        header[0] = kind;
+        header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        self.stream.write_all(&header).map_err(|_| "Local terminal connection failed")?;
+        if !payload.is_empty() {
+            self.stream.write_all(payload).map_err(|_| "Local terminal connection failed")?;
+        }
+        Ok(())
+    }
+
+    /// Reads all currently available output frames without blocking the UI.
+    /// Returns output chunks and marks the session exited when the helper exits.
+    pub fn poll_output(&mut self) -> Result<Vec<Vec<u8>>, &'static str> {
+        use std::io::Read;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => {
+                    self.exited = true;
+                    break;
+                }
+                Ok(count) => self.pending.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err("Local terminal connection failed"),
+            }
+        }
+        let mut output = Vec::new();
+        loop {
+            if self.pending.len() < 5 { break; }
+            let kind = self.pending[0];
+            let length = u32::from_be_bytes([
+                self.pending[1], self.pending[2], self.pending[3], self.pending[4],
+            ]) as usize;
+            if length > 65_536 {
+                self.exited = true;
+                return Err("Local terminal sent an invalid frame");
+            }
+            if self.pending.len() < 5 + length { break; }
+            let payload = self.pending[5..5 + length].to_vec();
+            self.pending.drain(..5 + length);
+            match kind {
+                0x81 => output.push(payload),
+                0x82 => self.exited = true,
+                _ => {
+                    self.exited = true;
+                    return Err("Local terminal sent an unknown frame");
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn is_exited(&self) -> bool { self.exited }
+
+    pub fn stop(mut self) {
+        let _ = self.close();
+        let _ = stop_local_pty(self.session_id);
+    }
+}
+
+impl Drop for LocalPty {
+    fn drop(&mut self) {
+        let _ = stop_local_pty(self.session_id);
+    }
+}
+
+/// Starts a PTY helper, then connects to its private Unix socket.
+pub fn connect_local_pty(session_id: u64) -> Result<LocalPty, &'static str> {
+    use std::{os::unix::net::UnixStream, thread, time::{Duration, Instant}};
+    let socket = start_local_pty(session_id)?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let stream = loop {
+        match UnixStream::connect(&socket) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(30)),
+            Err(_) => {
+                let _ = stop_local_pty(session_id);
+                return Err("Local terminal helper did not become ready");
+            }
+        }
+    };
+    stream.set_nonblocking(true).map_err(|_| {
+        let _ = stop_local_pty(session_id);
+        "Could not configure local terminal connection"
+    })?;
+    Ok(LocalPty { session_id, stream, pending: Vec::new(), exited: false })
+}
+
 /// App-private recording storage excluded from Android Auto Backup.
 pub fn recording_directory() -> Result<PathBuf, &'static str> {
     bridge()?.call(|env, activity| {
