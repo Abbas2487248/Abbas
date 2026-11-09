@@ -1,9 +1,8 @@
 /*
  * Standalone Android PTY feasibility probe.
- *
  * Run only as a separate single-purpose process, never by forking from the
- * multithreaded Android app. Tests Bionic PTY setup, input/output, runtime
- * resize, Ctrl-C delivery to the foreground process, Ctrl-D/EOF, and reaping.
+ * multithreaded Android app. Tests Bionic PTY setup, VINTR signal delivery,
+ * input/output, runtime resize, VEOF and child reaping.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -19,13 +18,20 @@
 #include <termios.h>
 #include <unistd.h>
 
+static volatile sig_atomic_t got_int = 0;
+
+static void on_int(int signo) {
+    (void)signo;
+    got_int = 1;
+}
+
 static void fail(const char *what) {
     fprintf(stderr, "FAIL: %s: %s\n", what, strerror(errno));
     exit(1);
 }
 
 static void stop_child(pid_t child, int master) {
-    kill(child, SIGKILL);
+    (void)kill(child, SIGKILL);
     (void)waitpid(child, NULL, 0);
     if (master >= 0) close(master);
 }
@@ -96,42 +102,56 @@ int main(void) {
         int slave = open(slave_name, O_RDWR);
         if (slave < 0) _exit(112);
         if (ioctl(slave, TIOCSCTTY, 0) != 0) _exit(113);
-        if (dup2(slave, STDIN_FILENO) < 0) _exit(114);
-        if (dup2(slave, STDOUT_FILENO) < 0) _exit(115);
-        if (dup2(slave, STDERR_FILENO) < 0) _exit(116);
+        if (tcsetpgrp(slave, getpid()) != 0) _exit(114);
+        if (dup2(slave, STDIN_FILENO) < 0) _exit(115);
+        if (dup2(slave, STDOUT_FILENO) < 0) _exit(116);
+        if (dup2(slave, STDERR_FILENO) < 0) _exit(117);
         if (slave > STDERR_FILENO) close(slave);
 
-        char *const argv[] = {
-            (char *)"/system/bin/sh", (char *)"-c",
-            (char *)"printf 'READY\\n'; sleep 30; printf 'AFTER_INT\\n'; "
-                    "IFS= read -r line; printf 'INPUT_OK:%s\\n' \"$line\"; "
-                    "stty size",
-            NULL
-        };
-        execv(argv[0], argv);
-        _exit(127);
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = on_int;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGINT, &action, NULL) != 0) _exit(118);
+
+        dprintf(STDOUT_FILENO, "READY\n");
+        while (!got_int) usleep(10000);
+        dprintf(STDOUT_FILENO, "SIGNAL_OK\n");
+
+        char line[256];
+        ssize_t n = read(STDIN_FILENO, line, sizeof(line) - 1);
+        if (n <= 0) _exit(119);
+        line[n] = '\0';
+        line[strcspn(line, "\r\n")] = '\0';
+        dprintf(STDOUT_FILENO, "INPUT_OK:%s\n", line);
+
+        struct winsize current;
+        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &current) != 0) _exit(120);
+        dprintf(STDOUT_FILENO, "%u %u\n", current.ws_row, current.ws_col);
+
+        n = read(STDIN_FILENO, line, sizeof(line));
+        if (n != 0) _exit(121);
+        dprintf(STDOUT_FILENO, "EOF_OK\n");
+        _exit(0);
     }
 
     fprintf(stderr, "PTY slave: %s\n", slave_name);
     char output[4096] = {0};
     size_t used = 0;
-
     if (!read_until(master, child, output, sizeof(output), &used, "READY"))
         return 2;
 
-    /* Resize while the session is live. */
+    const char interrupt = 3;
+    send_bytes(master, &interrupt, 1, child);
+    if (!read_until(master, child, output, sizeof(output), &used, "SIGNAL_OK"))
+        return 3;
+
     ws.ws_row = 50;
     ws.ws_col = 120;
     if (ioctl(master, TIOCSWINSZ, &ws) != 0) {
         stop_child(child, master);
         fail("runtime TIOCSWINSZ");
     }
-
-    /* VINTR (Ctrl-C) should interrupt the foreground sleep process group. */
-    const char interrupt = 3;
-    send_bytes(master, &interrupt, 1, child);
-    if (!read_until(master, child, output, sizeof(output), &used, "AFTER_INT"))
-        return 3;
 
     static const char input[] = "fesTerm-after-interrupt\n";
     send_bytes(master, input, sizeof(input) - 1, child);
@@ -141,21 +161,18 @@ int main(void) {
     if (!read_until(master, child, output, sizeof(output), &used, "50 120"))
         return 5;
 
-    /* VEOF (Ctrl-D) on an empty canonical input line should end the shell. */
     const char eof = 4;
     send_bytes(master, &eof, 1, child);
+    if (!read_until(master, child, output, sizeof(output), &used, "EOF_OK"))
+        return 6;
     close(master);
 
     int status = 0;
     if (waitpid(child, &status, 0) < 0) fail("waitpid");
-    if (strstr(output, "INPUT_OK:fesTerm-after-interrupt") == NULL ||
-        strstr(output, "50 120") == NULL || !WIFEXITED(status) ||
-        WEXITSTATUS(status) != 0) {
-        fprintf(stderr, "FAIL: output checks or child exit failed (status=%d)\n",
-                status);
-        return 6;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "FAIL: child exit status=%d\n", status);
+        return 7;
     }
-
-    puts("PASS: PTY input/output, Ctrl-C, resize, Ctrl-D/EOF and child reaping");
+    puts("PASS: PTY input/output, Ctrl-C signal, resize, Ctrl-D/EOF and child reaping");
     return 0;
 }
