@@ -169,13 +169,77 @@ public final class FestermActivity extends NativeActivity {
                 throw new IOException("Could not install PTY helper", error);
             }
 
-            String socket = new File(root, "session-" + sessionId + ".sock").getAbsolutePath();
-            java.lang.Process process = new ProcessBuilder(executable.getAbsolutePath(), socket, root.getAbsolutePath())
-                    .redirectError(new File(root, "session-" + sessionId + ".log"))
-                    .redirectOutput(new File(root, "session-" + sessionId + ".log"))
-                    .start();
-            ptyHelpers.put(sessionId, process);
-            return socket;
+            File socketFile = new File(root, "session-" + sessionId + ".sock");
+            File logFile = new File(root, "session-" + sessionId + ".log");
+            String socket = socketFile.getAbsolutePath();
+            if (socketFile.exists() && !socketFile.delete()) {
+                throw new IOException("Could not clear stale PTY socket");
+            }
+            if (logFile.exists() && !logFile.delete()) {
+                throw new IOException("Could not clear previous PTY log");
+            }
+
+            java.lang.Process process;
+            try {
+                process = new ProcessBuilder(executable.getAbsolutePath(), socket, root.getAbsolutePath())
+                        .redirectErrorStream(true)
+                        .redirectOutput(logFile)
+                        .start();
+            } catch (IOException error) {
+                throw new IOException("Could not launch PTY helper: " + error.getMessage(), error);
+            }
+
+            // The helper binds its Unix socket before it waits for Rust to connect.
+            // Do not report success merely because ProcessBuilder returned a Process.
+            long deadline = SystemClock.uptimeMillis() + 2500;
+            try {
+                while (SystemClock.uptimeMillis() < deadline) {
+                    if (!process.isAlive()) {
+                        throw new IOException("PTY helper exited with code " + process.exitValue()
+                                + diagnosticLog(logFile));
+                    }
+                    try {
+                        StructStat socketMetadata = Os.lstat(socket);
+                        if (OsConstants.S_ISSOCK(socketMetadata.st_mode)) {
+                            ptyHelpers.put(sessionId, process);
+                            return socket;
+                        }
+                    } catch (ErrnoException missing) {
+                        if (missing.errno != OsConstants.ENOENT) {
+                            throw new IOException("Could not inspect PTY socket: " + missing.getMessage(), missing);
+                        }
+                    }
+                    SystemClock.sleep(25);
+                }
+                throw new IOException("PTY helper did not create its socket within 2.5 seconds"
+                        + diagnosticLog(logFile));
+            } catch (IOException error) {
+                process.destroy();
+                try {
+                    if (!process.waitFor(300, TimeUnit.MILLISECONDS)) process.destroyForcibly();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    process.destroyForcibly();
+                }
+                throw error;
+            }
+        }
+    }
+
+    /** Returns only the last few bytes of the helper log for actionable startup errors. */
+    private static String diagnosticLog(File logFile) {
+        if (!logFile.isFile()) return " (no helper log was created)";
+        try (RandomAccessFile log = new RandomAccessFile(logFile, "r")) {
+            long length = log.length();
+            int count = (int) Math.min(length, 4096);
+            byte[] bytes = new byte[count];
+            log.seek(length - count);
+            log.readFully(bytes);
+            String message = new String(bytes, StandardCharsets.UTF_8).trim();
+            Arrays.fill(bytes, (byte) 0);
+            return message.isEmpty() ? " (helper log is empty)" : ": " + message;
+        } catch (IOException error) {
+            return " (could not read helper log: " + error.getMessage() + ")";
         }
     }
 
