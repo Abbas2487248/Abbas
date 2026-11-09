@@ -125,6 +125,13 @@ def build(args):
     helper_binary = output / "libfesterm_pty_helper.so"
     run(linker, "-Wall", "-Wextra", "-Werror", "-O2", "-fPIE", "-pie",
         "-Wl,-z,max-page-size=16384", helper_source, "-o", helper_binary, env=env)
+    helper_binary.chmod(0o755)
+    # Verify this is an ARM64 Android PIE (ET_DYN) before putting it in the APK.
+    header = helper_binary.read_bytes()[:20]
+    if (len(header) < 20 or header[:4] != b"\\x7fELF" or header[4:6] != b"\\x02\\x01"
+            or int.from_bytes(header[16:18], "little") != 3
+            or int.from_bytes(header[18:20], "little") != 183):
+        raise ValueError("PTY helper is not a 64-bit little-endian ARM64 PIE executable")
     keystore = ROOT / "target" / "android" / "development.keystore"
     if not keystore.exists():
         run("keytool", "-genkeypair", "-keystore", keystore, "-storepass", "android",
