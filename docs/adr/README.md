@@ -54,6 +54,8 @@ Architecture decision records preserve decisions that affect the project across 
 
 ## Proposed Decisions
 
+- [ADR 0082: Android Local Execution Environment](0082-android-local-execution-environment.md) - proposed staged feasibility and implementation plan for a VPN-free, app-private local shell, runtimes and optional Linux userlands
+
 - [ADR 0077: Synchronized Local Terminal Recording and MP4 Export](0077-synchronized-terminal-recording-and-mp4-export.md) - explicitly selected sessions share a timeline and produce separate local MP4s; platform and privacy qualification required
 - [ADR 0078: Desktop Split-Pane Presentation](0078-desktop-split-pane-presentation.md) - issue #65; bounded live-view presentation trees, unchanged session/document ownership and staged desktop qualification
 - [ADR 0075: Mobile Accessibility Tree and UI Automation](0075-mobile-accessibility-tree.md) - lazily activated platform AccessKit adapters on iOS and Android, privacy-gated terminal rows, named fields without secrets and a shared Maestro suite
