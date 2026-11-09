@@ -50,6 +50,8 @@ public final class FestermActivity extends NativeActivity {
     private static final String KEY_ALIAS = "io.github.fes.festerm.secrets.v1";
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService files = Executors.newSingleThreadExecutor();
+    private final ConcurrentMap<Long, Process> ptyHelpers = new ConcurrentHashMap<>();
+    private final Object ptyLock = new Object();
     private InputView input;
     private View shield, accessibilityHost;
     private boolean ready, destroyed, resumed;
@@ -117,6 +119,86 @@ public final class FestermActivity extends NativeActivity {
         File directory = new File(getFilesDir(), "festerm");
         if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("Storage unavailable");
         return directory.getCanonicalPath();
+    }
+
+    /**
+     * Installs the packaged PTY executable into app-private storage and starts
+     * one isolated helper process. Rust connects to the returned Unix socket.
+     */
+    public String startLocalPty(long sessionId) throws IOException {
+        if (sessionId <= 0 || destroyed) throw new IOException("Local terminal unavailable");
+        synchronized (ptyLock) {
+            Process previous = ptyHelpers.get(sessionId);
+            if (previous != null && previous.isAlive()) {
+                throw new IOException("Local terminal already running");
+            }
+            ptyHelpers.remove(sessionId);
+            File root = new File(privateDirectory(), "pty");
+            if (!root.isDirectory() && !root.mkdirs()) throw new IOException("PTY storage unavailable");
+            try {
+                StructStat metadata = Os.lstat(root.getPath());
+                if (!OsConstants.S_ISDIR(metadata.st_mode) || metadata.st_uid != android.os.Process.myUid()) {
+                    throw new IOException("PTY storage is not private");
+                }
+                Os.chmod(root.getPath(), 0700);
+            } catch (ErrnoException error) {
+                throw new IOException("PTY storage protection failed", error);
+            }
+
+            File source = new File(getApplicationInfo().nativeLibraryDir, "libfesterm_pty_helper.so");
+            File executable = new File(root, "festerm-pty-helper");
+            File temporary = new File(root, "festerm-pty-helper.tmp");
+            if (!source.isFile() || !source.canRead()) throw new IOException("PTY helper is missing");
+            try (InputStream in = new FileInputStream(source);
+                 OutputStream out = new FileOutputStream(temporary, false)) {
+                byte[] buffer = new byte[16384];
+                int count;
+                while ((count = in.read(buffer)) != -1) out.write(buffer, 0, count);
+                out.getFD().sync();
+            }
+            try {
+                Os.chmod(temporary.getPath(), 0700);
+                Os.rename(temporary.getPath(), executable.getPath());
+                StructStat binary = Os.lstat(executable.getPath());
+                if (!OsConstants.S_ISREG(binary.st_mode) || binary.st_uid != android.os.Process.myUid()
+                        || (binary.st_mode & 0777) != 0700) {
+                    throw new IOException("PTY helper permissions are invalid");
+                }
+            } catch (ErrnoException error) {
+                temporary.delete();
+                throw new IOException("Could not install PTY helper", error);
+            }
+
+            String socket = new File(root, "session-" + sessionId + ".sock").getAbsolutePath();
+            Process process = new ProcessBuilder(executable.getAbsolutePath(), socket, root.getAbsolutePath())
+                    .redirectError(new File(root, "session-" + sessionId + ".log"))
+                    .redirectOutput(new File(root, "session-" + sessionId + ".log"))
+                    .start();
+            ptyHelpers.put(sessionId, process);
+            return socket;
+        }
+    }
+
+    /** Stops the helper and its PTY shell when a local tab is closed. */
+    public void stopLocalPty(long sessionId) {
+        synchronized (ptyLock) {
+            Process process = ptyHelpers.remove(sessionId);
+            if (process == null) return;
+            process.destroy();
+            try {
+                if (!process.waitFor(300, TimeUnit.MILLISECONDS)) {
+                    process.destroyForcibly();
+                    process.waitFor(300, TimeUnit.MILLISECONDS);
+                }
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                process.destroyForcibly();
+            }
+        }
+    }
+
+    private void stopAllLocalPtys() {
+        for (Long sessionId : new ArrayList<>(ptyHelpers.keySet())) stopLocalPty(sessionId);
     }
 
     public RecordingEncoder newRecordingEncoder(String path, int width, int height) throws IOException {
@@ -412,6 +494,7 @@ public final class FestermActivity extends NativeActivity {
 
     @Override protected void onDestroy() {
         destroyed = true;
+        stopAllLocalPtys();
         cancelSpeech();
         if (authPending) {
             long token = authToken;
