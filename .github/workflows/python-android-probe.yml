@@ -1,0 +1,74 @@
+name: Python Android runtime probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            triple: aarch64-linux-android
+            clang: aarch64-linux-android29-clang
+            sha256: 423c80b957330cf0ebb92b9b20f2294c292144a441bdb0ceb8c69d14928e569b
+          - abi: x86_64
+            triple: x86_64-linux-android
+            clang: x86_64-linux-android29-clang
+            sha256: 6ebda1fc3f28efc5861cad397254e8ce5d81ba4f83a3cb6a0c124c3826a0e14c
+
+    steps:
+      - name: Download official CPython Android package
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="python-3.14.10-${{ matrix.triple }}.tar.gz"
+          URL="https://www.python.org/ftp/python/3.14.10/$FILE"
+          curl --fail --location --retry 3 --output "$FILE" "$URL"
+          echo "${{ matrix.sha256 }}  $FILE" | sha256sum --check
+          mkdir extracted
+          tar -xzf "$FILE" -C extracted
+          echo "Archive top-level entries:"
+          tar -tzf "$FILE" | sed -n '1,100p'
+          echo "Extracted prefix tree:"
+          find extracted -maxdepth 4 -type f | sort | sed -n '1,180p'
+          test -f extracted/prefix/include/python3.14/Python.h
+          test -f extracted/prefix/lib/libpython3.14.so
+          test -d extracted/prefix/lib/python3.14
+
+      - name: Compile and inspect a standalone Python launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "ndk;27.2.12479018"
+          NDK="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > python_probe.c <<'EOF'
+          #include <Python.h>
+          int main(int argc, char **argv) {
+              return Py_BytesMain(argc, argv);
+          }
+          EOF
+          PREFIX="$GITHUB_WORKSPACE/extracted/prefix"
+          "$NDK/${{ matrix.clang }}" -fPIE -pie \
+            -I"$PREFIX/include/python3.14" \
+            python_probe.c -L"$PREFIX/lib" \
+            -Wl,-rpath,'$ORIGIN' -Wl,-rpath-link,"$PREFIX/lib" \
+            -lpython3.14 -o python-probe
+          echo "ELF header:"
+          "$NDK/llvm-readelf" -h python-probe
+          echo "Dynamic dependencies:"
+          "$NDK/llvm-readelf" -d python-probe
+          echo "Python shared-library dependencies:"
+          "$NDK/llvm-readelf" -d "$PREFIX/lib/libpython3.14.so"
+          file python-probe "$PREFIX/lib/libpython3.14.so"
+          mkdir -p probe-output
+          cp python-probe "$PREFIX/lib/libpython3.14.so" probe-output/
+          cp "$PREFIX/lib/libpython3.so" probe-output/ || true
