@@ -185,7 +185,26 @@ jobs:
           nohup python3 "$RUNNER_TEMP/dashboard.py" > "$RUNNER_TEMP/dashboard.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/dashboard.pid"
 
-          curl -fsS http://127.0.0.1:8765/api/status >/dev/null
+          echo "Waiting for the dashboard to become ready..."
+          READY=0
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:8765/api/status >/dev/null; then
+              READY=1
+              break
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/dashboard.pid")" 2>/dev/null; then
+              echo "::error::Dashboard process stopped during startup. Log follows:"
+              cat "$RUNNER_TEMP/dashboard.log" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "$READY" != "1" ]]; then
+            echo "::error::Dashboard did not become ready within 15 seconds. Log follows:"
+            cat "$RUNNER_TEMP/dashboard.log" || true
+            exit 1
+          fi
+          echo "Dashboard is responding."
 
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o "$RUNNER_TEMP/cloudflared"
           chmod +x "$RUNNER_TEMP/cloudflared"
