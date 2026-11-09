@@ -185,7 +185,7 @@ impl MobileApp {
                     self.terminal = Terminal::with_scrollback_limit(
                         self.terminal.dimensions(), SCROLLBACK_LIMIT
                     ).expect("existing valid bounded grid");
-                    self.terminal.ingest(b"fesTerm local shell\\r\\n");
+                    self.terminal.ingest(b"fesTerm local shell\r\n");
                 }
                 Err(error) => {
                     self.terminal = fixture_terminal();
