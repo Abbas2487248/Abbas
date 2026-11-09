@@ -262,8 +262,11 @@ int main(int argc, char **argv) {
     int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server < 0) return 3;
     if (prepare_socket_path(&address) != 0 ||
-        bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        chmod(address.sun_path, 0600) != 0 || listen(server, 1) != 0) {
+        bind(server, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(server);
+        return 4;
+    }
+    if (chmod(address.sun_path, 0600) != 0 || listen(server, 1) != 0) {
         close(server);
         (void)unlink(address.sun_path);
         return 4;
