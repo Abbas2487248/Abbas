@@ -1849,10 +1849,16 @@ impl MobileApp {
         #[cfg(target_os = "android")]
         if lifecycle.active {
             if let Some(pty) = self.sink.local_pty.as_ref().and_then(Weak::upgrade) {
-                match pty.borrow_mut().poll_output() {
+                let (result, exited) = {
+                    let mut session = pty.borrow_mut();
+                    let result = session.poll_output();
+                    let exited = session.is_exited();
+                    (result, exited)
+                };
+                match result {
                     Ok(chunks) => {
                         for chunk in chunks { self.terminal.ingest(&chunk); }
-                        if pty.borrow().is_exited() { self.sink.local_pty = None; }
+                        if exited { self.sink.local_pty = None; }
                         ui.ctx().request_repaint();
                     }
                     Err(_) => { self.sink.local_pty = None; }
