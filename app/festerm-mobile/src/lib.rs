@@ -3127,6 +3127,17 @@ impl MobileApp {
         if let Some(notice) = self.input_notice {
             ui.label(egui::RichText::new(notice).color(theme::color::DANGER));
         }
+        // A failed local PTY launch falls back to the offline fixture. Keep its
+        // startup error visible on the terminal screen so the user can diagnose it.
+        if self.active_is_local() {
+            if let Some(notice) = self.notice.as_deref() {
+                ui.label(
+                    egui::RichText::new(notice)
+                        .color(theme::color::DANGER)
+                        .size(theme::type_scale::CAPTION + 0.5),
+                );
+            }
+        }
         let terminal_rect = ui.available_rect_before_wrap().shrink(theme::space::SM);
         let gesture = ui.input_mut(|input| {
             let any_touches = input.any_touches();
