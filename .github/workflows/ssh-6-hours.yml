@@ -210,15 +210,29 @@ jobs:
           fi
           echo "Dashboard is responding."
 
+          sudo systemctl stop ttyd.service || true
+          sudo systemctl disable ttyd.service || true
           nohup ttyd -i 127.0.0.1 -p 7681 -c "admin:${WEB_CONTROL_TOKEN}" -W -b /terminal bash > "$RUNNER_TEMP/ttyd.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/ttyd.pid"
+
+          for i in $(seq 1 10); do
+            if curl -fsS http://127.0.0.1:7681/terminal/ >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if ! kill -0 "$(cat "$RUNNER_TEMP/ttyd.pid")" 2>/dev/null; then
+            echo "::error::ttyd failed to start. Log follows:"
+            cat "$RUNNER_TEMP/ttyd.log" || true
+            exit 1
+          fi
 
           sudo tee /etc/nginx/sites-available/default >/dev/null <<'NGINX'
           server {
               listen 127.0.0.1:8080;
               server_name _;
               location /terminal/ {
-                  proxy_pass http://127.0.0.1:7681/terminal/;
+                  proxy_pass http://127.0.0.1:7681;
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
                   proxy_set_header Connection "upgrade";
