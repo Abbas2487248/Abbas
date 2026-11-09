@@ -47,24 +47,28 @@ FESTERM_RUN_OPTIONAL_VALIDATION=1 FESTERM_ANDROID_EMULATOR_SERIAL=emulator-5580 
 | --- | --- |
 | Layout and terminals | Shared iOS design tokens, responsive phone/tablet layout and terminal engine; measured system/keyboard insets; GLES rendering. |
 | Input | Exclusive native `InputConnection` for forms/system keyboard; shared custom keyboards and hardware-key routing. While an app-owned keyboard is selected the system keyboard stays hidden but the same text-aware client remains for hardware and field-targeted input. Stale field callbacks and bounded-queue overflow are refused. |
+| Local shell | App-private interactive shell through the isolated Android PTY helper and private Unix socket. No root access, broad filesystem permission or background shell service. |
+| Python runtime | **Planned, not yet implemented:** bundled ABI-matched CPython, checksum-verified at build time and provisioned automatically into app-private storage. Initial scope is `python` and local `.py` scripts; third-party packages/`pip` are not included. |
 | Profiles and credentials | App-private metadata; encrypted credentials authenticated per reference using a non-exportable Android Keystore key. Backup is disabled. Missing/invalid keys do not produce plaintext fallbacks. |
-| SSH, SFTP and Dev Tunnels | Existing native Rust protocols, trust prompts, persistence and recovery policy; no local shell, CLI dependency or background service. Plain SSH is retired on suspension, as on iOS. |
+| SSH, SFTP and Dev Tunnels | Existing native Rust protocols, trust prompts, persistence and recovery policy. Plain SSH is retired on suspension, as on iOS. |
 | Documents | **Open or import** reopens a saved private copy or imports through Android's picker, preserving a sanitized name/type. Saving never overwrites the provider original. Private copies use shared revision/conflict and writer-admission policy. The saved-copy chooser is bounded to 200 directory entries. |
 | App lock | Android device security/biometrics through request-bound prompts, so a late reply or stale cancellation never affects a newer prompt; "Use device passcode" is credential-only on Android 11+ (Android 10 shows the combined prompt). Shared grace policy, native privacy cover and secure-window screenshot protection. |
 | Dictation | On-device recognizer only, Android 12+ when a local model is available; bounded capture/review with no network fallback. The level meter follows the recognizer's own estimate rather than measured samples. |
 
-Uninstalling removes profiles, imported documents and credentials. This port
-does not claim provider in-place editing, continuous background connectivity,
-Play Store readiness, physical-device qualification, TalkBack parity or
-universal local speech availability. System keyboard and biometric UI naturally
-follow Android rather than copying Apple controls. Qualification is tracked
-separately in [manual validation](../../docs/manual-validation.md#android-shared-mobile-port-adr-0073).
+Uninstalling removes profiles, imported documents, credentials and the
+app-private Python runtime. This port does not claim provider in-place editing,
+continuous background connectivity, Play Store readiness, physical-device
+qualification, TalkBack parity or universal local speech availability.
+System keyboard and biometric UI naturally follow Android rather than copying
+Apple controls. Qualification is tracked separately in
+[manual validation](../../docs/manual-validation.md#android-shared-mobile-port-adr-0073).
 
 ## Accessibility
 
 TalkBack and UI automation see the shared egui tree through
 `accesskit_android`, hosted on an input-free view attached at the window origin
-(ADR 0075). Run the shared Maestro flows with
+(ADR 0075). A plugin activates the tree only when a platform client asks for it
+and injects bounded actions as egui input. Run the shared Maestro flows with
 `scripts/run-mobile-ui-flows.py --platform android --device <emulator>`.
 Explore-by-touch is not yet supported: hover events reach `NativeActivity`'s
 input queue, not the host view.
