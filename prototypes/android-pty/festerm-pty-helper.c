@@ -211,9 +211,11 @@ static int run_session(int client, const char *home_path) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3 || argv[1][0] != '/' || argv[2][0] != '/' ||
+    const char *home_path = argc == 3 ? argv[2] : getenv("HOME");
+    if ((argc != 2 && argc != 3) || argv[1][0] != '/' ||
+        !home_path || home_path[0] != '/' ||
         strlen(argv[1]) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-        fprintf(stderr, "usage: festerm-pty-helper SOCKET_PATH APP_PRIVATE_HOME\n");
+        fprintf(stderr, "usage: festerm-pty-helper SOCKET_PATH [APP_PRIVATE_HOME]\n");
         return 2;
     }
     struct sockaddr_un address;
@@ -233,7 +235,7 @@ int main(int argc, char **argv) {
     int client;
     do { client = accept4(server, NULL, NULL, SOCK_CLOEXEC); }
     while (client < 0 && errno == EINTR);
-    int result = client < 0 ? 5 : run_session(client, argv[2]);
+    int result = client < 0 ? 5 : run_session(client, home_path);
     if (client >= 0) close(client);
     close(server);
     (void)unlink(address.sun_path);
