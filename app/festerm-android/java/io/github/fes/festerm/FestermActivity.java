@@ -157,28 +157,12 @@ public final class FestermActivity extends NativeActivity {
                 throw new IOException("PTY storage protection failed", error);
             }
 
-            File source = new File(getApplicationInfo().nativeLibraryDir, "libfesterm_pty_helper.so");
-            File executable = new File(root, "festerm-pty-helper");
-            File temporary = new File(root, "festerm-pty-helper.tmp");
-            if (!source.isFile() || !source.canRead()) throw new IOException("PTY helper is missing");
-            try (InputStream in = new FileInputStream(source);
-                 FileOutputStream out = new FileOutputStream(temporary, false)) {
-                byte[] buffer = new byte[16384];
-                int count;
-                while ((count = in.read(buffer)) != -1) out.write(buffer, 0, count);
-                out.getFD().sync();
-            }
-            try {
-                Os.chmod(temporary.getPath(), 0700);
-                Os.rename(temporary.getPath(), executable.getPath());
-                StructStat binary = Os.lstat(executable.getPath());
-                if (!OsConstants.S_ISREG(binary.st_mode) || binary.st_uid != android.os.Process.myUid()
-                        || (binary.st_mode & 0777) != 0700) {
-                    throw new IOException("PTY helper permissions are invalid");
-                }
-            } catch (ErrnoException error) {
-                temporary.delete();
-                throw new IOException("Could not install PTY helper", error);
+            // Execute from Android's extracted native-library directory.
+            // App files storage may be mounted noexec, so copying a PIE there
+            // and launching it can fail with EACCES even after chmod(0700).
+            File executable = new File(getApplicationInfo().nativeLibraryDir, "libfesterm_pty_helper.so");
+            if (!executable.isFile() || !executable.canRead() || !executable.canExecute()) {
+                throw new IOException("Packaged PTY helper is missing or not executable");
             }
 
             File socketFile = new File(root, "session-" + sessionId + ".sock");
