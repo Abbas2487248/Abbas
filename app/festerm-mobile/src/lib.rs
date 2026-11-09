@@ -71,7 +71,7 @@ use festerm_ui_egui::{
 };
 use std::{
     cell::{Cell, RefCell},
-    rc::Rc,
+    rc::{Rc, Weak},
 };
 
 /// Writes `text` to the pasteboard and returns the confirmation to show; the
@@ -664,6 +664,8 @@ pub struct ProbeSink {
     diagnostics: InputSinkDiagnostics,
     #[cfg(feature = "live-ssh")]
     live: SuspensionHandle,
+    #[cfg(target_os = "android")]
+    local_pty: Option<Weak<RefCell<festerm_android_platform::LocalPty>>>,
 }
 
 impl EncodedInputSink for ProbeSink {
@@ -671,6 +673,10 @@ impl EncodedInputSink for ProbeSink {
         #[cfg(feature = "live-ssh")]
         if let Some(live) = self.live.connection.borrow_mut().as_mut() {
             live.send(bytes);
+        }
+        #[cfg(target_os = "android")]
+        if let Some(pty) = self.local_pty.as_ref().and_then(Weak::upgrade) {
+            if pty.borrow_mut().send_input(bytes).is_err() { self.local_pty = None; }
         }
         self.diagnostics.byte_count = self
             .diagnostics
@@ -695,6 +701,13 @@ impl EncodedInputSink for ProbeSink {
         }
         #[cfg(not(feature = "live-ssh"))]
         let _ = dimensions;
+        #[cfg(target_os = "android")]
+        if let Some(pty) = self.local_pty.as_ref().and_then(Weak::upgrade) {
+            let _ = pty.borrow_mut().resize(
+                dimensions.rows().min(u16::MAX as usize) as u16,
+                dimensions.columns().min(u16::MAX as usize) as u16,
+            );
+        }
     }
 }
 
@@ -1832,6 +1845,19 @@ impl MobileApp {
             self.poll_background(ui.ctx());
             self.poll_tunnels(ui.ctx());
             self.auto_reconnect_tunnel(ui.ctx());
+        }
+        #[cfg(target_os = "android")]
+        if lifecycle.active {
+            if let Some(pty) = self.sink.local_pty.as_ref().and_then(Weak::upgrade) {
+                match pty.borrow_mut().poll_output() {
+                    Ok(chunks) => {
+                        for chunk in chunks { self.terminal.ingest(&chunk); }
+                        if pty.borrow().is_exited() { self.sink.local_pty = None; }
+                        ui.ctx().request_repaint();
+                    }
+                    Err(_) => { self.sink.local_pty = None; }
+                }
+            }
         }
         #[cfg(feature = "live-ssh")]
         if lifecycle.active {
