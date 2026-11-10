@@ -51,7 +51,7 @@ class PythonAndroidRuntimeTests(unittest.TestCase):
                 (root / f"stdlib_{index}.py").write_text("# stdlib")
             output = Path(directory) / "python314.zip"
             count = runtime._make_stdlib_zip(root, output)
-            self.assertEqual(count, 501)
+            self.assertEqual(count, 503)
             with zipfile.ZipFile(output) as archive:
                 names = archive.namelist()
                 self.assertIn("encodings/__init__.py", names)
