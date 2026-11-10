@@ -44,6 +44,8 @@ class PythonAndroidRuntimeTests(unittest.TestCase):
             (root / "lib-dynload" / "native.so").write_bytes(b"native")
             (root / "tests" / "test_sample.py").write_text("# test")
             (root / "__pycache__" / "sample.pyc").write_bytes(b"bytecode")
+            for index in range(500):
+                (root / f"stdlib_{index}.py").write_text("# stdlib")
             output = Path(directory) / "python314.zip"
             count = runtime._make_stdlib_zip(root, output)
             self.assertEqual(count, 1)
