@@ -37,10 +37,13 @@ class PythonAndroidRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "stdlib"
             (root / "encodings").mkdir(parents=True)
+            (root / "ensurepip" / "_bundled").mkdir(parents=True)
             (root / "lib-dynload").mkdir()
             (root / "tests").mkdir()
             (root / "__pycache__").mkdir()
             (root / "encodings" / "__init__.py").write_text("# encoding")
+            (root / "ensurepip" / "__init__.py").write_text("# ensurepip")
+            (root / "ensurepip" / "_bundled" / "pip-25.0-py3-none-any.whl").write_bytes(b"wheel")
             (root / "lib-dynload" / "native.so").write_bytes(b"native")
             (root / "tests" / "test_sample.py").write_text("# test")
             (root / "__pycache__" / "sample.pyc").write_bytes(b"bytecode")
@@ -52,6 +55,8 @@ class PythonAndroidRuntimeTests(unittest.TestCase):
             with zipfile.ZipFile(output) as archive:
                 names = archive.namelist()
                 self.assertIn("encodings/__init__.py", names)
+                self.assertIn("ensurepip/__init__.py", names)
+                self.assertIn("ensurepip/_bundled/pip-25.0-py3-none-any.whl", names)
                 self.assertFalse(any("lib-dynload" in name for name in names))
                 self.assertFalse(any("/tests/" in name for name in names))
                 self.assertFalse(any(name.endswith(".pyc") for name in names))
