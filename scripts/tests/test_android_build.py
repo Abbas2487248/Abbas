@@ -3,11 +3,13 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "build-android.py"
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("android_build", SCRIPT)
 android = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(android)

@@ -50,6 +50,8 @@ public final class FestermActivity extends NativeActivity {
     private static final String KEY_ALIAS = "io.github.fes.festerm.secrets.v1";
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService files = Executors.newSingleThreadExecutor();
+    private final ConcurrentMap<Long, java.lang.Process> ptyHelpers = new ConcurrentHashMap<>();
+    private final Object ptyLock = new Object();
     private InputView input;
     private View shield, accessibilityHost;
     private boolean ready, destroyed, resumed;
@@ -117,6 +119,225 @@ public final class FestermActivity extends NativeActivity {
         File directory = new File(getFilesDir(), "festerm");
         if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("Storage unavailable");
         return directory.getCanonicalPath();
+    }
+
+    /**
+     * Installs the packaged PTY executable into app-private storage and starts
+     * one isolated helper process. Rust connects to the returned Unix socket.
+     */
+    public String startLocalPty(long sessionId) {
+        try {
+            return startLocalPtyInternal(sessionId);
+        } catch (IOException error) {
+            String detail = error.getMessage();
+            if (detail == null || detail.isEmpty()) detail = error.getClass().getSimpleName();
+            detail = detail.replaceAll("[\\p{Cntrl}&&[^\\t]]", " ");
+            if (detail.length() > 512) detail = detail.substring(0, 512);
+            return "\u0001FESTERM_PTY_ERROR:" + detail;
+        }
+    }
+
+    /**
+     * Installs the packaged CPython standard-library archive and exposes the
+     * native PIE launcher through a private "python" command. Executable and
+     * extension ELF files stay in nativeLibraryDir because files/ may be noexec.
+     */
+    private File[] preparePythonRuntime() throws IOException {
+        File nativeDir = new File(getApplicationInfo().nativeLibraryDir);
+        File launcher = new File(nativeDir, "libfesterm_python_exec.so");
+        if (!launcher.isFile() || !launcher.canRead() || !launcher.canExecute()) {
+            throw new IOException("Packaged Python 3.14 launcher is missing or not executable");
+        }
+
+        File runtime = new File(privateDirectory(), "python");
+        File lib = new File(runtime, "lib");
+        File bin = new File(runtime, "bin");
+        if (!lib.isDirectory() && !lib.mkdirs()) {
+            throw new IOException("Python runtime directory could not be created");
+        }
+        if (!bin.isDirectory() && !bin.mkdirs()) {
+            throw new IOException("Python command directory could not be created");
+        }
+
+        File stdlib = new File(lib, "python314.zip");
+        if (!stdlib.isFile() || stdlib.length() == 0) {
+            File temporary = new File(lib, "python314.zip.tmp");
+            try (InputStream input = getAssets().open("python/python314.zip");
+                 FileOutputStream output = new FileOutputStream(temporary)) {
+                byte[] buffer = new byte[64 * 1024];
+                int count;
+                while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                output.getFD().sync();
+            } catch (IOException error) {
+                temporary.delete();
+                throw new IOException("Could not install Python standard library: " + error.getMessage(), error);
+            }
+            if (!temporary.renameTo(stdlib)) {
+                temporary.delete();
+                throw new IOException("Could not finalize Python standard library");
+            }
+        }
+
+        File command = new File(bin, "python");
+        String target = launcher.getAbsolutePath();
+        try {
+            try {
+                StructStat metadata = Os.lstat(command.getAbsolutePath());
+                if (OsConstants.S_ISLNK(metadata.st_mode) &&
+                    target.equals(Os.readlink(command.getAbsolutePath()))) {
+                    return new File[]{runtime, stdlib, nativeDir, command};
+                }
+                if (OsConstants.S_ISLNK(metadata.st_mode)) {
+                    if (!command.delete()) throw new IOException("Could not remove stale Python command link");
+                } else if (!command.delete()) {
+                    throw new IOException("Could not replace private Python command");
+                }
+            } catch (ErrnoException missing) {
+                if (missing.errno != OsConstants.ENOENT) throw missing;
+            }
+            Os.symlink(target, command.getAbsolutePath());
+        } catch (ErrnoException error) {
+            throw new IOException("Could not create Python command link: " + error.getMessage(), error);
+        }
+        return new File[]{runtime, stdlib, nativeDir, command};
+    }
+
+    private String startLocalPtyInternal(long sessionId) throws IOException {
+        if (sessionId <= 0 || destroyed) throw new IOException("Local terminal unavailable");
+        synchronized (ptyLock) {
+            java.lang.Process previous = ptyHelpers.get(sessionId);
+            if (previous != null && previous.isAlive()) {
+                throw new IOException("Local terminal already running");
+            }
+            ptyHelpers.remove(sessionId);
+            File root = new File(privateDirectory(), "pty");
+            if (!root.isDirectory() && !root.mkdirs()) throw new IOException("PTY storage unavailable");
+            try {
+                StructStat metadata = Os.lstat(root.getPath());
+                if (!OsConstants.S_ISDIR(metadata.st_mode) || metadata.st_uid != android.os.Process.myUid()) {
+                    throw new IOException("PTY storage is not private");
+                }
+                Os.chmod(root.getPath(), 0700);
+            } catch (ErrnoException error) {
+                throw new IOException("PTY storage protection failed", error);
+            }
+
+            // Execute from Android's extracted native-library directory.
+            // App files storage may be mounted noexec, so copying a PIE there
+            // and launching it can fail with EACCES even after chmod(0700).
+            File executable = new File(getApplicationInfo().nativeLibraryDir, "libfesterm_pty_helper.so");
+            if (!executable.isFile() || !executable.canRead() || !executable.canExecute()) {
+                throw new IOException("Packaged PTY helper is missing or not executable");
+            }
+
+            File[] pythonRuntime = preparePythonRuntime();
+
+            File socketFile = new File(root, "session-" + sessionId + ".sock");
+            File logFile = new File(root, "session-" + sessionId + ".log");
+            String socket = socketFile.getAbsolutePath();
+            if (socketFile.exists() && !socketFile.delete()) {
+                throw new IOException("Could not clear stale PTY socket");
+            }
+            if (logFile.exists() && !logFile.delete()) {
+                throw new IOException("Could not clear previous PTY log");
+            }
+
+            java.lang.Process process;
+            try {
+                ProcessBuilder builder = new ProcessBuilder(
+                        executable.getAbsolutePath(), socket, root.getAbsolutePath());
+                Map<String, String> environment = builder.environment();
+                String oldPath = environment.getOrDefault("PATH", "/system/bin");
+                String oldLibraryPath = environment.getOrDefault("LD_LIBRARY_PATH", "");
+                environment.put("PATH", pythonRuntime[3].getParent() + ":"
+                        + pythonRuntime[2].getAbsolutePath() + ":" + oldPath);
+                environment.put("PYTHONHOME", pythonRuntime[0].getAbsolutePath());
+                environment.put("PYTHONPATH", pythonRuntime[1].getAbsolutePath() + ":"
+                        + pythonRuntime[2].getAbsolutePath());
+                environment.put("PYTHONNOUSERSITE", "1");
+                environment.put("LD_LIBRARY_PATH", pythonRuntime[2].getAbsolutePath()
+                        + (oldLibraryPath.isEmpty() ? "" : ":" + oldLibraryPath));
+                process = builder.redirectErrorStream(true)
+                        .redirectOutput(logFile)
+                        .start();
+            } catch (IOException error) {
+                throw new IOException("Could not launch PTY helper: " + error.getMessage(), error);
+            }
+
+            // The helper binds its Unix socket before it waits for Rust to connect.
+            // Do not report success merely because ProcessBuilder returned a Process.
+            long deadline = SystemClock.uptimeMillis() + 2500;
+            try {
+                while (SystemClock.uptimeMillis() < deadline) {
+                    if (!process.isAlive()) {
+                        throw new IOException("PTY helper exited with code " + process.exitValue()
+                                + diagnosticLog(logFile));
+                    }
+                    try {
+                        StructStat socketMetadata = Os.lstat(socket);
+                        if (OsConstants.S_ISSOCK(socketMetadata.st_mode)) {
+                            ptyHelpers.put(sessionId, process);
+                            return socket;
+                        }
+                    } catch (ErrnoException missing) {
+                        if (missing.errno != OsConstants.ENOENT) {
+                            throw new IOException("Could not inspect PTY socket: " + missing.getMessage(), missing);
+                        }
+                    }
+                    SystemClock.sleep(25);
+                }
+                throw new IOException("PTY helper did not create its socket within 2.5 seconds"
+                        + diagnosticLog(logFile));
+            } catch (IOException error) {
+                process.destroy();
+                try {
+                    if (!process.waitFor(300, TimeUnit.MILLISECONDS)) process.destroyForcibly();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    process.destroyForcibly();
+                }
+                throw error;
+            }
+        }
+    }
+
+    /** Returns only the last few bytes of the helper log for actionable startup errors. */
+    private static String diagnosticLog(File logFile) {
+        if (!logFile.isFile()) return " (no helper log was created)";
+        try (RandomAccessFile log = new RandomAccessFile(logFile, "r")) {
+            long length = log.length();
+            int count = (int) Math.min(length, 4096);
+            byte[] bytes = new byte[count];
+            log.seek(length - count);
+            log.readFully(bytes);
+            String message = new String(bytes, StandardCharsets.UTF_8).trim();
+            Arrays.fill(bytes, (byte) 0);
+            return message.isEmpty() ? " (helper log is empty)" : ": " + message;
+        } catch (IOException error) {
+            return " (could not read helper log: " + error.getMessage() + ")";
+        }
+    }
+
+    /** Stops the helper and its PTY shell when a local tab is closed. */
+    public void stopLocalPty(long sessionId) {
+        synchronized (ptyLock) {
+            java.lang.Process process = ptyHelpers.remove(sessionId);
+            if (process == null) return;
+            process.destroy();
+            try {
+                if (!process.waitFor(300, TimeUnit.MILLISECONDS)) {
+                    process.destroyForcibly();
+                    process.waitFor(300, TimeUnit.MILLISECONDS);
+                }
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                process.destroyForcibly();
+            }
+        }
+    }
+
+    private void stopAllLocalPtys() {
+        for (Long sessionId : new ArrayList<>(ptyHelpers.keySet())) stopLocalPty(sessionId);
     }
 
     public RecordingEncoder newRecordingEncoder(String path, int width, int height) throws IOException {
@@ -412,6 +633,7 @@ public final class FestermActivity extends NativeActivity {
 
     @Override protected void onDestroy() {
         destroyed = true;
+        stopAllLocalPtys();
         cancelSpeech();
         if (authPending) {
             long token = authToken;

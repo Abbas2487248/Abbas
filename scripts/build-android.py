@@ -14,6 +14,8 @@ import tomllib
 import urllib.request
 import zipfile
 
+from python_android_runtime import prepare_python_runtime
+
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app" / "festerm-android"
 API = 35
@@ -117,6 +119,22 @@ def build(args):
     run("cargo", "build", "--locked", "-p", "festerm-android", "--target", target,
         *features, *(["--release"] if args.release else []), env=env)
     library = cargo_target / target / mode / "libfesterm_android.so"
+
+    # Build the isolated PTY helper as a standalone Android PIE executable.
+    # It is packaged in the ABI native-library directory so PackageManager
+    # extracts it with the app's native libraries; it is never linked into Rust.
+    helper_source = ROOT / "prototypes" / "android-pty" / "festerm-pty-helper.c"
+    helper_binary = output / "libfesterm_pty_helper.so"
+    run(linker, "-Wall", "-Wextra", "-Werror", "-O2", "-fPIE", "-pie",
+        "-Wl,-z,max-page-size=16384", helper_source, "-o", helper_binary, env=env)
+    helper_binary.chmod(0o755)
+    # Verify a 64-bit little-endian Android PIE (ET_DYN) for the selected ABI.
+    expected_machine = {"arm64-v8a": 183, "x86_64": 62}[args.abi]
+    header = helper_binary.read_bytes()[:20]
+    if (len(header) < 20 or header[:4] != b"\x7fELF" or header[4:6] != b"\x02\x01"
+            or int.from_bytes(header[16:18], "little") != 3
+            or int.from_bytes(header[18:20], "little") != expected_machine):
+        raise ValueError(f"PTY helper is not a 64-bit little-endian {args.abi} PIE executable")
     keystore = ROOT / "target" / "android" / "development.keystore"
     if not keystore.exists():
         run("keytool", "-genkeypair", "-keystore", keystore, "-storepass", "android",
@@ -132,6 +150,7 @@ def build(args):
         dex.mkdir()
         resource_dir = work / "res"
         shutil.copytree(APP / "res", resource_dir)
+        python_runtime = prepare_python_runtime(args.abi, llvm, linker, work / "python-runtime")
         jars = []
         for dependency in dependencies:
             if dependency.suffix == ".aar":
@@ -160,6 +179,10 @@ def build(args):
         with zipfile.ZipFile(unsigned, "a", compression=zipfile.ZIP_DEFLATED) as package:
             package.write(dex / "classes.dex", "classes.dex")
             package.write(library, f"lib/{args.abi}/libfesterm_android.so")
+            package.write(helper_binary, f"lib/{args.abi}/libfesterm_pty_helper.so")
+            for native_file in sorted(python_runtime["native_dir"].glob("*.so")):
+                package.write(native_file, f"lib/{args.abi}/{native_file.name}")
+            package.write(python_runtime["stdlib_zip"], "assets/python/python314.zip", compress_type=zipfile.ZIP_STORED)
             package.write(APP / "NOTICE.txt", "assets/NOTICE.txt")
             package.write(ROOT / "vendor/egui-winit/LICENSE-APACHE", "assets/licenses/Apache-2.0.txt")
         aligned = work / "aligned.apk"
@@ -176,6 +199,15 @@ def build(args):
         "live_ssh": not args.offline, "signing": "development-only",
         "recording_validation": args.recording_validation,
         "profile": mode, "ndk": NDK, "build_tools": BUILD_TOOLS,
+        "local_pty_helper": "standalone-pie-in-native-lib-dir",
+        "python_runtime": {
+            "version": "3.14.10",
+            "archive_sha256": python_runtime["archive_sha256"],
+            "native_extensions": python_runtime["extension_count"],
+            "stdlib_files": python_runtime["stdlib_file_count"],
+            "launcher": "libfesterm_python_exec.so",
+            "status": "packaged-not-yet-device-tested",
+        },
         "sha256": digest,
     }
     (output / "build-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")

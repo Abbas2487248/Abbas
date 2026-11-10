@@ -1,0 +1,136 @@
+name: Python Android runtime probe
+
+on:
+  push:
+    branches:
+      - android-pty-launch-proof
+    paths:
+      - '.github/workflows/python-android-probe.yml'
+      - 'scripts/python_android_runtime.py'
+      - 'scripts/tests/test_android*.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            triple: aarch64-linux-android
+            clang: aarch64-linux-android29-clang
+            sha256: 423c80b957330cf0ebb92b9b20f2294c292144a441bdb0ceb8c69d14928e569b
+          - abi: x86_64
+            triple: x86_64-linux-android
+            clang: x86_64-linux-android29-clang
+            sha256: 6ebda1fc3f28efc5861cad397254e8ce5d81ba4f83a3cb6a0c124c3826a0e14c
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Download official CPython Android package
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="python-3.14.10-${{ matrix.triple }}.tar.gz"
+          URL="https://www.python.org/ftp/python/3.14.10/$FILE"
+          curl --fail --location --retry 3 --output "$FILE" "$URL"
+          echo "${{ matrix.sha256 }}  $FILE" | sha256sum --check
+          mkdir extracted
+          tar -xzf "$FILE" -C extracted
+          echo "Archive top-level entries:"
+          tar -tzf "$FILE" | sed -n '1,100p'
+          echo "Extracted prefix tree:"
+          find extracted -maxdepth 4 -type f | sort | sed -n '1,180p'
+          test -f extracted/prefix/include/python3.14/Python.h
+          test -f extracted/prefix/lib/libpython3.14.so
+          test -d extracted/prefix/lib/python3.14
+
+      - name: Compile and inspect a standalone Python launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "ndk;27.2.12479018"
+          NDK="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > python_probe.c <<'EOF'
+          #include <Python.h>
+          int main(int argc, char **argv) {
+              return Py_BytesMain(argc, argv);
+          }
+          EOF
+          PREFIX="$GITHUB_WORKSPACE/extracted/prefix"
+          "$NDK/${{ matrix.clang }}" -fPIE -pie \
+            -I"$PREFIX/include/python3.14" \
+            python_probe.c -L"$PREFIX/lib" \
+            -Wl,-rpath,'$ORIGIN' -Wl,-rpath-link,"$PREFIX/lib" \
+            -lpython3.14 -o python-probe
+          echo "ELF header:"
+          "$NDK/llvm-readelf" -h python-probe
+          echo "Dynamic dependencies:"
+          "$NDK/llvm-readelf" -d python-probe
+          echo "Python shared-library dependencies:"
+          "$NDK/llvm-readelf" -d "$PREFIX/lib/libpython3.14.so"
+          file python-probe "$PREFIX/lib/libpython3.14.so"
+
+      - name: Test Android CPython packaging
+        shell: bash
+        env:
+          PYTHON_RUNTIME_ABI: ${{ matrix.abi }}
+          PYTHON_RUNTIME_CLANG: ${{ matrix.clang }}
+        run: |
+          set -euo pipefail
+          FILE="python-3.14.10-${{ matrix.triple }}.tar.gz"
+          mkdir -p target/python-android-cache
+          cp "$FILE" "target/python-android-cache/$FILE"
+          python3 -m unittest discover -s scripts/tests -p 'test_android*.py'
+          python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from python_android_runtime import prepare_python_runtime
+          ndk_bin = Path(os.environ["ANDROID_HOME"]) / "ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          linker = ndk_bin / os.environ["PYTHON_RUNTIME_CLANG"]
+          result = prepare_python_runtime(
+              os.environ["PYTHON_RUNTIME_ABI"], ndk_bin, linker,
+              Path("target/python-runtime-validation"),
+          )
+          print("Verified Android CPython runtime:")
+          print(f"  native extensions: {result['extension_count']}")
+          print(f"  standard-library files: {result['stdlib_file_count']}")
+          print(f"  archive SHA256: {result['archive_sha256']}")
+          PY
+
+      - name: Package verified ARM64 runtime for device testing
+        if: matrix.abi == 'arm64-v8a'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-artifact
+          cp python-probe runtime-artifact/
+          printf '%s\n' \
+            'Python version: 3.14.10' \
+            'Android ABI: arm64-v8a' \
+            'Official archive SHA256: ${{ matrix.sha256 }}' \
+            'Note: launcher compilation/ELF inspection passed; on-device execution is not yet proven.' \
+            > runtime-artifact/BUILD-INFO.txt
+          tar -czf python-android-arm64-runtime.tar.gz -C extracted prefix -C "$GITHUB_WORKSPACE/runtime-artifact" .
+          sha256sum python-android-arm64-runtime.tar.gz > python-android-arm64-runtime.tar.gz.sha256
+
+      - name: Upload verified ARM64 runtime artifact
+        if: matrix.abi == 'arm64-v8a'
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-3.14.10-android-arm64-runtime
+          path: |
+            python-android-arm64-runtime.tar.gz
+            python-android-arm64-runtime.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
