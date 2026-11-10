@@ -24,7 +24,7 @@ class PythonAndroidRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             archive = root / "unsafe.tar"
-            with tarfile.open(archive, "w") as output:
+            with tarfile.open(archive, "w:gz") as output:
                 info = tarfile.TarInfo("../escape.txt")
                 info.size = 1
                 import io
@@ -48,9 +48,13 @@ class PythonAndroidRuntimeTests(unittest.TestCase):
                 (root / f"stdlib_{index}.py").write_text("# stdlib")
             output = Path(directory) / "python314.zip"
             count = runtime._make_stdlib_zip(root, output)
-            self.assertEqual(count, 1)
+            self.assertEqual(count, 501)
             with zipfile.ZipFile(output) as archive:
-                self.assertEqual(archive.namelist(), ["encodings/__init__.py"])
+                names = archive.namelist()
+                self.assertIn("encodings/__init__.py", names)
+                self.assertFalse(any("lib-dynload" in name for name in names))
+                self.assertFalse(any("/tests/" in name for name in names))
+                self.assertFalse(any(name.endswith(".pyc") for name in names))
 
     def test_unsupported_abi_is_rejected_before_build(self):
         with tempfile.TemporaryDirectory() as directory:
