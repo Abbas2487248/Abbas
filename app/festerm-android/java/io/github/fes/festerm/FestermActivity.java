@@ -137,6 +137,64 @@ public final class FestermActivity extends NativeActivity {
         }
     }
 
+    /**
+     * Installs the packaged CPython standard-library archive and exposes the
+     * native PIE launcher through a private "python" command. Executable and
+     * extension ELF files stay in nativeLibraryDir because files/ may be noexec.
+     */
+    private File[] preparePythonRuntime() throws IOException {
+        File nativeDir = new File(getApplicationInfo().nativeLibraryDir);
+        File launcher = new File(nativeDir, "libfesterm_python_exec.so");
+        if (!launcher.isFile() || !launcher.canRead() || !launcher.canExecute()) {
+            throw new IOException("Packaged Python 3.14 launcher is missing or not executable");
+        }
+
+        File runtime = new File(privateDirectory(), "python");
+        File lib = new File(runtime, "lib");
+        File bin = new File(runtime, "bin");
+        if (!lib.isDirectory() && !lib.mkdirs()) {
+            throw new IOException("Python runtime directory could not be created");
+        }
+        if (!bin.isDirectory() && !bin.mkdirs()) {
+            throw new IOException("Python command directory could not be created");
+        }
+
+        File stdlib = new File(lib, "python314.zip");
+        if (!stdlib.isFile() || stdlib.length() == 0) {
+            File temporary = new File(lib, "python314.zip.tmp");
+            try (InputStream input = getAssets().open("python/python314.zip");
+                 FileOutputStream output = new FileOutputStream(temporary)) {
+                byte[] buffer = new byte[64 * 1024];
+                int count;
+                while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                output.getFD().sync();
+            } catch (IOException error) {
+                temporary.delete();
+                throw new IOException("Could not install Python standard library: " + error.getMessage(), error);
+            }
+            if (!temporary.renameTo(stdlib)) {
+                temporary.delete();
+                throw new IOException("Could not finalize Python standard library");
+            }
+        }
+
+        File command = new File(bin, "python");
+        String target = launcher.getAbsolutePath();
+        try {
+            if (command.exists() || Files.isSymbolicLink(command.toPath())) {
+                if (Files.isSymbolicLink(command.toPath()) &&
+                    target.equals(Os.readlink(command.getAbsolutePath()))) {
+                    return new File[]{runtime, stdlib, nativeDir, command};
+                }
+                if (!command.delete()) throw new IOException("Could not replace private Python command");
+            }
+            Os.symlink(target, command.getAbsolutePath());
+        } catch (ErrnoException error) {
+            throw new IOException("Could not create Python command link: " + error.getMessage(), error);
+        }
+        return new File[]{runtime, stdlib, nativeDir, command};
+    }
+
     private String startLocalPtyInternal(long sessionId) throws IOException {
         if (sessionId <= 0 || destroyed) throw new IOException("Local terminal unavailable");
         synchronized (ptyLock) {
