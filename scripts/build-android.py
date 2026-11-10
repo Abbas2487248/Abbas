@@ -182,7 +182,7 @@ def build(args):
             package.write(helper_binary, f"lib/{args.abi}/libfesterm_pty_helper.so")
             for native_file in sorted(python_runtime["native_dir"].glob("*.so")):
                 package.write(native_file, f"lib/{args.abi}/{native_file.name}")
-            package.write(python_runtime["stdlib_zip"], "assets/python/python314.zip")
+            package.write(python_runtime["stdlib_zip"], "assets/python/python314.zip", compress_type=zipfile.ZIP_STORED)
             package.write(APP / "NOTICE.txt", "assets/NOTICE.txt")
             package.write(ROOT / "vendor/egui-winit/LICENSE-APACHE", "assets/licenses/Apache-2.0.txt")
         aligned = work / "aligned.apk"
