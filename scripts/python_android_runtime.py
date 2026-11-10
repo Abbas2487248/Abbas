@@ -87,7 +87,7 @@ def _safe_extract(archive, destination):
 
 
 def _make_stdlib_zip(stdlib, destination):
-    skipped = {"__pycache__", "test", "tests", "tkinter", "idlelib", "ensurepip"}
+    skipped = {"__pycache__", "test", "tests", "tkinter", "idlelib"}
     count = 0
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED,
                          compresslevel=9) as output:
@@ -163,6 +163,11 @@ def prepare_python_runtime(abi, ndk_bin, linker, work):
         for name in __import__("re").findall(r"Shared library: \[([^]]+)\]", details):
             if name not in bundled and name not in SYSTEM_LIBRARIES:
                 raise ValueError(f"Unresolved Android CPython dependency {name} in {path.name}")
+
+    ensurepip = prefix / "lib" / "python3.14" / "ensurepip"
+    bundled_pip = list((ensurepip / "_bundled").glob("pip-*.whl"))
+    if not (ensurepip / "__init__.py").is_file() or not bundled_pip:
+        raise ValueError("Official CPython archive is missing ensurepip or its bundled pip wheel")
 
     assets = work / "assets"
     assets.mkdir(parents=True, exist_ok=True)
