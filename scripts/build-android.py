@@ -14,6 +14,8 @@ import tomllib
 import urllib.request
 import zipfile
 
+from python_android_runtime import prepare_python_runtime
+
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app" / "festerm-android"
 API = 35
@@ -148,6 +150,7 @@ def build(args):
         dex.mkdir()
         resource_dir = work / "res"
         shutil.copytree(APP / "res", resource_dir)
+        python_runtime = prepare_python_runtime(args.abi, llvm, linker, work / "python-runtime")
         jars = []
         for dependency in dependencies:
             if dependency.suffix == ".aar":
@@ -177,6 +180,9 @@ def build(args):
             package.write(dex / "classes.dex", "classes.dex")
             package.write(library, f"lib/{args.abi}/libfesterm_android.so")
             package.write(helper_binary, f"lib/{args.abi}/libfesterm_pty_helper.so")
+            for native_file in sorted(python_runtime["native_dir"].glob("*.so")):
+                package.write(native_file, f"lib/{args.abi}/{native_file.name}")
+            package.write(python_runtime["stdlib_zip"], "assets/python/python314.zip")
             package.write(APP / "NOTICE.txt", "assets/NOTICE.txt")
             package.write(ROOT / "vendor/egui-winit/LICENSE-APACHE", "assets/licenses/Apache-2.0.txt")
         aligned = work / "aligned.apk"
@@ -194,6 +200,14 @@ def build(args):
         "recording_validation": args.recording_validation,
         "profile": mode, "ndk": NDK, "build_tools": BUILD_TOOLS,
         "local_pty_helper": "standalone-pie-in-native-lib-dir",
+        "python_runtime": {
+            "version": "3.14.10",
+            "archive_sha256": python_runtime["archive_sha256"],
+            "native_extensions": python_runtime["extension_count"],
+            "stdlib_files": python_runtime["stdlib_file_count"],
+            "launcher": "libfesterm_python_exec.so",
+            "status": "packaged-not-yet-device-tested",
+        },
         "sha256": digest,
     }
     (output / "build-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
