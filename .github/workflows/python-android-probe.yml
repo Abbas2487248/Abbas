@@ -6,6 +6,8 @@ on:
       - android-pty-launch-proof
     paths:
       - '.github/workflows/python-android-probe.yml'
+      - 'scripts/python_android_runtime.py'
+      - 'scripts/tests/test_android*.py'
   workflow_dispatch:
 
 permissions:
@@ -29,6 +31,8 @@ jobs:
             sha256: 6ebda1fc3f28efc5861cad397254e8ce5d81ba4f83a3cb6a0c124c3826a0e14c
 
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
       - name: Download official CPython Android package
         shell: bash
         run: |
@@ -74,6 +78,35 @@ jobs:
           echo "Python shared-library dependencies:"
           "$NDK/llvm-readelf" -d "$PREFIX/lib/libpython3.14.so"
           file python-probe "$PREFIX/lib/libpython3.14.so"
+
+      - name: Test Android CPython packaging
+        shell: bash
+        env:
+          PYTHON_RUNTIME_ABI: ${{ matrix.abi }}
+          PYTHON_RUNTIME_CLANG: ${{ matrix.clang }}
+        run: |
+          set -euo pipefail
+          FILE="python-3.14.10-${{ matrix.triple }}.tar.gz"
+          mkdir -p target/python-android-cache
+          cp "$FILE" "target/python-android-cache/$FILE"
+          python3 -m unittest discover -s scripts/tests -p 'test_android*.py'
+          python3 - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          from python_android_runtime import prepare_python_runtime
+          ndk_bin = Path(os.environ["ANDROID_HOME"]) / "ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          linker = ndk_bin / os.environ["PYTHON_RUNTIME_CLANG"]
+          result = prepare_python_runtime(
+              os.environ["PYTHON_RUNTIME_ABI"], ndk_bin, linker,
+              Path("target/python-runtime-validation"),
+          )
+          print("Verified Android CPython runtime:")
+          print(f"  native extensions: {result['extension_count']}")
+          print(f"  standard-library files: {result['stdlib_file_count']}")
+          print(f"  archive SHA256: {result['archive_sha256']}")
+          PY
 
       - name: Package verified ARM64 runtime for device testing
         if: matrix.abi == 'arm64-v8a'
