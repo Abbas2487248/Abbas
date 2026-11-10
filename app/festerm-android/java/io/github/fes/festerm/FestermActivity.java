@@ -181,12 +181,19 @@ public final class FestermActivity extends NativeActivity {
         File command = new File(bin, "python");
         String target = launcher.getAbsolutePath();
         try {
-            if (command.exists() || Files.isSymbolicLink(command.toPath())) {
-                if (Files.isSymbolicLink(command.toPath()) &&
+            try {
+                StructStat metadata = Os.lstat(command.getAbsolutePath());
+                if (OsConstants.S_ISLNK(metadata.st_mode) &&
                     target.equals(Os.readlink(command.getAbsolutePath()))) {
                     return new File[]{runtime, stdlib, nativeDir, command};
                 }
-                if (!command.delete()) throw new IOException("Could not replace private Python command");
+                if (OsConstants.S_ISLNK(metadata.st_mode)) {
+                    Os.unlink(command.getAbsolutePath());
+                } else if (!command.delete()) {
+                    throw new IOException("Could not replace private Python command");
+                }
+            } catch (ErrnoException missing) {
+                if (missing.errno != OsConstants.ENOENT) throw missing;
             }
             Os.symlink(target, command.getAbsolutePath());
         } catch (ErrnoException error) {
