@@ -223,6 +223,8 @@ public final class FestermActivity extends NativeActivity {
                 throw new IOException("Packaged PTY helper is missing or not executable");
             }
 
+            File[] pythonRuntime = preparePythonRuntime();
+
             File socketFile = new File(root, "session-" + sessionId + ".sock");
             File logFile = new File(root, "session-" + sessionId + ".log");
             String socket = socketFile.getAbsolutePath();
@@ -235,8 +237,20 @@ public final class FestermActivity extends NativeActivity {
 
             java.lang.Process process;
             try {
-                process = new ProcessBuilder(executable.getAbsolutePath(), socket, root.getAbsolutePath())
-                        .redirectErrorStream(true)
+                ProcessBuilder builder = new ProcessBuilder(
+                        executable.getAbsolutePath(), socket, root.getAbsolutePath());
+                Map<String, String> environment = builder.environment();
+                String oldPath = environment.getOrDefault("PATH", "/system/bin");
+                String oldLibraryPath = environment.getOrDefault("LD_LIBRARY_PATH", "");
+                environment.put("PATH", pythonRuntime[3].getParent() + ":"
+                        + pythonRuntime[2].getAbsolutePath() + ":" + oldPath);
+                environment.put("PYTHONHOME", pythonRuntime[0].getAbsolutePath());
+                environment.put("PYTHONPATH", pythonRuntime[1].getAbsolutePath() + ":"
+                        + pythonRuntime[2].getAbsolutePath());
+                environment.put("PYTHONNOUSERSITE", "1");
+                environment.put("LD_LIBRARY_PATH", pythonRuntime[2].getAbsolutePath()
+                        + (oldLibraryPath.isEmpty() ? "" : ":" + oldLibraryPath));
+                process = builder.redirectErrorStream(true)
                         .redirectOutput(logFile)
                         .start();
             } catch (IOException error) {
