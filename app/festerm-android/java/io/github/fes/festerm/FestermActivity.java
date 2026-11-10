@@ -188,7 +188,7 @@ public final class FestermActivity extends NativeActivity {
                     return new File[]{runtime, stdlib, nativeDir, command};
                 }
                 if (OsConstants.S_ISLNK(metadata.st_mode)) {
-                    Os.unlink(command.getAbsolutePath());
+                    if (!command.delete()) throw new IOException("Could not remove stale Python command link");
                 } else if (!command.delete()) {
                     throw new IOException("Could not replace private Python command");
                 }
